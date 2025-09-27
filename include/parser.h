@@ -1,0 +1,57 @@
+#pragma once
+
+#include "token.h"
+#include "ast.h"
+#include <vector>
+#include <optional>
+
+namespace tinyjs {
+
+class Parser {
+public:
+  explicit Parser(std::vector<Token> tokens);
+
+  std::optional<Program> parse();
+
+private:
+  std::vector<Token> tokens_;
+  size_t pos_ = 0;
+
+  const Token& current() const;
+  const Token& peek(size_t offset = 1) const;
+  const Token& advance();
+  bool match(TokenType type) const;
+  bool expect(TokenType type);
+  void consumeSemicolon();
+
+  StmtPtr parseStatement();
+  StmtPtr parseVarDeclaration();
+  StmtPtr parseFunctionDeclaration();
+  StmtPtr parseReturnStatement();
+  StmtPtr parseIfStatement();
+  StmtPtr parseWhileStatement();
+  StmtPtr parseForStatement();
+  StmtPtr parseBlockStatement();
+  StmtPtr parseExpressionStatement();
+  StmtPtr parseTryStatement();
+
+  ExprPtr parseExpression();
+  ExprPtr parseAssignment();
+  ExprPtr parseConditional();
+  ExprPtr parseLogicalOr();
+  ExprPtr parseLogicalAnd();
+  ExprPtr parseEquality();
+  ExprPtr parseRelational();
+  ExprPtr parseAdditive();
+  ExprPtr parseMultiplicative();
+  ExprPtr parseUnary();
+  ExprPtr parsePostfix();
+  ExprPtr parseCall();
+  ExprPtr parseMember();
+  ExprPtr parsePrimary();
+  ExprPtr parseArrayExpression();
+  ExprPtr parseObjectExpression();
+  ExprPtr parseFunctionExpression();
+};
+
+}
