@@ -109,6 +109,7 @@ private:
   Task evaluateArray(const ArrayExpr& expr);
   Task evaluateObject(const ObjectExpr& expr);
   Task evaluateFunction(const FunctionExpr& expr);
+  Task evaluateAwait(const AwaitExpr& expr);
 
   Task evaluateVarDecl(const VarDeclaration& decl);
   Task evaluateFuncDecl(const FunctionDeclaration& decl);

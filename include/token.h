@@ -9,6 +9,7 @@ namespace tinyjs {
 enum class TokenType {
   EndOfFile,
   Number,
+  BigInt,
   String,
   Identifier,
 
@@ -21,6 +22,8 @@ enum class TokenType {
   Const,
   Var,
   Function,
+  Async,
+  Await,
   Return,
   If,
   Else,

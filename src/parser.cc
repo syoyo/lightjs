@@ -62,6 +62,11 @@ StmtPtr Parser::parseStatement() {
     case TokenType::Const:
     case TokenType::Var:
       return parseVarDeclaration();
+    case TokenType::Async:
+      if (peek().type == TokenType::Function) {
+        return parseFunctionDeclaration();
+      }
+      return parseExpressionStatement();
     case TokenType::Function:
       return parseFunctionDeclaration();
     case TokenType::Return:
@@ -129,6 +134,12 @@ StmtPtr Parser::parseVarDeclaration() {
 }
 
 StmtPtr Parser::parseFunctionDeclaration() {
+  bool isAsync = false;
+  if (match(TokenType::Async)) {
+    isAsync = true;
+    advance();
+  }
+
   expect(TokenType::Function);
 
   if (!match(TokenType::Identifier)) {
@@ -165,6 +176,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.id = {name};
   funcDecl.params = std::move(params);
   funcDecl.body = std::move(blockStmt->body);
+  funcDecl.isAsync = isAsync;
 
   return std::make_unique<Statement>(std::move(funcDecl));
 }
@@ -482,6 +494,12 @@ ExprPtr Parser::parseMultiplicative() {
 }
 
 ExprPtr Parser::parseUnary() {
+  if (match(TokenType::Await)) {
+    advance();
+    auto argument = parseUnary();
+    return std::make_unique<Expression>(AwaitExpr{std::move(argument)});
+  }
+
   if (match(TokenType::Bang) || match(TokenType::Minus) ||
       match(TokenType::Plus) || match(TokenType::Typeof)) {
 
@@ -583,6 +601,12 @@ ExprPtr Parser::parsePrimary() {
     return std::make_unique<Expression>(NumberLiteral{value});
   }
 
+  if (match(TokenType::BigInt)) {
+    int64_t value = std::stoll(current().value);
+    advance();
+    return std::make_unique<Expression>(BigIntLiteral{value});
+  }
+
   if (match(TokenType::String)) {
     std::string value = current().value;
     advance();
@@ -608,6 +632,12 @@ ExprPtr Parser::parsePrimary() {
     std::string name = current().value;
     advance();
     return std::make_unique<Expression>(Identifier{name});
+  }
+
+  if (match(TokenType::Async)) {
+    if (peek().type == TokenType::Function) {
+      return parseFunctionExpression();
+    }
   }
 
   if (match(TokenType::Function)) {
@@ -678,6 +708,12 @@ ExprPtr Parser::parseObjectExpression() {
 }
 
 ExprPtr Parser::parseFunctionExpression() {
+  bool isAsync = false;
+  if (match(TokenType::Async)) {
+    isAsync = true;
+    advance();
+  }
+
   expect(TokenType::Function);
 
   std::string name;
@@ -707,6 +743,7 @@ ExprPtr Parser::parseFunctionExpression() {
   FunctionExpr funcExpr;
   funcExpr.params = std::move(params);
   funcExpr.name = name;
+  funcExpr.isAsync = isAsync;
   if (blockStmt) {
     funcExpr.body = std::move(blockStmt->body);
   }

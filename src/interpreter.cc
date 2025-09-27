@@ -67,6 +67,8 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return Value(Undefined{});
   } else if (auto* node = std::get_if<NumberLiteral>(&expr.node)) {
     co_return Value(node->value);
+  } else if (auto* node = std::get_if<BigIntLiteral>(&expr.node)) {
+    co_return Value(BigInt(node->value));
   } else if (auto* node = std::get_if<StringLiteral>(&expr.node)) {
     co_return Value(node->value);
   } else if (auto* node = std::get_if<BoolLiteral>(&expr.node)) {
@@ -93,6 +95,8 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return co_await evaluateObject(*node);
   } else if (auto* node = std::get_if<FunctionExpr>(&expr.node)) {
     co_return co_await evaluateFunction(*node);
+  } else if (auto* node = std::get_if<AwaitExpr>(&expr.node)) {
+    co_return co_await evaluateAwait(*node);
   }
   co_return Value(Undefined{});
 }
@@ -115,30 +119,69 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (left.isString() || right.isString()) {
         co_return Value(left.toString() + right.toString());
       }
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(BigInt(left.toBigInt() + right.toBigInt()));
+      }
       co_return Value(left.toNumber() + right.toNumber());
     case BinaryExpr::Op::Sub:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(BigInt(left.toBigInt() - right.toBigInt()));
+      }
       co_return Value(left.toNumber() - right.toNumber());
     case BinaryExpr::Op::Mul:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(BigInt(left.toBigInt() * right.toBigInt()));
+      }
       co_return Value(left.toNumber() * right.toNumber());
     case BinaryExpr::Op::Div:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(BigInt(left.toBigInt() / right.toBigInt()));
+      }
       co_return Value(left.toNumber() / right.toNumber());
     case BinaryExpr::Op::Mod:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(BigInt(left.toBigInt() % right.toBigInt()));
+      }
       co_return Value(std::fmod(left.toNumber(), right.toNumber()));
     case BinaryExpr::Op::Less:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() < right.toBigInt());
+      }
       co_return Value(left.toNumber() < right.toNumber());
     case BinaryExpr::Op::Greater:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() > right.toBigInt());
+      }
       co_return Value(left.toNumber() > right.toNumber());
     case BinaryExpr::Op::LessEqual:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() <= right.toBigInt());
+      }
       co_return Value(left.toNumber() <= right.toNumber());
     case BinaryExpr::Op::GreaterEqual:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() >= right.toBigInt());
+      }
       co_return Value(left.toNumber() >= right.toNumber());
     case BinaryExpr::Op::Equal:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() == right.toBigInt());
+      }
       co_return Value(left.toNumber() == right.toNumber());
     case BinaryExpr::Op::NotEqual:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() != right.toBigInt());
+      }
       co_return Value(left.toNumber() != right.toNumber());
     case BinaryExpr::Op::StrictEqual:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() == right.toBigInt());
+      }
       co_return Value(left.toNumber() == right.toNumber());
     case BinaryExpr::Op::StrictNotEqual:
+      if (left.isBigInt() && right.isBigInt()) {
+        co_return Value(left.toBigInt() != right.toBigInt());
+      }
       co_return Value(left.toNumber() != right.toNumber());
     case BinaryExpr::Op::LogicalAnd:
       co_return left.toBool() ? right : left;
@@ -160,6 +203,9 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
     case UnaryExpr::Op::Not:
       co_return Value(!arg.toBool());
     case UnaryExpr::Op::Minus:
+      if (arg.isBigInt()) {
+        co_return Value(BigInt(-arg.toBigInt()));
+      }
       co_return Value(-arg.toNumber());
     case UnaryExpr::Op::Plus:
       co_return Value(arg.toNumber());
@@ -168,6 +214,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isNull()) co_return Value("object");
       if (arg.isBool()) co_return Value("boolean");
       if (arg.isNumber()) co_return Value("number");
+      if (arg.isBigInt()) co_return Value("bigint");
       if (arg.isString()) co_return Value("string");
       if (arg.isFunction()) co_return Value("function");
       co_return Value("object");
@@ -210,6 +257,78 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
       env_->set(id->name, result);
       co_return result;
+    }
+  }
+
+  if (auto* member = std::get_if<MemberExpr>(&expr.left->node)) {
+    auto objTask = evaluate(*member->object);
+    while (!objTask.done()) {
+      std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
+    }
+    Value obj = objTask.result();
+
+    std::string propName;
+    if (member->computed) {
+      auto propTask = evaluate(*member->property);
+      while (!propTask.done()) {
+        std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
+      }
+      propName = propTask.result().toString();
+    } else {
+      if (auto* id = std::get_if<Identifier>(&member->property->node)) {
+        propName = id->name;
+      }
+    }
+
+    if (obj.isObject()) {
+      auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      if (expr.op == AssignmentExpr::Op::Assign) {
+        objPtr->properties[propName] = right;
+      } else {
+        Value current = objPtr->properties[propName];
+        switch (expr.op) {
+          case AssignmentExpr::Op::AddAssign:
+            objPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+            break;
+          case AssignmentExpr::Op::SubAssign:
+            objPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
+            break;
+          case AssignmentExpr::Op::MulAssign:
+            objPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
+            break;
+          case AssignmentExpr::Op::DivAssign:
+            objPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
+            break;
+          default:
+            objPtr->properties[propName] = right;
+        }
+      }
+      co_return right;
+    }
+
+    if (obj.isArray()) {
+      auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+      try {
+        size_t idx = std::stoul(propName);
+        if (idx >= arrPtr->elements.size()) {
+          arrPtr->elements.resize(idx + 1, Value(Undefined{}));
+        }
+        arrPtr->elements[idx] = right;
+        co_return right;
+      } catch (...) {}
+    }
+
+    if (obj.isTypedArray()) {
+      auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
+      try {
+        size_t idx = std::stoul(propName);
+        if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
+          taPtr->setBigIntElement(idx, right.toBigInt());
+        } else {
+          taPtr->setElement(idx, right.toNumber());
+        }
+        co_return right;
+      } catch (...) {}
     }
   }
 
@@ -306,6 +425,20 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
   }
 
+  if (obj.isPromise()) {
+    auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+    if (promisePtr->state == PromiseState::Fulfilled) {
+      Value resolvedValue = promisePtr->result;
+      if (resolvedValue.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(resolvedValue.data);
+        auto it = objPtr->properties.find(propName);
+        if (it != objPtr->properties.end()) {
+          co_return it->second;
+        }
+      }
+    }
+  }
+
   if (obj.isObject()) {
     auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
     auto it = objPtr->properties.find(propName);
@@ -323,6 +456,26 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       size_t idx = std::stoul(propName);
       if (idx < arrPtr->elements.size()) {
         co_return arrPtr->elements[idx];
+      }
+    } catch (...) {}
+  }
+
+  if (obj.isTypedArray()) {
+    auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
+    if (propName == "length") {
+      co_return Value(static_cast<double>(taPtr->length));
+    }
+    if (propName == "byteLength") {
+      co_return Value(static_cast<double>(taPtr->buffer.size()));
+    }
+    try {
+      size_t idx = std::stoul(propName);
+      if (idx < taPtr->length) {
+        if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
+          co_return Value(BigInt(taPtr->getBigIntElement(idx)));
+        } else {
+          co_return Value(taPtr->getElement(idx));
+        }
       }
     } catch (...) {}
   }
@@ -384,6 +537,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   auto func = std::make_shared<Function>();
   func->isNative = false;
+  func->isAsync = expr.isAsync;
 
   for (const auto& param : expr.params) {
     func->params.push_back(param.name);
@@ -393,6 +547,26 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->closure = env_;
 
   co_return Value(func);
+}
+
+Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
+  auto task = evaluate(*expr.argument);
+  while (!task.done()) {
+    std::coroutine_handle<>::from_address(task.handle.address()).resume();
+  }
+  Value val = task.result();
+
+  if (val.isPromise()) {
+    auto promise = std::get<std::shared_ptr<Promise>>(val.data);
+    if (promise->state == PromiseState::Fulfilled) {
+      co_return promise->result;
+    } else if (promise->state == PromiseState::Rejected) {
+      co_return promise->result;
+    }
+    co_return Value(Undefined{});
+  }
+
+  co_return val;
 }
 
 Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
@@ -413,6 +587,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
 Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   auto func = std::make_shared<Function>();
   func->isNative = false;
+  func->isAsync = decl.isAsync;
 
   for (const auto& param : decl.params) {
     func->params.push_back(param.name);

@@ -137,6 +137,201 @@ int main() {
     greeting + name
   )", "Hello, TinyJS");
 
+  runTest("BigInt literal", R"(
+    let big = 9007199254740991n;
+    big
+  )", "9007199254740991n");
+
+  runTest("BigInt arithmetic addition", R"(
+    let a = 100n;
+    let b = 200n;
+    a + b
+  )", "300n");
+
+  runTest("BigInt arithmetic subtraction", R"(
+    let a = 500n;
+    let b = 200n;
+    a - b
+  )", "300n");
+
+  runTest("BigInt arithmetic multiplication", R"(
+    let a = 123456789n;
+    let b = 987654321n;
+    a * b
+  )", "121932631112635269n");
+
+  runTest("BigInt arithmetic division", R"(
+    let a = 1000n;
+    let b = 3n;
+    a / b
+  )", "333n");
+
+  runTest("BigInt arithmetic modulo", R"(
+    let a = 1000n;
+    let b = 7n;
+    a % b
+  )", "6n");
+
+  runTest("BigInt comparison", R"(
+    let a = 100n;
+    let b = 200n;
+    a < b
+  )", "true");
+
+  runTest("BigInt equality", R"(
+    let a = 12345n;
+    let b = 12345n;
+    a === b
+  )", "true");
+
+  runTest("BigInt typeof", R"(
+    let big = 999n;
+    typeof big
+  )", "bigint");
+
+  runTest("BigInt negation", R"(
+    let big = 42n;
+    -big
+  )", "-42n");
+
+  runTest("Uint8Array creation", R"(
+    let arr = Uint8Array(10);
+    arr
+  )", "[TypedArray]");
+
+  runTest("Uint8Array length", R"(
+    let arr = Uint8Array(5);
+    arr.length
+  )", "5");
+
+  runTest("Uint8Array set and get", R"(
+    let arr = Uint8Array(3);
+    arr[0] = 100;
+    arr[1] = 200;
+    arr[2] = 50;
+    arr[1]
+  )", "200");
+
+  runTest("Int8Array negative values", R"(
+    let arr = Int8Array(2);
+    arr[0] = -10;
+    arr[1] = 120;
+    arr[0]
+  )", "-10");
+
+  runTest("Uint8ClampedArray clamping", R"(
+    let arr = Uint8ClampedArray(3);
+    arr[0] = 300;
+    arr[1] = -50;
+    arr[2] = 128;
+    arr[0]
+  )", "255");
+
+  runTest("Float32Array", R"(
+    let arr = Float32Array(2);
+    arr[0] = 3.14;
+    arr[1] = 2.71;
+    arr[0]
+  )", "3.14");
+
+  runTest("Int32Array", R"(
+    let arr = Int32Array(2);
+    arr[0] = 1000000;
+    arr[1] = -999999;
+    arr[0]
+  )", "1e+06");
+
+  runTest("Uint16Array", R"(
+    let arr = Uint16Array(3);
+    arr[0] = 65535;
+    arr[1] = 32768;
+    arr[2] = 100;
+    arr[1]
+  )", "32768");
+
+  runTest("TypedArray byteLength", R"(
+    let arr = Uint32Array(10);
+    arr.byteLength
+  )", "40");
+
+  runTest("Float16Array creation", R"(
+    let arr = Float16Array(5);
+    arr
+  )", "[TypedArray]");
+
+  runTest("Float16Array length", R"(
+    let arr = Float16Array(8);
+    arr.length
+  )", "8");
+
+  runTest("Float16Array set and get", R"(
+    let arr = Float16Array(3);
+    arr[0] = 1.5;
+    arr[1] = 2.75;
+    arr[2] = 3.25;
+    arr[1]
+  )", "2.75");
+
+  runTest("Float16Array byteLength", R"(
+    let arr = Float16Array(10);
+    arr.byteLength
+  )", "20");
+
+  runTest("Async function declaration", R"(
+    async function test() {
+      return 42;
+    }
+    test()
+  )", "42");
+
+  runTest("Async function expression", R"(
+    let fn = async function() {
+      return "hello";
+    };
+    fn()
+  )", "hello");
+
+  runTest("SHA-256 hash", R"(
+    crypto.sha256("hello")
+  )", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+
+  runTest("SHA-256 empty string", R"(
+    crypto.sha256("")
+  )", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+  runTest("HMAC-SHA256", R"(
+    crypto.hmac("key", "message")
+  )", "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a");
+
+  runTest("Hex encoding", R"(
+    crypto.toHex("hello")
+  )", "68656c6c6f");
+
+  runTest("Fetch returns promise", R"(
+    let result = fetch("file:///test.txt");
+    typeof result
+  )", "object");
+
+  runTest("Fetch file protocol", R"(
+    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    resp.status
+  )", "200");
+
+  runTest("Fetch file protocol - ok property", R"(
+    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    resp.ok
+  )", "true");
+
+  runTest("Fetch file protocol - text method", R"(
+    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    resp.text()
+  )", "Hello from file!\n");
+
+  runTest("Fetch file not found", R"(
+    let resp = fetch("file:///nonexistent.txt");
+    resp.status
+  )", "404");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

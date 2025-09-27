@@ -9,6 +9,8 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"const", TokenType::Const},
   {"var", TokenType::Var},
   {"function", TokenType::Function},
+  {"async", TokenType::Async},
+  {"await", TokenType::Await},
   {"return", TokenType::Return},
   {"if", TokenType::If},
   {"else", TokenType::Else},
@@ -103,12 +105,14 @@ std::optional<Token> Lexer::readNumber() {
   uint32_t startLine = line_;
   uint32_t startColumn = column_;
   size_t start = pos_;
+  bool hasDot = false;
 
   while (!isAtEnd() && isDigit(current())) {
     advance();
   }
 
   if (!isAtEnd() && current() == '.' && isDigit(peek())) {
+    hasDot = true;
     advance();
     while (!isAtEnd() && isDigit(current())) {
       advance();
@@ -123,6 +127,11 @@ std::optional<Token> Lexer::readNumber() {
     while (!isAtEnd() && isDigit(current())) {
       advance();
     }
+  }
+
+  if (!isAtEnd() && current() == 'n' && !hasDot) {
+    advance();
+    return Token(TokenType::BigInt, source_.substr(start, pos_ - start - 1), startLine, startColumn);
   }
 
   return Token(TokenType::Number, source_.substr(start, pos_ - start), startLine, startColumn);

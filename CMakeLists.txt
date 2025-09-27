@@ -13,6 +13,8 @@ add_library(tinyjs
   src/value.cc
   src/environment.cc
   src/interpreter.cc
+  src/crypto.cc
+  src/http.cc
 )
 
 target_include_directories(tinyjs PUBLIC

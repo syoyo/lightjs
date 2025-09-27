@@ -1,5 +1,8 @@
 #include "environment.h"
+#include "crypto.h"
+#include "http.h"
 #include <iostream>
+#include <thread>
 
 namespace tinyjs {
 
@@ -71,6 +74,117 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   env->define("console", Value(consoleObj));
   env->define("undefined", Value(Undefined{}));
+
+  auto createTypedArrayConstructor = [](TypedArrayType type) {
+    auto func = std::make_shared<Function>();
+    func->isNative = true;
+    func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
+      if (args.empty()) {
+        return Value(std::make_shared<TypedArray>(type, 0));
+      }
+      size_t length = static_cast<size_t>(args[0].toNumber());
+      return Value(std::make_shared<TypedArray>(type, length));
+    };
+    return Value(func);
+  };
+
+  env->define("Int8Array", createTypedArrayConstructor(TypedArrayType::Int8));
+  env->define("Uint8Array", createTypedArrayConstructor(TypedArrayType::Uint8));
+  env->define("Uint8ClampedArray", createTypedArrayConstructor(TypedArrayType::Uint8Clamped));
+  env->define("Int16Array", createTypedArrayConstructor(TypedArrayType::Int16));
+  env->define("Uint16Array", createTypedArrayConstructor(TypedArrayType::Uint16));
+  env->define("Float16Array", createTypedArrayConstructor(TypedArrayType::Float16));
+  env->define("Int32Array", createTypedArrayConstructor(TypedArrayType::Int32));
+  env->define("Uint32Array", createTypedArrayConstructor(TypedArrayType::Uint32));
+  env->define("Float32Array", createTypedArrayConstructor(TypedArrayType::Float32));
+  env->define("Float64Array", createTypedArrayConstructor(TypedArrayType::Float64));
+  env->define("BigInt64Array", createTypedArrayConstructor(TypedArrayType::BigInt64));
+  env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64));
+
+  auto cryptoObj = std::make_shared<Object>();
+
+  auto sha256Fn = std::make_shared<Function>();
+  sha256Fn->isNative = true;
+  sha256Fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string(""));
+    std::string input = args[0].toString();
+    std::string result = crypto::SHA256::hashHex(
+      reinterpret_cast<const uint8_t*>(input.c_str()), input.length()
+    );
+    return Value(result);
+  };
+  cryptoObj->properties["sha256"] = Value(sha256Fn);
+
+  auto hmacFn = std::make_shared<Function>();
+  hmacFn->isNative = true;
+  hmacFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(std::string(""));
+    std::string key = args[0].toString();
+    std::string message = args[1].toString();
+    std::string result = crypto::HMAC::computeHex(
+      reinterpret_cast<const uint8_t*>(key.c_str()), key.length(),
+      reinterpret_cast<const uint8_t*>(message.c_str()), message.length()
+    );
+    return Value(result);
+  };
+  cryptoObj->properties["hmac"] = Value(hmacFn);
+
+  auto toHexFn = std::make_shared<Function>();
+  toHexFn->isNative = true;
+  toHexFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string(""));
+    std::string input = args[0].toString();
+    std::string result = crypto::toHex(
+      reinterpret_cast<const uint8_t*>(input.c_str()), input.length()
+    );
+    return Value(result);
+  };
+  cryptoObj->properties["toHex"] = Value(toHexFn);
+
+  env->define("crypto", Value(cryptoObj));
+
+  auto fetchFn = std::make_shared<Function>();
+  fetchFn->isNative = true;
+  fetchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(Undefined{});
+    }
+
+    std::string url = args[0].toString();
+
+    auto promise = std::make_shared<Promise>();
+    http::HTTPClient client;
+
+    try {
+      http::Response httpResp = client.get(url);
+
+      auto respObj = std::make_shared<Object>();
+      respObj->properties["status"] = Value(static_cast<double>(httpResp.statusCode));
+      respObj->properties["statusText"] = Value(httpResp.statusText);
+      respObj->properties["ok"] = Value(httpResp.statusCode >= 200 && httpResp.statusCode < 300);
+
+      auto textFn = std::make_shared<Function>();
+      textFn->isNative = true;
+      std::string bodyText = httpResp.bodyAsString();
+      textFn->nativeFunc = [bodyText](const std::vector<Value>&) -> Value {
+        return Value(bodyText);
+      };
+      respObj->properties["text"] = Value(textFn);
+
+      auto headersObj = std::make_shared<Object>();
+      for (const auto& [key, value] : httpResp.headers) {
+        headersObj->properties[key] = Value(value);
+      }
+      respObj->properties["headers"] = Value(headersObj);
+
+      promise->resolve(Value(respObj));
+    } catch (...) {
+      promise->reject(Value(std::string("Fetch failed")));
+    }
+
+    return Value(promise);
+  };
+  env->define("fetch", Value(fetchFn));
 
   return env;
 }

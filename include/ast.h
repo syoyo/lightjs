@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <variant>
+#include <cstdint>
 
 namespace tinyjs {
 
@@ -19,6 +20,10 @@ struct Identifier {
 
 struct NumberLiteral {
   double value;
+};
+
+struct BigIntLiteral {
+  int64_t value;
 };
 
 struct StringLiteral {
@@ -93,16 +98,23 @@ struct ObjectExpr {
   std::vector<ObjectProperty> properties;
 };
 
+struct AwaitExpr {
+  ExprPtr argument;
+};
+
 struct FunctionExpr {
   std::vector<Identifier> params;
   std::vector<StmtPtr> body;
   std::string name;
+  bool isAsync;
+  FunctionExpr() : isAsync(false) {}
 };
 
 struct Expression {
   std::variant<
     Identifier,
     NumberLiteral,
+    BigIntLiteral,
     StringLiteral,
     BoolLiteral,
     NullLiteral,
@@ -115,7 +127,8 @@ struct Expression {
     ConditionalExpr,
     ArrayExpr,
     ObjectExpr,
-    FunctionExpr
+    FunctionExpr,
+    AwaitExpr
   > node;
 
   template<typename T>
@@ -137,6 +150,8 @@ struct FunctionDeclaration {
   Identifier id;
   std::vector<Identifier> params;
   std::vector<StmtPtr> body;
+  bool isAsync;
+  FunctionDeclaration() : isAsync(false) {}
 };
 
 struct ReturnStmt {
