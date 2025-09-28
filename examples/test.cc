@@ -332,6 +332,74 @@ int main() {
     resp.status
   )", "404");
 
+  runTest("Regex literal", R"(
+    let re = /hello/;
+    re
+  )", "/hello/");
+
+  runTest("Regex literal with flags", R"(
+    let re = /hello/i;
+    re
+  )", "/hello/i");
+
+  runTest("Regex test - match", R"(
+    let re = /world/;
+    re.test("hello world")
+  )", "true");
+
+  runTest("Regex test - no match", R"(
+    let re = /xyz/;
+    re.test("hello world")
+  )", "false");
+
+  runTest("Regex test - case insensitive", R"(
+    let re = /HELLO/i;
+    re.test("hello world")
+  )", "true");
+
+  runTest("Regex exec - match", R"(
+    let re = /world/;
+    let result = re.exec("hello world");
+    result
+  )", "[Array]");
+
+  runTest("Regex exec - no match", R"(
+    let re = /xyz/;
+    let result = re.exec("hello world");
+    result
+  )", "null");
+
+  runTest("String match method", R"(
+    let str = "hello world";
+    let result = str.match(/world/);
+    result
+  )", "[Array]");
+
+  runTest("String replace with regex", R"(
+    let str = "hello world";
+    str.replace(/world/, "universe")
+  )", "hello universe");
+
+  runTest("String replace with string", R"(
+    let str = "hello world";
+    str.replace("world", "there")
+  )", "hello there");
+
+  runTest("RegExp constructor", R"(
+    let re = RegExp("test", "i");
+    re.test("TEST")
+  )", "true");
+
+  runTest("Regex source property", R"(
+    let re = /hello/;
+    re.source
+  )", "hello");
+
+  runTest("Regex flags property", R"(
+    let re = /hello/gi;
+    re.flags
+  )", "gi");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

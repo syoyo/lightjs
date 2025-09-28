@@ -11,6 +11,7 @@ enum class TokenType {
   Number,
   BigInt,
   String,
+  Regex,
   Identifier,
 
   True,

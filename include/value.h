@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef USE_SIMPLE_REGEX
+#define USE_SIMPLE_REGEX 0
+#endif
+
 #include <variant>
 #include <string>
 #include <vector>
@@ -9,12 +13,19 @@
 #include <cstdint>
 #include <cstring>
 
+#if USE_SIMPLE_REGEX
+#include "simple_regex.h"
+#else
+#include <regex>
+#endif
+
 namespace tinyjs {
 
 struct Value;
 struct Object;
 struct Function;
 struct Promise;
+struct Regex;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -44,6 +55,71 @@ struct Array {
 
 struct Object {
   std::unordered_map<std::string, Value> properties;
+};
+
+struct Regex {
+#if USE_SIMPLE_REGEX
+  simple_regex::Regex* regex;
+#else
+  std::regex regex;
+#endif
+  std::string pattern;
+  std::string flags;
+
+  Regex(const std::string& p, const std::string& f = "")
+    : pattern(p), flags(f) {
+#if USE_SIMPLE_REGEX
+    bool caseInsensitive = false;
+    for (char flag : flags) {
+      if (flag == 'i') caseInsensitive = true;
+    }
+    regex = new simple_regex::Regex(pattern, caseInsensitive);
+#else
+    std::regex::flag_type options = std::regex::ECMAScript;
+    for (char flag : flags) {
+      if (flag == 'i') options |= std::regex::icase;
+    }
+    regex = std::regex(pattern, options);
+#endif
+  }
+
+  ~Regex() {
+#if USE_SIMPLE_REGEX
+    delete regex;
+#endif
+  }
+
+  Regex(const Regex& other) : pattern(other.pattern), flags(other.flags) {
+#if USE_SIMPLE_REGEX
+    bool caseInsensitive = false;
+    for (char flag : flags) {
+      if (flag == 'i') caseInsensitive = true;
+    }
+    regex = new simple_regex::Regex(pattern, caseInsensitive);
+#else
+    regex = other.regex;
+#endif
+  }
+
+  Regex& operator=(const Regex& other) {
+    if (this != &other) {
+#if USE_SIMPLE_REGEX
+      delete regex;
+#endif
+      pattern = other.pattern;
+      flags = other.flags;
+#if USE_SIMPLE_REGEX
+      bool caseInsensitive = false;
+      for (char flag : flags) {
+        if (flag == 'i') caseInsensitive = true;
+      }
+      regex = new simple_regex::Regex(pattern, caseInsensitive);
+#else
+      regex = other.regex;
+#endif
+    }
+    return *this;
+  }
 };
 
 enum class TypedArrayType {
@@ -162,7 +238,8 @@ struct Value {
     std::shared_ptr<Array>,
     std::shared_ptr<Object>,
     std::shared_ptr<TypedArray>,
-    std::shared_ptr<Promise>
+    std::shared_ptr<Promise>,
+    std::shared_ptr<Regex>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -180,6 +257,7 @@ struct Value {
   Value(std::shared_ptr<Object> o) : data(o) {}
   Value(std::shared_ptr<TypedArray> ta) : data(ta) {}
   Value(std::shared_ptr<Promise> p) : data(p) {}
+  Value(std::shared_ptr<Regex> r) : data(r) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -192,6 +270,7 @@ struct Value {
   bool isObject() const { return std::holds_alternative<std::shared_ptr<Object>>(data); }
   bool isTypedArray() const { return std::holds_alternative<std::shared_ptr<TypedArray>>(data); }
   bool isPromise() const { return std::holds_alternative<std::shared_ptr<Promise>>(data); }
+  bool isRegex() const { return std::holds_alternative<std::shared_ptr<Regex>>(data); }
 
   bool toBool() const;
   double toNumber() const;

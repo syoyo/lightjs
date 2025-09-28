@@ -186,6 +186,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("fetch", Value(fetchFn));
 
+  auto regExpConstructor = std::make_shared<Function>();
+  regExpConstructor->isNative = true;
+  regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(Undefined{});
+    std::string pattern = args[0].toString();
+    std::string flags = args.size() > 1 ? args[1].toString() : "";
+    return Value(std::make_shared<Regex>(pattern, flags));
+  };
+  env->define("RegExp", Value(regExpConstructor));
+
   return env;
 }
 

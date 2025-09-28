@@ -31,11 +31,13 @@ private:
   std::optional<Token> readNumber();
   std::optional<Token> readString(char quote);
   std::optional<Token> readIdentifier();
+  std::optional<Token> readRegex();
   std::optional<Token> readOperator();
 
   static bool isDigit(char c);
   static bool isAlpha(char c);
   static bool isAlphaNumeric(char c);
+  static bool expectsRegex(TokenType type);
 };
 
 }

@@ -10,19 +10,24 @@ TinyJS is a C++20 JavaScript (ES2020) interpreter featuring:
 - No RTTI (`-fno-rtti` enabled)
 - Pure C/C++ crypto implementations (SHA-256, HMAC)
 - Minimal fetch API with platform-specific sockets (Winsock2/POSIX)
-- Comprehensive type support: BigInt, TypedArrays (12 types including Float16Array), Promises
+- Comprehensive type support: BigInt, TypedArrays (12 types including Float16Array), Promises, RegExp
+- **Dual regex implementations**: Choose between std::regex or pure C/C++ simple regex engine
 
 ## Build Commands
 
 ```bash
 # Initial setup (from repository root)
 mkdir -p build && cd build
-cmake ..
 
-# Build the project
+# Build with std::regex (default)
+cmake ..
 make
 
-# Run all tests (46 tests)
+# Build with simple regex implementation (pure C/C++, no STL regex)
+cmake .. -DUSE_SIMPLE_REGEX=ON
+make
+
+# Run all tests (60 tests)
 ./tinyjs_test
 
 # Rebuild after changes

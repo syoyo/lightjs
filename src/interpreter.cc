@@ -71,6 +71,9 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return Value(BigInt(node->value));
   } else if (auto* node = std::get_if<StringLiteral>(&expr.node)) {
     co_return Value(node->value);
+  } else if (auto* node = std::get_if<RegexLiteral>(&expr.node)) {
+    auto regex = std::make_shared<Regex>(node->pattern, node->flags);
+    co_return Value(regex);
   } else if (auto* node = std::get_if<BoolLiteral>(&expr.node)) {
     co_return Value(node->value);
   } else if (std::holds_alternative<NullLiteral>(expr.node)) {
@@ -478,6 +481,128 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
       }
     } catch (...) {}
+  }
+
+  if (obj.isRegex()) {
+    auto regexPtr = std::get<std::shared_ptr<Regex>>(obj.data);
+
+    if (propName == "test") {
+      auto testFn = std::make_shared<Function>();
+      testFn->isNative = true;
+      testFn->nativeFunc = [regexPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        std::string str = args[0].toString();
+#if USE_SIMPLE_REGEX
+        return Value(regexPtr->regex->search(str));
+#else
+        return Value(std::regex_search(str, regexPtr->regex));
+#endif
+      };
+      co_return Value(testFn);
+    }
+
+    if (propName == "exec") {
+      auto execFn = std::make_shared<Function>();
+      execFn->isNative = true;
+      execFn->nativeFunc = [regexPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Null{});
+        std::string str = args[0].toString();
+#if USE_SIMPLE_REGEX
+        std::vector<simple_regex::Regex::Match> matches;
+        if (regexPtr->regex->search(str, matches)) {
+          auto arr = std::make_shared<Array>();
+          for (const auto& m : matches) {
+            arr->elements.push_back(Value(m.str));
+          }
+          return Value(arr);
+        }
+#else
+        std::smatch match;
+        if (std::regex_search(str, match, regexPtr->regex)) {
+          auto arr = std::make_shared<Array>();
+          for (const auto& m : match) {
+            arr->elements.push_back(Value(m.str()));
+          }
+          return Value(arr);
+        }
+#endif
+        return Value(Null{});
+      };
+      co_return Value(execFn);
+    }
+
+    if (propName == "source") {
+      co_return Value(regexPtr->pattern);
+    }
+
+    if (propName == "flags") {
+      co_return Value(regexPtr->flags);
+    }
+  }
+
+  if (obj.isString()) {
+    std::string str = std::get<std::string>(obj.data);
+
+    if (propName == "length") {
+      co_return Value(static_cast<double>(str.length()));
+    }
+
+    if (propName == "match") {
+      auto matchFn = std::make_shared<Function>();
+      matchFn->isNative = true;
+      matchFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isRegex()) return Value(Null{});
+        auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+#if USE_SIMPLE_REGEX
+        std::vector<simple_regex::Regex::Match> matches;
+        if (regexPtr->regex->search(str, matches)) {
+          auto arr = std::make_shared<Array>();
+          for (const auto& m : matches) {
+            arr->elements.push_back(Value(m.str));
+          }
+          return Value(arr);
+        }
+#else
+        std::smatch match;
+        if (std::regex_search(str, match, regexPtr->regex)) {
+          auto arr = std::make_shared<Array>();
+          for (const auto& m : match) {
+            arr->elements.push_back(Value(m.str()));
+          }
+          return Value(arr);
+        }
+#endif
+        return Value(Null{});
+      };
+      co_return Value(matchFn);
+    }
+
+    if (propName == "replace") {
+      auto replaceFn = std::make_shared<Function>();
+      replaceFn->isNative = true;
+      replaceFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) return Value(str);
+        if (args[0].isRegex()) {
+          auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+          std::string replacement = args[1].toString();
+#if USE_SIMPLE_REGEX
+          return Value(regexPtr->regex->replace(str, replacement));
+#else
+          return Value(std::regex_replace(str, regexPtr->regex, replacement));
+#endif
+        } else {
+          std::string search = args[0].toString();
+          std::string replacement = args[1].toString();
+          std::string result = str;
+          size_t pos = result.find(search);
+          if (pos != std::string::npos) {
+            result.replace(pos, search.length(), replacement);
+          }
+          return Value(result);
+        }
+      };
+      co_return Value(replaceFn);
+    }
   }
 
   co_return Value(Undefined{});

@@ -191,6 +191,72 @@ std::optional<Token> Lexer::readIdentifier() {
   return Token(TokenType::Identifier, ident, startLine, startColumn);
 }
 
+std::optional<Token> Lexer::readRegex() {
+  uint32_t startLine = line_;
+  uint32_t startColumn = column_;
+  advance();
+
+  std::string pattern;
+  while (!isAtEnd() && current() != '/') {
+    if (current() == '\\') {
+      pattern += current();
+      advance();
+      if (!isAtEnd()) {
+        pattern += current();
+        advance();
+      }
+    } else if (current() == '\n') {
+      return std::nullopt;
+    } else {
+      pattern += current();
+      advance();
+    }
+  }
+
+  if (isAtEnd()) {
+    return std::nullopt;
+  }
+
+  advance();
+
+  std::string flags;
+  while (!isAtEnd() && isAlpha(current())) {
+    flags += current();
+    advance();
+  }
+
+  std::string value = pattern + "||" + flags;
+  return Token(TokenType::Regex, value, startLine, startColumn);
+}
+
+bool Lexer::expectsRegex(TokenType type) {
+  return type == TokenType::Equal ||
+         type == TokenType::LeftParen ||
+         type == TokenType::LeftBracket ||
+         type == TokenType::Comma ||
+         type == TokenType::Semicolon ||
+         type == TokenType::Return ||
+         type == TokenType::Colon ||
+         type == TokenType::Question ||
+         type == TokenType::AmpAmp ||
+         type == TokenType::PipePipe ||
+         type == TokenType::Bang ||
+         type == TokenType::EqualEqual ||
+         type == TokenType::EqualEqualEqual ||
+         type == TokenType::BangEqual ||
+         type == TokenType::BangEqualEqual ||
+         type == TokenType::Less ||
+         type == TokenType::Greater ||
+         type == TokenType::LessEqual ||
+         type == TokenType::GreaterEqual ||
+         type == TokenType::Plus ||
+         type == TokenType::Minus ||
+         type == TokenType::Star ||
+         type == TokenType::Slash ||
+         type == TokenType::Percent ||
+         type == TokenType::LeftBrace;
+}
+
 std::vector<Token> Lexer::tokenize() {
   std::vector<Token> tokens;
 
@@ -322,6 +388,13 @@ std::vector<Token> Lexer::tokenize() {
           advance();
           advance();
         } else {
+          bool canBeRegex = tokens.empty() || expectsRegex(tokens.back().type);
+          if (canBeRegex) {
+            if (auto token = readRegex()) {
+              tokens.push_back(*token);
+              break;
+            }
+          }
           tokens.emplace_back(TokenType::Slash, startLine, startColumn);
           advance();
         }

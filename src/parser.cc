@@ -613,6 +613,15 @@ ExprPtr Parser::parsePrimary() {
     return std::make_unique<Expression>(StringLiteral{value});
   }
 
+  if (match(TokenType::Regex)) {
+    std::string value = current().value;
+    advance();
+    size_t sep = value.find("||");
+    std::string pattern = value.substr(0, sep);
+    std::string flags = (sep != std::string::npos) ? value.substr(sep + 2) : "";
+    return std::make_unique<Expression>(RegexLiteral{pattern, flags});
+  }
+
   if (match(TokenType::True)) {
     advance();
     return std::make_unique<Expression>(BoolLiteral{true});

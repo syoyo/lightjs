@@ -102,6 +102,8 @@ std::string Value::toString() const {
       return "[TypedArray]";
     } else if constexpr (std::is_same_v<T, std::shared_ptr<Promise>>) {
       return "[Promise]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<Regex>>) {
+      return "/" + arg->pattern + "/" + arg->flags;
     } else {
       return "";
     }

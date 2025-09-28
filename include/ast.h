@@ -30,6 +30,11 @@ struct StringLiteral {
   std::string value;
 };
 
+struct RegexLiteral {
+  std::string pattern;
+  std::string flags;
+};
+
 struct BoolLiteral {
   bool value;
 };
@@ -116,6 +121,7 @@ struct Expression {
     NumberLiteral,
     BigIntLiteral,
     StringLiteral,
+    RegexLiteral,
     BoolLiteral,
     NullLiteral,
     BinaryExpr,
