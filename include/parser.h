@@ -34,6 +34,8 @@ private:
   StmtPtr parseBlockStatement();
   StmtPtr parseExpressionStatement();
   StmtPtr parseTryStatement();
+  StmtPtr parseImportDeclaration();
+  StmtPtr parseExportDeclaration();
 
   ExprPtr parseExpression();
   ExprPtr parseAssignment();

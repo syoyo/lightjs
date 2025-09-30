@@ -88,6 +88,10 @@ public:
   Task evaluate(const Statement& stmt);
   Task evaluate(const Program& program);
 
+  // Environment management for modules
+  std::shared_ptr<Environment> getEnvironment() const { return env_; }
+  void setEnvironment(std::shared_ptr<Environment> env) { env_ = env; }
+
 private:
   std::shared_ptr<Environment> env_;
 
@@ -120,6 +124,10 @@ private:
   Task evaluateWhile(const WhileStmt& stmt);
   Task evaluateFor(const ForStmt& stmt);
   Task evaluateTry(const TryStmt& stmt);
+  Task evaluateImport(const ImportDeclaration& stmt);
+  Task evaluateExportNamed(const ExportNamedDeclaration& stmt);
+  Task evaluateExportDefault(const ExportDefaultDeclaration& stmt);
+  Task evaluateExportAll(const ExportAllDeclaration& stmt);
 };
 
 }

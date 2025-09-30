@@ -55,6 +55,14 @@ Task Interpreter::evaluate(const Statement& stmt) {
     co_return Value(Undefined{});
   } else if (auto* node = std::get_if<TryStmt>(&stmt.node)) {
     co_return co_await evaluateTry(*node);
+  } else if (auto* node = std::get_if<ImportDeclaration>(&stmt.node)) {
+    co_return co_await evaluateImport(*node);
+  } else if (auto* node = std::get_if<ExportNamedDeclaration>(&stmt.node)) {
+    co_return co_await evaluateExportNamed(*node);
+  } else if (auto* node = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    co_return co_await evaluateExportDefault(*node);
+  } else if (auto* node = std::get_if<ExportAllDeclaration>(&stmt.node)) {
+    co_return co_await evaluateExportAll(*node);
   }
   co_return Value(Undefined{});
 }
@@ -971,6 +979,38 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   }
 
   co_return result;
+}
+
+Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
+  // Import evaluation is handled at the module level during instantiation
+  // This is just a placeholder as imports are resolved before execution
+  co_return Value(Undefined{});
+}
+
+Task Interpreter::evaluateExportNamed(const ExportNamedDeclaration& stmt) {
+  // If there's a declaration, evaluate it
+  if (stmt.declaration) {
+    co_return co_await evaluate(*stmt.declaration);
+  }
+
+  // Export bindings are handled at the module level
+  co_return Value(Undefined{});
+}
+
+Task Interpreter::evaluateExportDefault(const ExportDefaultDeclaration& stmt) {
+  // Evaluate the expression being exported
+  auto task = evaluate(*stmt.declaration);
+  while (!task.done()) {
+    std::coroutine_handle<>::from_address(task.handle.address()).resume();
+  }
+
+  // The module system will capture this value
+  co_return task.result();
+}
+
+Task Interpreter::evaluateExportAll(const ExportAllDeclaration& stmt) {
+  // Re-exports are handled at the module level
+  co_return Value(Undefined{});
 }
 
 }

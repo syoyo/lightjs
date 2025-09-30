@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <variant>
+#include <optional>
 #include <cstdint>
 
 namespace tinyjs {
@@ -210,6 +211,39 @@ struct TryStmt {
   bool hasFinalizer;
 };
 
+// Import/Export nodes for ES6 modules
+struct ImportSpecifier {
+  Identifier imported;
+  Identifier local;
+};
+
+struct ImportDeclaration {
+  std::vector<ImportSpecifier> specifiers;
+  std::optional<Identifier> defaultImport;
+  std::optional<Identifier> namespaceImport;  // import * as name
+  std::string source;
+};
+
+struct ExportSpecifier {
+  Identifier local;
+  Identifier exported;
+};
+
+struct ExportNamedDeclaration {
+  std::vector<ExportSpecifier> specifiers;
+  std::optional<std::string> source;  // for re-exports
+  StmtPtr declaration;  // for export const/let/var/function
+};
+
+struct ExportDefaultDeclaration {
+  ExprPtr declaration;  // can be expression or function/class
+};
+
+struct ExportAllDeclaration {
+  std::string source;
+  std::optional<Identifier> exported;  // export * as name from
+};
+
 struct Statement {
   std::variant<
     VarDeclaration,
@@ -223,7 +257,11 @@ struct Statement {
     BreakStmt,
     ContinueStmt,
     ThrowStmt,
-    TryStmt
+    TryStmt,
+    ImportDeclaration,
+    ExportNamedDeclaration,
+    ExportDefaultDeclaration,
+    ExportAllDeclaration
   > node;
 
   template<typename T>
@@ -232,6 +270,7 @@ struct Statement {
 
 struct Program {
   std::vector<StmtPtr> body;
+  bool isModule = false;
 };
 
 }

@@ -172,13 +172,11 @@ private:
     try {
       Test262Metadata metadata = parseMetadata(testCode);
 
-      // Skip module tests (not yet supported)
+      // Handle module tests
       if (metadata.isModule) {
-        result.phase = "skip";
-        result.actualError = "Module tests not yet supported";
-        auto endTime = std::chrono::high_resolution_clock::now();
-        result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
-        return result;
+        // Module tests require special handling with ModuleLoader
+        // For now, we'll parse and evaluate as a module
+        result.phase = "runtime";
       }
 
       std::string preparedCode = prepareTestCode(testCode, metadata);

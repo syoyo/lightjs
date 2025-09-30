@@ -24,6 +24,7 @@ add_library(tinyjs
   src/crypto.cc
   src/http.cc
   src/simple_regex.cc
+  src/module.cc
 )
 
 target_include_directories(tinyjs PUBLIC

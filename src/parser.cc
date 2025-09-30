@@ -89,6 +89,10 @@ StmtPtr Parser::parseStatement() {
       return std::make_unique<Statement>(ThrowStmt{parseExpression()});
     case TokenType::Try:
       return parseTryStatement();
+    case TokenType::Import:
+      return parseImportDeclaration();
+    case TokenType::Export:
+      return parseExportDeclaration();
     case TokenType::LeftBrace:
       return parseBlockStatement();
     default:
@@ -334,6 +338,177 @@ StmtPtr Parser::parseTryStatement() {
     hasHandler,
     hasFinalizer
   });
+}
+
+StmtPtr Parser::parseImportDeclaration() {
+  expect(TokenType::Import);
+
+  ImportDeclaration import;
+
+  // Check for default import: import foo from "module"
+  if (match(TokenType::Identifier)) {
+    import.defaultImport = Identifier{current().value};
+    advance();
+
+    // Check for additional named imports: import foo, { bar } from "module"
+    if (match(TokenType::Comma)) {
+      advance();
+    }
+  }
+
+  // Check for namespace import: import * as name from "module"
+  if (match(TokenType::Star)) {
+    advance();
+    expect(TokenType::As);
+    if (match(TokenType::Identifier)) {
+      import.namespaceImport = Identifier{current().value};
+      advance();
+    }
+  }
+  // Check for named imports: import { foo, bar as baz } from "module"
+  else if (match(TokenType::LeftBrace)) {
+    advance();
+
+    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+      if (!import.specifiers.empty()) {
+        expect(TokenType::Comma);
+      }
+
+      if (match(TokenType::Identifier)) {
+        ImportSpecifier spec;
+        spec.imported = Identifier{current().value};
+        spec.local = spec.imported;
+        advance();
+
+        // Check for renaming: foo as bar
+        if (match(TokenType::As)) {
+          advance();
+          if (match(TokenType::Identifier)) {
+            spec.local = Identifier{current().value};
+            advance();
+          }
+        }
+
+        import.specifiers.push_back(spec);
+      }
+    }
+
+    expect(TokenType::RightBrace);
+  }
+
+  // Expect 'from' keyword
+  expect(TokenType::From);
+
+  // Expect module source string
+  if (match(TokenType::String)) {
+    import.source = current().value;
+    advance();
+  }
+
+  consumeSemicolon();
+
+  return std::make_unique<Statement>(std::move(import));
+}
+
+StmtPtr Parser::parseExportDeclaration() {
+  expect(TokenType::Export);
+
+  // Export default declaration
+  if (match(TokenType::Default)) {
+    advance();
+
+    ExportDefaultDeclaration exportDefault;
+
+    // Can be expression or function/class declaration
+    if (match(TokenType::Function) || match(TokenType::Async)) {
+      exportDefault.declaration = parseFunctionExpression();
+    } else {
+      exportDefault.declaration = parseAssignment();
+    }
+
+    consumeSemicolon();
+    return std::make_unique<Statement>(std::move(exportDefault));
+  }
+
+  // Export all declaration: export * from "module" or export * as name from "module"
+  if (match(TokenType::Star)) {
+    advance();
+
+    ExportAllDeclaration exportAll;
+
+    if (match(TokenType::As)) {
+      advance();
+      if (match(TokenType::Identifier)) {
+        exportAll.exported = Identifier{current().value};
+        advance();
+      }
+    }
+
+    expect(TokenType::From);
+
+    if (match(TokenType::String)) {
+      exportAll.source = current().value;
+      advance();
+    }
+
+    consumeSemicolon();
+    return std::make_unique<Statement>(std::move(exportAll));
+  }
+
+  // Export named declaration
+  ExportNamedDeclaration exportNamed;
+
+  // Export variable/function declaration
+  if (match(TokenType::Const) || match(TokenType::Let) ||
+      match(TokenType::Var) || match(TokenType::Function) ||
+      match(TokenType::Async)) {
+    exportNamed.declaration = parseStatement();
+    return std::make_unique<Statement>(std::move(exportNamed));
+  }
+
+  // Export list: export { foo, bar as baz }
+  if (match(TokenType::LeftBrace)) {
+    advance();
+
+    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+      if (!exportNamed.specifiers.empty()) {
+        expect(TokenType::Comma);
+      }
+
+      if (match(TokenType::Identifier)) {
+        ExportSpecifier spec;
+        spec.local = Identifier{current().value};
+        spec.exported = spec.local;
+        advance();
+
+        // Check for renaming: foo as bar
+        if (match(TokenType::As)) {
+          advance();
+          if (match(TokenType::Identifier)) {
+            spec.exported = Identifier{current().value};
+            advance();
+          }
+        }
+
+        exportNamed.specifiers.push_back(spec);
+      }
+    }
+
+    expect(TokenType::RightBrace);
+
+    // Check for re-export: export { foo } from "module"
+    if (match(TokenType::From)) {
+      advance();
+      if (match(TokenType::String)) {
+        exportNamed.source = current().value;
+        advance();
+      }
+    }
+
+    consumeSemicolon();
+  }
+
+  return std::make_unique<Statement>(std::move(exportNamed));
 }
 
 ExprPtr Parser::parseExpression() {
