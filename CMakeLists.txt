@@ -38,3 +38,15 @@ target_link_libraries(tinyjs_test tinyjs)
 
 enable_testing()
 add_test(NAME tinyjs_test COMMAND tinyjs_test)
+
+# Test262 conformance runner
+add_executable(test262_runner
+  test262/test262_runner.cc
+  test262/test262_harness.cc
+)
+
+target_link_libraries(test262_runner tinyjs)
+
+target_include_directories(test262_runner PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/test262
+)

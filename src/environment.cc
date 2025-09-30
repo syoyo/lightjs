@@ -199,4 +199,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   return env;
 }
 
+std::shared_ptr<Object> Environment::getGlobal() const {
+  auto globalObj = std::make_shared<Object>();
+
+  // Walk up to the root environment
+  const Environment* current = this;
+  while (current->parent_) {
+    current = current->parent_.get();
+  }
+
+  // Add all global bindings to the object
+  for (const auto& [name, value] : current->bindings_) {
+    globalObj->properties[name] = value;
+  }
+
+  return globalObj;
+}
+
 }

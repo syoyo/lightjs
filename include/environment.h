@@ -19,6 +19,7 @@ public:
 
   static std::shared_ptr<Environment> createGlobal();
   std::shared_ptr<Environment> createChild();
+  std::shared_ptr<Object> getGlobal() const;
 
 private:
   std::shared_ptr<Environment> parent_;
