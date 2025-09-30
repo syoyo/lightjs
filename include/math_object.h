@@ -1,0 +1,27 @@
+#pragma once
+
+#include "value.h"
+#include <vector>
+
+namespace tinyjs {
+
+// Math object methods
+Value Math_abs(const std::vector<Value>& args);
+Value Math_ceil(const std::vector<Value>& args);
+Value Math_floor(const std::vector<Value>& args);
+Value Math_round(const std::vector<Value>& args);
+Value Math_trunc(const std::vector<Value>& args);
+Value Math_max(const std::vector<Value>& args);
+Value Math_min(const std::vector<Value>& args);
+Value Math_pow(const std::vector<Value>& args);
+Value Math_sqrt(const std::vector<Value>& args);
+Value Math_sin(const std::vector<Value>& args);
+Value Math_cos(const std::vector<Value>& args);
+Value Math_tan(const std::vector<Value>& args);
+Value Math_random(const std::vector<Value>& args);
+Value Math_sign(const std::vector<Value>& args);
+Value Math_log(const std::vector<Value>& args);
+Value Math_log10(const std::vector<Value>& args);
+Value Math_exp(const std::vector<Value>& args);
+
+} // namespace tinyjs

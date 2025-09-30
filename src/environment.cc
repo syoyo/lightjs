@@ -4,6 +4,10 @@
 #include "gc.h"
 #include "json.h"
 #include "object_methods.h"
+#include "array_methods.h"
+#include "string_methods.h"
+#include "math_object.h"
+#include "date_object.h"
 #include <iostream>
 #include <thread>
 
@@ -389,6 +393,131 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["create"] = Value(objectCreate);
 
   env->define("Object", Value(objectConstructor));
+
+  // Math object
+  auto mathObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Math constants
+  mathObj->properties["PI"] = Value(3.141592653589793);
+  mathObj->properties["E"] = Value(2.718281828459045);
+  mathObj->properties["LN2"] = Value(0.6931471805599453);
+  mathObj->properties["LN10"] = Value(2.302585092994046);
+  mathObj->properties["LOG2E"] = Value(1.4426950408889634);
+  mathObj->properties["LOG10E"] = Value(0.4342944819032518);
+  mathObj->properties["SQRT1_2"] = Value(0.7071067811865476);
+  mathObj->properties["SQRT2"] = Value(1.4142135623730951);
+
+  // Math methods
+  auto mathAbs = std::make_shared<Function>();
+  mathAbs->isNative = true;
+  mathAbs->nativeFunc = Math_abs;
+  mathObj->properties["abs"] = Value(mathAbs);
+
+  auto mathCeil = std::make_shared<Function>();
+  mathCeil->isNative = true;
+  mathCeil->nativeFunc = Math_ceil;
+  mathObj->properties["ceil"] = Value(mathCeil);
+
+  auto mathFloor = std::make_shared<Function>();
+  mathFloor->isNative = true;
+  mathFloor->nativeFunc = Math_floor;
+  mathObj->properties["floor"] = Value(mathFloor);
+
+  auto mathRound = std::make_shared<Function>();
+  mathRound->isNative = true;
+  mathRound->nativeFunc = Math_round;
+  mathObj->properties["round"] = Value(mathRound);
+
+  auto mathTrunc = std::make_shared<Function>();
+  mathTrunc->isNative = true;
+  mathTrunc->nativeFunc = Math_trunc;
+  mathObj->properties["trunc"] = Value(mathTrunc);
+
+  auto mathMax = std::make_shared<Function>();
+  mathMax->isNative = true;
+  mathMax->nativeFunc = Math_max;
+  mathObj->properties["max"] = Value(mathMax);
+
+  auto mathMin = std::make_shared<Function>();
+  mathMin->isNative = true;
+  mathMin->nativeFunc = Math_min;
+  mathObj->properties["min"] = Value(mathMin);
+
+  auto mathPow = std::make_shared<Function>();
+  mathPow->isNative = true;
+  mathPow->nativeFunc = Math_pow;
+  mathObj->properties["pow"] = Value(mathPow);
+
+  auto mathSqrt = std::make_shared<Function>();
+  mathSqrt->isNative = true;
+  mathSqrt->nativeFunc = Math_sqrt;
+  mathObj->properties["sqrt"] = Value(mathSqrt);
+
+  auto mathSin = std::make_shared<Function>();
+  mathSin->isNative = true;
+  mathSin->nativeFunc = Math_sin;
+  mathObj->properties["sin"] = Value(mathSin);
+
+  auto mathCos = std::make_shared<Function>();
+  mathCos->isNative = true;
+  mathCos->nativeFunc = Math_cos;
+  mathObj->properties["cos"] = Value(mathCos);
+
+  auto mathTan = std::make_shared<Function>();
+  mathTan->isNative = true;
+  mathTan->nativeFunc = Math_tan;
+  mathObj->properties["tan"] = Value(mathTan);
+
+  auto mathRandom = std::make_shared<Function>();
+  mathRandom->isNative = true;
+  mathRandom->nativeFunc = Math_random;
+  mathObj->properties["random"] = Value(mathRandom);
+
+  auto mathSign = std::make_shared<Function>();
+  mathSign->isNative = true;
+  mathSign->nativeFunc = Math_sign;
+  mathObj->properties["sign"] = Value(mathSign);
+
+  auto mathLog = std::make_shared<Function>();
+  mathLog->isNative = true;
+  mathLog->nativeFunc = Math_log;
+  mathObj->properties["log"] = Value(mathLog);
+
+  auto mathLog10 = std::make_shared<Function>();
+  mathLog10->isNative = true;
+  mathLog10->nativeFunc = Math_log10;
+  mathObj->properties["log10"] = Value(mathLog10);
+
+  auto mathExp = std::make_shared<Function>();
+  mathExp->isNative = true;
+  mathExp->nativeFunc = Math_exp;
+  mathObj->properties["exp"] = Value(mathExp);
+
+  env->define("Math", Value(mathObj));
+
+  // Date constructor
+  auto dateConstructor = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Date as function
+  auto dateFunc = std::make_shared<Function>();
+  dateFunc->isNative = true;
+  dateFunc->nativeFunc = Date_constructor;
+  dateConstructor->properties["constructor"] = Value(dateFunc);
+
+  // Date static methods
+  auto dateNow = std::make_shared<Function>();
+  dateNow->isNative = true;
+  dateNow->nativeFunc = Date_now;
+  dateConstructor->properties["now"] = Value(dateNow);
+
+  auto dateParse = std::make_shared<Function>();
+  dateParse->isNative = true;
+  dateParse->nativeFunc = Date_parse;
+  dateConstructor->properties["parse"] = Value(dateParse);
+
+  env->define("Date", Value(dateConstructor));
 
   return env;
 }

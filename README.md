@@ -118,6 +118,61 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Object.hasOwnProperty() - check property existence
   - Object.getOwnPropertyNames() - get all property names
   - Object.create() - create new objects
+- ✅ **Array methods**
+  - Array.prototype.push() - add elements to end
+  - Array.prototype.pop() - remove element from end
+  - Array.prototype.shift() - remove element from beginning
+  - Array.prototype.unshift() - add elements to beginning
+  - Array.prototype.slice() - extract section of array
+  - Array.prototype.splice() - change array contents
+  - Array.prototype.join() - join elements into string
+  - Array.prototype.indexOf() - find index of element
+  - Array.prototype.includes() - check if element exists
+  - Array.prototype.reverse() - reverse array in place
+  - Array.prototype.concat() - concatenate arrays
+- ✅ **String methods**
+  - String.prototype.charAt() - character at index
+  - String.prototype.charCodeAt() - character code at index
+  - String.prototype.indexOf() - find substring index
+  - String.prototype.lastIndexOf() - find last substring index
+  - String.prototype.substring() - extract substring
+  - String.prototype.substr() - extract substring (legacy)
+  - String.prototype.slice() - extract portion of string
+  - String.prototype.split() - split string into array
+  - String.prototype.replace() - replace substring
+  - String.prototype.toLowerCase() - convert to lowercase
+  - String.prototype.toUpperCase() - convert to uppercase
+  - String.prototype.trim() - remove whitespace
+- ✅ **Math object** (Pure C++ implementation)
+  - Math constants: PI, E, LN2, LN10, LOG2E, LOG10E, SQRT1_2, SQRT2
+  - Math.abs() - absolute value
+  - Math.ceil() - round up
+  - Math.floor() - round down
+  - Math.round() - round to nearest integer
+  - Math.trunc() - truncate decimal part
+  - Math.max() - maximum value
+  - Math.min() - minimum value
+  - Math.pow() - exponentiation
+  - Math.sqrt() - square root
+  - Math.sin(), Math.cos(), Math.tan() - trigonometric functions
+  - Math.random() - random number generation
+  - Math.sign() - sign of number
+  - Math.log(), Math.log10() - logarithmic functions
+  - Math.exp() - exponential function
+- ✅ **Date object** (Chrono-based implementation)
+  - Date constructor with multiple signatures
+  - Date.now() - current timestamp
+  - Date.parse() - parse date string (simplified)
+  - Date.prototype.getTime() - get timestamp
+  - Date.prototype.getFullYear() - get year
+  - Date.prototype.getMonth() - get month
+  - Date.prototype.getDate() - get day of month
+  - Date.prototype.getDay() - get day of week
+  - Date.prototype.getHours() - get hours
+  - Date.prototype.getMinutes() - get minutes
+  - Date.prototype.getSeconds() - get seconds
+  - Date.prototype.toString() - string representation
+  - Date.prototype.toISOString() - ISO 8601 string
 
 ### Testing Infrastructure
 - ✅ **Test262 Support**
@@ -257,11 +312,8 @@ console.log('PI =', PI);
 - [ ] **Numeric separators** (`1_000_000`)
 
 ### Built-in Objects & APIs
-- [ ] **Array methods** - map, filter, reduce, forEach, etc.
-- [ ] **String methods** - split, join, substring, replace, etc.
+- [ ] **Array higher-order methods** - map, filter, reduce, forEach
 - [ ] **Number methods** - toFixed, toPrecision, parseInt, parseFloat
-- [ ] **Math object** - Math.random, Math.floor, Math.ceil, etc.
-- [ ] **Date object** - Date manipulation
 - [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
 - [ ] **ArrayBuffer** and DataView
 - [ ] **Intl** - Internationalization API

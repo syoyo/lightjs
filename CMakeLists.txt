@@ -28,6 +28,10 @@ add_library(tinyjs
   src/gc.cc
   src/gc_value.cc
   src/json.cc
+  src/array_methods.cc
+  src/string_methods.cc
+  src/math_object.cc
+  src/date_object.cc
 )
 
 target_include_directories(tinyjs PUBLIC
@@ -77,6 +81,13 @@ add_executable(simple_object_test
 )
 
 target_link_libraries(simple_object_test tinyjs)
+
+# Array/String/Math/Date methods test
+add_executable(methods_test
+  examples/methods_test.cc
+)
+
+target_link_libraries(methods_test tinyjs)
 
 # Test262 conformance runner
 add_executable(test262_runner
