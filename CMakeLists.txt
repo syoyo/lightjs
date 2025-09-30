@@ -27,6 +27,7 @@ add_library(tinyjs
   src/module.cc
   src/gc.cc
   src/gc_value.cc
+  src/json.cc
 )
 
 target_include_directories(tinyjs PUBLIC
@@ -48,6 +49,34 @@ add_executable(gc_test
 )
 
 target_link_libraries(gc_test tinyjs)
+
+# JSON and Object methods test
+add_executable(json_object_test
+  examples/json_object_test.cc
+)
+
+target_link_libraries(json_object_test tinyjs)
+
+# Debug test
+add_executable(debug_test
+  examples/debug_test.cc
+)
+
+target_link_libraries(debug_test tinyjs)
+
+# Debug test 2
+add_executable(debug_test2
+  examples/debug_test2.cc
+)
+
+target_link_libraries(debug_test2 tinyjs)
+
+# Simple Object test
+add_executable(simple_object_test
+  examples/simple_object_test.cc
+)
+
+target_link_libraries(simple_object_test tinyjs)
 
 # Test262 conformance runner
 add_executable(test262_runner

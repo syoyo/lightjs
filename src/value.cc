@@ -480,4 +480,148 @@ std::shared_ptr<Promise> Promise::rejected(const Value& reason) {
   return promise;
 }
 
+// Object static methods implementation
+Value Object_keys(const std::vector<Value>& args) {
+  if (args.empty() || !args[0].isObject()) {
+    auto emptyArray = std::make_shared<Array>();
+    return Value(emptyArray);
+  }
+
+  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto result = std::make_shared<Array>();
+
+  for (const auto& [key, value] : obj->properties) {
+    result->elements.push_back(Value(key));
+  }
+
+  return Value(result);
+}
+
+Value Object_values(const std::vector<Value>& args) {
+  if (args.empty() || !args[0].isObject()) {
+    auto emptyArray = std::make_shared<Array>();
+    return Value(emptyArray);
+  }
+
+  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto result = std::make_shared<Array>();
+
+  for (const auto& [key, value] : obj->properties) {
+    result->elements.push_back(value);
+  }
+
+  return Value(result);
+}
+
+Value Object_entries(const std::vector<Value>& args) {
+  if (args.empty() || !args[0].isObject()) {
+    auto emptyArray = std::make_shared<Array>();
+    return Value(emptyArray);
+  }
+
+  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto result = std::make_shared<Array>();
+
+  for (const auto& [key, value] : obj->properties) {
+    auto entry = std::make_shared<Array>();
+    entry->elements.push_back(Value(key));
+    entry->elements.push_back(value);
+    result->elements.push_back(Value(entry));
+  }
+
+  return Value(result);
+}
+
+Value Object_assign(const std::vector<Value>& args) {
+  if (args.empty()) {
+    throw std::runtime_error("Object.assign requires at least 1 argument");
+  }
+
+  Value target = args[0];
+  if (target.isNull() || target.isUndefined()) {
+    throw std::runtime_error("Cannot convert undefined or null to object");
+  }
+
+  // Convert target to object if needed
+  std::shared_ptr<Object> targetObj;
+  if (target.isObject()) {
+    targetObj = std::get<std::shared_ptr<Object>>(target.data);
+  } else {
+    targetObj = std::make_shared<Object>();
+  }
+
+  // Copy properties from sources
+  for (size_t i = 1; i < args.size(); ++i) {
+    if (args[i].isNull() || args[i].isUndefined()) {
+      continue; // Skip null/undefined sources
+    }
+
+    if (args[i].isObject()) {
+      auto sourceObj = std::get<std::shared_ptr<Object>>(args[i].data);
+      for (const auto& [key, value] : sourceObj->properties) {
+        targetObj->properties[key] = value;
+      }
+    }
+  }
+
+  return Value(targetObj);
+}
+
+Value Object_hasOwnProperty(const std::vector<Value>& args) {
+  if (args.size() < 2) {
+    return Value(false);
+  }
+
+  if (!args[0].isObject()) {
+    return Value(false);
+  }
+
+  if (!args[1].isString()) {
+    return Value(false);
+  }
+
+  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  std::string key = std::get<std::string>(args[1].data);
+
+  return Value(obj->properties.find(key) != obj->properties.end());
+}
+
+Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
+  if (args.empty() || !args[0].isObject()) {
+    auto emptyArray = std::make_shared<Array>();
+    return Value(emptyArray);
+  }
+
+  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto result = std::make_shared<Array>();
+
+  for (const auto& [key, value] : obj->properties) {
+    result->elements.push_back(Value(key));
+  }
+
+  return Value(result);
+}
+
+Value Object_create(const std::vector<Value>& args) {
+  auto newObj = std::make_shared<Object>();
+
+  // Simple implementation - doesn't handle prototype properly
+  // but creates a new object
+  if (args.size() > 1 && args[1].isObject()) {
+    // Add properties from the properties descriptor object
+    auto props = std::get<std::shared_ptr<Object>>(args[1].data);
+    for (const auto& [key, descriptor] : props->properties) {
+      if (descriptor.isObject()) {
+        auto desc = std::get<std::shared_ptr<Object>>(descriptor.data);
+        auto valueIt = desc->properties.find("value");
+        if (valueIt != desc->properties.end()) {
+          newObj->properties[key] = valueIt->second;
+        }
+      }
+    }
+  }
+
+  return Value(newObj);
+}
+
 }

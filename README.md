@@ -105,6 +105,19 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - `Promise.all()`, `Promise.race()`
   - `.then()`, `.catch()`, `.finally()`
   - Promise chaining support
+- ✅ **JSON object** (Pure C++ implementation)
+  - JSON.parse() for parsing JSON strings
+  - JSON.stringify() for serializing objects to JSON
+  - Support for all JSON types (string, number, boolean, null, array, object)
+  - Proper escape sequence handling
+- ✅ **Object methods**
+  - Object.keys() - get property names
+  - Object.values() - get property values
+  - Object.entries() - get key-value pairs
+  - Object.assign() - copy properties between objects
+  - Object.hasOwnProperty() - check property existence
+  - Object.getOwnPropertyNames() - get all property names
+  - Object.create() - create new objects
 
 ### Testing Infrastructure
 - ✅ **Test262 Support**
@@ -246,11 +259,9 @@ console.log('PI =', PI);
 ### Built-in Objects & APIs
 - [ ] **Array methods** - map, filter, reduce, forEach, etc.
 - [ ] **String methods** - split, join, substring, replace, etc.
-- [ ] **Object methods** - keys, values, entries, assign, etc.
 - [ ] **Number methods** - toFixed, toPrecision, parseInt, parseFloat
 - [ ] **Math object** - Math.random, Math.floor, Math.ceil, etc.
 - [ ] **Date object** - Date manipulation
-- [ ] **JSON object** - JSON.parse, JSON.stringify
 - [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
 - [ ] **ArrayBuffer** and DataView
 - [ ] **Intl** - Internationalization API

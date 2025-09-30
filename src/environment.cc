@@ -2,6 +2,8 @@
 #include "crypto.h"
 #include "http.h"
 #include "gc.h"
+#include "json.h"
+#include "object_methods.h"
 #include <iostream>
 #include <thread>
 
@@ -321,6 +323,72 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // For now, define Promise as an object with static methods
   // In a full implementation, we'd need to make Function objects support properties
   env->define("Promise", Value(promiseConstructor));
+
+  // JSON object
+  auto jsonObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // JSON.parse
+  auto jsonParse = std::make_shared<Function>();
+  jsonParse->isNative = true;
+  jsonParse->nativeFunc = JSON_parse;
+  jsonObj->properties["parse"] = Value(jsonParse);
+
+  // JSON.stringify
+  auto jsonStringify = std::make_shared<Function>();
+  jsonStringify->isNative = true;
+  jsonStringify->nativeFunc = JSON_stringify;
+  jsonObj->properties["stringify"] = Value(jsonStringify);
+
+  env->define("JSON", Value(jsonObj));
+
+  // Object static methods
+  auto objectConstructor = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Object.keys
+  auto objectKeys = std::make_shared<Function>();
+  objectKeys->isNative = true;
+  objectKeys->nativeFunc = Object_keys;
+  objectConstructor->properties["keys"] = Value(objectKeys);
+
+  // Object.values
+  auto objectValues = std::make_shared<Function>();
+  objectValues->isNative = true;
+  objectValues->nativeFunc = Object_values;
+  objectConstructor->properties["values"] = Value(objectValues);
+
+  // Object.entries
+  auto objectEntries = std::make_shared<Function>();
+  objectEntries->isNative = true;
+  objectEntries->nativeFunc = Object_entries;
+  objectConstructor->properties["entries"] = Value(objectEntries);
+
+  // Object.assign
+  auto objectAssign = std::make_shared<Function>();
+  objectAssign->isNative = true;
+  objectAssign->nativeFunc = Object_assign;
+  objectConstructor->properties["assign"] = Value(objectAssign);
+
+  // Object.hasOwnProperty (for prototypal access)
+  auto objectHasOwnProperty = std::make_shared<Function>();
+  objectHasOwnProperty->isNative = true;
+  objectHasOwnProperty->nativeFunc = Object_hasOwnProperty;
+  objectConstructor->properties["hasOwnProperty"] = Value(objectHasOwnProperty);
+
+  // Object.getOwnPropertyNames
+  auto objectGetOwnPropertyNames = std::make_shared<Function>();
+  objectGetOwnPropertyNames->isNative = true;
+  objectGetOwnPropertyNames->nativeFunc = Object_getOwnPropertyNames;
+  objectConstructor->properties["getOwnPropertyNames"] = Value(objectGetOwnPropertyNames);
+
+  // Object.create
+  auto objectCreate = std::make_shared<Function>();
+  objectCreate->isNative = true;
+  objectCreate->nativeFunc = Object_create;
+  objectConstructor->properties["create"] = Value(objectCreate);
+
+  env->define("Object", Value(objectConstructor));
 
   return env;
 }
