@@ -222,4 +222,262 @@ void TypedArray::setBigIntElement(size_t index, int64_t value) {
   }
 }
 
+// Helper function for value equality in Map/Set
+static bool valuesEqual(const Value& a, const Value& b) {
+  if (a.data.index() != b.data.index()) return false;
+
+  if (a.isNumber() && b.isNumber()) {
+    double an = std::get<double>(a.data);
+    double bn = std::get<double>(b.data);
+    // Handle NaN
+    if (std::isnan(an) && std::isnan(bn)) return true;
+    return an == bn;
+  }
+
+  if (a.isString()) return std::get<std::string>(a.data) == std::get<std::string>(b.data);
+  if (a.isBool()) return std::get<bool>(a.data) == std::get<bool>(b.data);
+  if (a.isBigInt()) return std::get<BigInt>(a.data).value == std::get<BigInt>(b.data).value;
+  if (a.isNull() || a.isUndefined()) return true;
+
+  // For objects, compare by reference
+  if (a.isObject()) return std::get<std::shared_ptr<Object>>(a.data) == std::get<std::shared_ptr<Object>>(b.data);
+  if (a.isArray()) return std::get<std::shared_ptr<Array>>(a.data) == std::get<std::shared_ptr<Array>>(b.data);
+  if (a.isFunction()) return std::get<std::shared_ptr<Function>>(a.data) == std::get<std::shared_ptr<Function>>(b.data);
+  if (a.isMap()) return std::get<std::shared_ptr<Map>>(a.data) == std::get<std::shared_ptr<Map>>(b.data);
+  if (a.isSet()) return std::get<std::shared_ptr<Set>>(a.data) == std::get<std::shared_ptr<Set>>(b.data);
+
+  return false;
+}
+
+// Map implementation
+void Map::set(const Value& key, const Value& value) {
+  for (auto& entry : entries) {
+    if (valuesEqual(entry.first, key)) {
+      entry.second = value;
+      return;
+    }
+  }
+  entries.push_back({key, value});
+}
+
+bool Map::has(const Value& key) const {
+  for (const auto& entry : entries) {
+    if (valuesEqual(entry.first, key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Value Map::get(const Value& key) const {
+  for (const auto& entry : entries) {
+    if (valuesEqual(entry.first, key)) {
+      return entry.second;
+    }
+  }
+  return Value(Undefined{});
+}
+
+bool Map::deleteKey(const Value& key) {
+  for (auto it = entries.begin(); it != entries.end(); ++it) {
+    if (valuesEqual(it->first, key)) {
+      entries.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Set implementation
+bool Set::add(const Value& value) {
+  if (!has(value)) {
+    values.push_back(value);
+    return true;
+  }
+  return false;
+}
+
+bool Set::has(const Value& value) const {
+  for (const auto& v : values) {
+    if (valuesEqual(v, value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Set::deleteValue(const Value& value) {
+  for (auto it = values.begin(); it != values.end(); ++it) {
+    if (valuesEqual(*it, value)) {
+      values.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Promise implementation
+void Promise::resolve(Value val) {
+  if (state != PromiseState::Pending) return;
+
+  state = PromiseState::Fulfilled;
+  result = val;
+
+  // Execute all fulfilled callbacks
+  for (size_t i = 0; i < fulfilledCallbacks.size(); ++i) {
+    try {
+      Value callbackResult = fulfilledCallbacks[i](val);
+      if (i < chainedPromises.size()) {
+        chainedPromises[i]->resolve(callbackResult);
+      }
+    } catch (...) {
+      if (i < chainedPromises.size()) {
+        chainedPromises[i]->reject(Value("Callback error"));
+      }
+    }
+  }
+}
+
+void Promise::reject(Value val) {
+  if (state != PromiseState::Pending) return;
+
+  state = PromiseState::Rejected;
+  result = val;
+
+  // Execute all rejected callbacks
+  for (size_t i = 0; i < rejectedCallbacks.size(); ++i) {
+    if (rejectedCallbacks[i]) {
+      try {
+        Value callbackResult = rejectedCallbacks[i](val);
+        if (i < chainedPromises.size()) {
+          chainedPromises[i]->resolve(callbackResult);
+        }
+      } catch (...) {
+        if (i < chainedPromises.size()) {
+          chainedPromises[i]->reject(Value("Callback error"));
+        }
+      }
+    } else {
+      // No rejection handler, propagate the rejection
+      if (i < chainedPromises.size()) {
+        chainedPromises[i]->reject(val);
+      }
+    }
+  }
+}
+
+std::shared_ptr<Promise> Promise::then(
+    std::function<Value(Value)> onFulfilled,
+    std::function<Value(Value)> onRejected) {
+  auto chainedPromise = std::make_shared<Promise>();
+
+  if (state == PromiseState::Pending) {
+    fulfilledCallbacks.push_back(onFulfilled ? onFulfilled : [](Value v) { return v; });
+    rejectedCallbacks.push_back(onRejected);
+    chainedPromises.push_back(chainedPromise);
+  } else if (state == PromiseState::Fulfilled) {
+    if (onFulfilled) {
+      try {
+        Value callbackResult = onFulfilled(result);
+        chainedPromise->resolve(callbackResult);
+      } catch (...) {
+        chainedPromise->reject(Value("Callback error"));
+      }
+    } else {
+      chainedPromise->resolve(result);
+    }
+  } else if (state == PromiseState::Rejected) {
+    if (onRejected) {
+      try {
+        Value callbackResult = onRejected(result);
+        chainedPromise->resolve(callbackResult);
+      } catch (...) {
+        chainedPromise->reject(Value("Callback error"));
+      }
+    } else {
+      chainedPromise->reject(result);
+    }
+  }
+
+  return chainedPromise;
+}
+
+std::shared_ptr<Promise> Promise::catch_(std::function<Value(Value)> onRejected) {
+  return then(nullptr, onRejected);
+}
+
+std::shared_ptr<Promise> Promise::finally(std::function<Value()> onFinally) {
+  auto finallyHandler = [onFinally](Value v) -> Value {
+    onFinally();
+    return v;
+  };
+  return then(finallyHandler, finallyHandler);
+}
+
+std::shared_ptr<Promise> Promise::all(const std::vector<std::shared_ptr<Promise>>& promises) {
+  auto resultPromise = std::make_shared<Promise>();
+
+  if (promises.empty()) {
+    auto emptyArray = std::make_shared<Array>();
+    resultPromise->resolve(Value(emptyArray));
+    return resultPromise;
+  }
+
+  auto results = std::make_shared<std::vector<Value>>(promises.size());
+  auto resolvedCount = std::make_shared<size_t>(0);
+
+  for (size_t i = 0; i < promises.size(); ++i) {
+    size_t index = i;
+    promises[i]->then(
+      [resultPromise, results, resolvedCount, index, promiseCount = promises.size()](Value v) -> Value {
+        (*results)[index] = v;
+        (*resolvedCount)++;
+        if (*resolvedCount == promiseCount) {
+          auto arrayResult = std::make_shared<Array>();
+          arrayResult->elements = *results;
+          resultPromise->resolve(Value(arrayResult));
+        }
+        return v;
+      },
+      [resultPromise](Value reason) -> Value {
+        resultPromise->reject(reason);
+        return reason;
+      }
+    );
+  }
+
+  return resultPromise;
+}
+
+std::shared_ptr<Promise> Promise::race(const std::vector<std::shared_ptr<Promise>>& promises) {
+  auto resultPromise = std::make_shared<Promise>();
+
+  for (auto& promise : promises) {
+    promise->then(
+      [resultPromise](Value v) -> Value {
+        resultPromise->resolve(v);
+        return v;
+      },
+      [resultPromise](Value reason) -> Value {
+        resultPromise->reject(reason);
+        return reason;
+      }
+    );
+  }
+
+  return resultPromise;
+}
+
+std::shared_ptr<Promise> Promise::resolved(const Value& value) {
+  auto promise = std::make_shared<Promise>();
+  promise->resolve(value);
+  return promise;
+}
+
+std::shared_ptr<Promise> Promise::rejected(const Value& reason) {
+  auto promise = std::make_shared<Promise>();
+  promise->reject(reason);
+  return promise;
+}
+
 }

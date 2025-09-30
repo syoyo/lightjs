@@ -69,6 +69,8 @@ StmtPtr Parser::parseStatement() {
       return parseExpressionStatement();
     case TokenType::Function:
       return parseFunctionDeclaration();
+    case TokenType::Class:
+      return parseClassDeclaration();
     case TokenType::Return:
       return parseReturnStatement();
     case TokenType::If:
@@ -183,6 +185,95 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.isAsync = isAsync;
 
   return std::make_unique<Statement>(std::move(funcDecl));
+}
+
+StmtPtr Parser::parseClassDeclaration() {
+  expect(TokenType::Class);
+
+  if (!match(TokenType::Identifier)) {
+    return nullptr;
+  }
+  std::string className = current().value;
+  advance();
+
+  ExprPtr superClass;
+  if (match(TokenType::Extends)) {
+    advance();
+    superClass = parsePrimary();
+  }
+
+  expect(TokenType::LeftBrace);
+
+  std::vector<MethodDefinition> methods;
+  while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+    MethodDefinition method;
+
+    // Check for static
+    if (match(TokenType::Static)) {
+      method.isStatic = true;
+      advance();
+    }
+
+    // Check for async
+    if (match(TokenType::Async)) {
+      method.isAsync = true;
+      advance();
+    }
+
+    // Check for getter/setter
+    if (match(TokenType::Get)) {
+      method.kind = MethodDefinition::Kind::Get;
+      advance();
+    } else if (match(TokenType::Set)) {
+      method.kind = MethodDefinition::Kind::Set;
+      advance();
+    }
+
+    // Method name
+    if (match(TokenType::Identifier)) {
+      std::string methodName = current().value;
+      if (methodName == "constructor") {
+        method.kind = MethodDefinition::Kind::Constructor;
+      }
+      method.key.name = methodName;
+      advance();
+    } else {
+      return nullptr;
+    }
+
+    // Parameters
+    expect(TokenType::LeftParen);
+    while (!match(TokenType::RightParen)) {
+      if (match(TokenType::Identifier)) {
+        method.params.push_back({current().value});
+        advance();
+        if (match(TokenType::Comma)) {
+          advance();
+        }
+      } else {
+        break;
+      }
+    }
+    expect(TokenType::RightParen);
+
+    // Method body
+    expect(TokenType::LeftBrace);
+    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+      method.body.push_back(parseStatement());
+    }
+    expect(TokenType::RightBrace);
+
+    methods.push_back(std::move(method));
+  }
+  expect(TokenType::RightBrace);
+
+  auto decl = std::make_unique<Statement>(ClassDeclaration{
+    {className},
+    std::move(superClass),
+    std::move(methods)
+  });
+
+  return decl;
 }
 
 StmtPtr Parser::parseReturnStatement() {
@@ -828,6 +919,24 @@ ExprPtr Parser::parsePrimary() {
     return parseFunctionExpression();
   }
 
+  if (match(TokenType::Class)) {
+    return parseClassExpression();
+  }
+
+  if (match(TokenType::New)) {
+    return parseNewExpression();
+  }
+
+  if (match(TokenType::This)) {
+    advance();
+    return std::make_unique<Expression>(ThisExpr{});
+  }
+
+  if (match(TokenType::Super)) {
+    advance();
+    return std::make_unique<Expression>(SuperExpr{});
+  }
+
   if (match(TokenType::LeftParen)) {
     advance();
     auto expr = parseExpression();
@@ -933,6 +1042,118 @@ ExprPtr Parser::parseFunctionExpression() {
   }
 
   return std::make_unique<Expression>(std::move(funcExpr));
+}
+
+ExprPtr Parser::parseClassExpression() {
+  expect(TokenType::Class);
+
+  std::string className;
+  if (match(TokenType::Identifier)) {
+    className = current().value;
+    advance();
+  }
+
+  ExprPtr superClass;
+  if (match(TokenType::Extends)) {
+    advance();
+    superClass = parsePrimary();
+  }
+
+  expect(TokenType::LeftBrace);
+
+  std::vector<MethodDefinition> methods;
+  while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+    MethodDefinition method;
+
+    // Check for static
+    if (match(TokenType::Static)) {
+      method.isStatic = true;
+      advance();
+    }
+
+    // Check for async
+    if (match(TokenType::Async)) {
+      method.isAsync = true;
+      advance();
+    }
+
+    // Check for getter/setter
+    if (match(TokenType::Get)) {
+      method.kind = MethodDefinition::Kind::Get;
+      advance();
+    } else if (match(TokenType::Set)) {
+      method.kind = MethodDefinition::Kind::Set;
+      advance();
+    }
+
+    // Method name
+    if (match(TokenType::Identifier)) {
+      std::string methodName = current().value;
+      if (methodName == "constructor") {
+        method.kind = MethodDefinition::Kind::Constructor;
+      }
+      method.key.name = methodName;
+      advance();
+    } else {
+      return nullptr;
+    }
+
+    // Parameters
+    expect(TokenType::LeftParen);
+    while (!match(TokenType::RightParen)) {
+      if (match(TokenType::Identifier)) {
+        method.params.push_back({current().value});
+        advance();
+        if (match(TokenType::Comma)) {
+          advance();
+        }
+      } else {
+        break;
+      }
+    }
+    expect(TokenType::RightParen);
+
+    // Method body
+    expect(TokenType::LeftBrace);
+    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+      method.body.push_back(parseStatement());
+    }
+    expect(TokenType::RightBrace);
+
+    methods.push_back(std::move(method));
+  }
+  expect(TokenType::RightBrace);
+
+  ClassExpr classExpr;
+  classExpr.name = className;
+  classExpr.superClass = std::move(superClass);
+  classExpr.methods = std::move(methods);
+
+  return std::make_unique<Expression>(std::move(classExpr));
+}
+
+ExprPtr Parser::parseNewExpression() {
+  expect(TokenType::New);
+
+  auto callee = parseMember();
+
+  std::vector<ExprPtr> args;
+  if (match(TokenType::LeftParen)) {
+    advance();
+    while (!match(TokenType::RightParen)) {
+      args.push_back(parseAssignment());
+      if (!match(TokenType::RightParen)) {
+        expect(TokenType::Comma);
+      }
+    }
+    expect(TokenType::RightParen);
+  }
+
+  NewExpr newExpr;
+  newExpr.callee = std::move(callee);
+  newExpr.arguments = std::move(args);
+
+  return std::make_unique<Expression>(std::move(newExpr));
 }
 
 }

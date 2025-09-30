@@ -70,6 +70,37 @@ struct Object : public GCObject {
   void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
+// Map collection - maintains insertion order
+struct Map : public GCObject {
+  std::vector<std::pair<Value, Value>> entries;
+
+  void set(const Value& key, const Value& value);
+  bool has(const Value& key) const;
+  Value get(const Value& key) const;
+  bool deleteKey(const Value& key);
+  void clear() { entries.clear(); }
+  size_t size() const { return entries.size(); }
+
+  // GCObject interface
+  const char* typeName() const override { return "Map"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// Set collection - maintains insertion order
+struct Set : public GCObject {
+  std::vector<Value> values;
+
+  bool add(const Value& value);
+  bool has(const Value& value) const;
+  bool deleteValue(const Value& value);
+  void clear() { values.clear(); }
+  size_t size() const { return values.size(); }
+
+  // GCObject interface
+  const char* typeName() const override { return "Set"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
 struct Regex : public GCObject {
 #if USE_SIMPLE_REGEX
   simple_regex::Regex* regex;
@@ -260,7 +291,9 @@ struct Value {
     std::shared_ptr<Object>,
     std::shared_ptr<TypedArray>,
     std::shared_ptr<Promise>,
-    std::shared_ptr<Regex>
+    std::shared_ptr<Regex>,
+    std::shared_ptr<Map>,
+    std::shared_ptr<Set>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -292,6 +325,8 @@ struct Value {
   bool isTypedArray() const { return std::holds_alternative<std::shared_ptr<TypedArray>>(data); }
   bool isPromise() const { return std::holds_alternative<std::shared_ptr<Promise>>(data); }
   bool isRegex() const { return std::holds_alternative<std::shared_ptr<Regex>>(data); }
+  bool isMap() const { return std::holds_alternative<std::shared_ptr<Map>>(data); }
+  bool isSet() const { return std::holds_alternative<std::shared_ptr<Set>>(data); }
 
   bool toBool() const;
   double toNumber() const;
@@ -308,30 +343,27 @@ enum class PromiseState {
 struct Promise : public GCObject {
   PromiseState state;
   Value result;
-  std::function<void(Value)> onFulfilled;
-  std::function<void(Value)> onRejected;
+  std::vector<std::function<Value(Value)>> fulfilledCallbacks;
+  std::vector<std::function<Value(Value)>> rejectedCallbacks;
+  std::vector<std::shared_ptr<Promise>> chainedPromises;
 
   Promise() : state(PromiseState::Pending), result(Undefined{}) {}
 
-  void resolve(Value val) {
-    if (state == PromiseState::Pending) {
-      state = PromiseState::Fulfilled;
-      result = val;
-      if (onFulfilled) {
-        onFulfilled(val);
-      }
-    }
-  }
+  void resolve(Value val);
+  void reject(Value val);
 
-  void reject(Value val) {
-    if (state == PromiseState::Pending) {
-      state = PromiseState::Rejected;
-      result = val;
-      if (onRejected) {
-        onRejected(val);
-      }
-    }
-  }
+  std::shared_ptr<Promise> then(
+    std::function<Value(Value)> onFulfilled,
+    std::function<Value(Value)> onRejected = nullptr);
+
+  std::shared_ptr<Promise> catch_(std::function<Value(Value)> onRejected);
+  std::shared_ptr<Promise> finally(std::function<Value()> onFinally);
+
+  // Static methods
+  static std::shared_ptr<Promise> all(const std::vector<std::shared_ptr<Promise>>& promises);
+  static std::shared_ptr<Promise> race(const std::vector<std::shared_ptr<Promise>>& promises);
+  static std::shared_ptr<Promise> resolved(const Value& value);
+  static std::shared_ptr<Promise> rejected(const Value& reason);
 
   // GCObject interface
   const char* typeName() const override { return "Promise"; }

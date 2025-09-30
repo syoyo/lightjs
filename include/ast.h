@@ -116,6 +116,40 @@ struct FunctionExpr {
   FunctionExpr() : isAsync(false) {}
 };
 
+struct SuperExpr {};
+
+struct NewExpr {
+  ExprPtr callee;
+  std::vector<ExprPtr> arguments;
+};
+
+struct ThisExpr {};
+
+struct MethodDefinition {
+  enum class Kind { Constructor, Method, Get, Set };
+  Kind kind;
+  Identifier key;
+  std::vector<Identifier> params;
+  std::vector<StmtPtr> body;
+  bool isStatic;
+  bool isAsync;
+  MethodDefinition() : kind(Kind::Method), isStatic(false), isAsync(false) {}
+
+  // Add move constructor and assignment
+  MethodDefinition(MethodDefinition&&) = default;
+  MethodDefinition& operator=(MethodDefinition&&) = default;
+
+  // Delete copy constructor and assignment
+  MethodDefinition(const MethodDefinition&) = delete;
+  MethodDefinition& operator=(const MethodDefinition&) = delete;
+};
+
+struct ClassExpr {
+  std::string name;
+  ExprPtr superClass;
+  std::vector<MethodDefinition> methods;
+};
+
 struct Expression {
   std::variant<
     Identifier,
@@ -135,7 +169,11 @@ struct Expression {
     ArrayExpr,
     ObjectExpr,
     FunctionExpr,
-    AwaitExpr
+    ClassExpr,
+    AwaitExpr,
+    NewExpr,
+    ThisExpr,
+    SuperExpr
   > node;
 
   template<typename T>
@@ -159,6 +197,12 @@ struct FunctionDeclaration {
   std::vector<StmtPtr> body;
   bool isAsync;
   FunctionDeclaration() : isAsync(false) {}
+};
+
+struct ClassDeclaration {
+  Identifier id;
+  ExprPtr superClass;
+  std::vector<MethodDefinition> methods;
 };
 
 struct ReturnStmt {
@@ -248,6 +292,7 @@ struct Statement {
   std::variant<
     VarDeclaration,
     FunctionDeclaration,
+    ClassDeclaration,
     ReturnStmt,
     ExpressionStmt,
     BlockStmt,

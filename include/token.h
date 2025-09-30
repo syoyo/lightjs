@@ -44,6 +44,12 @@ enum class TokenType {
   From,
   As,
   Default,
+  Class,
+  Extends,
+  Static,
+  Super,
+  Get,
+  Set,
 
   Plus,
   Minus,

@@ -10,6 +10,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 - **No RTTI** (`-fno-rtti` enabled) - Reduced binary size
 - **CMake build system** - Cross-platform support
 - **Security-focused** - Safe evaluation with bounded execution
+- **Garbage Collection** - Automatic memory management with reference counting and cycle detection
 
 ### Implemented JavaScript Features
 
@@ -47,6 +48,13 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Method calls
   - `this` binding
   - `new` operator for constructors
+- ✅ **Classes**
+  - ES6 class syntax
+  - Constructor methods
+  - Instance and static methods
+  - Class inheritance with `extends`
+  - `super` keyword
+  - Getters and setters
 
 #### Advanced Features
 - ✅ **Async/Await**
@@ -73,6 +81,11 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Dual implementation support
   - Standard regex with flags (i, g, m)
   - Pure C++ simple regex engine option
+- ✅ **Map/Set Collections**
+  - Map with key-value pairs
+  - Set with unique values
+  - Insertion order preservation
+  - has(), get(), set(), delete() methods
 
 #### Built-in APIs
 - ✅ **Console**
@@ -89,8 +102,9 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 - ✅ **Promise API**
   - Promise constructor
   - `Promise.resolve()`, `Promise.reject()`
-  - `Promise.all()`
-  - `.then()`, `.catch()` (planned)
+  - `Promise.all()`, `Promise.race()`
+  - `.then()`, `.catch()`, `.finally()`
+  - Promise chaining support
 
 ### Testing Infrastructure
 - ✅ **Test262 Support**
@@ -206,13 +220,11 @@ console.log('PI =', PI);
 ## TODO - Unimplemented Features
 
 ### Language Features
-- [ ] **Classes** - ES6 class syntax
 - [ ] **Generators** - Generator functions and iterators
 - [ ] **Destructuring** - Array and object destructuring
 - [ ] **Spread/Rest** operators (`...`)
 - [ ] **Template literals** - Backtick strings with interpolation
 - [ ] **Symbol** type
-- [ ] **Map/Set** collections
 - [ ] **WeakMap/WeakSet**
 - [ ] **Proxy/Reflect** APIs
 - [ ] **for...of** loops
@@ -240,7 +252,6 @@ console.log('PI =', PI);
 - [ ] **Date object** - Date manipulation
 - [ ] **JSON object** - JSON.parse, JSON.stringify
 - [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
-- [ ] **Promise methods** - .then(), .catch(), .finally(), race()
 - [ ] **ArrayBuffer** and DataView
 - [ ] **Intl** - Internationalization API
 - [ ] **URL** and URLSearchParams
@@ -272,7 +283,6 @@ console.log('PI =', PI);
 - [ ] **JIT compilation**
 - [ ] **Bytecode generation**
 - [ ] **Optimization passes**
-- [ ] **Garbage collection**
 - [ ] **Memory pooling**
 - [ ] **String interning**
 

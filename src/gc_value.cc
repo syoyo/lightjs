@@ -17,6 +17,10 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
         if (*promise) refs.push_back(promise->get());
     } else if (auto* regex = std::get_if<std::shared_ptr<Regex>>(&value.data)) {
         if (*regex) refs.push_back(regex->get());
+    } else if (auto* map = std::get_if<std::shared_ptr<Map>>(&value.data)) {
+        if (*map) refs.push_back(map->get());
+    } else if (auto* set = std::get_if<std::shared_ptr<Set>>(&value.data)) {
+        if (*set) refs.push_back(set->get());
     }
 }
 
@@ -39,6 +43,22 @@ void Object::getReferences(std::vector<GCObject*>& refs) const {
 
 void Promise::getReferences(std::vector<GCObject*>& refs) const {
     addValueReferences(result, refs);
+    for (const auto& chainedPromise : chainedPromises) {
+        if (chainedPromise) refs.push_back(chainedPromise.get());
+    }
+}
+
+void Map::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& [key, value] : entries) {
+        addValueReferences(key, refs);
+        addValueReferences(value, refs);
+    }
+}
+
+void Set::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& value : values) {
+        addValueReferences(value, refs);
+    }
 }
 
 } // namespace tinyjs

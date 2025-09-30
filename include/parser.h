@@ -27,6 +27,7 @@ private:
   StmtPtr parseStatement();
   StmtPtr parseVarDeclaration();
   StmtPtr parseFunctionDeclaration();
+  StmtPtr parseClassDeclaration();
   StmtPtr parseReturnStatement();
   StmtPtr parseIfStatement();
   StmtPtr parseWhileStatement();
@@ -54,6 +55,8 @@ private:
   ExprPtr parseArrayExpression();
   ExprPtr parseObjectExpression();
   ExprPtr parseFunctionExpression();
+  ExprPtr parseClassExpression();
+  ExprPtr parseNewExpression();
 };
 
 }
