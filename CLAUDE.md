@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TinyJS is a C++20 JavaScript (ES2020) interpreter featuring:
 - C++20 coroutine-based async execution model
+- **Full async/await support** for asynchronous programming
 - No C++ exceptions (`-fno-exceptions` removed, but try/catch is used)
 - No RTTI (`-fno-rtti` enabled)
 - Pure C/C++ crypto implementations (SHA-256, HMAC)
@@ -118,12 +119,20 @@ TypedArrays store binary data in `std::vector<uint8_t>` with typed accessors:
 
 **When adding new TypedArray types:** Update `TypedArrayType` enum, `elementSize()`, and both get/set methods in `value.cc`.
 
-### Promise and Fetch API
+### Async/Await and Promise API
 
-Promises are currently synchronous (resolve immediately):
-- `fetch()` in `environment.cc` executes HTTP/file requests synchronously
-- Returns fulfilled Promise with Response object
-- Promise property access is handled specially in `evaluateMember()` in `interpreter.cc`
+Full async/await support is implemented:
+- **Async functions** return Promises automatically
+- **Await expressions** properly unwrap Promise values
+- **Promise constructor** with executor function
+- **Promise.resolve()** and **Promise.reject()** static methods
+- **Promise.all()** for parallel Promise handling
+
+**Implementation details:**
+- Async functions in `evaluateCall()` wrap their results in Promises
+- Await expressions in `evaluateAwait()` extract values from Promises
+- Uses C++20 coroutines throughout for async execution
+- `fetch()` returns a Promise that resolves with Response object
 
 **Important:** When accessing properties on a Promise (e.g., `fetch(url).status`), the interpreter automatically unwraps the fulfilled Promise result. This logic is in `Interpreter::evaluateMember()`.
 

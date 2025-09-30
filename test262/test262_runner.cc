@@ -172,10 +172,10 @@ private:
     try {
       Test262Metadata metadata = parseMetadata(testCode);
 
-      // Skip tests with unsupported features
-      if (metadata.isAsync || metadata.isModule) {
+      // Skip module tests (not yet supported)
+      if (metadata.isModule) {
         result.phase = "skip";
-        result.actualError = "Async/Module tests not yet supported";
+        result.actualError = "Module tests not yet supported";
         auto endTime = std::chrono::high_resolution_clock::now();
         result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
         return result;
@@ -228,12 +228,38 @@ private:
         Value finalResult = task.result();
         result.phase = "runtime";
 
-        if (metadata.negative) {
-          // Should have thrown but didn't
-          result.passed = false;
-          result.actualError = "Expected error but test completed successfully";
+        // For async tests, check if the result is a Promise
+        if (metadata.isAsync && finalResult.isPromise()) {
+          auto promise = std::get<std::shared_ptr<Promise>>(finalResult.data);
+          // Check Promise state
+          if (promise->state == PromiseState::Rejected) {
+            result.actualError = "Promise rejected";
+            if (metadata.negative && metadata.negativePhase == "runtime") {
+              result.passed = true;
+            } else {
+              result.passed = false;
+            }
+          } else if (promise->state == PromiseState::Fulfilled) {
+            if (metadata.negative) {
+              // Should have thrown but didn't
+              result.passed = false;
+              result.actualError = "Expected error but test completed successfully";
+            } else {
+              result.passed = true;
+            }
+          } else {
+            // Pending promise
+            result.passed = false;
+            result.actualError = "Promise still pending";
+          }
         } else {
-          result.passed = true;
+          if (metadata.negative) {
+            // Should have thrown but didn't
+            result.passed = false;
+            result.actualError = "Expected error but test completed successfully";
+          } else {
+            result.passed = true;
+          }
         }
       } catch (const std::exception& e) {
         result.phase = "runtime";

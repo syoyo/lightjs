@@ -373,36 +373,83 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       co_return func->nativeFunc(args);
     }
 
-    auto prevEnv = env_;
-    env_ = std::static_pointer_cast<Environment>(func->closure);
-    env_ = env_->createChild();
+    // If it's an async function, wrap the result in a Promise
+    if (func->isAsync) {
+      auto promise = std::make_shared<Promise>();
 
-    for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
-      env_->define(func->params[i], args[i]);
-    }
+      // Execute the function body
+      auto prevEnv = env_;
+      env_ = std::static_pointer_cast<Environment>(func->closure);
+      env_ = env_->createChild();
 
-    auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
-    Value result = Value(Undefined{});
-
-    auto prevFlow = flow_;
-    flow_ = ControlFlow{};
-
-    for (const auto& stmt : *bodyPtr) {
-      auto stmtTask = evaluate(*stmt);
-      while (!stmtTask.done()) {
-        std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+      for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
+        env_->define(func->params[i], args[i]);
       }
-      result = stmtTask.result();
 
-      if (flow_.type == ControlFlow::Type::Return) {
-        result = flow_.value;
-        break;
+      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+      Value result = Value(Undefined{});
+
+      auto prevFlow = flow_;
+      flow_ = ControlFlow{};
+
+      try {
+        for (const auto& stmt : *bodyPtr) {
+          auto stmtTask = evaluate(*stmt);
+          while (!stmtTask.done()) {
+            std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+          }
+          result = stmtTask.result();
+
+          if (flow_.type == ControlFlow::Type::Return) {
+            result = flow_.value;
+            break;
+          }
+        }
+
+        // Resolve the promise with the result
+        promise->resolve(result);
+      } catch (const std::exception& e) {
+        // Reject the promise if there's an error
+        promise->reject(Value(std::string(e.what())));
       }
-    }
 
-    flow_ = prevFlow;
-    env_ = prevEnv;
-    co_return result;
+      flow_ = prevFlow;
+      env_ = prevEnv;
+
+      co_return Value(promise);
+    } else {
+      // Regular synchronous function
+      auto prevEnv = env_;
+      env_ = std::static_pointer_cast<Environment>(func->closure);
+      env_ = env_->createChild();
+
+      for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
+        env_->define(func->params[i], args[i]);
+      }
+
+      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+      Value result = Value(Undefined{});
+
+      auto prevFlow = flow_;
+      flow_ = ControlFlow{};
+
+      for (const auto& stmt : *bodyPtr) {
+        auto stmtTask = evaluate(*stmt);
+        while (!stmtTask.done()) {
+          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+        }
+        result = stmtTask.result();
+
+        if (flow_.type == ControlFlow::Type::Return) {
+          result = flow_.value;
+          break;
+        }
+      }
+
+      flow_ = prevFlow;
+      env_ = prevEnv;
+      co_return result;
+    }
   }
 
   co_return Value(Undefined{});

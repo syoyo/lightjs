@@ -196,6 +196,125 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("RegExp", Value(regExpConstructor));
 
+  // Promise constructor
+  auto promiseConstructor = std::make_shared<Object>();
+
+  // Promise.resolve
+  auto promiseResolve = std::make_shared<Function>();
+  promiseResolve->isNative = true;
+  promiseResolve->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto promise = std::make_shared<Promise>();
+    if (!args.empty()) {
+      promise->resolve(args[0]);
+    } else {
+      promise->resolve(Value(Undefined{}));
+    }
+    return Value(promise);
+  };
+  promiseConstructor->properties["resolve"] = Value(promiseResolve);
+
+  // Promise.reject
+  auto promiseReject = std::make_shared<Function>();
+  promiseReject->isNative = true;
+  promiseReject->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto promise = std::make_shared<Promise>();
+    if (!args.empty()) {
+      promise->reject(args[0]);
+    } else {
+      promise->reject(Value(Undefined{}));
+    }
+    return Value(promise);
+  };
+  promiseConstructor->properties["reject"] = Value(promiseReject);
+
+  // Promise.all
+  auto promiseAll = std::make_shared<Function>();
+  promiseAll->isNative = true;
+  promiseAll->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      auto promise = std::make_shared<Promise>();
+      promise->reject(Value(std::string("Promise.all expects an array")));
+      return Value(promise);
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto resultPromise = std::make_shared<Promise>();
+    auto results = std::make_shared<Array>();
+
+    bool hasRejection = false;
+    for (const auto& elem : arr->elements) {
+      if (elem.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        if (p->state == PromiseState::Rejected) {
+          hasRejection = true;
+          resultPromise->reject(p->result);
+          break;
+        } else if (p->state == PromiseState::Fulfilled) {
+          results->elements.push_back(p->result);
+        }
+      } else {
+        results->elements.push_back(elem);
+      }
+    }
+
+    if (!hasRejection) {
+      resultPromise->resolve(Value(results));
+    }
+
+    return Value(resultPromise);
+  };
+  promiseConstructor->properties["all"] = Value(promiseAll);
+
+  // Promise constructor function
+  auto promiseFunc = std::make_shared<Function>();
+  promiseFunc->isNative = true;
+  promiseFunc->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto promise = std::make_shared<Promise>();
+
+    if (!args.empty() && args[0].isFunction()) {
+      auto executor = std::get<std::shared_ptr<Function>>(args[0].data);
+
+      // Create resolve and reject functions
+      auto resolveFunc = std::make_shared<Function>();
+      resolveFunc->isNative = true;
+      auto promisePtr = promise;
+      resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promisePtr->resolve(args[0]);
+        } else {
+          promisePtr->resolve(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      auto rejectFunc = std::make_shared<Function>();
+      rejectFunc->isNative = true;
+      rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promisePtr->reject(args[0]);
+        } else {
+          promisePtr->reject(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      // Call executor with resolve and reject
+      if (executor->isNative) {
+        try {
+          executor->nativeFunc({Value(resolveFunc), Value(rejectFunc)});
+        } catch (const std::exception& e) {
+          promise->reject(Value(std::string(e.what())));
+        }
+      }
+    }
+
+    return Value(promise);
+  };
+
+  // For now, define Promise as an object with static methods
+  // In a full implementation, we'd need to make Function objects support properties
+  env->define("Promise", Value(promiseConstructor));
+
   return env;
 }
 
