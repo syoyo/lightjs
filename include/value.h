@@ -12,6 +12,7 @@
 #include <functional>
 #include <cstdint>
 #include <cstring>
+#include "gc.h"
 
 #if USE_SIMPLE_REGEX
 #include "simple_regex.h"
@@ -38,7 +39,7 @@ struct BigInt {
 
 using NativeFunction = std::function<Value(const std::vector<Value>&)>;
 
-struct Function {
+struct Function : public GCObject {
   std::vector<std::string> params;
   std::shared_ptr<void> body;
   std::shared_ptr<void> closure;
@@ -47,17 +48,29 @@ struct Function {
   NativeFunction nativeFunc;
 
   Function() : isNative(false), isAsync(false) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "Function"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
-struct Array {
+struct Array : public GCObject {
   std::vector<Value> elements;
+
+  // GCObject interface
+  const char* typeName() const override { return "Array"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
-struct Object {
+struct Object : public GCObject {
   std::unordered_map<std::string, Value> properties;
+
+  // GCObject interface
+  const char* typeName() const override { return "Object"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
-struct Regex {
+struct Regex : public GCObject {
 #if USE_SIMPLE_REGEX
   simple_regex::Regex* regex;
 #else
@@ -120,6 +133,10 @@ struct Regex {
     }
     return *this;
   }
+
+  // GCObject interface
+  const char* typeName() const override { return "Regex"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {}
 };
 
 enum class TypedArrayType {
@@ -187,7 +204,7 @@ inline float float16_to_float32(uint16_t value) {
   return result;
 }
 
-struct TypedArray {
+struct TypedArray : public GCObject {
   TypedArrayType type;
   std::vector<uint8_t> buffer;
   size_t byteOffset;
@@ -224,6 +241,10 @@ struct TypedArray {
   void setElement(size_t index, double value);
   int64_t getBigIntElement(size_t index) const;
   void setBigIntElement(size_t index, int64_t value);
+
+  // GCObject interface
+  const char* typeName() const override { return "TypedArray"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {}
 };
 
 struct Value {
@@ -284,7 +305,7 @@ enum class PromiseState {
   Rejected
 };
 
-struct Promise {
+struct Promise : public GCObject {
   PromiseState state;
   Value result;
   std::function<void(Value)> onFulfilled;
@@ -311,6 +332,10 @@ struct Promise {
       }
     }
   }
+
+  // GCObject interface
+  const char* typeName() const override { return "Promise"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 }

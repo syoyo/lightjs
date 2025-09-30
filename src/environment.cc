@@ -1,6 +1,7 @@
 #include "environment.h"
 #include "crypto.h"
 #include "http.h"
+#include "gc.h"
 #include <iostream>
 #include <thread>
 
@@ -70,6 +71,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   auto consoleObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
   consoleObj->properties["log"] = Value(consoleFn);
 
   env->define("console", Value(consoleObj));
@@ -102,6 +104,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64));
 
   auto cryptoObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   auto sha256Fn = std::make_shared<Function>();
   sha256Fn->isNative = true;
@@ -159,6 +162,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       http::Response httpResp = client.get(url);
 
       auto respObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
       respObj->properties["status"] = Value(static_cast<double>(httpResp.statusCode));
       respObj->properties["statusText"] = Value(httpResp.statusText);
       respObj->properties["ok"] = Value(httpResp.statusCode >= 200 && httpResp.statusCode < 300);
@@ -172,6 +176,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       respObj->properties["text"] = Value(textFn);
 
       auto headersObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
       for (const auto& [key, value] : httpResp.headers) {
         headersObj->properties[key] = Value(value);
       }
@@ -198,6 +203,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Promise constructor
   auto promiseConstructor = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Promise.resolve
   auto promiseResolve = std::make_shared<Function>();
@@ -233,6 +239,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseAll->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
+      GarbageCollector::instance().reportAllocation(sizeof(Promise));
       promise->reject(Value(std::string("Promise.all expects an array")));
       return Value(promise);
     }
@@ -320,6 +327,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
 std::shared_ptr<Object> Environment::getGlobal() const {
   auto globalObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Walk up to the root environment
   const Environment* current = this;

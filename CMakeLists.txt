@@ -25,6 +25,8 @@ add_library(tinyjs
   src/http.cc
   src/simple_regex.cc
   src/module.cc
+  src/gc.cc
+  src/gc_value.cc
 )
 
 target_include_directories(tinyjs PUBLIC
@@ -39,6 +41,13 @@ target_link_libraries(tinyjs_test tinyjs)
 
 enable_testing()
 add_test(NAME tinyjs_test COMMAND tinyjs_test)
+
+# Garbage collection test
+add_executable(gc_test
+  examples/gc_test.cc
+)
+
+target_link_libraries(gc_test tinyjs)
 
 # Test262 conformance runner
 add_executable(test262_runner

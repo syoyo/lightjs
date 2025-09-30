@@ -1,4 +1,5 @@
 #include "interpreter.h"
+#include "gc.h"
 #include <iostream>
 #include <cmath>
 
@@ -686,6 +687,7 @@ Task Interpreter::evaluateConditional(const ConditionalExpr& expr) {
 
 Task Interpreter::evaluateArray(const ArrayExpr& expr) {
   auto arr = std::make_shared<Array>();
+  GarbageCollector::instance().reportAllocation(sizeof(Array));
   for (const auto& elem : expr.elements) {
     auto task = evaluate(*elem);
     while (!task.done()) {
@@ -698,6 +700,7 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 
 Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   auto obj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
   for (const auto& prop : expr.properties) {
     auto keyTask = evaluate(*prop.key);
     while (!keyTask.done()) {
