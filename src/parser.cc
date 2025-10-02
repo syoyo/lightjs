@@ -774,6 +774,120 @@ ExprPtr Parser::parseExpression() {
 }
 
 ExprPtr Parser::parseAssignment() {
+  // Check for arrow functions
+  // Case 1: Single parameter without parentheses (e.g., x => x * 2)
+  if (match(TokenType::Identifier)) {
+    size_t savedPos = pos_;
+    auto paramName = current().value;
+    advance();
+
+    if (match(TokenType::Arrow)) {
+      advance(); // consume =>
+
+      FunctionExpr func;
+      func.isArrow = true;
+      func.params.push_back(Identifier{paramName});
+
+      // Parse body: either expression or block statement
+      if (match(TokenType::LeftBrace)) {
+        // Block body { ... }
+        auto blockStmt = parseBlockStatement();
+        if (auto* block = std::get_if<BlockStmt>(&blockStmt->node)) {
+          func.body = std::move(block->body);
+        }
+      } else {
+        // Expression body (implicit return)
+        auto expr = parseAssignment();
+        auto returnStmt = std::make_unique<Statement>(ReturnStmt{std::move(expr)});
+        func.body.push_back(std::move(returnStmt));
+      }
+
+      return std::make_unique<Expression>(std::move(func));
+    }
+
+    // Not an arrow function, restore position
+    pos_ = savedPos;
+  }
+
+  // Case 2: Parenthesized parameters (e.g., (x, y) => x + y) or (x) => x * 2
+  if (match(TokenType::LeftParen)) {
+    size_t savedPos = pos_;
+    advance();
+
+    // Try to parse as arrow function parameters
+    std::vector<Identifier> params;
+    std::optional<Identifier> restParam;
+    bool isArrowFunc = false;
+
+    if (!match(TokenType::RightParen)) {
+      // Parse parameter list
+      do {
+        if (match(TokenType::DotDotDot)) {
+          // Rest parameter
+          advance();
+          if (!match(TokenType::Identifier)) {
+            // Not a valid arrow function, restore
+            pos_ = savedPos;
+            goto normal_parse;
+          }
+          restParam = Identifier{current().value};
+          advance();
+          break;
+        }
+
+        if (!match(TokenType::Identifier)) {
+          // Not a valid arrow function, restore
+          pos_ = savedPos;
+          goto normal_parse;
+        }
+        params.push_back(Identifier{current().value});
+        advance();
+
+        if (match(TokenType::Comma)) {
+          advance();
+        } else {
+          break;
+        }
+      } while (true);
+    }
+
+    if (match(TokenType::RightParen)) {
+      advance();
+      if (match(TokenType::Arrow)) {
+        isArrowFunc = true;
+      }
+    }
+
+    if (isArrowFunc) {
+      advance(); // consume =>
+
+      FunctionExpr func;
+      func.isArrow = true;
+      func.params = std::move(params);
+      func.restParam = restParam;
+
+      // Parse body: either expression or block statement
+      if (match(TokenType::LeftBrace)) {
+        // Block body { ... }
+        auto blockStmt = parseBlockStatement();
+        if (auto* block = std::get_if<BlockStmt>(&blockStmt->node)) {
+          func.body = std::move(block->body);
+        }
+      } else {
+        // Expression body (implicit return)
+        auto expr = parseAssignment();
+        auto returnStmt = std::make_unique<Statement>(ReturnStmt{std::move(expr)});
+        func.body.push_back(std::move(returnStmt));
+      }
+
+      return std::make_unique<Expression>(std::move(func));
+    }
+
+    // Not an arrow function, restore
+    pos_ = savedPos;
+  }
+
+normal_parse:
   auto left = parseConditional();
 
   if (match(TokenType::Equal) || match(TokenType::PlusEqual) ||
@@ -799,7 +913,7 @@ ExprPtr Parser::parseAssignment() {
 }
 
 ExprPtr Parser::parseConditional() {
-  auto expr = parseLogicalOr();
+  auto expr = parseNullishCoalescing();
 
   if (match(TokenType::Question)) {
     advance();
@@ -814,6 +928,22 @@ ExprPtr Parser::parseConditional() {
   }
 
   return expr;
+}
+
+ExprPtr Parser::parseNullishCoalescing() {
+  auto left = parseLogicalOr();
+
+  while (match(TokenType::QuestionQuestion)) {
+    advance();
+    auto right = parseLogicalOr();
+    left = std::make_unique<Expression>(BinaryExpr{
+      BinaryExpr::Op::NullishCoalescing,
+      std::move(left),
+      std::move(right)
+    });
+  }
+
+  return left;
 }
 
 ExprPtr Parser::parseLogicalOr() {
@@ -1007,26 +1137,29 @@ ExprPtr Parser::parseMember() {
   auto expr = parsePrimary();
 
   while (true) {
-    if (match(TokenType::Dot)) {
+    if (match(TokenType::Dot) || match(TokenType::QuestionDot)) {
+      bool isOptional = match(TokenType::QuestionDot);
       advance();
       if (match(TokenType::Identifier)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
-        expr = std::make_unique<Expression>(MemberExpr{
-          std::move(expr),
-          std::move(prop),
-          false
-        });
+        MemberExpr member;
+        member.object = std::move(expr);
+        member.property = std::move(prop);
+        member.computed = false;
+        member.optional = isOptional;
+        expr = std::make_unique<Expression>(std::move(member));
       }
     } else if (match(TokenType::LeftBracket)) {
       advance();
       auto prop = parseExpression();
       expect(TokenType::RightBracket);
-      expr = std::make_unique<Expression>(MemberExpr{
-        std::move(expr),
-        std::move(prop),
-        true
-      });
+      MemberExpr member;
+      member.object = std::move(expr);
+      member.property = std::move(prop);
+      member.computed = true;
+      member.optional = false;
+      expr = std::make_unique<Expression>(std::move(member));
     } else {
       break;
     }

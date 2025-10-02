@@ -222,6 +222,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       co_return left.toBool() ? right : left;
     case BinaryExpr::Op::LogicalOr:
       co_return left.toBool() ? left : right;
+    case BinaryExpr::Op::NullishCoalescing:
+      // Return right if left is null or undefined, otherwise return left
+      co_return (left.isNull() || left.isUndefined()) ? right : left;
   }
 
   co_return Value(Undefined{});
@@ -533,6 +536,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
   }
   Value obj = objTask.result();
+
+  // Optional chaining: if object is null or undefined, return undefined
+  if (expr.optional && (obj.isNull() || obj.isUndefined())) {
+    co_return Value(Undefined{});
+  }
 
   std::string propName;
   if (expr.computed) {

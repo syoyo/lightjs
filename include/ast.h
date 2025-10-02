@@ -52,7 +52,7 @@ struct BinaryExpr {
     Add, Sub, Mul, Div, Mod,
     Equal, NotEqual, StrictEqual, StrictNotEqual,
     Less, Greater, LessEqual, GreaterEqual,
-    LogicalAnd, LogicalOr
+    LogicalAnd, LogicalOr, NullishCoalescing
   };
   Op op;
   ExprPtr left;
@@ -88,6 +88,8 @@ struct MemberExpr {
   ExprPtr object;
   ExprPtr property;
   bool computed;
+  bool optional;  // Optional chaining (?.)
+  MemberExpr() : computed(false), optional(false) {}
 };
 
 struct ConditionalExpr {
@@ -119,7 +121,8 @@ struct FunctionExpr {
   std::vector<StmtPtr> body;
   std::string name;
   bool isAsync;
-  FunctionExpr() : isAsync(false) {}
+  bool isArrow;  // Arrow function expression (e.g., (x) => x * 2)
+  FunctionExpr() : isAsync(false), isArrow(false) {}
 };
 
 struct SuperExpr {};

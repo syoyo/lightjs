@@ -86,6 +86,8 @@ enum class TokenType {
   MinusMinus,
 
   Question,
+  QuestionDot,  // Optional chaining ?.
+  QuestionQuestion,  // Nullish coalescing ??
   Colon,
 
   LeftParen,

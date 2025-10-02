@@ -405,8 +405,18 @@ std::vector<Token> Lexer::tokenize() {
         }
         break;
       case '?':
-        tokens.emplace_back(TokenType::Question, startLine, startColumn);
-        advance();
+        if (peek() == '?') {
+          tokens.emplace_back(TokenType::QuestionQuestion, startLine, startColumn);
+          advance();
+          advance();
+        } else if (peek() == '.') {
+          tokens.emplace_back(TokenType::QuestionDot, startLine, startColumn);
+          advance();
+          advance();
+        } else {
+          tokens.emplace_back(TokenType::Question, startLine, startColumn);
+          advance();
+        }
         break;
       case ':':
         tokens.emplace_back(TokenType::Colon, startLine, startColumn);

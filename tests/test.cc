@@ -400,6 +400,81 @@ int main() {
     re.flags
   )", "gi");
 
+  runTest("Arrow function - single parameter", R"(
+    let square = x => x * x;
+    square(5)
+  )", "25");
+
+  runTest("Arrow function - multiple parameters", R"(
+    let add = (a, b) => a + b;
+    add(10, 20)
+  )", "30");
+
+  runTest("Arrow function - no parameters", R"(
+    let getNum = () => 42;
+    getNum()
+  )", "42");
+
+  runTest("Arrow function - block body", R"(
+    let multiply = (x, y) => {
+      let result = x * y;
+      return result;
+    };
+    multiply(6, 7)
+  )", "42");
+
+  runTest("Arrow function - with rest parameters", R"(
+    let sum = (...nums) => {
+      let total = 0;
+      for (let i = 0; i < nums.length; i = i + 1) {
+        total = total + nums[i];
+      }
+      return total;
+    };
+    sum(1, 2, 3, 4, 5)
+  )", "15");
+
+  runTest("Arrow function - in array method", R"(
+    let nums = [1, 2, 3, 4, 5];
+    let doubled = nums.map(n => n * 2);
+    doubled
+  )", "[Array]");
+
+  runTest("Optional chaining - with value", R"(
+    let obj = {a: {b: {c: 42}}};
+    obj?.a?.b?.c
+  )", "42");
+
+  runTest("Optional chaining - with null", R"(
+    let obj = null;
+    obj?.a?.b?.c
+  )", "undefined");
+
+  runTest("Optional chaining - with undefined", R"(
+    let obj = {a: null};
+    obj?.a?.b?.c
+  )", "undefined");
+
+  runTest("Nullish coalescing - with null", R"(
+    let x = null;
+    x ?? 42
+  )", "42");
+
+  runTest("Nullish coalescing - with undefined", R"(
+    let x;
+    x ?? 100
+  )", "100");
+
+  runTest("Nullish coalescing - with value", R"(
+    let x = 0;
+    x ?? 42
+  )", "0");
+
+  runTest("Nullish coalescing - with false", R"(
+    let x = false;
+    x ?? true
+  )", "false");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

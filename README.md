@@ -44,7 +44,9 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - `throw` statements
 - ✅ **Functions**
   - Function declarations and expressions
-  - Arrow functions (parsing ready)
+  - Arrow functions with expression and block bodies
+  - Single parameter and multi-parameter arrow functions
+  - Arrow functions with rest parameters
   - Closures and lexical scoping
   - Recursion support
 - ✅ **Objects**
@@ -427,12 +429,94 @@ And so are you!`;
 console.log(poem);
 ```
 
+### Arrow Functions
+
+```javascript
+// Single parameter (no parentheses needed)
+let square = x => x * x;
+console.log(square(5));  // 25
+
+// Multiple parameters
+let add = (a, b) => a + b;
+console.log(add(10, 20));  // 30
+
+// No parameters
+let getFortyTwo = () => 42;
+console.log(getFortyTwo());  // 42
+
+// Block body with explicit return
+let multiply = (x, y) => {
+    let result = x * y;
+    return result;
+};
+console.log(multiply(6, 7));  // 42
+
+// With rest parameters
+let sum = (...nums) => {
+    let total = 0;
+    for (let i = 0; i < nums.length; i++) {
+        total = total + nums[i];
+    }
+    return total;
+};
+console.log(sum(1, 2, 3, 4, 5));  // 15
+
+// Used with array methods
+let numbers = [1, 2, 3, 4, 5];
+let doubled = numbers.map(n => n * 2);
+let evens = numbers.filter(n => n % 2 === 0);
+```
+
+### Optional Chaining and Nullish Coalescing
+
+```javascript
+// Optional chaining - safe property access
+let user = {
+    name: 'Alice',
+    address: {
+        city: 'NYC',
+        zip: '10001'
+    }
+};
+
+console.log(user?.address?.city);  // 'NYC'
+console.log(user?.contact?.phone);  // undefined (no error!)
+
+let nullUser = null;
+console.log(nullUser?.name);  // undefined (no error!)
+
+// Nullish coalescing - default values for null/undefined only
+let x = null;
+console.log(x ?? 'default');  // 'default'
+
+let y = 0;
+console.log(y ?? 42);  // 0 (not 42, because 0 is not null/undefined)
+
+let z = false;
+console.log(z ?? true);  // false (not true, because false is not null/undefined)
+
+let config = {
+    timeout: 0  // explicitly set to 0
+};
+let timeout = config.timeout ?? 5000;  // Uses 0, not 5000
+
+// Combining optional chaining with nullish coalescing
+let settings = null;
+let theme = settings?.theme ?? 'light';  // 'light'
+```
+
+- ✅ **Modern Operators**
+  - Optional chaining (`?.`) - Safe property access on null/undefined
+  - Nullish coalescing (`??`) - Default values for null/undefined only
+  - Spread operator for arrays and function calls
+  - Rest parameters for functions
+
 ## TODO - Unimplemented Features
 
 ### Language Features
 - [ ] **Generators** - Generator functions and iterators
-- [ ] **Destructuring** - Array and object destructuring
-- [ ] **Spread/Rest** operators (`...`)
+- [x] **Destructuring** - Array and object destructuring (✅ Implemented)
+- [x] **Spread/Rest** operators (`...`) (✅ Implemented)
 - [ ] **Symbol** type
 - [ ] **WeakMap/WeakSet**
 - [ ] **Proxy/Reflect** APIs
@@ -442,8 +526,8 @@ console.log(poem);
 - [ ] **Property descriptors** and defineProperty
 - [ ] **Static class members**
 - [ ] **Private class fields**
-- [ ] **Optional chaining** (`?.`)
-- [ ] **Nullish coalescing** (`??`)
+- [x] **Optional chaining** (`?.`) (✅ Implemented)
+- [x] **Nullish coalescing** (`??`) (✅ Implemented)
 - [ ] **Logical assignment** operators (`&&=`, `||=`, `??=`)
 - [ ] **Numeric separators** (`1_000_000`)
 

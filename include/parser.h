@@ -43,6 +43,7 @@ private:
   ExprPtr parseExpression();
   ExprPtr parseAssignment();
   ExprPtr parseConditional();
+  ExprPtr parseNullishCoalescing();
   ExprPtr parseLogicalOr();
   ExprPtr parseLogicalAnd();
   ExprPtr parseEquality();
