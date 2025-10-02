@@ -11,6 +11,7 @@ enum class TokenType {
   Number,
   BigInt,
   String,
+  TemplateLiteral,
   Regex,
   Identifier,
 
@@ -30,6 +31,11 @@ enum class TokenType {
   Else,
   While,
   For,
+  In,
+  Of,
+  Do,
+  Switch,
+  Case,
   Break,
   Continue,
   Try,
@@ -92,6 +98,7 @@ enum class TokenType {
   Semicolon,
   Comma,
   Dot,
+  DotDotDot,
 
   Arrow,
 

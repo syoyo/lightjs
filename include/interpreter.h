@@ -122,7 +122,11 @@ private:
   Task evaluateBlock(const BlockStmt& stmt);
   Task evaluateIf(const IfStmt& stmt);
   Task evaluateWhile(const WhileStmt& stmt);
+  Task evaluateDoWhile(const DoWhileStmt& stmt);
   Task evaluateFor(const ForStmt& stmt);
+  Task evaluateForIn(const ForInStmt& stmt);
+  Task evaluateForOf(const ForOfStmt& stmt);
+  Task evaluateSwitch(const SwitchStmt& stmt);
   Task evaluateTry(const TryStmt& stmt);
   Task evaluateImport(const ImportDeclaration& stmt);
   Task evaluateExportNamed(const ExportNamedDeclaration& stmt);

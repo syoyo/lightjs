@@ -39,7 +39,7 @@ target_include_directories(tinyjs PUBLIC
 )
 
 add_executable(tinyjs_test
-  examples/test.cc
+  tests/test.cc
 )
 
 target_link_libraries(tinyjs_test tinyjs)
@@ -49,42 +49,42 @@ add_test(NAME tinyjs_test COMMAND tinyjs_test)
 
 # Garbage collection test
 add_executable(gc_test
-  examples/gc_test.cc
+  tests/gc_test.cc
 )
 
 target_link_libraries(gc_test tinyjs)
 
 # JSON and Object methods test
 add_executable(json_object_test
-  examples/json_object_test.cc
+  tests/json_object_test.cc
 )
 
 target_link_libraries(json_object_test tinyjs)
 
 # Debug test
 add_executable(debug_test
-  examples/debug_test.cc
+  tests/debug_test.cc
 )
 
 target_link_libraries(debug_test tinyjs)
 
 # Debug test 2
 add_executable(debug_test2
-  examples/debug_test2.cc
+  tests/debug_test2.cc
 )
 
 target_link_libraries(debug_test2 tinyjs)
 
 # Simple Object test
 add_executable(simple_object_test
-  examples/simple_object_test.cc
+  tests/simple_object_test.cc
 )
 
 target_link_libraries(simple_object_test tinyjs)
 
 # Array/String/Math/Date methods test
 add_executable(methods_test
-  examples/methods_test.cc
+  tests/methods_test.cc
 )
 
 target_link_libraries(methods_test tinyjs)

@@ -264,4 +264,101 @@ Value Array_concat(const std::vector<Value>& args) {
     return Value(result);
 }
 
+// Array.prototype.map
+Value Array_map(const std::vector<Value>& args) {
+    if (args.empty() || !args[0].isArray()) {
+        throw std::runtime_error("Array.map called on non-array");
+    }
+    if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("Array.map requires a callback function");
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+    auto result = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+        std::vector<Value> callArgs = {arr->elements[i], Value(static_cast<double>(i)), args[0]};
+        Value mapped = callback->nativeFunc ? callback->nativeFunc(callArgs) : Value(Undefined{});
+        result->elements.push_back(mapped);
+    }
+
+    return Value(result);
+}
+
+// Array.prototype.filter
+Value Array_filter(const std::vector<Value>& args) {
+    if (args.empty() || !args[0].isArray()) {
+        throw std::runtime_error("Array.filter called on non-array");
+    }
+    if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("Array.filter requires a callback function");
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+    auto result = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+        std::vector<Value> callArgs = {arr->elements[i], Value(static_cast<double>(i)), args[0]};
+        Value keep = callback->nativeFunc ? callback->nativeFunc(callArgs) : Value(Undefined{});
+        if (keep.toBool()) {
+            result->elements.push_back(arr->elements[i]);
+        }
+    }
+
+    return Value(result);
+}
+
+// Array.prototype.reduce
+Value Array_reduce(const std::vector<Value>& args) {
+    if (args.empty() || !args[0].isArray()) {
+        throw std::runtime_error("Array.reduce called on non-array");
+    }
+    if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("Array.reduce requires a callback function");
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+
+    if (arr->elements.empty()) {
+        return args.size() > 2 ? args[2] : Value(Undefined{});
+    }
+
+    Value accumulator = args.size() > 2 ? args[2] : arr->elements[0];
+    size_t start = args.size() > 2 ? 0 : 1;
+
+    for (size_t i = start; i < arr->elements.size(); ++i) {
+        std::vector<Value> callArgs = {accumulator, arr->elements[i], Value(static_cast<double>(i)), args[0]};
+        accumulator = callback->nativeFunc ? callback->nativeFunc(callArgs) : Value(Undefined{});
+    }
+
+    return accumulator;
+}
+
+// Array.prototype.forEach
+Value Array_forEach(const std::vector<Value>& args) {
+    if (args.empty() || !args[0].isArray()) {
+        throw std::runtime_error("Array.forEach called on non-array");
+    }
+    if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("Array.forEach requires a callback function");
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+        std::vector<Value> callArgs = {arr->elements[i], Value(static_cast<double>(i)), args[0]};
+        if (callback->nativeFunc) {
+            callback->nativeFunc(callArgs);
+        }
+    }
+
+    return Value(Undefined{});
+}
+
 } // namespace tinyjs

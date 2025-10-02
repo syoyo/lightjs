@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <memory>
 #include <functional>
+#include <optional>
 #include <cstdint>
 #include <cstring>
 #include "gc.h"
@@ -41,6 +42,7 @@ using NativeFunction = std::function<Value(const std::vector<Value>&)>;
 
 struct Function : public GCObject {
   std::vector<std::string> params;
+  std::optional<std::string> restParam;
   std::shared_ptr<void> body;
   std::shared_ptr<void> closure;
   bool isNative;

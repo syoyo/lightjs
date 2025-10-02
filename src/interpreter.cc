@@ -1,4 +1,5 @@
 #include "interpreter.h"
+#include "array_methods.h"
 #include "gc.h"
 #include <iostream>
 #include <cmath>
@@ -38,8 +39,16 @@ Task Interpreter::evaluate(const Statement& stmt) {
     co_return co_await evaluateIf(*node);
   } else if (auto* node = std::get_if<WhileStmt>(&stmt.node)) {
     co_return co_await evaluateWhile(*node);
+  } else if (auto* node = std::get_if<DoWhileStmt>(&stmt.node)) {
+    co_return co_await evaluateDoWhile(*node);
   } else if (auto* node = std::get_if<ForStmt>(&stmt.node)) {
     co_return co_await evaluateFor(*node);
+  } else if (auto* node = std::get_if<ForInStmt>(&stmt.node)) {
+    co_return co_await evaluateForIn(*node);
+  } else if (auto* node = std::get_if<ForOfStmt>(&stmt.node)) {
+    co_return co_await evaluateForOf(*node);
+  } else if (auto* node = std::get_if<SwitchStmt>(&stmt.node)) {
+    co_return co_await evaluateSwitch(*node);
   } else if (std::holds_alternative<BreakStmt>(stmt.node)) {
     flow_.type = ControlFlow::Type::Break;
     co_return Value(Undefined{});
@@ -80,6 +89,20 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return Value(BigInt(node->value));
   } else if (auto* node = std::get_if<StringLiteral>(&expr.node)) {
     co_return Value(node->value);
+  } else if (auto* node = std::get_if<TemplateLiteral>(&expr.node)) {
+    // Evaluate template literal with interpolation
+    std::string result;
+    for (size_t i = 0; i < node->quasis.size(); i++) {
+      result += node->quasis[i];
+      if (i < node->expressions.size()) {
+        auto exprTask = evaluate(*node->expressions[i]);
+        while (!exprTask.done()) {
+          std::coroutine_handle<>::from_address(exprTask.handle.address()).resume();
+        }
+        result += exprTask.result().toString();
+      }
+    }
+    co_return Value(result);
   } else if (auto* node = std::get_if<RegexLiteral>(&expr.node)) {
     auto regex = std::make_shared<Regex>(node->pattern, node->flags);
     co_return Value(regex);
@@ -369,11 +392,31 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
   std::vector<Value> args;
   for (const auto& arg : expr.arguments) {
-    auto argTask = evaluate(*arg);
-    while (!argTask.done()) {
-      std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
+    // Check if this is a spread element
+    if (auto* spread = std::get_if<SpreadElement>(&arg->node)) {
+      // Evaluate the argument
+      auto argTask = evaluate(*spread->argument);
+      while (!argTask.done()) {
+        std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
+      }
+      Value val = argTask.result();
+
+      // Spread the value into args
+      if (val.isArray()) {
+        auto srcArr = std::get<std::shared_ptr<Array>>(val.data);
+        for (const auto& item : srcArr->elements) {
+          args.push_back(item);
+        }
+      } else {
+        args.push_back(val);
+      }
+    } else {
+      auto argTask = evaluate(*arg);
+      while (!argTask.done()) {
+        std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
+      }
+      args.push_back(argTask.result());
     }
-    args.push_back(argTask.result());
   }
 
   if (callee.isFunction()) {
@@ -393,6 +436,16 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
       for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
         env_->define(func->params[i], args[i]);
+      }
+
+      // Handle rest parameter
+      if (func->restParam.has_value()) {
+        auto restArr = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        for (size_t i = func->params.size(); i < args.size(); ++i) {
+          restArr->elements.push_back(args[i]);
+        }
+        env_->define(*func->restParam, Value(restArr));
       }
 
       auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
@@ -434,6 +487,16 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
       for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
         env_->define(func->params[i], args[i]);
+      }
+
+      // Handle rest parameter
+      if (func->restParam.has_value()) {
+        auto restArr = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        for (size_t i = func->params.size(); i < args.size(); ++i) {
+          restArr->elements.push_back(args[i]);
+        }
+        env_->define(*func->restParam, Value(restArr));
       }
 
       auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
@@ -511,6 +574,115 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "length") {
       co_return Value(static_cast<double>(arrPtr->elements.size()));
     }
+
+    // Array higher-order methods
+    // Create a special native function that captures the array and method name
+    if (propName == "map") {
+      auto mapFn = std::make_shared<Function>();
+      mapFn->isNative = true;
+      mapFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("map requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          // Call the callback function
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
+          Value mapped;
+          if (callback->isNative) {
+            mapped = callback->nativeFunc(callArgs);
+          } else {
+            // For non-native functions, we'd need to evaluate them properly
+            // For now, return undefined
+            mapped = Value(Undefined{});
+          }
+          result->elements.push_back(mapped);
+        }
+        return Value(result);
+      };
+      co_return Value(mapFn);
+    }
+
+    if (propName == "filter") {
+      auto filterFn = std::make_shared<Function>();
+      filterFn->isNative = true;
+      filterFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("filter requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
+          Value keep;
+          if (callback->isNative) {
+            keep = callback->nativeFunc(callArgs);
+          } else {
+            keep = Value(Undefined{});
+          }
+          if (keep.toBool()) {
+            result->elements.push_back(arrPtr->elements[i]);
+          }
+        }
+        return Value(result);
+      };
+      co_return Value(filterFn);
+    }
+
+    if (propName == "forEach") {
+      auto forEachFn = std::make_shared<Function>();
+      forEachFn->isNative = true;
+      forEachFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("forEach requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
+          if (callback->isNative) {
+            callback->nativeFunc(callArgs);
+          }
+        }
+        return Value(Undefined{});
+      };
+      co_return Value(forEachFn);
+    }
+
+    if (propName == "reduce") {
+      auto reduceFn = std::make_shared<Function>();
+      reduceFn->isNative = true;
+      reduceFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("reduce requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+
+        if (arrPtr->elements.empty()) {
+          return args.size() > 1 ? args[1] : Value(Undefined{});
+        }
+
+        Value accumulator = args.size() > 1 ? args[1] : arrPtr->elements[0];
+        size_t start = args.size() > 1 ? 0 : 1;
+
+        for (size_t i = start; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {accumulator, arrPtr->elements[i], Value(static_cast<double>(i))};
+          if (callback->isNative) {
+            accumulator = callback->nativeFunc(callArgs);
+          } else {
+            accumulator = Value(Undefined{});
+          }
+        }
+        return accumulator;
+      };
+      co_return Value(reduceFn);
+    }
+
     try {
       size_t idx = std::stoul(propName);
       if (idx < arrPtr->elements.size()) {
@@ -689,11 +861,38 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
   auto arr = std::make_shared<Array>();
   GarbageCollector::instance().reportAllocation(sizeof(Array));
   for (const auto& elem : expr.elements) {
-    auto task = evaluate(*elem);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
+    // Check if this is a spread element
+    if (auto* spread = std::get_if<SpreadElement>(&elem->node)) {
+      // Evaluate the argument
+      auto task = evaluate(*spread->argument);
+      while (!task.done()) {
+        std::coroutine_handle<>::from_address(task.handle.address()).resume();
+      }
+      Value val = task.result();
+
+      // Spread the value into the array
+      if (val.isArray()) {
+        auto srcArr = std::get<std::shared_ptr<Array>>(val.data);
+        for (const auto& item : srcArr->elements) {
+          arr->elements.push_back(item);
+        }
+      } else if (val.isString()) {
+        // String is iterable
+        std::string str = std::get<std::string>(val.data);
+        for (char ch : str) {
+          arr->elements.push_back(Value(std::string(1, ch)));
+        }
+      } else {
+        // Other iterables could be supported here
+        arr->elements.push_back(val);
+      }
+    } else {
+      auto task = evaluate(*elem);
+      while (!task.done()) {
+        std::coroutine_handle<>::from_address(task.handle.address()).resume();
+      }
+      arr->elements.push_back(task.result());
     }
-    arr->elements.push_back(task.result());
   }
   co_return Value(arr);
 }
@@ -702,11 +901,21 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   auto obj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   for (const auto& prop : expr.properties) {
-    auto keyTask = evaluate(*prop.key);
-    while (!keyTask.done()) {
-      std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
+    std::string key;
+
+    // For identifier keys, use the identifier name directly (not its value from environment)
+    if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
+      key = ident->name;
+    } else if (auto* str = std::get_if<StringLiteral>(&prop.key->node)) {
+      key = str->value;
+    } else {
+      // For computed property names, evaluate the expression
+      auto keyTask = evaluate(*prop.key);
+      while (!keyTask.done()) {
+        std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
+      }
+      key = keyTask.result().toString();
     }
-    std::string key = keyTask.result().toString();
 
     auto valTask = evaluate(*prop.value);
     while (!valTask.done()) {
@@ -724,6 +933,10 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
 
   for (const auto& param : expr.params) {
     func->params.push_back(param.name);
+  }
+
+  if (expr.restParam.has_value()) {
+    func->restParam = expr.restParam->name;
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
@@ -774,6 +987,10 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
 
   for (const auto& param : decl.params) {
     func->params.push_back(param.name);
+  }
+
+  if (decl.restParam.has_value()) {
+    func->restParam = decl.restParam->name;
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
@@ -930,6 +1147,264 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   }
 
   env_ = prevEnv;
+  co_return result;
+}
+
+Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
+  Value result = Value(Undefined{});
+
+  do {
+    auto bodyTask = evaluate(*stmt.body);
+    while (!bodyTask.done()) {
+      std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+    }
+    result = bodyTask.result();
+
+    if (flow_.type == ControlFlow::Type::Break) {
+      flow_.type = ControlFlow::Type::None;
+      break;
+    } else if (flow_.type == ControlFlow::Type::Continue) {
+      flow_.type = ControlFlow::Type::None;
+    } else if (flow_.type != ControlFlow::Type::None) {
+      break;
+    }
+
+    auto testTask = evaluate(*stmt.test);
+    while (!testTask.done()) {
+      std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
+    }
+
+    if (!testTask.result().toBool()) {
+      break;
+    }
+  } while (true);
+
+  co_return result;
+}
+
+Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
+  auto prevEnv = env_;
+  env_ = env_->createChild();
+
+  // Evaluate the right-hand side (the object to iterate over)
+  auto rightTask = evaluate(*stmt.right);
+  while (!rightTask.done()) {
+    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
+  }
+  Value obj = rightTask.result();
+
+  Value result = Value(Undefined{});
+
+  // Get the variable name from the left side
+  std::string varName;
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
+    if (!varDecl->declarations.empty()) {
+      varName = varDecl->declarations[0].id.name;
+      // Define the variable in the loop scope
+      env_->define(varName, Value(Undefined{}));
+    }
+  } else if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.left->node)) {
+    if (auto* ident = std::get_if<Identifier>(&exprStmt->expression->node)) {
+      varName = ident->name;
+    }
+  }
+
+  // Iterate over object properties
+  if (auto* objPtr = std::get_if<std::shared_ptr<Object>>(&obj.data)) {
+    for (const auto& [key, value] : (*objPtr)->properties) {
+      // Assign the key to the loop variable
+      env_->set(varName, Value(key));
+
+      auto bodyTask = evaluate(*stmt.body);
+      while (!bodyTask.done()) {
+        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+      }
+      result = bodyTask.result();
+
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        flow_.type = ControlFlow::Type::None;
+        continue;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  }
+
+  env_ = prevEnv;
+  co_return result;
+}
+
+Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
+  auto prevEnv = env_;
+  env_ = env_->createChild();
+
+  // Evaluate the right-hand side (the iterable to iterate over)
+  auto rightTask = evaluate(*stmt.right);
+  while (!rightTask.done()) {
+    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
+  }
+  Value iterable = rightTask.result();
+
+  Value result = Value(Undefined{});
+
+  // Get the variable name from the left side
+  std::string varName;
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
+    if (!varDecl->declarations.empty()) {
+      varName = varDecl->declarations[0].id.name;
+      // Define the variable in the loop scope
+      env_->define(varName, Value(Undefined{}));
+    }
+  } else if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.left->node)) {
+    if (auto* ident = std::get_if<Identifier>(&exprStmt->expression->node)) {
+      varName = ident->name;
+    }
+  }
+
+  // Iterate over array elements
+  if (auto* arrPtr = std::get_if<std::shared_ptr<Array>>(&iterable.data)) {
+    for (const auto& elem : (*arrPtr)->elements) {
+      // Assign the element to the loop variable
+      env_->set(varName, elem);
+
+      auto bodyTask = evaluate(*stmt.body);
+      while (!bodyTask.done()) {
+        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+      }
+      result = bodyTask.result();
+
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        flow_.type = ControlFlow::Type::None;
+        continue;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  } else if (auto* strPtr = std::get_if<std::string>(&iterable.data)) {
+    // Iterate over string characters
+    for (char c : *strPtr) {
+      env_->set(varName, Value(std::string(1, c)));
+
+      auto bodyTask = evaluate(*stmt.body);
+      while (!bodyTask.done()) {
+        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+      }
+      result = bodyTask.result();
+
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        flow_.type = ControlFlow::Type::None;
+        continue;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  }
+
+  env_ = prevEnv;
+  co_return result;
+}
+
+Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
+  // Evaluate the discriminant
+  auto discriminantTask = evaluate(*stmt.discriminant);
+  while (!discriminantTask.done()) {
+    std::coroutine_handle<>::from_address(discriminantTask.handle.address()).resume();
+  }
+  Value discriminant = discriminantTask.result();
+
+  Value result = Value(Undefined{});
+  bool foundMatch = false;
+  bool hasDefault = false;
+  size_t defaultIndex = 0;
+
+  // Find default case if any
+  for (size_t i = 0; i < stmt.cases.size(); i++) {
+    if (!stmt.cases[i].test) {
+      hasDefault = true;
+      defaultIndex = i;
+      break;
+    }
+  }
+
+  // First pass: find matching case
+  for (size_t i = 0; i < stmt.cases.size(); i++) {
+    const auto& caseClause = stmt.cases[i];
+
+    if (caseClause.test) {
+      auto testTask = evaluate(*caseClause.test);
+      while (!testTask.done()) {
+        std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
+      }
+      Value testValue = testTask.result();
+
+      // Perform strict equality check
+      bool isEqual = false;
+      if (discriminant.isBigInt() && testValue.isBigInt()) {
+        isEqual = (discriminant.toBigInt() == testValue.toBigInt());
+      } else if (discriminant.isNumber() && testValue.isNumber()) {
+        isEqual = (discriminant.toNumber() == testValue.toNumber());
+      } else if (discriminant.isString() && testValue.isString()) {
+        isEqual = (discriminant.toString() == testValue.toString());
+      } else if (discriminant.isBool() && testValue.isBool()) {
+        isEqual = (discriminant.toBool() == testValue.toBool());
+      } else if (discriminant.isNull() && testValue.isNull()) {
+        isEqual = true;
+      } else if (discriminant.isUndefined() && testValue.isUndefined()) {
+        isEqual = true;
+      }
+
+      if (isEqual) {
+        foundMatch = true;
+      }
+    }
+
+    // Execute if we found a match or if we're in fall-through mode
+    if (foundMatch) {
+      for (const auto& consequentStmt : caseClause.consequent) {
+        auto stmtTask = evaluate(*consequentStmt);
+        while (!stmtTask.done()) {
+          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+        }
+        result = stmtTask.result();
+
+        if (flow_.type == ControlFlow::Type::Break) {
+          flow_.type = ControlFlow::Type::None;
+          co_return result;
+        } else if (flow_.type != ControlFlow::Type::None) {
+          co_return result;
+        }
+      }
+    }
+  }
+
+  // If no match found, execute default case
+  if (!foundMatch && hasDefault) {
+    const auto& defaultCase = stmt.cases[defaultIndex];
+    for (const auto& consequentStmt : defaultCase.consequent) {
+      auto stmtTask = evaluate(*consequentStmt);
+      while (!stmtTask.done()) {
+        std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+      }
+      result = stmtTask.result();
+
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        co_return result;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        co_return result;
+      }
+    }
+  }
+
   co_return result;
 }
 

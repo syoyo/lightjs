@@ -30,6 +30,7 @@ private:
 
   std::optional<Token> readNumber();
   std::optional<Token> readString(char quote);
+  std::optional<Token> readTemplateLiteral();
   std::optional<Token> readIdentifier();
   std::optional<Token> readRegex();
   std::optional<Token> readOperator();

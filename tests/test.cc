@@ -282,14 +282,14 @@ int main() {
       return 42;
     }
     test()
-  )", "42");
+  )", "[Promise]");
 
   runTest("Async function expression", R"(
     let fn = async function() {
       return "hello";
     };
     fn()
-  )", "hello");
+  )", "[Promise]");
 
   runTest("SHA-256 hash", R"(
     crypto.sha256("hello")

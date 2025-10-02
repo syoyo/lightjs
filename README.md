@@ -20,6 +20,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Primitives: `undefined`, `null`, `boolean`, `number`, `string`, `bigint`
   - Objects and Arrays
   - Functions (regular and arrow functions)
+  - Template literals with interpolation (`` `Hello, ${name}` ``)
   - Regular Expressions (dual implementation: std::regex or pure C++)
 - ✅ **Operators**
   - Arithmetic: `+`, `-`, `*`, `/`, `%`
@@ -32,7 +33,11 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 - ✅ **Control Flow**
   - `if`/`else` statements
   - `while` loops
+  - `do...while` loops
   - `for` loops
+  - `for...in` loops (iterate over object keys)
+  - `for...of` loops (iterate over iterable values)
+  - `switch` statements with case/default and fall-through
   - `break` and `continue`
   - `return` statements
   - `try`/`catch`/`finally` with error handling
@@ -130,6 +135,10 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Array.prototype.includes() - check if element exists
   - Array.prototype.reverse() - reverse array in place
   - Array.prototype.concat() - concatenate arrays
+  - Array.prototype.map() - transform elements (functional)
+  - Array.prototype.filter() - select elements (functional)
+  - Array.prototype.reduce() - aggregate values (functional)
+  - Array.prototype.forEach() - iterate over elements
 - ✅ **String methods**
   - String.prototype.charAt() - character at index
   - String.prototype.charCodeAt() - character code at index
@@ -182,6 +191,48 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Negative test support
   - Async test handling
   - Module test support
+
+## Recent Updates
+
+### Latest Changes (2025-10-01) - Session 2
+- ✅ **Implemented for...in loops** - Iterate over object property keys
+  - Syntax: `for (let key in obj) { ... }`
+  - Works with object literals and Object instances
+
+- ✅ **Implemented for...of loops** - Iterate over iterable values
+  - Syntax: `for (let value of iterable) { ... }`
+  - Supports arrays and strings
+  - Proper iterator protocol support
+
+- ✅ **Implemented do...while loops** - Execute body at least once
+  - Syntax: `do { ... } while (condition);`
+  - Condition evaluated after each iteration
+
+- ✅ **Implemented switch statements** - Multi-way conditional branching
+  - Syntax: `switch (expr) { case value: ...; break; default: ...; }`
+  - Full support for `case`, `default`, and `break` statements
+  - Proper fall-through behavior when break is omitted
+  - Uses strict equality (===) for case matching
+
+- 🔧 **Fixed object property access bug** - Object literals now work correctly
+  - Object literal keys (`{a: 1}`) are now properly treated as property names
+  - Previously, keys were incorrectly evaluated as variable lookups
+  - Fix enables proper for...in iteration and Object.keys() functionality
+
+- ✅ **Implemented template literals** - Modern string interpolation
+  - Syntax: `` `Hello, ${name}!` ``
+  - Full support for `${expression}` interpolation
+  - Expressions are evaluated and converted to strings
+  - Supports nested expressions and function calls
+  - Escape sequences: `\n`, `\t`, `\r`, `\\`, `` \` ``, `\$`
+
+- ✅ **Implemented array higher-order methods** - Functional programming support
+  - `Array.prototype.map()` - Transform array elements
+  - `Array.prototype.filter()` - Select array elements
+  - `Array.prototype.reduce()` - Aggregate array values
+  - `Array.prototype.forEach()` - Iterate over array elements
+  - Currently supports native callback functions
+  - Note: Full JavaScript callback support in progress
 
 ## Build Instructions
 
@@ -285,25 +336,110 @@ console.log('2 + 3 =', add(2, 3));
 console.log('PI =', PI);
 ```
 
+### Control Flow Examples
+
+```javascript
+// for...in loop - iterate over object keys
+let person = {name: 'Alice', age: 30, city: 'NYC'};
+for (let key in person) {
+    console.log(key + ':', person[key]);
+}
+
+// for...of loop - iterate over array values
+let numbers = [10, 20, 30, 40];
+let sum = 0;
+for (let num of numbers) {
+    sum = sum + num;
+}
+console.log('Sum:', sum);  // Sum: 100
+
+// for...of with strings
+let word = 'hello';
+for (let char of word) {
+    console.log(char);
+}
+
+// do...while loop
+let count = 0;
+do {
+    count = count + 1;
+} while (count < 5);
+console.log('Count:', count);  // Count: 5
+
+// switch statement with break
+function getGrade(score) {
+    switch (score) {
+        case 90:
+            return 'A';
+        case 80:
+            return 'B';
+        case 70:
+            return 'C';
+        default:
+            return 'F';
+    }
+}
+
+// switch with fall-through
+function getDaysInMonth(month) {
+    let days = 0;
+    switch (month) {
+        case 'January':
+        case 'March':
+        case 'May':
+            days = 31;
+            break;
+        case 'February':
+            days = 28;
+            break;
+        default:
+            days = 30;
+    }
+    return days;
+}
+```
+
+### Template Literals
+
+```javascript
+// Basic interpolation
+let name = 'Alice';
+let age = 30;
+console.log(`Name: ${name}, Age: ${age}`);  // Name: Alice, Age: 30
+
+// Expression interpolation
+let a = 10;
+let b = 20;
+console.log(`Sum: ${a + b}`);  // Sum: 30
+console.log(`Product: ${a * b}`);  // Product: 200
+
+// Function calls in interpolation
+function greet(name) {
+    return `Hello, ${name}!`;
+}
+console.log(`Message: ${greet('World')}`);  // Message: Hello, World!
+
+// Multi-line strings
+let poem = `Roses are red,
+Violets are blue,
+JavaScript is great,
+And so are you!`;
+console.log(poem);
+```
+
 ## TODO - Unimplemented Features
 
 ### Language Features
 - [ ] **Generators** - Generator functions and iterators
 - [ ] **Destructuring** - Array and object destructuring
 - [ ] **Spread/Rest** operators (`...`)
-- [ ] **Template literals** - Backtick strings with interpolation
 - [ ] **Symbol** type
 - [ ] **WeakMap/WeakSet**
 - [ ] **Proxy/Reflect** APIs
-- [ ] **for...of** loops
-- [ ] **for...in** loops
-- [ ] **switch** statements
-- [ ] **do...while** loops
 - [ ] **with** statement (deprecated but in spec)
 - [ ] **Labels** and labeled statements
 - [ ] **Computed property names**
 - [ ] **Property descriptors** and defineProperty
-- [ ] **Getters/Setters**
 - [ ] **Static class members**
 - [ ] **Private class fields**
 - [ ] **Optional chaining** (`?.`)
@@ -312,7 +448,6 @@ console.log('PI =', PI);
 - [ ] **Numeric separators** (`1_000_000`)
 
 ### Built-in Objects & APIs
-- [ ] **Array higher-order methods** - map, filter, reduce, forEach
 - [ ] **Number methods** - toFixed, toPrecision, parseInt, parseFloat
 - [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
 - [ ] **ArrayBuffer** and DataView

@@ -1,4 +1,5 @@
 #include "parser.h"
+#include "lexer.h"
 #include <stdexcept>
 
 namespace tinyjs {
@@ -77,8 +78,12 @@ StmtPtr Parser::parseStatement() {
       return parseIfStatement();
     case TokenType::While:
       return parseWhileStatement();
+    case TokenType::Do:
+      return parseDoWhileStatement();
     case TokenType::For:
       return parseForStatement();
+    case TokenType::Switch:
+      return parseSwitchStatement();
     case TokenType::Break:
       advance();
       consumeSemicolon();
@@ -157,13 +162,28 @@ StmtPtr Parser::parseFunctionDeclaration() {
   expect(TokenType::LeftParen);
 
   std::vector<Identifier> params;
+  std::optional<Identifier> restParam;
+
   while (!match(TokenType::RightParen)) {
     if (!params.empty()) {
       expect(TokenType::Comma);
     }
-    if (match(TokenType::Identifier)) {
+
+    // Check for rest parameter
+    if (match(TokenType::DotDotDot)) {
+      advance();
+      if (match(TokenType::Identifier)) {
+        restParam = Identifier{current().value};
+        advance();
+      }
+      // Rest parameter must be last
+      break;
+    } else if (match(TokenType::Identifier)) {
       params.push_back({current().value});
       advance();
+    } else {
+      // Unexpected token in parameter list
+      break;
     }
   }
   expect(TokenType::RightParen);
@@ -181,6 +201,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   FunctionDeclaration funcDecl;
   funcDecl.id = {name};
   funcDecl.params = std::move(params);
+  funcDecl.restParam = restParam;
   funcDecl.body = std::move(blockStmt->body);
   funcDecl.isAsync = isAsync;
 
@@ -323,6 +344,93 @@ StmtPtr Parser::parseForStatement() {
   expect(TokenType::For);
   expect(TokenType::LeftParen);
 
+  // Check if it's a for...in or for...of loop
+  size_t savedPos = pos_;
+  bool isForInOrOf = false;
+  bool isForOf = false;
+
+  // Try to detect for...in or for...of pattern
+  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+    advance();
+    if (match(TokenType::Identifier)) {
+      advance();
+      if (match(TokenType::In)) {
+        isForInOrOf = true;
+        isForOf = false;
+      } else if (match(TokenType::Of)) {
+        isForInOrOf = true;
+        isForOf = true;
+      }
+    }
+  } else if (match(TokenType::Identifier)) {
+    advance();
+    if (match(TokenType::In)) {
+      isForInOrOf = true;
+      isForOf = false;
+    } else if (match(TokenType::Of)) {
+      isForInOrOf = true;
+      isForOf = true;
+    }
+  }
+
+  // Reset position
+  pos_ = savedPos;
+
+  if (isForInOrOf) {
+    // Parse for...in or for...of
+    StmtPtr left = nullptr;
+    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+      VarDeclaration::Kind kind;
+      switch (current().type) {
+        case TokenType::Let: kind = VarDeclaration::Kind::Let; break;
+        case TokenType::Const: kind = VarDeclaration::Kind::Const; break;
+        case TokenType::Var: kind = VarDeclaration::Kind::Var; break;
+        default: return nullptr;
+      }
+      advance();
+
+      if (!match(TokenType::Identifier)) {
+        return nullptr;
+      }
+      std::string name = current().value;
+      advance();
+
+      VarDeclaration decl;
+      decl.kind = kind;
+      decl.declarations.push_back({Identifier{name}, nullptr});
+      left = std::make_unique<Statement>(std::move(decl));
+    } else {
+      auto expr = parseExpression();
+      left = std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
+    }
+
+    bool isOf = match(TokenType::Of);
+    if (isOf) {
+      advance();
+    } else {
+      expect(TokenType::In);
+    }
+
+    auto right = parseExpression();
+    expect(TokenType::RightParen);
+    auto body = parseStatement();
+
+    if (isOf) {
+      return std::make_unique<Statement>(ForOfStmt{
+        std::move(left),
+        std::move(right),
+        std::move(body)
+      });
+    } else {
+      return std::make_unique<Statement>(ForInStmt{
+        std::move(left),
+        std::move(right),
+        std::move(body)
+      });
+    }
+  }
+
+  // Regular for loop
   StmtPtr init = nullptr;
   if (!match(TokenType::Semicolon)) {
     if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
@@ -356,6 +464,65 @@ StmtPtr Parser::parseForStatement() {
     std::move(update),
     std::move(body)
   });
+}
+
+StmtPtr Parser::parseDoWhileStatement() {
+  expect(TokenType::Do);
+  auto body = parseStatement();
+  expect(TokenType::While);
+  expect(TokenType::LeftParen);
+  auto test = parseExpression();
+  expect(TokenType::RightParen);
+  consumeSemicolon();
+
+  return std::make_unique<Statement>(DoWhileStmt{std::move(body), std::move(test)});
+}
+
+StmtPtr Parser::parseSwitchStatement() {
+  expect(TokenType::Switch);
+  expect(TokenType::LeftParen);
+  auto discriminant = parseExpression();
+  expect(TokenType::RightParen);
+  expect(TokenType::LeftBrace);
+
+  std::vector<SwitchCase> cases;
+  while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+    if (match(TokenType::Case)) {
+      advance();
+      auto test = parseExpression();
+      expect(TokenType::Colon);
+
+      std::vector<StmtPtr> consequent;
+      while (!match(TokenType::Case) && !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+        // Check for 'default' keyword
+        if (match(TokenType::Default)) {
+          break;
+        }
+        if (auto stmt = parseStatement()) {
+          consequent.push_back(std::move(stmt));
+        }
+      }
+
+      cases.push_back(SwitchCase{std::move(test), std::move(consequent)});
+    } else if (match(TokenType::Default)) {
+      advance();
+      expect(TokenType::Colon);
+
+      std::vector<StmtPtr> consequent;
+      while (!match(TokenType::Case) && !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+        if (auto stmt = parseStatement()) {
+          consequent.push_back(std::move(stmt));
+        }
+      }
+
+      cases.push_back(SwitchCase{nullptr, std::move(consequent)});
+    } else {
+      break;
+    }
+  }
+
+  expect(TokenType::RightBrace);
+  return std::make_unique<Statement>(SwitchStmt{std::move(discriminant), std::move(cases)});
 }
 
 StmtPtr Parser::parseBlockStatement() {
@@ -818,7 +985,15 @@ ExprPtr Parser::parseCall() {
       if (!args.empty()) {
         expect(TokenType::Comma);
       }
-      args.push_back(parseExpression());
+
+      // Check for spread element in arguments
+      if (match(TokenType::DotDotDot)) {
+        advance();
+        auto arg = parseExpression();
+        args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
+      } else {
+        args.push_back(parseExpression());
+      }
     }
 
     expect(TokenType::RightParen);
@@ -877,6 +1052,53 @@ ExprPtr Parser::parsePrimary() {
     std::string value = current().value;
     advance();
     return std::make_unique<Expression>(StringLiteral{value});
+  }
+
+  if (match(TokenType::TemplateLiteral)) {
+    std::string content = current().value;
+    advance();
+
+    // Parse the template literal content to extract quasis and expressions
+    std::vector<std::string> quasis;
+    std::vector<ExprPtr> expressions;
+
+    std::string currentQuasi;
+    size_t i = 0;
+    while (i < content.length()) {
+      if (i + 1 < content.length() && content[i] == '$' && content[i+1] == '{') {
+        // Found interpolation start
+        quasis.push_back(currentQuasi);
+        currentQuasi.clear();
+
+        // Find the matching closing brace
+        i += 2;
+        int braceCount = 1;
+        std::string exprStr;
+        while (i < content.length() && braceCount > 0) {
+          if (content[i] == '{') braceCount++;
+          else if (content[i] == '}') braceCount--;
+
+          if (braceCount > 0) {
+            exprStr += content[i];
+          }
+          i++;
+        }
+
+        // Parse the expression
+        Lexer exprLexer(exprStr);
+        auto exprTokens = exprLexer.tokenize();
+        Parser exprParser(exprTokens);
+        if (auto expr = exprParser.parseExpression()) {
+          expressions.push_back(std::move(expr));
+        }
+      } else {
+        currentQuasi += content[i];
+        i++;
+      }
+    }
+    quasis.push_back(currentQuasi);
+
+    return std::make_unique<Expression>(TemplateLiteral{std::move(quasis), std::move(expressions)});
   }
 
   if (match(TokenType::Regex)) {
@@ -964,7 +1186,15 @@ ExprPtr Parser::parseArrayExpression() {
       expect(TokenType::Comma);
       if (match(TokenType::RightBracket)) break;
     }
-    elements.push_back(parseExpression());
+
+    // Check for spread element
+    if (match(TokenType::DotDotDot)) {
+      advance();
+      auto arg = parseExpression();
+      elements.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
+    } else {
+      elements.push_back(parseExpression());
+    }
   }
 
   expect(TokenType::RightBracket);
@@ -1018,13 +1248,28 @@ ExprPtr Parser::parseFunctionExpression() {
   expect(TokenType::LeftParen);
 
   std::vector<Identifier> params;
+  std::optional<Identifier> restParam;
+
   while (!match(TokenType::RightParen)) {
     if (!params.empty()) {
       expect(TokenType::Comma);
     }
-    if (match(TokenType::Identifier)) {
+
+    // Check for rest parameter
+    if (match(TokenType::DotDotDot)) {
+      advance();
+      if (match(TokenType::Identifier)) {
+        restParam = Identifier{current().value};
+        advance();
+      }
+      // Rest parameter must be last
+      break;
+    } else if (match(TokenType::Identifier)) {
       params.push_back({current().value});
       advance();
+    } else {
+      // Unexpected token in parameter list
+      break;
     }
   }
 
@@ -1035,6 +1280,7 @@ ExprPtr Parser::parseFunctionExpression() {
 
   FunctionExpr funcExpr;
   funcExpr.params = std::move(params);
+  funcExpr.restParam = restParam;
   funcExpr.name = name;
   funcExpr.isAsync = isAsync;
   if (blockStmt) {

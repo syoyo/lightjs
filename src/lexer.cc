@@ -16,6 +16,11 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"else", TokenType::Else},
   {"while", TokenType::While},
   {"for", TokenType::For},
+  {"in", TokenType::In},
+  {"of", TokenType::Of},
+  {"do", TokenType::Do},
+  {"switch", TokenType::Switch},
+  {"case", TokenType::Case},
   {"break", TokenType::Break},
   {"continue", TokenType::Continue},
   {"try", TokenType::Try},
@@ -183,6 +188,43 @@ std::optional<Token> Lexer::readString(char quote) {
   return Token(TokenType::String, str, startLine, startColumn);
 }
 
+std::optional<Token> Lexer::readTemplateLiteral() {
+  uint32_t startLine = line_;
+  uint32_t startColumn = column_;
+  advance(); // skip opening backtick
+
+  // For now, treat the entire template as a string with ${} markers
+  // The parser will need to parse the interpolation expressions
+  std::string content;
+  while (!isAtEnd() && current() != '`') {
+    if (current() == '\\') {
+      advance();
+      if (!isAtEnd()) {
+        char c = current();
+        switch (c) {
+          case 'n': content += '\n'; break;
+          case 't': content += '\t'; break;
+          case 'r': content += '\r'; break;
+          case '\\': content += '\\'; break;
+          case '`': content += '`'; break;
+          case '$': content += '$'; break;
+          default: content += c; break;
+        }
+        advance();
+      }
+    } else {
+      content += current();
+      advance();
+    }
+  }
+
+  if (!isAtEnd()) {
+    advance(); // skip closing backtick
+  }
+
+  return Token(TokenType::TemplateLiteral, content, startLine, startColumn);
+}
+
 std::optional<Token> Lexer::readIdentifier() {
   uint32_t startLine = line_;
   uint32_t startColumn = column_;
@@ -296,8 +338,15 @@ std::vector<Token> Lexer::tokenize() {
       continue;
     }
 
-    if (c == '"' || c == '\'' || c == '`') {
+    if (c == '"' || c == '\'') {
       if (auto token = readString(c)) {
+        tokens.push_back(*token);
+      }
+      continue;
+    }
+
+    if (c == '`') {
+      if (auto token = readTemplateLiteral()) {
         tokens.push_back(*token);
       }
       continue;
@@ -344,8 +393,16 @@ std::vector<Token> Lexer::tokenize() {
         advance();
         break;
       case '.':
-        tokens.emplace_back(TokenType::Dot, startLine, startColumn);
-        advance();
+        // Check for ... (spread/rest operator)
+        if (peek(1) == '.' && peek(2) == '.') {
+          tokens.emplace_back(TokenType::DotDotDot, startLine, startColumn);
+          advance(); // first .
+          advance(); // second .
+          advance(); // third .
+        } else {
+          tokens.emplace_back(TokenType::Dot, startLine, startColumn);
+          advance();
+        }
         break;
       case '?':
         tokens.emplace_back(TokenType::Question, startLine, startColumn);

@@ -31,6 +31,11 @@ struct StringLiteral {
   std::string value;
 };
 
+struct TemplateLiteral {
+  std::vector<std::string> quasis;  // Static string parts
+  std::vector<ExprPtr> expressions;  // Interpolated expressions
+};
+
 struct RegexLiteral {
   std::string pattern;
   std::string flags;
@@ -110,6 +115,7 @@ struct AwaitExpr {
 
 struct FunctionExpr {
   std::vector<Identifier> params;
+  std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   std::string name;
   bool isAsync;
@@ -117,6 +123,10 @@ struct FunctionExpr {
 };
 
 struct SuperExpr {};
+
+struct SpreadElement {
+  ExprPtr argument;
+};
 
 struct NewExpr {
   ExprPtr callee;
@@ -156,6 +166,7 @@ struct Expression {
     NumberLiteral,
     BigIntLiteral,
     StringLiteral,
+    TemplateLiteral,
     RegexLiteral,
     BoolLiteral,
     NullLiteral,
@@ -173,7 +184,8 @@ struct Expression {
     AwaitExpr,
     NewExpr,
     ThisExpr,
-    SuperExpr
+    SuperExpr,
+    SpreadElement
   > node;
 
   template<typename T>
@@ -194,6 +206,7 @@ struct VarDeclaration {
 struct FunctionDeclaration {
   Identifier id;
   std::vector<Identifier> params;
+  std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   bool isAsync;
   FunctionDeclaration() : isAsync(false) {}
@@ -233,6 +246,33 @@ struct ForStmt {
   ExprPtr test;
   ExprPtr update;
   StmtPtr body;
+};
+
+struct ForInStmt {
+  StmtPtr left;  // VarDeclaration or Identifier
+  ExprPtr right;
+  StmtPtr body;
+};
+
+struct ForOfStmt {
+  StmtPtr left;  // VarDeclaration or Identifier
+  ExprPtr right;
+  StmtPtr body;
+};
+
+struct DoWhileStmt {
+  StmtPtr body;
+  ExprPtr test;
+};
+
+struct SwitchCase {
+  ExprPtr test;  // nullptr for default case
+  std::vector<StmtPtr> consequent;
+};
+
+struct SwitchStmt {
+  ExprPtr discriminant;
+  std::vector<SwitchCase> cases;
 };
 
 struct BreakStmt {};
@@ -299,6 +339,10 @@ struct Statement {
     IfStmt,
     WhileStmt,
     ForStmt,
+    ForInStmt,
+    ForOfStmt,
+    DoWhileStmt,
+    SwitchStmt,
     BreakStmt,
     ContinueStmt,
     ThrowStmt,
