@@ -3,6 +3,8 @@
 #include "gc.h"
 #include <iostream>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
 
 namespace tinyjs {
 
@@ -263,6 +265,38 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 }
 
 Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
+  // For logical assignment operators, evaluate left first and potentially short-circuit
+  if (expr.op == AssignmentExpr::Op::AndAssign ||
+      expr.op == AssignmentExpr::Op::OrAssign ||
+      expr.op == AssignmentExpr::Op::NullishAssign) {
+
+    if (auto* id = std::get_if<Identifier>(&expr.left->node)) {
+      if (auto current = env_->get(id->name)) {
+        // Short-circuit evaluation
+        bool shouldAssign = false;
+        if (expr.op == AssignmentExpr::Op::AndAssign) {
+          shouldAssign = current->toBool();  // Only assign if left is truthy
+        } else if (expr.op == AssignmentExpr::Op::OrAssign) {
+          shouldAssign = !current->toBool();  // Only assign if left is falsy
+        } else if (expr.op == AssignmentExpr::Op::NullishAssign) {
+          shouldAssign = (current->isNull() || current->isUndefined());  // Only assign if left is nullish
+        }
+
+        if (shouldAssign) {
+          auto rightTask = evaluate(*expr.right);
+          while (!rightTask.done()) {
+            std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
+          }
+          Value right = rightTask.result();
+          env_->set(id->name, right);
+          co_return right;
+        } else {
+          co_return *current;
+        }
+      }
+    }
+  }
+
   auto rightTask = evaluate(*expr.right);
   while (!rightTask.done()) {
     std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
@@ -773,6 +807,97 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     if (propName == "flags") {
       co_return Value(regexPtr->flags);
+    }
+  }
+
+  if (obj.isNumber()) {
+    double num = std::get<double>(obj.data);
+
+    if (propName == "toFixed") {
+      auto toFixedFn = std::make_shared<Function>();
+      toFixedFn->isNative = true;
+      toFixedFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
+        int digits = args.empty() ? 0 : static_cast<int>(args[0].toNumber());
+        if (digits < 0) digits = 0;
+        if (digits > 100) digits = 100;
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(digits) << num;
+        return Value(oss.str());
+      };
+      co_return Value(toFixedFn);
+    }
+
+    if (propName == "toPrecision") {
+      auto toPrecisionFn = std::make_shared<Function>();
+      toPrecisionFn->isNative = true;
+      toPrecisionFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
+        if (args.empty()) {
+          return Value(std::to_string(num));
+        }
+        int precision = static_cast<int>(args[0].toNumber());
+        if (precision < 1) precision = 1;
+        if (precision > 100) precision = 100;
+
+        std::ostringstream oss;
+        oss << std::setprecision(precision) << num;
+        return Value(oss.str());
+      };
+      co_return Value(toPrecisionFn);
+    }
+
+    if (propName == "toExponential") {
+      auto toExponentialFn = std::make_shared<Function>();
+      toExponentialFn->isNative = true;
+      toExponentialFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
+        int digits = args.empty() ? 6 : static_cast<int>(args[0].toNumber());
+        if (digits < 0) digits = 0;
+        if (digits > 100) digits = 100;
+
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(digits) << num;
+        return Value(oss.str());
+      };
+      co_return Value(toExponentialFn);
+    }
+
+    if (propName == "toString") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
+        if (args.empty()) {
+          return Value(std::to_string(num));
+        }
+        int radix = static_cast<int>(args[0].toNumber());
+        if (radix < 2 || radix > 36) {
+          throw std::runtime_error("toString() radix must be between 2 and 36");
+        }
+        // For simplicity, only implement radix 10, 16, 8, 2
+        if (radix == 10) {
+          return Value(std::to_string(num));
+        } else if (radix == 16) {
+          std::ostringstream oss;
+          oss << std::hex << static_cast<long long>(num);
+          return Value(oss.str());
+        } else if (radix == 8) {
+          std::ostringstream oss;
+          oss << std::oct << static_cast<long long>(num);
+          return Value(oss.str());
+        } else if (radix == 2) {
+          std::string binary;
+          long long n = static_cast<long long>(num);
+          if (n == 0) return Value("0");
+          bool negative = n < 0;
+          if (negative) n = -n;
+          while (n > 0) {
+            binary = (n % 2 == 0 ? "0" : "1") + binary;
+            n /= 2;
+          }
+          return Value(negative ? "-" + binary : binary);
+        }
+        return Value(std::to_string(num));
+      };
+      co_return Value(toStringFn);
     }
   }
 

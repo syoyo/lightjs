@@ -508,8 +508,16 @@ let theme = settings?.theme ?? 'light';  // 'light'
 - ✅ **Modern Operators**
   - Optional chaining (`?.`) - Safe property access on null/undefined
   - Nullish coalescing (`??`) - Default values for null/undefined only
+  - Logical assignment (`&&=`, `||=`, `??=`) - Short-circuit assignment operators
   - Spread operator for arrays and function calls
   - Rest parameters for functions
+
+- ✅ **Number Object**
+  - Number.parseInt(), Number.parseFloat()
+  - Number.isNaN(), Number.isFinite()
+  - Number.MAX_VALUE, Number.MIN_VALUE, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN
+  - Global parseInt(), parseFloat(), isNaN(), isFinite()
+  - Instance methods: toFixed(), toPrecision(), toExponential(), toString(radix)
 
 ## TODO - Unimplemented Features
 
@@ -528,11 +536,11 @@ let theme = settings?.theme ?? 'light';  // 'light'
 - [ ] **Private class fields**
 - [x] **Optional chaining** (`?.`) (✅ Implemented)
 - [x] **Nullish coalescing** (`??`) (✅ Implemented)
-- [ ] **Logical assignment** operators (`&&=`, `||=`, `??=`)
+- [x] **Logical assignment** operators (`&&=`, `||=`, `??=`) (✅ Implemented)
 - [ ] **Numeric separators** (`1_000_000`)
 
 ### Built-in Objects & APIs
-- [ ] **Number methods** - toFixed, toPrecision, parseInt, parseFloat
+- [x] **Number methods** - toFixed, toPrecision, parseInt, parseFloat, isNaN, isFinite (✅ Implemented)
 - [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
 - [ ] **ArrayBuffer** and DataView
 - [ ] **Intl** - Internationalization API

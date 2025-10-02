@@ -892,7 +892,8 @@ normal_parse:
 
   if (match(TokenType::Equal) || match(TokenType::PlusEqual) ||
       match(TokenType::MinusEqual) || match(TokenType::StarEqual) ||
-      match(TokenType::SlashEqual)) {
+      match(TokenType::SlashEqual) || match(TokenType::AmpAmpEqual) ||
+      match(TokenType::PipePipeEqual) || match(TokenType::QuestionQuestionEqual)) {
 
     AssignmentExpr::Op op;
     switch (current().type) {
@@ -901,6 +902,9 @@ normal_parse:
       case TokenType::MinusEqual: op = AssignmentExpr::Op::SubAssign; break;
       case TokenType::StarEqual: op = AssignmentExpr::Op::MulAssign; break;
       case TokenType::SlashEqual: op = AssignmentExpr::Op::DivAssign; break;
+      case TokenType::AmpAmpEqual: op = AssignmentExpr::Op::AndAssign; break;
+      case TokenType::PipePipeEqual: op = AssignmentExpr::Op::OrAssign; break;
+      case TokenType::QuestionQuestionEqual: op = AssignmentExpr::Op::NullishAssign; break;
       default: op = AssignmentExpr::Op::Assign; break;
     }
     advance();

@@ -475,6 +475,85 @@ int main() {
     x ?? true
   )", "false");
 
+  runTest("Number.toFixed", R"(
+    let num = 3.14159;
+    num.toFixed(2)
+  )", "3.14");
+
+  runTest("Number.toPrecision", R"(
+    let num = 123.456;
+    num.toPrecision(4)
+  )", "123.5");
+
+  runTest("Number.toString with radix", R"(
+    let num = 255;
+    num.toString(16)
+  )", "ff");
+
+  runTest("Number.parseInt - decimal", R"(
+    Number.parseInt("42")
+  )", "42");
+
+  runTest("Number.parseInt - hexadecimal", R"(
+    Number.parseInt("0xFF", 16)
+  )", "255");
+
+  runTest("Number.parseFloat", R"(
+    Number.parseFloat("3.14")
+  )", "3.14");
+
+  runTest("Global parseInt", R"(
+    parseInt("123")
+  )", "123");
+
+  runTest("Global parseFloat", R"(
+    parseFloat("2.71828")
+  )", "2.71828");
+
+  runTest("Number.isNaN", R"(
+    Number.isNaN(0 / 0)
+  )", "true");
+
+  runTest("Number.isFinite", R"(
+    Number.isFinite(42)
+  )", "true");
+
+  runTest("Logical AND assignment (&&=) - truthy", R"(
+    let x = 5;
+    x &&= 10;
+    x
+  )", "10");
+
+  runTest("Logical AND assignment (&&=) - falsy", R"(
+    let x = 0;
+    x &&= 10;
+    x
+  )", "0");
+
+  runTest("Logical OR assignment (||=) - truthy", R"(
+    let x = 5;
+    x ||= 10;
+    x
+  )", "5");
+
+  runTest("Logical OR assignment (||=) - falsy", R"(
+    let x = 0;
+    x ||= 10;
+    x
+  )", "10");
+
+  runTest("Nullish assignment (??=) - nullish", R"(
+    let x = null;
+    x ??= 42;
+    x
+  )", "42");
+
+  runTest("Nullish assignment (??=) - zero", R"(
+    let x = 0;
+    x ??= 42;
+    x
+  )", "0");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

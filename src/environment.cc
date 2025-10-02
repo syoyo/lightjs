@@ -10,6 +10,8 @@
 #include "date_object.h"
 #include <iostream>
 #include <thread>
+#include <limits>
+#include <cmath>
 
 namespace tinyjs {
 
@@ -206,6 +208,143 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(std::make_shared<Regex>(pattern, flags));
   };
   env->define("RegExp", Value(regExpConstructor));
+
+  // Number object with static methods
+  auto numberObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Number.parseInt
+  auto parseIntFn = std::make_shared<Function>();
+  parseIntFn->isNative = true;
+  parseIntFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    std::string str = args[0].toString();
+    int radix = args.size() > 1 ? static_cast<int>(args[1].toNumber()) : 10;
+
+    if (radix != 0 && (radix < 2 || radix > 36)) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+
+    // Trim whitespace
+    size_t start = str.find_first_not_of(" \t\n\r\f\v");
+    if (start == std::string::npos) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    str = str.substr(start);
+
+    // Handle sign
+    bool negative = false;
+    if (!str.empty() && (str[0] == '+' || str[0] == '-')) {
+      negative = (str[0] == '-');
+      str = str.substr(1);
+    }
+
+    // Auto-detect radix if 0
+    if (radix == 0) {
+      if (str.size() >= 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        radix = 16;
+        str = str.substr(2);
+      } else {
+        radix = 10;
+      }
+    }
+
+    try {
+      size_t idx;
+      long long result = std::stoll(str, &idx, radix);
+      if (idx == 0) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      return Value(static_cast<double>(negative ? -result : result));
+    } catch (...) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+  };
+  numberObj->properties["parseInt"] = Value(parseIntFn);
+
+  // Number.parseFloat
+  auto parseFloatFn = std::make_shared<Function>();
+  parseFloatFn->isNative = true;
+  parseFloatFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    std::string str = args[0].toString();
+
+    // Trim whitespace
+    size_t start = str.find_first_not_of(" \t\n\r\f\v");
+    if (start == std::string::npos) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    str = str.substr(start);
+
+    if (str.empty()) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+
+    try {
+      size_t idx;
+      double result = std::stod(str, &idx);
+      if (idx == 0) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      return Value(result);
+    } catch (...) {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+  };
+  numberObj->properties["parseFloat"] = Value(parseFloatFn);
+
+  // Number.isNaN
+  auto isNaNFn = std::make_shared<Function>();
+  isNaNFn->isNative = true;
+  isNaNFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isNumber()) return Value(false);
+    double num = std::get<double>(args[0].data);
+    return Value(std::isnan(num));
+  };
+  numberObj->properties["isNaN"] = Value(isNaNFn);
+
+  // Number.isFinite
+  auto isFiniteFn = std::make_shared<Function>();
+  isFiniteFn->isNative = true;
+  isFiniteFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isNumber()) return Value(false);
+    double num = std::get<double>(args[0].data);
+    return Value(std::isfinite(num));
+  };
+  numberObj->properties["isFinite"] = Value(isFiniteFn);
+
+  // Number constants
+  numberObj->properties["MAX_VALUE"] = Value(std::numeric_limits<double>::max());
+  numberObj->properties["MIN_VALUE"] = Value(std::numeric_limits<double>::min());
+  numberObj->properties["POSITIVE_INFINITY"] = Value(std::numeric_limits<double>::infinity());
+  numberObj->properties["NEGATIVE_INFINITY"] = Value(-std::numeric_limits<double>::infinity());
+  numberObj->properties["NaN"] = Value(std::numeric_limits<double>::quiet_NaN());
+
+  env->define("Number", Value(numberObj));
+
+  // Global parseInt and parseFloat (aliases)
+  env->define("parseInt", Value(parseIntFn));
+  env->define("parseFloat", Value(parseFloatFn));
+
+  // Global isNaN (different from Number.isNaN - coerces to number first)
+  auto globalIsNaNFn = std::make_shared<Function>();
+  globalIsNaNFn->isNative = true;
+  globalIsNaNFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(true);
+    double num = args[0].toNumber();
+    return Value(std::isnan(num));
+  };
+  env->define("isNaN", Value(globalIsNaNFn));
+
+  // Global isFinite
+  auto globalIsFiniteFn = std::make_shared<Function>();
+  globalIsFiniteFn->isNative = true;
+  globalIsFiniteFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(false);
+    double num = args[0].toNumber();
+    return Value(std::isfinite(num));
+  };
+  env->define("isFinite", Value(globalIsFiniteFn));
 
   // Promise constructor
   auto promiseConstructor = std::make_shared<Object>();

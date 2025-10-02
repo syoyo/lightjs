@@ -406,9 +406,16 @@ std::vector<Token> Lexer::tokenize() {
         break;
       case '?':
         if (peek() == '?') {
-          tokens.emplace_back(TokenType::QuestionQuestion, startLine, startColumn);
-          advance();
-          advance();
+          if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::QuestionQuestionEqual, startLine, startColumn);
+            advance();
+            advance();
+            advance();
+          } else {
+            tokens.emplace_back(TokenType::QuestionQuestion, startLine, startColumn);
+            advance();
+            advance();
+          }
         } else if (peek() == '.') {
           tokens.emplace_back(TokenType::QuestionDot, startLine, startColumn);
           advance();
@@ -541,18 +548,32 @@ std::vector<Token> Lexer::tokenize() {
         break;
       case '&':
         if (peek() == '&') {
-          tokens.emplace_back(TokenType::AmpAmp, startLine, startColumn);
-          advance();
-          advance();
+          if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::AmpAmpEqual, startLine, startColumn);
+            advance();
+            advance();
+            advance();
+          } else {
+            tokens.emplace_back(TokenType::AmpAmp, startLine, startColumn);
+            advance();
+            advance();
+          }
         } else {
           advance();
         }
         break;
       case '|':
         if (peek() == '|') {
-          tokens.emplace_back(TokenType::PipePipe, startLine, startColumn);
-          advance();
-          advance();
+          if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::PipePipeEqual, startLine, startColumn);
+            advance();
+            advance();
+            advance();
+          } else {
+            tokens.emplace_back(TokenType::PipePipe, startLine, startColumn);
+            advance();
+            advance();
+          }
         } else {
           advance();
         }

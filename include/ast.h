@@ -66,7 +66,7 @@ struct UnaryExpr {
 };
 
 struct AssignmentExpr {
-  enum class Op { Assign, AddAssign, SubAssign, MulAssign, DivAssign };
+  enum class Op { Assign, AddAssign, SubAssign, MulAssign, DivAssign, AndAssign, OrAssign, NullishAssign };
   Op op;
   ExprPtr left;
   ExprPtr right;

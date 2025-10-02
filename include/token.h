@@ -81,6 +81,9 @@ enum class TokenType {
   MinusEqual,
   StarEqual,
   SlashEqual,
+  AmpAmpEqual,      // &&=
+  PipePipeEqual,    // ||=
+  QuestionQuestionEqual,  // ??=
 
   PlusPlus,
   MinusMinus,
