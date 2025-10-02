@@ -554,6 +554,46 @@ int main() {
     x
   )", "0");
 
+  runTest("String.includes - found", R"(
+    let str = "hello world";
+    str.includes("world")
+  )", "true");
+
+  runTest("String.includes - not found", R"(
+    let str = "hello world";
+    str.includes("xyz")
+  )", "false");
+
+  runTest("String.includes - with position", R"(
+    let str = "hello world";
+    str.includes("hello", 1)
+  )", "false");
+
+  runTest("String.repeat", R"(
+    let str = "abc";
+    str.repeat(3)
+  )", "abcabcabc");
+
+  runTest("String.padStart", R"(
+    let str = "5";
+    str.padStart(3, "0")
+  )", "005");
+
+  runTest("String.padEnd", R"(
+    let str = "5";
+    str.padEnd(3, "0")
+  )", "500");
+
+  runTest("Array.isArray - array", R"(
+    let arr = [1, 2, 3];
+    Array.isArray(arr)
+  )", "true");
+
+  runTest("Array.isArray - not array", R"(
+    let obj = {a: 1};
+    Array.isArray(obj)
+  )", "false");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

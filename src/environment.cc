@@ -346,6 +346,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("isFinite", Value(globalIsFiniteFn));
 
+  // Array object with static methods
+  auto arrayObj = std::make_shared<Object>();
+  // GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Array.isArray
+  auto isArrayFn = std::make_shared<Function>();
+  isArrayFn->isNative = true;
+  isArrayFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(false);
+    return Value(args[0].isArray());
+  };
+  arrayObj->properties["isArray"] = Value(isArrayFn);
+
+  env->define("Array", Value(arrayObj));
+
   // Promise constructor
   auto promiseConstructor = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));

@@ -908,6 +908,81 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       co_return Value(static_cast<double>(str.length()));
     }
 
+    if (propName == "includes") {
+      auto includesFn = std::make_shared<Function>();
+      includesFn->isNative = true;
+      includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        std::string searchStr = args[0].toString();
+        size_t position = 0;
+        if (args.size() > 1) {
+          position = static_cast<size_t>(args[1].toNumber());
+        }
+        return Value(str.find(searchStr, position) != std::string::npos);
+      };
+      co_return Value(includesFn);
+    }
+
+    if (propName == "repeat") {
+      auto repeatFn = std::make_shared<Function>();
+      repeatFn->isNative = true;
+      repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(std::string(""));
+        int count = static_cast<int>(args[0].toNumber());
+        if (count < 0 || count == INT_MAX) return Value(std::string(""));
+        std::string result;
+        for (int i = 0; i < count; ++i) {
+          result += str;
+        }
+        return Value(result);
+      };
+      co_return Value(repeatFn);
+    }
+
+    if (propName == "padStart") {
+      auto padStartFn = std::make_shared<Function>();
+      padStartFn->isNative = true;
+      padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(str);
+        size_t targetLength = static_cast<size_t>(args[0].toNumber());
+        if (targetLength <= str.length()) return Value(str);
+
+        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        if (padString.empty()) return Value(str);
+
+        size_t padLength = targetLength - str.length();
+        std::string result;
+        while (result.length() < padLength) {
+          result += padString;
+        }
+        result = result.substr(0, padLength) + str;
+        return Value(result);
+      };
+      co_return Value(padStartFn);
+    }
+
+    if (propName == "padEnd") {
+      auto padEndFn = std::make_shared<Function>();
+      padEndFn->isNative = true;
+      padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(str);
+        size_t targetLength = static_cast<size_t>(args[0].toNumber());
+        if (targetLength <= str.length()) return Value(str);
+
+        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        if (padString.empty()) return Value(str);
+
+        size_t padLength = targetLength - str.length();
+        std::string result = str;
+        while (result.length() < targetLength) {
+          result += padString;
+        }
+        result = result.substr(0, targetLength);
+        return Value(result);
+      };
+      co_return Value(padEndFn);
+    }
+
     if (propName == "match") {
       auto matchFn = std::make_shared<Function>();
       matchFn->isNative = true;
