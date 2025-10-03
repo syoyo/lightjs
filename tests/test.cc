@@ -594,6 +594,23 @@ int main() {
     Array.isArray(obj)
   )", "false");
 
+  runTest("Array.from - array", R"(
+    let arr = [1, 2, 3];
+    let copy = Array.from(arr);
+    copy
+  )", "[Array]");
+
+  runTest("Array.from - string", R"(
+    let str = "abc";
+    let arr = Array.from(str);
+    arr
+  )", "[Array]");
+
+  runTest("Array.of", R"(
+    let arr = Array.of(1, 2, 3, 4);
+    arr
+  )", "[Array]");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

@@ -1144,7 +1144,8 @@ ExprPtr Parser::parseMember() {
     if (match(TokenType::Dot) || match(TokenType::QuestionDot)) {
       bool isOptional = match(TokenType::QuestionDot);
       advance();
-      if (match(TokenType::Identifier)) {
+      // Accept identifiers OR keywords as property names
+      if (match(TokenType::Identifier) || match(TokenType::From) || match(TokenType::Of)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
         MemberExpr member;

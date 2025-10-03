@@ -359,6 +359,51 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   arrayObj->properties["isArray"] = Value(isArrayFn);
 
+  // Array.from - creates array from array-like or iterable object
+  auto fromFn = std::make_shared<Function>();
+  fromFn->isNative = true;
+  fromFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto result = std::make_shared<Array>();
+
+    if (args.empty()) {
+      return Value(result);
+    }
+
+    const Value& arrayLike = args[0];
+
+    // If it's already an array, copy it
+    if (arrayLike.isArray()) {
+      auto srcArray = std::get<std::shared_ptr<Array>>(arrayLike.data);
+      for (const auto& elem : srcArray->elements) {
+        result->elements.push_back(elem);
+      }
+      return Value(result);
+    }
+
+    // If it's a string, convert each character to array element
+    if (arrayLike.isString()) {
+      std::string str = std::get<std::string>(arrayLike.data);
+      for (char c : str) {
+        result->elements.push_back(Value(std::string(1, c)));
+      }
+      return Value(result);
+    }
+
+    // Otherwise return empty array
+    return Value(result);
+  };
+  arrayObj->properties["from"] = Value(fromFn);
+
+  // Array.of - creates array from arguments
+  auto ofFn = std::make_shared<Function>();
+  ofFn->isNative = true;
+  ofFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto result = std::make_shared<Array>();
+    result->elements = args;
+    return Value(result);
+  };
+  arrayObj->properties["of"] = Value(ofFn);
+
   env->define("Array", Value(arrayObj));
 
   // Promise constructor
