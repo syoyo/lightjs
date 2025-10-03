@@ -1122,28 +1122,49 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   auto obj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+
   for (const auto& prop : expr.properties) {
-    std::string key;
-
-    // For identifier keys, use the identifier name directly (not its value from environment)
-    if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
-      key = ident->name;
-    } else if (auto* str = std::get_if<StringLiteral>(&prop.key->node)) {
-      key = str->value;
-    } else {
-      // For computed property names, evaluate the expression
-      auto keyTask = evaluate(*prop.key);
-      while (!keyTask.done()) {
-        std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
+    if (prop.isSpread) {
+      // Handle spread syntax: ...sourceObj
+      auto spreadTask = evaluate(*prop.value);
+      while (!spreadTask.done()) {
+        std::coroutine_handle<>::from_address(spreadTask.handle.address()).resume();
       }
-      key = keyTask.result().toString();
-    }
+      Value spreadVal = spreadTask.result();
 
-    auto valTask = evaluate(*prop.value);
-    while (!valTask.done()) {
-      std::coroutine_handle<>::from_address(valTask.handle.address()).resume();
+      // Copy properties from spread object
+      if (spreadVal.isObject()) {
+        auto sourceObj = std::get<std::shared_ptr<Object>>(spreadVal.data);
+        for (const auto& [key, value] : sourceObj->properties) {
+          obj->properties[key] = value;
+        }
+      }
+    } else {
+      // Regular property
+      std::string key;
+
+      // For identifier keys, use the identifier name directly (not its value from environment)
+      if (prop.key) {
+        if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
+          key = ident->name;
+        } else if (auto* str = std::get_if<StringLiteral>(&prop.key->node)) {
+          key = str->value;
+        } else {
+          // For computed property names, evaluate the expression
+          auto keyTask = evaluate(*prop.key);
+          while (!keyTask.done()) {
+            std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
+          }
+          key = keyTask.result().toString();
+        }
+      }
+
+      auto valTask = evaluate(*prop.value);
+      while (!valTask.done()) {
+        std::coroutine_handle<>::from_address(valTask.handle.address()).resume();
+      }
+      obj->properties[key] = valTask.result();
     }
-    obj->properties[key] = valTask.result();
   }
   co_return Value(obj);
 }

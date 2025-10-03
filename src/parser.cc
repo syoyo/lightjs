@@ -1349,19 +1349,46 @@ ExprPtr Parser::parseObjectExpression() {
       if (match(TokenType::RightBrace)) break;
     }
 
-    ExprPtr key;
-    if (match(TokenType::Identifier)) {
-      key = std::make_unique<Expression>(Identifier{current().value});
+    // Check for spread syntax
+    if (match(TokenType::DotDotDot)) {
       advance();
-    } else if (match(TokenType::String)) {
-      key = std::make_unique<Expression>(StringLiteral{current().value});
-      advance();
+      auto spreadExpr = parseExpression();
+      ObjectProperty prop;
+      prop.isSpread = true;
+      prop.value = std::move(spreadExpr);
+      // key is nullptr for spread properties
+      properties.push_back(std::move(prop));
+    } else {
+      ExprPtr key;
+      if (match(TokenType::Identifier)) {
+        std::string identName = current().value;
+        key = std::make_unique<Expression>(Identifier{identName});
+        advance();
+
+        // Check for shorthand property notation
+        if (match(TokenType::Comma) || match(TokenType::RightBrace)) {
+          // Shorthand: {x} means {x: x}
+          ObjectProperty prop;
+          prop.key = std::move(key);
+          prop.value = std::make_unique<Expression>(Identifier{identName});
+          prop.isSpread = false;
+          properties.push_back(std::move(prop));
+          continue;
+        }
+      } else if (match(TokenType::String)) {
+        key = std::make_unique<Expression>(StringLiteral{current().value});
+        advance();
+      }
+
+      expect(TokenType::Colon);
+      auto value = parseExpression();
+
+      ObjectProperty prop;
+      prop.key = std::move(key);
+      prop.value = std::move(value);
+      prop.isSpread = false;
+      properties.push_back(std::move(prop));
     }
-
-    expect(TokenType::Colon);
-    auto value = parseExpression();
-
-    properties.push_back({std::move(key), std::move(value)});
   }
 
   expect(TokenType::RightBrace);

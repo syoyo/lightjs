@@ -674,6 +674,48 @@ int main() {
     `Result: ${x * 2} (doubled from ${x})`
   )", "Result: 10 (doubled from 5)");
 
+  runTest("Object spread - basic", R"(
+    let obj1 = { a: 1, b: 2 };
+    let obj2 = { ...obj1, c: 3 };
+    obj2.a + "," + obj2.b + "," + obj2.c
+  )", "1,2,3");
+
+  runTest("Object spread - override", R"(
+    let obj1 = { a: 1, b: 2 };
+    let obj2 = { ...obj1, b: 3, c: 4 };
+    obj2.a + "," + obj2.b + "," + obj2.c
+  )", "1,3,4");
+
+  runTest("Object spread - multiple", R"(
+    let obj1 = { a: 1 };
+    let obj2 = { b: 2 };
+    let obj3 = { ...obj1, ...obj2, c: 3 };
+    obj3.a + "," + obj3.b + "," + obj3.c
+  )", "1,2,3");
+
+  runTest("Array spread in function call", R"(
+    function sum(a, b, c) {
+      return a + b + c;
+    }
+    let nums = [1, 2, 3];
+    sum(...nums)
+  )", "6");
+
+  runTest("Object shorthand property", R"(
+    let x = 10;
+    let y = 20;
+    let obj = { x, y };
+    obj.x + "," + obj.y
+  )", "10,20");
+
+  runTest("Object shorthand with spread", R"(
+    let a = 1;
+    let b = 2;
+    let obj1 = { a };
+    let obj2 = { ...obj1, b };
+    obj2.a + "," + obj2.b
+  )", "1,2");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

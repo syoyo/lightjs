@@ -70,6 +70,9 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Optional chaining (`?.`) for safe property access
   - Nullish coalescing (`??`) operator
   - Logical assignment operators (`&&=`, `||=`, `??=`)
+  - Object spread syntax (`{...obj}`)
+  - Object shorthand property notation (`{x}` for `{x: x}`)
+  - Array spread in function calls (`func(...args)`)
 - ✅ **Async/Await**
   - Full async function support
   - Await expressions with Promise unwrapping
@@ -550,8 +553,8 @@ let theme = settings?.theme ?? 'light';  // 'light'
 
 ### Language Features
 - [ ] **Generators** - Generator functions and iterators
-- [x] **Destructuring** - Array and object destructuring (✅ Implemented)
-- [x] **Spread/Rest** operators (`...`) (✅ Implemented)
+- [ ] **Destructuring** - Array and object destructuring
+- [x] **Spread/Rest** operators (`...`) (✅ Implemented for objects, arrays, and function calls)
 - [ ] **Symbol** type
 - [ ] **WeakMap/WeakSet**
 - [ ] **Proxy/Reflect** APIs

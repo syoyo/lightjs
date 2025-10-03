@@ -105,6 +105,7 @@ struct ArrayExpr {
 struct ObjectProperty {
   ExprPtr key;
   ExprPtr value;
+  bool isSpread = false;  // For spread properties (...obj)
 };
 
 struct ObjectExpr {
