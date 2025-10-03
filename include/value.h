@@ -66,6 +66,8 @@ struct Array : public GCObject {
 
 struct Object : public GCObject {
   std::unordered_map<std::string, Value> properties;
+  bool frozen = false;  // Object.freeze() prevents adding/removing/modifying properties
+  bool sealed = false;  // Object.seal() prevents adding/removing properties (can still modify)
 
   // GCObject interface
   const char* typeName() const override { return "Object"; }

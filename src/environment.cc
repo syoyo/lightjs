@@ -591,6 +591,57 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectCreate->nativeFunc = Object_create;
   objectConstructor->properties["create"] = Value(objectCreate);
 
+  // Object.freeze - makes an object immutable
+  auto objectFreeze = std::make_shared<Function>();
+  objectFreeze->isNative = true;
+  objectFreeze->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    obj->frozen = true;
+    obj->sealed = true;  // Frozen objects are also sealed
+    return args[0];
+  };
+  objectConstructor->properties["freeze"] = Value(objectFreeze);
+
+  // Object.seal - prevents adding or removing properties
+  auto objectSeal = std::make_shared<Function>();
+  objectSeal->isNative = true;
+  objectSeal->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    obj->sealed = true;
+    return args[0];
+  };
+  objectConstructor->properties["seal"] = Value(objectSeal);
+
+  // Object.isFrozen - check if object is frozen
+  auto objectIsFrozen = std::make_shared<Function>();
+  objectIsFrozen->isNative = true;
+  objectIsFrozen->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return Value(true);  // Non-objects are considered frozen
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    return Value(obj->frozen);
+  };
+  objectConstructor->properties["isFrozen"] = Value(objectIsFrozen);
+
+  // Object.isSealed - check if object is sealed
+  auto objectIsSealed = std::make_shared<Function>();
+  objectIsSealed->isNative = true;
+  objectIsSealed->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return Value(true);  // Non-objects are considered sealed
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    return Value(obj->sealed);
+  };
+  objectConstructor->properties["isSealed"] = Value(objectIsSealed);
+
   env->define("Object", Value(objectConstructor));
 
   // Math object

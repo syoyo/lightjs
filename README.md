@@ -64,6 +64,12 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Getters and setters
 
 #### Advanced Features
+- ✅ **ES2020/ES2021 Features**
+  - Arrow functions (`=>`) with all variations
+  - Template literals with interpolation (`` `Hello ${name}` ``)
+  - Optional chaining (`?.`) for safe property access
+  - Nullish coalescing (`??`) operator
+  - Logical assignment operators (`&&=`, `||=`, `??=`)
 - ✅ **Async/Await**
   - Full async function support
   - Await expressions with Promise unwrapping
@@ -125,7 +131,14 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Object.hasOwnProperty() - check property existence
   - Object.getOwnPropertyNames() - get all property names
   - Object.create() - create new objects
+  - Object.freeze() - make objects immutable
+  - Object.seal() - prevent adding/removing properties
+  - Object.isFrozen() - check if object is frozen
+  - Object.isSealed() - check if object is sealed
 - ✅ **Array methods**
+  - Array.isArray() - check if value is array
+  - Array.from() - create array from iterable/array-like
+  - Array.of() - create array from arguments
   - Array.prototype.push() - add elements to end
   - Array.prototype.pop() - remove element from end
   - Array.prototype.shift() - remove element from beginning
@@ -154,6 +167,20 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - String.prototype.toLowerCase() - convert to lowercase
   - String.prototype.toUpperCase() - convert to uppercase
   - String.prototype.trim() - remove whitespace
+  - String.prototype.includes() - check if contains substring
+  - String.prototype.repeat() - repeat string n times
+  - String.prototype.padStart() - pad string at start
+  - String.prototype.padEnd() - pad string at end
+- ✅ **Number methods**
+  - Number.parseInt() - parse string to integer with radix
+  - Number.parseFloat() - parse string to floating point
+  - Number.isNaN() - check if value is NaN
+  - Number.isFinite() - check if value is finite
+  - Number constants (MAX_VALUE, MIN_VALUE, NaN, POSITIVE_INFINITY, NEGATIVE_INFINITY)
+  - Number.prototype.toFixed() - format with fixed decimals
+  - Number.prototype.toPrecision() - format with precision
+  - Number.prototype.toExponential() - format in exponential notation
+  - Number.prototype.toString() - convert to string with optional radix
 - ✅ **Math object** (Pure C++ implementation)
   - Math constants: PI, E, LN2, LN10, LOG2E, LOG10E, SQRT1_2, SQRT2
   - Math.abs() - absolute value
@@ -537,6 +564,8 @@ let theme = settings?.theme ?? 'light';  // 'light'
 - [x] **Optional chaining** (`?.`) (✅ Implemented)
 - [x] **Nullish coalescing** (`??`) (✅ Implemented)
 - [x] **Logical assignment** operators (`&&=`, `||=`, `??=`) (✅ Implemented)
+- [x] **Arrow functions** (✅ Implemented)
+- [x] **Template literals** (✅ Implemented)
 - [ ] **Numeric separators** (`1_000_000`)
 
 ### Built-in Objects & APIs

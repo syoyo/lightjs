@@ -354,6 +354,20 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+
+      // Check if object is frozen (can't modify any properties)
+      if (objPtr->frozen) {
+        // In strict mode this would throw, but we'll silently fail
+        co_return right;
+      }
+
+      // Check if object is sealed (can't add new properties)
+      bool isNewProperty = objPtr->properties.find(propName) == objPtr->properties.end();
+      if (objPtr->sealed && isNewProperty) {
+        // Can't add new properties to sealed object
+        co_return right;
+      }
+
       if (expr.op == AssignmentExpr::Op::Assign) {
         objPtr->properties[propName] = right;
       } else {

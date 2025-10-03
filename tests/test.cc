@@ -611,6 +611,69 @@ int main() {
     arr
   )", "[Array]");
 
+  runTest("Object.freeze", R"(
+    let obj = { x: 10, y: 20 };
+    Object.freeze(obj);
+    obj.x = 100;
+    obj.z = 30;
+    obj.x
+  )", "10");
+
+  runTest("Object.isFrozen", R"(
+    let obj = { a: 1 };
+    let frozen = Object.isFrozen(obj);
+    Object.freeze(obj);
+    let frozenAfter = Object.isFrozen(obj);
+    frozen + "," + frozenAfter
+  )", "false,true");
+
+  runTest("Object.seal", R"(
+    let obj = { x: 10 };
+    Object.seal(obj);
+    obj.x = 20;
+    obj.y = 30;
+    obj.x + "," + obj.y
+  )", "20,undefined");
+
+  runTest("Object.isSealed", R"(
+    let obj = { a: 1 };
+    let sealed = Object.isSealed(obj);
+    Object.seal(obj);
+    let sealedAfter = Object.isSealed(obj);
+    sealed + "," + sealedAfter
+  )", "false,true");
+
+  runTest("Object.keys", R"(
+    let obj = { a: 1, b: 2, c: 3 };
+    Object.keys(obj)
+  )", "[Array]");
+
+  runTest("Object.values", R"(
+    let obj = { a: 1, b: 2, c: 3 };
+    Object.values(obj)
+  )", "[Array]");
+
+  runTest("Object.entries", R"(
+    let obj = { a: 1, b: 2 };
+    Object.entries(obj)
+  )", "[Array]");
+
+  runTest("Template literal - basic", R"(
+    let name = "World";
+    `Hello, ${name}!`
+  )", "Hello, World!");
+
+  runTest("Template literal - expression", R"(
+    let a = 10;
+    let b = 20;
+    `The sum of ${a} and ${b} is ${a + b}`
+  )", "The sum of 10 and 20 is 30");
+
+  runTest("Template literal - nested", R"(
+    let x = 5;
+    `Result: ${x * 2} (doubled from ${x})`
+  )", "Result: 10 (doubled from 5)");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;
