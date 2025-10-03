@@ -50,6 +50,7 @@ private:
   ExprPtr parseRelational();
   ExprPtr parseAdditive();
   ExprPtr parseMultiplicative();
+  ExprPtr parseExponentiation();
   ExprPtr parseUnary();
   ExprPtr parsePostfix();
   ExprPtr parseCall();
@@ -60,6 +61,9 @@ private:
   ExprPtr parseFunctionExpression();
   ExprPtr parseClassExpression();
   ExprPtr parseNewExpression();
+  ExprPtr parsePattern();  // Parse destructuring patterns
+  ExprPtr parseArrayPattern();
+  ExprPtr parseObjectPattern();
 };
 
 }

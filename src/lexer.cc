@@ -458,7 +458,11 @@ std::vector<Token> Lexer::tokenize() {
         }
         break;
       case '*':
-        if (peek() == '=') {
+        if (peek() == '*') {
+          tokens.emplace_back(TokenType::StarStar, startLine, startColumn);
+          advance();
+          advance();
+        } else if (peek() == '=') {
           tokens.emplace_back(TokenType::StarEqual, startLine, startColumn);
           advance();
           advance();

@@ -47,6 +47,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Arrow functions with expression and block bodies
   - Single parameter and multi-parameter arrow functions
   - Arrow functions with rest parameters
+  - Default parameters for all function types
   - Closures and lexical scoping
   - Recursion support
 - ✅ **Objects**
@@ -73,6 +74,10 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Object spread syntax (`{...obj}`)
   - Object shorthand property notation (`{x}` for `{x: x}`)
   - Array spread in function calls (`func(...args)`)
+  - Default function parameters (`function fn(a = 0, b = 1)`)
+  - Destructuring assignment for arrays (`const [a, b] = [1, 2]`)
+  - Destructuring assignment for objects (`const {x, y} = obj`)
+  - Exponentiation operator (`**`) with right associativity
 - ✅ **Async/Await**
   - Full async function support
   - Await expressions with Promise unwrapping

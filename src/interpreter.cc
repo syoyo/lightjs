@@ -180,6 +180,21 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         co_return Value(BigInt(left.toBigInt() % right.toBigInt()));
       }
       co_return Value(std::fmod(left.toNumber(), right.toNumber()));
+    case BinaryExpr::Op::Exp:
+      if (left.isBigInt() && right.isBigInt()) {
+        // BigInt exponentiation
+        int64_t base = left.toBigInt();
+        int64_t exp = right.toBigInt();
+        if (exp < 0) {
+          co_return Value(0.0);  // Negative exponents for BigInt return 0
+        }
+        int64_t result = 1;
+        for (int64_t i = 0; i < exp; ++i) {
+          result *= base;
+        }
+        co_return Value(BigInt(result));
+      }
+      co_return Value(std::pow(left.toNumber(), right.toNumber()));
     case BinaryExpr::Op::Less:
       if (left.isBigInt() && right.isBigInt()) {
         co_return Value(left.toBigInt() < right.toBigInt());
@@ -485,8 +500,22 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       env_ = std::static_pointer_cast<Environment>(func->closure);
       env_ = env_->createChild();
 
-      for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
-        env_->define(func->params[i], args[i]);
+      for (size_t i = 0; i < func->params.size(); ++i) {
+        if (i < args.size()) {
+          // Use provided argument
+          env_->define(func->params[i].name, args[i]);
+        } else if (func->params[i].defaultValue) {
+          // Evaluate default value
+          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+          auto defaultTask = evaluate(*defaultExpr);
+          while (!defaultTask.done()) {
+            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+          }
+          env_->define(func->params[i].name, defaultTask.result());
+        } else {
+          // No default value, parameter is undefined
+          env_->define(func->params[i].name, Value(Undefined{}));
+        }
       }
 
       // Handle rest parameter
@@ -536,8 +565,22 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       env_ = std::static_pointer_cast<Environment>(func->closure);
       env_ = env_->createChild();
 
-      for (size_t i = 0; i < func->params.size() && i < args.size(); ++i) {
-        env_->define(func->params[i], args[i]);
+      for (size_t i = 0; i < func->params.size(); ++i) {
+        if (i < args.size()) {
+          // Use provided argument
+          env_->define(func->params[i].name, args[i]);
+        } else if (func->params[i].defaultValue) {
+          // Evaluate default value
+          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+          auto defaultTask = evaluate(*defaultExpr);
+          while (!defaultTask.done()) {
+            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+          }
+          env_->define(func->params[i].name, defaultTask.result());
+        } else {
+          // No default value, parameter is undefined
+          env_->define(func->params[i].name, Value(Undefined{}));
+        }
       }
 
       // Handle rest parameter
@@ -1175,7 +1218,12 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->isAsync = expr.isAsync;
 
   for (const auto& param : expr.params) {
-    func->params.push_back(param.name);
+    FunctionParam funcParam;
+    funcParam.name = param.name.name;
+    if (param.defaultValue) {
+      funcParam.defaultValue = std::shared_ptr<void>(const_cast<Expression*>(param.defaultValue.get()), [](void*){});
+    }
+    func->params.push_back(funcParam);
   }
 
   if (expr.restParam.has_value()) {
@@ -1218,7 +1266,51 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
       }
       value = task.result();
     }
-    env_->define(declarator.id.name, value, decl.kind == VarDeclaration::Kind::Const);
+
+    // Handle different pattern types
+    if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
+      env_->define(id->name, value, decl.kind == VarDeclaration::Kind::Const);
+    } else if (auto* arrayPat = std::get_if<ArrayPattern>(&declarator.pattern->node)) {
+      // Destructure array
+      if (!value.isArray()) {
+        // Convert to array-like if possible
+        continue;
+      }
+      auto arr = std::get<std::shared_ptr<Array>>(value.data);
+      for (size_t i = 0; i < arrayPat->elements.size(); ++i) {
+        if (!arrayPat->elements[i]) continue;  // Skip holes
+
+        Value elemValue = i < arr->elements.size() ? arr->elements[i] : Value(Undefined{});
+
+        if (auto* elemId = std::get_if<Identifier>(&arrayPat->elements[i]->node)) {
+          env_->define(elemId->name, elemValue, decl.kind == VarDeclaration::Kind::Const);
+        }
+        // TODO: Handle nested patterns
+      }
+    } else if (auto* objPat = std::get_if<ObjectPattern>(&declarator.pattern->node)) {
+      // Destructure object
+      if (!value.isObject()) {
+        continue;
+      }
+      auto obj = std::get<std::shared_ptr<Object>>(value.data);
+      for (const auto& prop : objPat->properties) {
+        std::string keyName;
+        if (auto* keyId = std::get_if<Identifier>(&prop.key->node)) {
+          keyName = keyId->name;
+        } else if (auto* keyStr = std::get_if<StringLiteral>(&prop.key->node)) {
+          keyName = keyStr->value;
+        } else {
+          continue;
+        }
+
+        Value propValue = obj->properties.count(keyName) ? obj->properties[keyName] : Value(Undefined{});
+
+        if (auto* valId = std::get_if<Identifier>(&prop.value->node)) {
+          env_->define(valId->name, propValue, decl.kind == VarDeclaration::Kind::Const);
+        }
+        // TODO: Handle nested patterns
+      }
+    }
   }
   co_return Value(Undefined{});
 }
@@ -1229,7 +1321,12 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->isAsync = decl.isAsync;
 
   for (const auto& param : decl.params) {
-    func->params.push_back(param.name);
+    FunctionParam funcParam;
+    funcParam.name = param.name.name;
+    if (param.defaultValue) {
+      funcParam.defaultValue = std::shared_ptr<void>(const_cast<Expression*>(param.defaultValue.get()), [](void*){});
+    }
+    func->params.push_back(funcParam);
   }
 
   if (decl.restParam.has_value()) {
@@ -1442,7 +1539,10 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   std::string varName;
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     if (!varDecl->declarations.empty()) {
-      varName = varDecl->declarations[0].id.name;
+      // For now, only support simple identifier patterns in for-in/for-of
+      if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
+        varName = id->name;
+      }
       // Define the variable in the loop scope
       env_->define(varName, Value(Undefined{}));
     }
@@ -1497,7 +1597,10 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   std::string varName;
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     if (!varDecl->declarations.empty()) {
-      varName = varDecl->declarations[0].id.name;
+      // For now, only support simple identifier patterns in for-in/for-of
+      if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
+        varName = id->name;
+      }
       // Define the variable in the loop scope
       env_->define(varName, Value(Undefined{}));
     }

@@ -49,7 +49,7 @@ struct NullLiteral {};
 
 struct BinaryExpr {
   enum class Op {
-    Add, Sub, Mul, Div, Mod,
+    Add, Sub, Mul, Div, Mod, Exp,  // Exp for exponentiation
     Equal, NotEqual, StrictEqual, StrictNotEqual,
     Less, Greater, LessEqual, GreaterEqual,
     LogicalAnd, LogicalOr, NullishCoalescing
@@ -116,8 +116,13 @@ struct AwaitExpr {
   ExprPtr argument;
 };
 
+struct Parameter {
+  Identifier name;
+  ExprPtr defaultValue;  // Optional default value
+};
+
 struct FunctionExpr {
-  std::vector<Identifier> params;
+  std::vector<Parameter> params;
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   std::string name;
@@ -164,6 +169,19 @@ struct ClassExpr {
   std::vector<MethodDefinition> methods;
 };
 
+// Destructuring patterns
+struct ArrayPattern {
+  std::vector<ExprPtr> elements;  // Can be Identifier or nested patterns
+};
+
+struct ObjectPattern {
+  struct Property {
+    ExprPtr key;
+    ExprPtr value;  // Pattern to bind to
+  };
+  std::vector<Property> properties;
+};
+
 struct Expression {
   std::variant<
     Identifier,
@@ -189,7 +207,9 @@ struct Expression {
     NewExpr,
     ThisExpr,
     SuperExpr,
-    SpreadElement
+    SpreadElement,
+    ArrayPattern,
+    ObjectPattern
   > node;
 
   template<typename T>
@@ -197,7 +217,7 @@ struct Expression {
 };
 
 struct VarDeclarator {
-  Identifier id;
+  ExprPtr pattern;  // Can be Identifier, ArrayPattern, or ObjectPattern
   ExprPtr init;
 };
 
@@ -209,7 +229,7 @@ struct VarDeclaration {
 
 struct FunctionDeclaration {
   Identifier id;
-  std::vector<Identifier> params;
+  std::vector<Parameter> params;
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   bool isAsync;

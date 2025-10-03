@@ -125,11 +125,11 @@ StmtPtr Parser::parseVarDeclaration() {
       expect(TokenType::Comma);
     }
 
-    if (!match(TokenType::Identifier)) {
+    // Parse pattern (identifier, array pattern, or object pattern)
+    ExprPtr pattern = parsePattern();
+    if (!pattern) {
       return nullptr;
     }
-    std::string name = current().value;
-    advance();
 
     ExprPtr init = nullptr;
     if (match(TokenType::Equal)) {
@@ -137,7 +137,7 @@ StmtPtr Parser::parseVarDeclaration() {
       init = parseExpression();
     }
 
-    decl.declarations.push_back({Identifier{name}, std::move(init)});
+    decl.declarations.push_back({std::move(pattern), std::move(init)});
   } while (match(TokenType::Comma));
 
   consumeSemicolon();
@@ -161,7 +161,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
 
   expect(TokenType::LeftParen);
 
-  std::vector<Identifier> params;
+  std::vector<Parameter> params;
   std::optional<Identifier> restParam;
 
   while (!match(TokenType::RightParen)) {
@@ -179,8 +179,17 @@ StmtPtr Parser::parseFunctionDeclaration() {
       // Rest parameter must be last
       break;
     } else if (match(TokenType::Identifier)) {
-      params.push_back({current().value});
+      Parameter param;
+      param.name = Identifier{current().value};
       advance();
+
+      // Check for default value
+      if (match(TokenType::Equal)) {
+        advance();
+        param.defaultValue = parseAssignment();
+      }
+
+      params.push_back(std::move(param));
     } else {
       // Unexpected token in parameter list
       break;
@@ -397,7 +406,7 @@ StmtPtr Parser::parseForStatement() {
 
       VarDeclaration decl;
       decl.kind = kind;
-      decl.declarations.push_back({Identifier{name}, nullptr});
+      decl.declarations.push_back({std::make_unique<Expression>(Identifier{name}), nullptr});
       left = std::make_unique<Statement>(std::move(decl));
     } else {
       auto expr = parseExpression();
@@ -786,7 +795,9 @@ ExprPtr Parser::parseAssignment() {
 
       FunctionExpr func;
       func.isArrow = true;
-      func.params.push_back(Identifier{paramName});
+      Parameter param;
+      param.name = Identifier{paramName};
+      func.params.push_back(std::move(param));
 
       // Parse body: either expression or block statement
       if (match(TokenType::LeftBrace)) {
@@ -815,7 +826,7 @@ ExprPtr Parser::parseAssignment() {
     advance();
 
     // Try to parse as arrow function parameters
-    std::vector<Identifier> params;
+    std::vector<Parameter> params;
     std::optional<Identifier> restParam;
     bool isArrowFunc = false;
 
@@ -840,8 +851,17 @@ ExprPtr Parser::parseAssignment() {
           pos_ = savedPos;
           goto normal_parse;
         }
-        params.push_back(Identifier{current().value});
+        Parameter param;
+        param.name = Identifier{current().value};
         advance();
+
+        // Check for default value (arrow functions support defaults)
+        if (match(TokenType::Equal)) {
+          advance();
+          param.defaultValue = parseAssignment();
+        }
+
+        params.push_back(std::move(param));
 
         if (match(TokenType::Comma)) {
           advance();
@@ -1042,7 +1062,7 @@ ExprPtr Parser::parseAdditive() {
 }
 
 ExprPtr Parser::parseMultiplicative() {
-  auto left = parseUnary();
+  auto left = parseExponentiation();
 
   while (match(TokenType::Star) || match(TokenType::Slash) || match(TokenType::Percent)) {
     BinaryExpr::Op op;
@@ -1053,8 +1073,21 @@ ExprPtr Parser::parseMultiplicative() {
       default: op = BinaryExpr::Op::Mul; break;
     }
     advance();
-    auto right = parseUnary();
+    auto right = parseExponentiation();
     left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
+  }
+
+  return left;
+}
+
+ExprPtr Parser::parseExponentiation() {
+  auto left = parseUnary();
+
+  // Right-to-left associativity for **
+  if (match(TokenType::StarStar)) {
+    advance();
+    auto right = parseExponentiation();  // Right associative
+    return std::make_unique<Expression>(BinaryExpr{BinaryExpr::Op::Exp, std::move(left), std::move(right)});
   }
 
   return left;
@@ -1412,7 +1445,7 @@ ExprPtr Parser::parseFunctionExpression() {
 
   expect(TokenType::LeftParen);
 
-  std::vector<Identifier> params;
+  std::vector<Parameter> params;
   std::optional<Identifier> restParam;
 
   while (!match(TokenType::RightParen)) {
@@ -1430,8 +1463,17 @@ ExprPtr Parser::parseFunctionExpression() {
       // Rest parameter must be last
       break;
     } else if (match(TokenType::Identifier)) {
-      params.push_back({current().value});
+      Parameter param;
+      param.name = Identifier{current().value};
       advance();
+
+      // Check for default value
+      if (match(TokenType::Equal)) {
+        advance();
+        param.defaultValue = parseAssignment();
+      }
+
+      params.push_back(std::move(param));
     } else {
       // Unexpected token in parameter list
       break;
@@ -1565,6 +1607,116 @@ ExprPtr Parser::parseNewExpression() {
   newExpr.arguments = std::move(args);
 
   return std::make_unique<Expression>(std::move(newExpr));
+}
+
+ExprPtr Parser::parsePattern() {
+  // Check for array destructuring pattern
+  if (match(TokenType::LeftBracket)) {
+    return parseArrayPattern();
+  }
+
+  // Check for object destructuring pattern
+  if (match(TokenType::LeftBrace)) {
+    return parseObjectPattern();
+  }
+
+  // Otherwise it must be an identifier
+  if (match(TokenType::Identifier)) {
+    std::string name = current().value;
+    advance();
+    return std::make_unique<Expression>(Identifier{name});
+  }
+
+  return nullptr;
+}
+
+ExprPtr Parser::parseArrayPattern() {
+  expect(TokenType::LeftBracket);
+
+  ArrayPattern pattern;
+
+  while (!match(TokenType::RightBracket) && pos_ < tokens_.size()) {
+    if (!pattern.elements.empty()) {
+      expect(TokenType::Comma);
+      // Allow trailing comma
+      if (match(TokenType::RightBracket)) {
+        break;
+      }
+    }
+
+    // Check for hole in array pattern (e.g., [a, , c])
+    if (match(TokenType::Comma)) {
+      pattern.elements.push_back(nullptr);
+      continue;
+    }
+
+    // Parse nested pattern or identifier
+    ExprPtr element = parsePattern();
+    if (!element) {
+      return nullptr;
+    }
+    pattern.elements.push_back(std::move(element));
+  }
+
+  expect(TokenType::RightBracket);
+
+  return std::make_unique<Expression>(std::move(pattern));
+}
+
+ExprPtr Parser::parseObjectPattern() {
+  expect(TokenType::LeftBrace);
+
+  ObjectPattern pattern;
+
+  while (!match(TokenType::RightBrace) && pos_ < tokens_.size()) {
+    if (!pattern.properties.empty()) {
+      expect(TokenType::Comma);
+      // Allow trailing comma
+      if (match(TokenType::RightBrace)) {
+        break;
+      }
+    }
+
+    // Parse property key
+    ExprPtr key;
+    if (match(TokenType::Identifier)) {
+      std::string name = current().value;
+      advance();
+      key = std::make_unique<Expression>(Identifier{name});
+    } else if (match(TokenType::String)) {
+      std::string value = current().value;
+      advance();
+      key = std::make_unique<Expression>(StringLiteral{value});
+    } else {
+      return nullptr;
+    }
+
+    // Check for shorthand property (e.g., {x} instead of {x: x})
+    ExprPtr value;
+    if (match(TokenType::Colon)) {
+      advance();
+      value = parsePattern();
+      if (!value) {
+        return nullptr;
+      }
+    } else {
+      // Shorthand - use key as both key and value pattern
+      if (auto* id = std::get_if<Identifier>(&key->node)) {
+        value = std::make_unique<Expression>(Identifier{id->name});
+      } else {
+        return nullptr;  // Shorthand only works with identifiers
+      }
+    }
+
+    ObjectPattern::Property prop;
+    prop.key = std::move(key);
+    prop.value = std::move(value);
+    pattern.properties.push_back(std::move(prop));
+  }
+
+  expect(TokenType::RightBrace);
+
+  return std::make_unique<Expression>(std::move(pattern));
 }
 
 }

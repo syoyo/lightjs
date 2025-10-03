@@ -716,6 +716,128 @@ int main() {
     obj2.a + "," + obj2.b
   )", "1,2");
 
+  // Default function parameters tests
+  runTest("Default parameter - basic", R"(
+    function greet(name = "World") {
+      return "Hello, " + name;
+    }
+    greet()
+  )", "Hello, World");
+
+  runTest("Default parameter - with argument", R"(
+    function greet(name = "World") {
+      return "Hello, " + name;
+    }
+    greet("Alice")
+  )", "Hello, Alice");
+
+  runTest("Default parameter - multiple", R"(
+    function add(a = 0, b = 0) {
+      return a + b;
+    }
+    add() + "," + add(5) + "," + add(5, 3)
+  )", "0,5,8");
+
+  runTest("Default parameter - expression", R"(
+    function multiply(a, b = a * 2) {
+      return a * b;
+    }
+    multiply(3) + "," + multiply(3, 4)
+  )", "18,12");
+
+  runTest("Default parameter - arrow function", R"(
+    const greet = (name = "World") => "Hello, " + name;
+    greet() + "," + greet("Bob")
+  )", "Hello, World,Hello, Bob");
+
+  runTest("Default parameter - with rest", R"(
+    function test(a = 1, b = 2, ...rest) {
+      return a + "," + b + "," + rest.length;
+    }
+    test() + "|" + test(10) + "|" + test(10, 20, 30, 40)
+  )", "1,2,0|10,2,0|10,20,2");
+
+  // Array destructuring tests
+  runTest("Array destructuring - basic", R"(
+    const [a, b] = [1, 2];
+    a + "," + b
+  )", "1,2");
+
+  runTest("Array destructuring - extra elements", R"(
+    const [x, y] = [10, 20, 30, 40];
+    x + "," + y
+  )", "10,20");
+
+  runTest("Array destructuring - missing elements", R"(
+    const [m, n, o] = [100, 200];
+    m + "," + n + "," + o
+  )", "100,200,undefined");
+
+  runTest("Array destructuring - with holes", R"(
+    const [first, , third] = [1, 2, 3];
+    first + "," + third
+  )", "1,3");
+
+  runTest("Array destructuring - let declaration", R"(
+    let [p, q] = [5, 6];
+    p = 10;
+    q = 20;
+    p + "," + q
+  )", "10,20");
+
+  // Object destructuring tests
+  runTest("Object destructuring - basic", R"(
+    const {x, y} = {x: 10, y: 20};
+    x + "," + y
+  )", "10,20");
+
+  runTest("Object destructuring - renamed", R"(
+    const {x: a, y: b} = {x: 1, y: 2};
+    a + "," + b
+  )", "1,2");
+
+  runTest("Object destructuring - missing properties", R"(
+    const {name, age} = {name: "Alice"};
+    name + "," + age
+  )", "Alice,undefined");
+
+  runTest("Object destructuring - shorthand", R"(
+    const obj = {foo: 100, bar: 200};
+    const {foo, bar} = obj;
+    foo + "," + bar
+  )", "100,200");
+
+  // Exponentiation operator tests
+  runTest("Exponentiation - basic", R"(
+    2 ** 3
+  )", "8");
+
+  runTest("Exponentiation - right associative", R"(
+    2 ** 3 ** 2
+  )", "512");
+
+  runTest("Exponentiation - with negatives", R"(
+    (-2) ** 3
+  )", "-8");
+
+  runTest("Exponentiation - fractional", R"(
+    4 ** 0.5
+  )", "2");
+
+  runTest("Exponentiation - zero exponent", R"(
+    10 ** 0
+  )", "1");
+
+  runTest("Exponentiation - with precedence", R"(
+    2 + 3 ** 2
+  )", "11");
+
+  runTest("Exponentiation - multiple", R"(
+    const a = 2 ** 4;
+    const b = 3 ** 3;
+    a + "," + b
+  )", "16,27");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

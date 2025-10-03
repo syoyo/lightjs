@@ -142,9 +142,12 @@ bool Module::evaluate(Interpreter* interpreter) {
           // Extract exported bindings
           if (auto* varDecl = std::get_if<VarDeclaration>(&exportNamed->declaration->node)) {
             for (const auto& decl : varDecl->declarations) {
-              auto value = environment_->get(decl.id.name);
-              if (value) {
-                exports_[decl.id.name] = *value;
+              // Only support simple identifier patterns in exports for now
+              if (auto* id = std::get_if<Identifier>(&decl.pattern->node)) {
+                auto value = environment_->get(id->name);
+                if (value) {
+                  exports_[id->name] = *value;
+                }
               }
             }
           } else if (auto* funcDecl = std::get_if<FunctionDeclaration>(&exportNamed->declaration->node)) {

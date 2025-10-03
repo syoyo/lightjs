@@ -40,8 +40,13 @@ struct BigInt {
 
 using NativeFunction = std::function<Value(const std::vector<Value>&)>;
 
+struct FunctionParam {
+  std::string name;
+  std::shared_ptr<void> defaultValue;  // Stores ExprPtr for default value
+};
+
 struct Function : public GCObject {
-  std::vector<std::string> params;
+  std::vector<FunctionParam> params;
   std::optional<std::string> restParam;
   std::shared_ptr<void> body;
   std::shared_ptr<void> closure;
