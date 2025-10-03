@@ -85,6 +85,15 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("console", Value(consoleObj));
   env->define("undefined", Value(Undefined{}));
 
+  // Symbol constructor
+  auto symbolFn = std::make_shared<Function>();
+  symbolFn->isNative = true;
+  symbolFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    std::string description = args.empty() ? "" : args[0].toString();
+    return Value(Symbol(description));
+  };
+  env->define("Symbol", Value(symbolFn));
+
   auto createTypedArrayConstructor = [](TypedArrayType type) {
     auto func = std::make_shared<Function>();
     func->isNative = true;

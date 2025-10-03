@@ -5,6 +5,7 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <unordered_set>
 
 namespace tinyjs {
 
@@ -225,16 +226,78 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         co_return Value(left.toBigInt() != right.toBigInt());
       }
       co_return Value(left.toNumber() != right.toNumber());
-    case BinaryExpr::Op::StrictEqual:
+    case BinaryExpr::Op::StrictEqual: {
+      // Strict equality requires same type
+      if (left.data.index() != right.data.index()) {
+        co_return Value(false);
+      }
+
+      if (left.isSymbol() && right.isSymbol()) {
+        auto& lsym = std::get<Symbol>(left.data);
+        auto& rsym = std::get<Symbol>(right.data);
+        co_return Value(lsym.id == rsym.id);
+      }
+
       if (left.isBigInt() && right.isBigInt()) {
         co_return Value(left.toBigInt() == right.toBigInt());
       }
-      co_return Value(left.toNumber() == right.toNumber());
-    case BinaryExpr::Op::StrictNotEqual:
+
+      if (left.isNumber() && right.isNumber()) {
+        co_return Value(left.toNumber() == right.toNumber());
+      }
+
+      if (left.isString() && right.isString()) {
+        co_return Value(std::get<std::string>(left.data) == std::get<std::string>(right.data));
+      }
+
+      if (left.isBool() && right.isBool()) {
+        co_return Value(std::get<bool>(left.data) == std::get<bool>(right.data));
+      }
+
+      if ((left.isNull() && right.isNull()) || (left.isUndefined() && right.isUndefined())) {
+        co_return Value(true);
+      }
+
+      // For objects, arrays, functions - compare by reference
+      // We already checked the types are the same
+      co_return Value(false);
+    }
+    case BinaryExpr::Op::StrictNotEqual: {
+      // Reuse StrictEqual logic
+      if (left.data.index() != right.data.index()) {
+        co_return Value(true);
+      }
+
+      if (left.isSymbol() && right.isSymbol()) {
+        auto& lsym = std::get<Symbol>(left.data);
+        auto& rsym = std::get<Symbol>(right.data);
+        co_return Value(lsym.id != rsym.id);
+      }
+
       if (left.isBigInt() && right.isBigInt()) {
         co_return Value(left.toBigInt() != right.toBigInt());
       }
-      co_return Value(left.toNumber() != right.toNumber());
+
+      if (left.isNumber() && right.isNumber()) {
+        co_return Value(left.toNumber() != right.toNumber());
+      }
+
+      if (left.isString() && right.isString()) {
+        co_return Value(std::get<std::string>(left.data) != std::get<std::string>(right.data));
+      }
+
+      if (left.isBool() && right.isBool()) {
+        co_return Value(std::get<bool>(left.data) != std::get<bool>(right.data));
+      }
+
+      if ((left.isNull() && right.isNull()) || (left.isUndefined() && right.isUndefined())) {
+        co_return Value(false);
+      }
+
+      // For objects, arrays, functions - compare by reference
+      // We already checked the types are the same
+      co_return Value(true);
+    }
     case BinaryExpr::Op::LogicalAnd:
       co_return left.toBool() ? right : left;
     case BinaryExpr::Op::LogicalOr:
@@ -270,6 +333,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isBool()) co_return Value("boolean");
       if (arg.isNumber()) co_return Value("number");
       if (arg.isBigInt()) co_return Value("bigint");
+      if (arg.isSymbol()) co_return Value("symbol");
       if (arg.isString()) co_return Value("string");
       if (arg.isFunction()) co_return Value("function");
       co_return Value("object");
@@ -1188,12 +1252,21 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 
       // For identifier keys, use the identifier name directly (not its value from environment)
       if (prop.key) {
-        if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
+        if (prop.isComputed) {
+          // For computed property names, evaluate the expression
+          auto keyTask = evaluate(*prop.key);
+          while (!keyTask.done()) {
+            std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
+          }
+          key = keyTask.result().toString();
+        } else if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
           key = ident->name;
         } else if (auto* str = std::get_if<StringLiteral>(&prop.key->node)) {
           key = str->value;
+        } else if (auto* num = std::get_if<NumberLiteral>(&prop.key->node)) {
+          key = std::to_string(static_cast<int>(num->value));
         } else {
-          // For computed property names, evaluate the expression
+          // Fallback: evaluate as expression
           auto keyTask = evaluate(*prop.key);
           while (!keyTask.done()) {
             std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
@@ -1287,12 +1360,25 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
         }
         // TODO: Handle nested patterns
       }
+
+      // Handle rest element
+      if (arrayPat->rest) {
+        auto restArr = std::make_shared<Array>();
+        for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
+          restArr->elements.push_back(arr->elements[i]);
+        }
+        if (auto* restId = std::get_if<Identifier>(&arrayPat->rest->node)) {
+          env_->define(restId->name, Value(restArr), decl.kind == VarDeclaration::Kind::Const);
+        }
+      }
     } else if (auto* objPat = std::get_if<ObjectPattern>(&declarator.pattern->node)) {
       // Destructure object
       if (!value.isObject()) {
         continue;
       }
       auto obj = std::get<std::shared_ptr<Object>>(value.data);
+      std::unordered_set<std::string> extractedKeys;
+
       for (const auto& prop : objPat->properties) {
         std::string keyName;
         if (auto* keyId = std::get_if<Identifier>(&prop.key->node)) {
@@ -1303,12 +1389,26 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
           continue;
         }
 
+        extractedKeys.insert(keyName);
         Value propValue = obj->properties.count(keyName) ? obj->properties[keyName] : Value(Undefined{});
 
         if (auto* valId = std::get_if<Identifier>(&prop.value->node)) {
           env_->define(valId->name, propValue, decl.kind == VarDeclaration::Kind::Const);
         }
         // TODO: Handle nested patterns
+      }
+
+      // Handle rest properties
+      if (objPat->rest) {
+        auto restObj = std::make_shared<Object>();
+        for (const auto& [key, val] : obj->properties) {
+          if (extractedKeys.find(key) == extractedKeys.end()) {
+            restObj->properties[key] = val;
+          }
+        }
+        if (auto* restId = std::get_if<Identifier>(&objPat->rest->node)) {
+          env_->define(restId->name, Value(restObj), decl.kind == VarDeclaration::Kind::Const);
+        }
       }
     }
   }

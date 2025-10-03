@@ -106,6 +106,7 @@ struct ObjectProperty {
   ExprPtr key;
   ExprPtr value;
   bool isSpread = false;  // For spread properties (...obj)
+  bool isComputed = false;  // For computed property names ([expr])
 };
 
 struct ObjectExpr {
@@ -172,6 +173,7 @@ struct ClassExpr {
 // Destructuring patterns
 struct ArrayPattern {
   std::vector<ExprPtr> elements;  // Can be Identifier or nested patterns
+  ExprPtr rest;  // Rest element (...rest)
 };
 
 struct ObjectPattern {
@@ -180,6 +182,7 @@ struct ObjectPattern {
     ExprPtr value;  // Pattern to bind to
   };
   std::vector<Property> properties;
+  ExprPtr rest;  // Rest properties (...rest)
 };
 
 struct Expression {

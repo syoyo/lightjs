@@ -4,6 +4,9 @@
 
 namespace tinyjs {
 
+// Initialize static member for Symbol IDs
+size_t Symbol::nextId = 0;
+
 bool Value::toBool() const {
   return std::visit([](auto&& arg) -> bool {
     using T = std::decay_t<decltype(arg)>;
@@ -17,6 +20,8 @@ bool Value::toBool() const {
       return arg != 0.0 && !std::isnan(arg);
     } else if constexpr (std::is_same_v<T, BigInt>) {
       return arg.value != 0;
+    } else if constexpr (std::is_same_v<T, Symbol>) {
+      return true;  // Symbols are always truthy
     } else if constexpr (std::is_same_v<T, std::string>) {
       return !arg.empty();
     } else {
@@ -90,6 +95,8 @@ std::string Value::toString() const {
       return oss.str();
     } else if constexpr (std::is_same_v<T, BigInt>) {
       return std::to_string(arg.value) + "n";
+    } else if constexpr (std::is_same_v<T, Symbol>) {
+      return "Symbol(" + arg.description + ")";
     } else if constexpr (std::is_same_v<T, std::string>) {
       return arg;
     } else if constexpr (std::is_same_v<T, std::shared_ptr<Function>>) {

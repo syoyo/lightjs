@@ -838,6 +838,87 @@ int main() {
     a + "," + b
   )", "16,27");
 
+  // Rest/spread in destructuring tests
+  runTest("Array destructuring - rest element", R"(
+    const [first, ...rest] = [1, 2, 3, 4, 5];
+    first + "," + rest.length + "," + rest[0] + "," + rest[3]
+  )", "1,4,2,5");
+
+  runTest("Array destructuring - rest with holes", R"(
+    const [a, , ...rest] = [10, 20, 30, 40];
+    a + "," + rest.length + "," + rest[0] + "," + rest[1]
+  )", "10,2,30,40");
+
+  runTest("Array destructuring - empty rest", R"(
+    const [x, y, ...rest] = [1, 2];
+    x + "," + y + "," + rest.length
+  )", "1,2,0");
+
+  runTest("Object destructuring - rest properties", R"(
+    const {a, ...rest} = {a: 1, b: 2, c: 3, d: 4};
+    a + "," + rest.b + "," + rest.c + "," + rest.d
+  )", "1,2,3,4");
+
+  runTest("Object destructuring - rest with renamed", R"(
+    const {x: foo, ...rest} = {x: 10, y: 20, z: 30};
+    foo + "," + rest.y + "," + rest.z
+  )", "10,20,30");
+
+  // Computed property names tests
+  runTest("Computed property name - basic", R"(
+    const key = "foo";
+    const obj = {[key]: 42};
+    obj.foo
+  )", "42");
+
+  runTest("Computed property name - expression", R"(
+    const prefix = "prop";
+    const num = 3;
+    const obj = {[prefix + num]: "value"};
+    obj.prop3
+  )", "value");
+
+  runTest("Computed property name - with regular props", R"(
+    const key1 = "dynamic";
+    const obj = {
+      normal: "static",
+      [key1]: "computed",
+      another: "regular"
+    };
+    obj.normal + "," + obj.dynamic + "," + obj.another
+  )", "static,computed,regular");
+
+  runTest("Computed property name - multiple", R"(
+    const a = "x";
+    const b = "y";
+    const obj = {[a]: 1, [b]: 2, z: 3};
+    obj.x + "," + obj.y + "," + obj.z
+  )", "1,2,3");
+
+  // Symbol tests
+  runTest("Symbol - basic creation", R"(
+    const sym = Symbol();
+    typeof sym
+  )", "symbol");
+
+  runTest("Symbol - with description", R"(
+    const sym = Symbol("mySymbol");
+    "" + sym  // This will use toString() internally
+  )", "Symbol(mySymbol)");
+
+  runTest("Symbol - unique identity", R"(
+    const sym1 = Symbol("test");
+    const sym2 = Symbol("test");
+    sym1 === sym2
+  )", "false");
+
+  runTest("Symbol - as object key", R"(
+    const sym = Symbol("prop");
+    const obj = {};
+    obj[sym] = 42;
+    obj[sym]
+  )", "42");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

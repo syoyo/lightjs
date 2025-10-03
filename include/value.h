@@ -38,6 +38,17 @@ struct BigInt {
   BigInt(int64_t v = 0) : value(v) {}
 };
 
+struct Symbol {
+  static size_t nextId;
+  size_t id;
+  std::string description;
+
+  Symbol(const std::string& desc = "") : id(nextId++), description(desc) {}
+
+  bool operator==(const Symbol& other) const { return id == other.id; }
+  bool operator!=(const Symbol& other) const { return id != other.id; }
+};
+
 using NativeFunction = std::function<Value(const std::vector<Value>&)>;
 
 struct FunctionParam {
@@ -294,6 +305,7 @@ struct Value {
     bool,
     double,
     BigInt,
+    Symbol,
     std::string,
     std::shared_ptr<Function>,
     std::shared_ptr<Array>,
@@ -313,6 +325,7 @@ struct Value {
   Value(int i) : data(static_cast<double>(i)) {}
   Value(BigInt bi) : data(bi) {}
   Value(int64_t i) : data(BigInt(i)) {}
+  Value(Symbol sym) : data(sym) {}
   Value(const std::string& s) : data(s) {}
   Value(const char* s) : data(std::string(s)) {}
   Value(std::shared_ptr<Function> f) : data(f) {}
@@ -327,6 +340,7 @@ struct Value {
   bool isBool() const { return std::holds_alternative<bool>(data); }
   bool isNumber() const { return std::holds_alternative<double>(data); }
   bool isBigInt() const { return std::holds_alternative<BigInt>(data); }
+  bool isSymbol() const { return std::holds_alternative<Symbol>(data); }
   bool isString() const { return std::holds_alternative<std::string>(data); }
   bool isFunction() const { return std::holds_alternative<std::shared_ptr<Function>>(data); }
   bool isArray() const { return std::holds_alternative<std::shared_ptr<Array>>(data); }

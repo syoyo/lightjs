@@ -77,7 +77,10 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Default function parameters (`function fn(a = 0, b = 1)`)
   - Destructuring assignment for arrays (`const [a, b] = [1, 2]`)
   - Destructuring assignment for objects (`const {x, y} = obj`)
+  - Rest/spread in destructuring (`const [first, ...rest] = arr`, `const {a, ...rest} = obj`)
   - Exponentiation operator (`**`) with right associativity
+  - Computed property names (`{[key]: value}`)
+  - Symbol primitive type with unique identity
 - ✅ **Async/Await**
   - Full async function support
   - Await expressions with Promise unwrapping

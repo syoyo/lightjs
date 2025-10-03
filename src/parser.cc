@@ -1393,7 +1393,15 @@ ExprPtr Parser::parseObjectExpression() {
       properties.push_back(std::move(prop));
     } else {
       ExprPtr key;
-      if (match(TokenType::Identifier)) {
+      bool isComputed = false;
+
+      // Check for computed property name [expr]
+      if (match(TokenType::LeftBracket)) {
+        advance();
+        key = parseExpression();
+        expect(TokenType::RightBracket);
+        isComputed = true;
+      } else if (match(TokenType::Identifier)) {
         std::string identName = current().value;
         key = std::make_unique<Expression>(Identifier{identName});
         advance();
@@ -1411,6 +1419,9 @@ ExprPtr Parser::parseObjectExpression() {
       } else if (match(TokenType::String)) {
         key = std::make_unique<Expression>(StringLiteral{current().value});
         advance();
+      } else if (match(TokenType::Number)) {
+        key = std::make_unique<Expression>(NumberLiteral{std::stod(current().value)});
+        advance();
       }
 
       expect(TokenType::Colon);
@@ -1420,6 +1431,7 @@ ExprPtr Parser::parseObjectExpression() {
       prop.key = std::move(key);
       prop.value = std::move(value);
       prop.isSpread = false;
+      prop.isComputed = isComputed;
       properties.push_back(std::move(prop));
     }
   }
@@ -1644,6 +1656,18 @@ ExprPtr Parser::parseArrayPattern() {
       }
     }
 
+    // Check for rest element (...rest)
+    if (match(TokenType::DotDotDot)) {
+      advance();
+      pattern.rest = parsePattern();
+      if (!pattern.rest) {
+        return nullptr;
+      }
+      // Rest must be last element
+      expect(TokenType::RightBracket);
+      break;
+    }
+
     // Check for hole in array pattern (e.g., [a, , c])
     if (match(TokenType::Comma)) {
       pattern.elements.push_back(nullptr);
@@ -1675,6 +1699,18 @@ ExprPtr Parser::parseObjectPattern() {
       if (match(TokenType::RightBrace)) {
         break;
       }
+    }
+
+    // Check for rest properties (...rest)
+    if (match(TokenType::DotDotDot)) {
+      advance();
+      pattern.rest = parsePattern();
+      if (!pattern.rest) {
+        return nullptr;
+      }
+      // Rest must be last element
+      expect(TokenType::RightBrace);
+      break;
     }
 
     // Parse property key
