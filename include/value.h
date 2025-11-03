@@ -28,6 +28,9 @@ struct Object;
 struct Function;
 struct Promise;
 struct Regex;
+struct Error;
+struct Generator;
+struct Proxy;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -63,9 +66,10 @@ struct Function : public GCObject {
   std::shared_ptr<void> closure;
   bool isNative;
   bool isAsync;
+  bool isGenerator;
   NativeFunction nativeFunc;
 
-  Function() : isNative(false), isAsync(false) {}
+  Function() : isNative(false), isAsync(false), isGenerator(false) {}
 
   // GCObject interface
   const char* typeName() const override { return "Function"; }
@@ -188,6 +192,90 @@ struct Regex : public GCObject {
   // GCObject interface
   const char* typeName() const override { return "Regex"; }
   void getReferences(std::vector<GCObject*>& refs) const override {}
+};
+
+// Error types for JavaScript exceptions
+enum class ErrorType {
+  Error,           // Generic Error
+  TypeError,       // Type-related errors
+  ReferenceError,  // Reference to undefined variable
+  RangeError,      // Value out of range
+  SyntaxError,     // Parsing/syntax errors
+  URIError,        // URI handling errors
+  EvalError        // eval() errors (legacy)
+};
+
+struct Error : public GCObject {
+  ErrorType type;
+  std::string message;
+  std::string stack;  // Optional stack trace
+
+  Error(ErrorType t = ErrorType::Error, const std::string& msg = "")
+    : type(t), message(msg) {}
+
+  std::string getName() const {
+    switch (type) {
+      case ErrorType::Error: return "Error";
+      case ErrorType::TypeError: return "TypeError";
+      case ErrorType::ReferenceError: return "ReferenceError";
+      case ErrorType::RangeError: return "RangeError";
+      case ErrorType::SyntaxError: return "SyntaxError";
+      case ErrorType::URIError: return "URIError";
+      case ErrorType::EvalError: return "EvalError";
+    }
+    return "Error";
+  }
+
+  std::string toString() const {
+    if (message.empty()) {
+      return getName();
+    }
+    return getName() + ": " + message;
+  }
+
+  // GCObject interface
+  const char* typeName() const override { return "Error"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {}
+};
+
+// Generator state for iterator protocol
+enum class GeneratorState {
+  SuspendedStart,  // Created but next() not called yet
+  SuspendedYield,  // Suspended at a yield expression
+  Executing,       // Currently executing
+  Completed        // Generator has returned
+};
+
+struct Generator : public GCObject {
+  std::shared_ptr<Function> function;  // The generator function
+  std::shared_ptr<void> context;       // Execution context (closure)
+  GeneratorState state;
+  std::shared_ptr<Value> currentValue;  // Last yielded or returned value
+  size_t yieldIndex;   // Index of last yield point (for resumption)
+
+  Generator(std::shared_ptr<Function> func, std::shared_ptr<void> ctx)
+    : function(func), context(ctx), state(GeneratorState::SuspendedStart),
+      currentValue(std::make_shared<Value>(Undefined{})), yieldIndex(0) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "Generator"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {
+    if (function) refs.push_back(function.get());
+  }
+};
+
+// Proxy for intercept operations on objects
+struct Proxy : public GCObject {
+  std::shared_ptr<Value> target;   // The target object being proxied
+  std::shared_ptr<Value> handler;  // Handler object with trap functions
+
+  Proxy(const Value& t, const Value& h)
+    : target(std::make_shared<Value>(t)),
+      handler(std::make_shared<Value>(h)) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "Proxy"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 enum class TypedArrayType {
@@ -314,7 +402,10 @@ struct Value {
     std::shared_ptr<Promise>,
     std::shared_ptr<Regex>,
     std::shared_ptr<Map>,
-    std::shared_ptr<Set>
+    std::shared_ptr<Set>,
+    std::shared_ptr<Error>,
+    std::shared_ptr<Generator>,
+    std::shared_ptr<Proxy>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -334,6 +425,9 @@ struct Value {
   Value(std::shared_ptr<TypedArray> ta) : data(ta) {}
   Value(std::shared_ptr<Promise> p) : data(p) {}
   Value(std::shared_ptr<Regex> r) : data(r) {}
+  Value(std::shared_ptr<Error> e) : data(e) {}
+  Value(std::shared_ptr<Generator> g) : data(g) {}
+  Value(std::shared_ptr<Proxy> p) : data(p) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -350,6 +444,9 @@ struct Value {
   bool isRegex() const { return std::holds_alternative<std::shared_ptr<Regex>>(data); }
   bool isMap() const { return std::holds_alternative<std::shared_ptr<Map>>(data); }
   bool isSet() const { return std::holds_alternative<std::shared_ptr<Set>>(data); }
+  bool isError() const { return std::holds_alternative<std::shared_ptr<Error>>(data); }
+  bool isGenerator() const { return std::holds_alternative<std::shared_ptr<Generator>>(data); }
+  bool isProxy() const { return std::holds_alternative<std::shared_ptr<Proxy>>(data); }
 
   bool toBool() const;
   double toNumber() const;

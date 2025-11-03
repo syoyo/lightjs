@@ -111,6 +111,12 @@ std::string Value::toString() const {
       return "[Promise]";
     } else if constexpr (std::is_same_v<T, std::shared_ptr<Regex>>) {
       return "/" + arg->pattern + "/" + arg->flags;
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<Error>>) {
+      return arg->toString();
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<Generator>>) {
+      return "[Generator]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<Proxy>>) {
+      return "[Proxy]";
     } else {
       return "";
     }

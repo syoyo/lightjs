@@ -919,6 +919,50 @@ int main() {
     obj[sym]
   )", "42");
 
+  // Error types
+  runTest("Error - basic constructor", R"(
+    const err = Error("Something went wrong");
+    err.toString()
+  )", "Error: Something went wrong");
+
+  runTest("TypeError - basic constructor", R"(
+    const err = TypeError("Type mismatch");
+    err.toString()
+  )", "TypeError: Type mismatch");
+
+  runTest("ReferenceError - basic constructor", R"(
+    const err = ReferenceError("Variable not found");
+    err.toString()
+  )", "ReferenceError: Variable not found");
+
+  runTest("Error - without message", R"(
+    const err = Error();
+    err.toString()
+  )", "Error");
+
+  runTest("RangeError - basic constructor", R"(
+    const err = RangeError("Index out of bounds");
+    err.toString()
+  )", "RangeError: Index out of bounds");
+
+  // Dynamic import tests
+  runTest("Dynamic import - returns Promise", R"(
+    import("./module.js").toString()
+  )", "[Promise]");
+
+  runTest("Dynamic import - module namespace properties", R"(
+    const modulePromise = import("./test-module.js");
+    modulePromise.toString()
+  )", "[Promise]");
+
+  runTest("Dynamic import - without argument returns Promise", R"(
+    import().toString()
+  )", "[Promise]");
+
+  runTest("Dynamic import - can be called multiple times", R"(
+    import("./module1.js").toString() + "," + import("./module2.js").toString()
+  )", "[Promise],[Promise]");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

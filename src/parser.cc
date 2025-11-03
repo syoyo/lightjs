@@ -1302,6 +1302,33 @@ ExprPtr Parser::parsePrimary() {
     return std::make_unique<Expression>(Identifier{name});
   }
 
+  // Dynamic import: import(specifier)
+  if (match(TokenType::Import)) {
+    advance();
+    if (match(TokenType::LeftParen)) {
+      // This is a dynamic import expression
+      // Create a CallExpr with "import" as the callee identifier
+      auto importId = std::make_unique<Expression>(Identifier{"import"});
+
+      advance(); // consume '('
+      std::vector<ExprPtr> args;
+
+      if (!match(TokenType::RightParen)) {
+        args.push_back(parseExpression());
+        while (match(TokenType::Comma)) {
+          advance();
+          if (match(TokenType::RightParen)) break;
+          args.push_back(parseExpression());
+        }
+      }
+
+      expect(TokenType::RightParen);
+      return std::make_unique<Expression>(CallExpr{std::move(importId), std::move(args)});
+    }
+    // If not followed by '(', it's a static import statement (error here)
+    return nullptr;
+  }
+
   if (match(TokenType::Async)) {
     if (peek().type == TokenType::Function) {
       return parseFunctionExpression();

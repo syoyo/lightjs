@@ -208,6 +208,46 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("fetch", Value(fetchFn));
 
+  // Dynamic import() function - returns a Promise
+  auto importFn = std::make_shared<Function>();
+  importFn->isNative = true;
+  importFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      auto promise = std::make_shared<Promise>();
+      auto err = std::make_shared<Error>(ErrorType::TypeError, "import() requires a module specifier");
+      promise->reject(Value(err));
+      return Value(promise);
+    }
+
+    std::string specifier = args[0].toString();
+    auto promise = std::make_shared<Promise>();
+
+    try {
+      // For now, create a simple module namespace object
+      // In a full implementation, this would:
+      // 1. Load the module file
+      // 2. Parse and evaluate it
+      // 3. Return the module's exports as a namespace object
+
+      auto moduleNamespace = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+      // Placeholder: Set a default export marker
+      moduleNamespace->properties["__esModule"] = Value(true);
+      moduleNamespace->properties["__moduleSpecifier"] = Value(specifier);
+
+      // TODO: Actually load and evaluate the module
+      // For now, we'll just resolve with an empty namespace
+      promise->resolve(Value(moduleNamespace));
+    } catch (...) {
+      auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
+      promise->reject(Value(err));
+    }
+
+    return Value(promise);
+  };
+  env->define("import", Value(importFn));
+
   auto regExpConstructor = std::make_shared<Function>();
   regExpConstructor->isNative = true;
   regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -217,6 +257,25 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(std::make_shared<Regex>(pattern, flags));
   };
   env->define("RegExp", Value(regExpConstructor));
+
+  // Error constructors
+  auto createErrorConstructor = [](ErrorType type) {
+    auto func = std::make_shared<Function>();
+    func->isNative = true;
+    func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
+      std::string message = args.empty() ? "" : args[0].toString();
+      return Value(std::make_shared<Error>(type, message));
+    };
+    return Value(func);
+  };
+
+  env->define("Error", createErrorConstructor(ErrorType::Error));
+  env->define("TypeError", createErrorConstructor(ErrorType::TypeError));
+  env->define("ReferenceError", createErrorConstructor(ErrorType::ReferenceError));
+  env->define("RangeError", createErrorConstructor(ErrorType::RangeError));
+  env->define("SyntaxError", createErrorConstructor(ErrorType::SyntaxError));
+  env->define("URIError", createErrorConstructor(ErrorType::URIError));
+  env->define("EvalError", createErrorConstructor(ErrorType::EvalError));
 
   // Number object with static methods
   auto numberObj = std::make_shared<Object>();

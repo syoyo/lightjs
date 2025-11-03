@@ -117,6 +117,11 @@ struct AwaitExpr {
   ExprPtr argument;
 };
 
+struct YieldExpr {
+  ExprPtr argument;
+  bool delegate = false;  // yield* (delegate to another iterator)
+};
+
 struct Parameter {
   Identifier name;
   ExprPtr defaultValue;  // Optional default value
@@ -128,8 +133,9 @@ struct FunctionExpr {
   std::vector<StmtPtr> body;
   std::string name;
   bool isAsync;
+  bool isGenerator;  // Generator function (function*)
   bool isArrow;  // Arrow function expression (e.g., (x) => x * 2)
-  FunctionExpr() : isAsync(false), isArrow(false) {}
+  FunctionExpr() : isAsync(false), isGenerator(false), isArrow(false) {}
 };
 
 struct SuperExpr {};
@@ -207,6 +213,7 @@ struct Expression {
     FunctionExpr,
     ClassExpr,
     AwaitExpr,
+    YieldExpr,
     NewExpr,
     ThisExpr,
     SuperExpr,
@@ -236,7 +243,8 @@ struct FunctionDeclaration {
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   bool isAsync;
-  FunctionDeclaration() : isAsync(false) {}
+  bool isGenerator;  // Generator function (function*)
+  FunctionDeclaration() : isAsync(false), isGenerator(false) {}
 };
 
 struct ClassDeclaration {

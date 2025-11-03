@@ -21,6 +21,12 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
         if (*map) refs.push_back(map->get());
     } else if (auto* set = std::get_if<std::shared_ptr<Set>>(&value.data)) {
         if (*set) refs.push_back(set->get());
+    } else if (auto* err = std::get_if<std::shared_ptr<Error>>(&value.data)) {
+        if (*err) refs.push_back(err->get());
+    } else if (auto* gen = std::get_if<std::shared_ptr<Generator>>(&value.data)) {
+        if (*gen) refs.push_back(gen->get());
+    } else if (auto* proxy = std::get_if<std::shared_ptr<Proxy>>(&value.data)) {
+        if (*proxy) refs.push_back(proxy->get());
     }
 }
 
@@ -59,6 +65,11 @@ void Set::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& value : values) {
         addValueReferences(value, refs);
     }
+}
+
+void Proxy::getReferences(std::vector<GCObject*>& refs) const {
+    if (target) addValueReferences(*target, refs);
+    if (handler) addValueReferences(*handler, refs);
 }
 
 } // namespace tinyjs

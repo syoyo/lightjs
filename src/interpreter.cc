@@ -514,6 +514,30 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
 }
 
 Task Interpreter::evaluateCall(const CallExpr& expr) {
+  // Special handling for dynamic import()
+  if (auto* id = std::get_if<Identifier>(&expr.callee->node)) {
+    if (id->name == "import") {
+      // This is a dynamic import - call the global import function
+      if (auto importFunc = env_->get("import")) {
+        std::vector<Value> args;
+        for (const auto& arg : expr.arguments) {
+          auto argTask = evaluate(*arg);
+          while (!argTask.done()) {
+            std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
+          }
+          args.push_back(argTask.result());
+        }
+
+        if (importFunc->isFunction()) {
+          auto func = std::get<std::shared_ptr<Function>>(importFunc->data);
+          if (func->isNative) {
+            co_return func->nativeFunc(args);
+          }
+        }
+      }
+    }
+  }
+
   auto calleeTask = evaluate(*expr.callee);
   while (!calleeTask.done()) {
     std::coroutine_handle<>::from_address(calleeTask.handle.address()).resume();
@@ -928,6 +952,27 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     if (propName == "flags") {
       co_return Value(regexPtr->flags);
+    }
+  }
+
+  if (obj.isError()) {
+    auto errorPtr = std::get<std::shared_ptr<Error>>(obj.data);
+
+    if (propName == "toString") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->nativeFunc = [errorPtr](const std::vector<Value>&) -> Value {
+        return Value(errorPtr->toString());
+      };
+      co_return Value(toStringFn);
+    }
+
+    if (propName == "name") {
+      co_return Value(errorPtr->getName());
+    }
+
+    if (propName == "message") {
+      co_return Value(errorPtr->message);
     }
   }
 
