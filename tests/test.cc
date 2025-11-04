@@ -947,7 +947,8 @@ int main() {
 
   // Dynamic import tests
   runTest("Dynamic import - returns Promise", R"(
-    import("./module.js").toString()
+    const p = import("./module.js");
+    p.toString()
   )", "[Promise]");
 
   runTest("Dynamic import - module namespace properties", R"(
@@ -956,11 +957,14 @@ int main() {
   )", "[Promise]");
 
   runTest("Dynamic import - without argument returns Promise", R"(
-    import().toString()
+    const p = import();
+    p.toString()
   )", "[Promise]");
 
   runTest("Dynamic import - can be called multiple times", R"(
-    import("./module1.js").toString() + "," + import("./module2.js").toString()
+    const m1 = import("./module1.js");
+    const m2 = import("./module2.js");
+    m1.toString() + "," + m2.toString()
   )", "[Promise],[Promise]");
 
   std::cout << "=== All tests completed ===" << std::endl;

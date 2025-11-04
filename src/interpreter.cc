@@ -518,7 +518,9 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   if (auto* id = std::get_if<Identifier>(&expr.callee->node)) {
     if (id->name == "import") {
       // This is a dynamic import - call the global import function
-      if (auto importFunc = env_->get("import")) {
+      auto importFunc = env_->get("import");
+
+      if (importFunc && importFunc->isFunction()) {
         std::vector<Value> args;
         for (const auto& arg : expr.arguments) {
           auto argTask = evaluate(*arg);
@@ -528,13 +530,17 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
           args.push_back(argTask.result());
         }
 
-        if (importFunc->isFunction()) {
-          auto func = std::get<std::shared_ptr<Function>>(importFunc->data);
-          if (func->isNative) {
-            co_return func->nativeFunc(args);
-          }
+        auto func = std::get<std::shared_ptr<Function>>(importFunc->data);
+        if (func->isNative) {
+          co_return func->nativeFunc(args);
         }
       }
+
+      // If we couldn't find the import function, return an error Promise
+      auto promise = std::make_shared<Promise>();
+      auto err = std::make_shared<Error>(ErrorType::ReferenceError, "import is not defined");
+      promise->reject(Value(err));
+      co_return Value(promise);
     }
   }
 
@@ -736,6 +742,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   if (obj.isPromise()) {
     auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+
+    // Add toString method for Promise
+    if (propName == "toString") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->nativeFunc = [](const std::vector<Value>&) -> Value {
+        return Value("[Promise]");
+      };
+      co_return Value(toStringFn);
+    }
+
     if (promisePtr->state == PromiseState::Fulfilled) {
       Value resolvedValue = promisePtr->result;
       if (resolvedValue.isObject()) {
