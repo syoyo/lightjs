@@ -970,6 +970,9 @@ int main() {
   // WeakMap/WeakSet infrastructure is implemented but needs method binding
   // TODO: Add tests once .set(), .get(), .has(), .delete() are bound
 
+  // Proxy and Reflect API infrastructure implemented
+  // TODO: Add tests once non-native function trap handlers are supported
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

@@ -297,6 +297,99 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("WeakSet", Value(weakSetConstructor));
 
+  // Proxy constructor
+  auto proxyConstructor = std::make_shared<Function>();
+  proxyConstructor->isNative = true;
+  proxyConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) {
+      // Need target and handler
+      return Value(Undefined{});
+    }
+    auto proxy = std::make_shared<Proxy>(args[0], args[1]);
+    GarbageCollector::instance().reportAllocation(sizeof(Proxy));
+    return Value(proxy);
+  };
+  env->define("Proxy", Value(proxyConstructor));
+
+  // Reflect object with static methods
+  auto reflectObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Reflect.get(target, property)
+  auto reflectGet = std::make_shared<Function>();
+  reflectGet->isNative = true;
+  reflectGet->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(Undefined{});
+
+    const Value& target = args[0];
+    std::string prop = args[1].toString();
+
+    if (target.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      auto it = obj->properties.find(prop);
+      if (it != obj->properties.end()) {
+        return it->second;
+      }
+    }
+    return Value(Undefined{});
+  };
+  reflectObj->properties["get"] = Value(reflectGet);
+
+  // Reflect.set(target, property, value)
+  auto reflectSet = std::make_shared<Function>();
+  reflectSet->isNative = true;
+  reflectSet->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 3) return Value(false);
+
+    const Value& target = args[0];
+    std::string prop = args[1].toString();
+    const Value& value = args[2];
+
+    if (target.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      obj->properties[prop] = value;
+      return Value(true);
+    }
+    return Value(false);
+  };
+  reflectObj->properties["set"] = Value(reflectSet);
+
+  // Reflect.has(target, property)
+  auto reflectHas = std::make_shared<Function>();
+  reflectHas->isNative = true;
+  reflectHas->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+
+    const Value& target = args[0];
+    std::string prop = args[1].toString();
+
+    if (target.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      return Value(obj->properties.find(prop) != obj->properties.end());
+    }
+    return Value(false);
+  };
+  reflectObj->properties["has"] = Value(reflectHas);
+
+  // Reflect.deleteProperty(target, property)
+  auto reflectDelete = std::make_shared<Function>();
+  reflectDelete->isNative = true;
+  reflectDelete->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+
+    const Value& target = args[0];
+    std::string prop = args[1].toString();
+
+    if (target.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      return Value(obj->properties.erase(prop) > 0);
+    }
+    return Value(false);
+  };
+  reflectObj->properties["deleteProperty"] = Value(reflectDelete);
+
+  env->define("Reflect", Value(reflectObj));
+
   // Number object with static methods
   auto numberObj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));

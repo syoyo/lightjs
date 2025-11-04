@@ -727,6 +727,54 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     co_return Value(Undefined{});
   }
 
+  // Proxy trap handling - intercept get operations
+  if (obj.isProxy()) {
+    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+
+    // Compute property name
+    std::string propName;
+    if (expr.computed) {
+      auto propTask = evaluate(*expr.property);
+      while (!propTask.done()) {
+        std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
+      }
+      propName = propTask.result().toString();
+    } else {
+      if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
+        propName = id->name;
+      }
+    }
+
+    // Check if handler has a 'get' trap
+    if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto getTrapIt = handlerObj->properties.find("get");
+
+      if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
+        // Call the get trap: handler.get(target, property, receiver)
+        auto getTrap = std::get<std::shared_ptr<Function>>(getTrapIt->second.data);
+        if (getTrap->isNative) {
+          std::vector<Value> trapArgs = {
+            *proxyPtr->target,
+            Value(propName),
+            obj  // receiver is the proxy itself
+          };
+          co_return getTrap->nativeFunc(trapArgs);
+        }
+      }
+    }
+
+    // No trap, fall through to default behavior on target
+    if (proxyPtr->target && proxyPtr->target->isObject()) {
+      auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+      auto it = targetObj->properties.find(propName);
+      if (it != targetObj->properties.end()) {
+        co_return it->second;
+      }
+    }
+    co_return Value(Undefined{});
+  }
+
   std::string propName;
   if (expr.computed) {
     auto propTask = evaluate(*expr.property);
