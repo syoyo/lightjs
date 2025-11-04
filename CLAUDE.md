@@ -28,7 +28,7 @@ make
 cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
-# Run all tests (60 tests)
+# Run all tests (178 tests)
 ./tinyjs_test
 
 # Rebuild after changes
@@ -110,6 +110,29 @@ Implements lexical scoping with parent chain:
 - `crypto` object (sha256, hmac, toHex)
 - `fetch()` - Returns Promise with Response object
 
+### ArrayBuffer and DataView Implementation
+
+**ArrayBuffer** (`include/value.h`, `src/value.cc`):
+- Fixed-length raw binary data buffer backed by `std::vector<uint8_t>`
+- Constructor: `ArrayBuffer(byteLength)` - zero-initializes buffer
+- Property: `byteLength` - read-only size of the buffer
+- Shared across DataView and TypedArray instances for efficient memory management
+
+**DataView** (`include/value.h`, `src/value.cc`):
+- Low-level interface for reading/writing multiple numeric types in an ArrayBuffer
+- Constructor: `DataView(buffer, byteOffset?, byteLength?)`
+- Properties: `buffer`, `byteOffset`, `byteLength`
+- **Get methods**: `getInt8()`, `getUint8()`, `getInt16()`, `getUint16()`, `getInt32()`, `getUint32()`, `getFloat32()`, `getFloat64()`, `getBigInt64()`, `getBigUint64()`
+- **Set methods**: `setInt8()`, `setUint8()`, `setInt16()`, `setUint16()`, `setInt32()`, `setUint32()`, `setFloat32()`, `setFloat64()`, `setBigInt64()`, `setBigUint64()`
+- **Endianness support**: All multi-byte get/set methods accept optional `littleEndian` parameter (default: false for big-endian)
+- **Implementation**: Uses `std::memcpy` and template-based byte swapping for cross-platform endianness handling
+- **Bounds checking**: All methods throw RangeError if accessing out of bounds
+
+**Adding DataView methods to interpreter:**
+- Methods are dynamically bound in `Interpreter::evaluateMember()` when accessing DataView properties
+- Each method returns a native Function that captures the DataView pointer via lambda
+- Pattern used: Check `obj.isDataView()`, create native function with captured `viewPtr`, bind to property name
+
 ### TypedArray Implementation
 
 TypedArrays store binary data in `std::vector<uint8_t>` with typed accessors:
@@ -118,6 +141,8 @@ TypedArrays store binary data in `std::vector<uint8_t>` with typed accessors:
 - BigInt64/BigUint64 arrays use separate `getBigIntElement()`/`setBigIntElement()` methods
 
 **When adding new TypedArray types:** Update `TypedArrayType` enum, `elementSize()`, and both get/set methods in `value.cc`.
+
+**Future enhancement:** TypedArrays can be updated to share ArrayBuffer backing store instead of maintaining separate buffers.
 
 ### Async/Await and Promise API
 

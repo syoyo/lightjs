@@ -813,6 +813,239 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
   }
 
+  // ArrayBuffer property access
+  if (obj.isArrayBuffer()) {
+    auto bufferPtr = std::get<std::shared_ptr<ArrayBuffer>>(obj.data);
+    if (propName == "byteLength") {
+      co_return Value(static_cast<double>(bufferPtr->byteLength));
+    }
+  }
+
+  // DataView property and method access
+  if (obj.isDataView()) {
+    auto viewPtr = std::get<std::shared_ptr<DataView>>(obj.data);
+
+    if (propName == "buffer") {
+      co_return Value(viewPtr->buffer);
+    }
+    if (propName == "byteOffset") {
+      co_return Value(static_cast<double>(viewPtr->byteOffset));
+    }
+    if (propName == "byteLength") {
+      co_return Value(static_cast<double>(viewPtr->byteLength));
+    }
+
+    // DataView get methods
+    if (propName == "getInt8") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getInt8 requires offset");
+        return Value(static_cast<double>(viewPtr->getInt8(static_cast<size_t>(args[0].toNumber()))));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getUint8") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getUint8 requires offset");
+        return Value(static_cast<double>(viewPtr->getUint8(static_cast<size_t>(args[0].toNumber()))));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getInt16") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getInt16 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(static_cast<double>(viewPtr->getInt16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getUint16") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getUint16 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(static_cast<double>(viewPtr->getUint16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getInt32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getInt32 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(static_cast<double>(viewPtr->getInt32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getUint32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getUint32 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(static_cast<double>(viewPtr->getUint32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getFloat32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getFloat32 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(static_cast<double>(viewPtr->getFloat32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getFloat64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getFloat64 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(viewPtr->getFloat64(static_cast<size_t>(args[0].toNumber()), littleEndian));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getBigInt64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getBigInt64 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(BigInt(viewPtr->getBigInt64(static_cast<size_t>(args[0].toNumber()), littleEndian)));
+      };
+      co_return Value(fn);
+    }
+    if (propName == "getBigUint64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) throw std::runtime_error("getBigUint64 requires offset");
+        bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
+        return Value(BigInt(static_cast<int64_t>(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
+      };
+      co_return Value(fn);
+    }
+
+    // DataView set methods
+    if (propName == "setInt8") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setInt8 requires offset and value");
+        viewPtr->setInt8(static_cast<size_t>(args[0].toNumber()), static_cast<int8_t>(args[1].toNumber()));
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setUint8") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setUint8 requires offset and value");
+        viewPtr->setUint8(static_cast<size_t>(args[0].toNumber()), static_cast<uint8_t>(args[1].toNumber()));
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setInt16") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setInt16 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setInt16(static_cast<size_t>(args[0].toNumber()), static_cast<int16_t>(args[1].toNumber()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setUint16") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setUint16 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setUint16(static_cast<size_t>(args[0].toNumber()), static_cast<uint16_t>(args[1].toNumber()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setInt32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setInt32 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setInt32(static_cast<size_t>(args[0].toNumber()), static_cast<int32_t>(args[1].toNumber()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setUint32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setUint32 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setUint32(static_cast<size_t>(args[0].toNumber()), static_cast<uint32_t>(args[1].toNumber()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setFloat32") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setFloat32 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setFloat32(static_cast<size_t>(args[0].toNumber()), static_cast<float>(args[1].toNumber()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setFloat64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setFloat64 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setFloat64(static_cast<size_t>(args[0].toNumber()), args[1].toNumber(), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setBigInt64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setBigInt64 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), args[1].toBigInt(), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+    if (propName == "setBigUint64") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) throw std::runtime_error("setBigUint64 requires offset and value");
+        bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
+        viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), static_cast<uint64_t>(args[1].toBigInt()), littleEndian);
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+  }
+
   if (obj.isObject()) {
     auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
     auto it = objPtr->properties.find(propName);

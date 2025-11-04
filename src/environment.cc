@@ -120,6 +120,45 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("BigInt64Array", createTypedArrayConstructor(TypedArrayType::BigInt64));
   env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64));
 
+  // ArrayBuffer constructor
+  auto arrayBufferConstructor = std::make_shared<Function>();
+  arrayBufferConstructor->isNative = true;
+  arrayBufferConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    size_t length = 0;
+    if (!args.empty()) {
+      length = static_cast<size_t>(args[0].toNumber());
+    }
+    auto buffer = std::make_shared<ArrayBuffer>(length);
+    GarbageCollector::instance().reportAllocation(length);
+    return Value(buffer);
+  };
+  env->define("ArrayBuffer", Value(arrayBufferConstructor));
+
+  // DataView constructor
+  auto dataViewConstructor = std::make_shared<Function>();
+  dataViewConstructor->isNative = true;
+  dataViewConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArrayBuffer()) {
+      throw std::runtime_error("TypeError: DataView requires an ArrayBuffer");
+    }
+
+    auto buffer = std::get<std::shared_ptr<ArrayBuffer>>(args[0].data);
+    size_t byteOffset = 0;
+    size_t byteLength = 0;
+
+    if (args.size() > 1) {
+      byteOffset = static_cast<size_t>(args[1].toNumber());
+    }
+    if (args.size() > 2) {
+      byteLength = static_cast<size_t>(args[2].toNumber());
+    }
+
+    auto dataView = std::make_shared<DataView>(buffer, byteOffset, byteLength);
+    GarbageCollector::instance().reportAllocation(sizeof(DataView));
+    return Value(dataView);
+  };
+  env->define("DataView", Value(dataViewConstructor));
+
   auto cryptoObj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 

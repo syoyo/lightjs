@@ -222,6 +222,22 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Date.prototype.getSeconds() - get seconds
   - Date.prototype.toString() - string representation
   - Date.prototype.toISOString() - ISO 8601 string
+- ✅ **ArrayBuffer** - Fixed-length binary data buffer
+  - ArrayBuffer constructor
+  - byteLength property
+  - Zero-initialized memory allocation
+- ✅ **DataView** - Low-level interface for reading/writing binary data
+  - DataView constructor with buffer, byteOffset, byteLength
+  - buffer, byteOffset, byteLength properties
+  - getInt8(), getUint8() - 8-bit integer access
+  - getInt16(), getUint16() - 16-bit integer access
+  - getInt32(), getUint32() - 32-bit integer access
+  - getFloat32(), getFloat64() - floating point access
+  - getBigInt64(), getBigUint64() - 64-bit BigInt access
+  - setInt8(), setUint8(), setInt16(), setUint16() - set integer values
+  - setInt32(), setUint32(), setFloat32(), setFloat64() - set numeric values
+  - setBigInt64(), setBigUint64() - set BigInt values
+  - **Full endianness support** (little-endian and big-endian)
 
 ### Testing Infrastructure
 - ✅ **Test262 Support**
@@ -581,8 +597,8 @@ let theme = settings?.theme ?? 'light';  // 'light'
 
 ### Built-in Objects & APIs
 - [x] **Number methods** - toFixed, toPrecision, parseInt, parseFloat, isNaN, isFinite (✅ Implemented)
-- [ ] **Error types** - TypeError, ReferenceError, SyntaxError, etc.
-- [ ] **ArrayBuffer** and DataView
+- [x] **Error types** - TypeError, ReferenceError, SyntaxError, etc. (✅ Implemented)
+- [x] **ArrayBuffer** and **DataView** (✅ Implemented with full endianness support)
 - [ ] **Intl** - Internationalization API
 - [ ] **URL** and URLSearchParams
 - [ ] **TextEncoder/TextDecoder**

@@ -34,6 +34,8 @@ struct Generator;
 struct Proxy;
 struct WeakMap;
 struct WeakSet;
+struct ArrayBuffer;
+struct DataView;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -312,6 +314,72 @@ struct Proxy : public GCObject {
   void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
+// ArrayBuffer - Fixed-length raw binary data buffer
+struct ArrayBuffer : public GCObject {
+  std::vector<uint8_t> data;
+  size_t byteLength;
+
+  ArrayBuffer(size_t length) : byteLength(length) {
+    data.resize(length, 0);
+  }
+
+  // Constructor from existing data
+  ArrayBuffer(const std::vector<uint8_t>& sourceData)
+    : data(sourceData), byteLength(sourceData.size()) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "ArrayBuffer"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {}
+};
+
+// DataView - Low-level interface for reading/writing multiple number types in an ArrayBuffer
+struct DataView : public GCObject {
+  std::shared_ptr<ArrayBuffer> buffer;
+  size_t byteOffset;
+  size_t byteLength;
+
+  DataView(std::shared_ptr<ArrayBuffer> buf, size_t offset = 0, size_t length = 0)
+    : buffer(buf), byteOffset(offset) {
+    if (length == 0) {
+      byteLength = buf->byteLength - offset;
+    } else {
+      byteLength = length;
+    }
+    // Validate bounds
+    if (byteOffset + byteLength > buf->byteLength) {
+      byteLength = buf->byteLength > byteOffset ? buf->byteLength - byteOffset : 0;
+    }
+  }
+
+  // Get methods with optional little-endian parameter (default true for DataView)
+  int8_t getInt8(size_t byteOffset) const;
+  uint8_t getUint8(size_t byteOffset) const;
+  int16_t getInt16(size_t byteOffset, bool littleEndian = false) const;
+  uint16_t getUint16(size_t byteOffset, bool littleEndian = false) const;
+  int32_t getInt32(size_t byteOffset, bool littleEndian = false) const;
+  uint32_t getUint32(size_t byteOffset, bool littleEndian = false) const;
+  float getFloat32(size_t byteOffset, bool littleEndian = false) const;
+  double getFloat64(size_t byteOffset, bool littleEndian = false) const;
+  int64_t getBigInt64(size_t byteOffset, bool littleEndian = false) const;
+  uint64_t getBigUint64(size_t byteOffset, bool littleEndian = false) const;
+
+  // Set methods with optional little-endian parameter
+  void setInt8(size_t byteOffset, int8_t value);
+  void setUint8(size_t byteOffset, uint8_t value);
+  void setInt16(size_t byteOffset, int16_t value, bool littleEndian = false);
+  void setUint16(size_t byteOffset, uint16_t value, bool littleEndian = false);
+  void setInt32(size_t byteOffset, int32_t value, bool littleEndian = false);
+  void setUint32(size_t byteOffset, uint32_t value, bool littleEndian = false);
+  void setFloat32(size_t byteOffset, float value, bool littleEndian = false);
+  void setFloat64(size_t byteOffset, double value, bool littleEndian = false);
+  void setBigInt64(size_t byteOffset, int64_t value, bool littleEndian = false);
+  void setBigUint64(size_t byteOffset, uint64_t value, bool littleEndian = false);
+
+  // GCObject interface
+  const char* typeName() const override { return "DataView"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {}
+};
+
 enum class TypedArrayType {
   Int8,
   Uint8,
@@ -441,7 +509,9 @@ struct Value {
     std::shared_ptr<Generator>,
     std::shared_ptr<Proxy>,
     std::shared_ptr<WeakMap>,
-    std::shared_ptr<WeakSet>
+    std::shared_ptr<WeakSet>,
+    std::shared_ptr<ArrayBuffer>,
+    std::shared_ptr<DataView>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -466,6 +536,8 @@ struct Value {
   Value(std::shared_ptr<Proxy> p) : data(p) {}
   Value(std::shared_ptr<WeakMap> wm) : data(wm) {}
   Value(std::shared_ptr<WeakSet> ws) : data(ws) {}
+  Value(std::shared_ptr<ArrayBuffer> ab) : data(ab) {}
+  Value(std::shared_ptr<DataView> dv) : data(dv) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -487,6 +559,8 @@ struct Value {
   bool isProxy() const { return std::holds_alternative<std::shared_ptr<Proxy>>(data); }
   bool isWeakMap() const { return std::holds_alternative<std::shared_ptr<WeakMap>>(data); }
   bool isWeakSet() const { return std::holds_alternative<std::shared_ptr<WeakSet>>(data); }
+  bool isArrayBuffer() const { return std::holds_alternative<std::shared_ptr<ArrayBuffer>>(data); }
+  bool isDataView() const { return std::holds_alternative<std::shared_ptr<DataView>>(data); }
 
   bool toBool() const;
   double toNumber() const;

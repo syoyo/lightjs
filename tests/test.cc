@@ -973,6 +973,140 @@ int main() {
   // Proxy and Reflect API infrastructure implemented
   // TODO: Add tests once non-native function trap handlers are supported
 
+  // ArrayBuffer tests
+  runTest("ArrayBuffer - basic construction", R"(
+    const buffer = ArrayBuffer(16);
+    buffer.byteLength
+  )", "16");
+
+  runTest("ArrayBuffer - zero length", R"(
+    const buffer = ArrayBuffer(0);
+    buffer.byteLength
+  )", "0");
+
+  runTest("ArrayBuffer - type check", R"(
+    const buffer = ArrayBuffer(8);
+    "" + buffer
+  )", "[ArrayBuffer]");
+
+  // DataView tests - basic properties
+  runTest("DataView - basic construction", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.byteLength
+  )", "16");
+
+  runTest("DataView - with offset", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer, 4);
+    view.byteOffset
+  )", "4");
+
+  runTest("DataView - with offset and length", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer, 4, 8);
+    view.byteLength
+  )", "8");
+
+  runTest("DataView - buffer property", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.buffer.byteLength
+  )", "16");
+
+  // DataView - Int8/Uint8 operations
+  runTest("DataView - setInt8 and getInt8", R"(
+    const buffer = ArrayBuffer(4);
+    const view = DataView(buffer);
+    view.setInt8(0, -42);
+    view.getInt8(0)
+  )", "-42");
+
+  runTest("DataView - setUint8 and getUint8", R"(
+    const buffer = ArrayBuffer(4);
+    const view = DataView(buffer);
+    view.setUint8(0, 200);
+    view.getUint8(0)
+  )", "200");
+
+  // DataView - Int16/Uint16 operations
+  runTest("DataView - setInt16 and getInt16 (big-endian)", R"(
+    const buffer = ArrayBuffer(4);
+    const view = DataView(buffer);
+    view.setInt16(0, -1234, false);
+    view.getInt16(0, false)
+  )", "-1234");
+
+  runTest("DataView - setUint16 and getUint16 (little-endian)", R"(
+    const buffer = ArrayBuffer(4);
+    const view = DataView(buffer);
+    view.setUint16(0, 5678, true);
+    view.getUint16(0, true)
+  )", "5678");
+
+  // DataView - Int32/Uint32 operations
+  runTest("DataView - setInt32 and getInt32", R"(
+    const buffer = ArrayBuffer(8);
+    const view = DataView(buffer);
+    view.setInt32(0, -123456, false);
+    view.getInt32(0, false)
+  )", "-123456");
+
+  runTest("DataView - setUint32 and getUint32", R"(
+    const buffer = ArrayBuffer(8);
+    const view = DataView(buffer);
+    view.setUint32(0, 987654, true);
+    view.getUint32(0, true)
+  )", "987654");
+
+  // DataView - Float32/Float64 operations
+  runTest("DataView - setFloat32 and getFloat32", R"(
+    const buffer = ArrayBuffer(8);
+    const view = DataView(buffer);
+    view.setFloat32(0, 3.14, false);
+    view.getFloat32(0, false)
+  )", "3.14");
+
+  runTest("DataView - setFloat64 and getFloat64", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.setFloat64(0, 2.718281828, true);
+    view.getFloat64(0, true)
+  )", "2.71828");
+
+  // DataView - BigInt operations
+  runTest("DataView - setBigInt64 and getBigInt64", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.setBigInt64(0, 9007199254740991n, false);
+    view.getBigInt64(0, false)
+  )", "9007199254740991n");
+
+  runTest("DataView - setBigUint64 and getBigUint64", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.setBigUint64(0, 18446744073709551n, true);
+    view.getBigUint64(0, true)
+  )", "18446744073709551n");
+
+  // DataView - multiple values in same buffer
+  runTest("DataView - multiple values", R"(
+    const buffer = ArrayBuffer(16);
+    const view = DataView(buffer);
+    view.setInt8(0, 42);
+    view.setInt16(2, 1000, false);
+    view.setInt32(4, 100000, false);
+    view.getInt8(0) + "," + view.getInt16(2, false) + "," + view.getInt32(4, false)
+  )", "42,1000,100000");
+
+  // DataView - endianness test
+  runTest("DataView - endianness matters", R"(
+    const buffer = ArrayBuffer(4);
+    const view = DataView(buffer);
+    view.setUint16(0, 258, true);
+    view.getUint8(0) + "," + view.getUint8(1)
+  )", "2,1");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;
