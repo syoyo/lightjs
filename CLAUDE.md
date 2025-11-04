@@ -28,7 +28,7 @@ make
 cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
-# Run all tests (187 tests)
+# Run all tests (197 tests)
 ./tinyjs_test
 
 # Rebuild after changes
@@ -108,9 +108,28 @@ Implements lexical scoping with parent chain:
 - `console.log()` - Native function
 - TypedArray constructors (Int8Array, Float16Array, etc.)
 - ArrayBuffer, DataView constructors
+- String constructor with static methods (fromCharCode, fromCodePoint)
 - `crypto` object (sha256, hmac, toHex)
 - `fetch()` - Returns Promise with Response object
 - `globalThis` - Reference to the global object itself
+
+### Unicode Support (`include/unicode.h`, `src/unicode.cc`)
+
+TinyJS provides full UTF-8 Unicode support:
+- **UTF-8 aware string operations**: All string methods work with Unicode code points, not bytes
+- **String length**: Returns code point count, not byte count (e.g., "👋".length === 1)
+- **Character access**: `charAt()` returns full Unicode characters including emoji
+- **Code point utilities**: `codePointAt()`, `charCodeAt()`, `fromCharCode()`, `fromCodePoint()`
+- **Multi-byte sequences**: Proper handling of 1-4 byte UTF-8 sequences
+- **Emoji support**: Full support for emoji including surrogate pairs
+- **International scripts**: CJK characters, Arabic, Hebrew, Cyrillic, etc.
+
+**Implementation details:**
+- `unicode::utf8Length()` - Count code points in UTF-8 string
+- `unicode::codePointAt()` - Get Unicode code point at index
+- `unicode::charAt()` - Get character string at code point index
+- `unicode::encodeUTF8()` / `decodeUTF8()` - Convert between code points and UTF-8
+- Validation and proper error handling for invalid UTF-8 sequences
 
 ### ArrayBuffer and DataView Implementation
 

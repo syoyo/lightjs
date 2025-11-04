@@ -32,6 +32,7 @@ add_library(tinyjs
   src/string_methods.cc
   src/math_object.cc
   src/date_object.cc
+  src/unicode.cc
 )
 
 target_include_directories(tinyjs PUBLIC

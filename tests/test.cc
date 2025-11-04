@@ -1151,6 +1151,54 @@ int main() {
     num * num
   )", "25");
 
+  // Unicode tests
+  runTest("Unicode - emoji length", R"(
+    const str = "Hello 👋 World 🌍";
+    str.length
+  )", "15");
+
+  runTest("Unicode - CJK characters", R"(
+    const str = "你好世界";
+    str.length
+  )", "4");
+
+  runTest("Unicode - charAt with emoji", R"(
+    const str = "A👋B";
+    str.charAt(1)
+  )", "👋");
+
+  runTest("Unicode - codePointAt", R"(
+    const str = "👋";
+    str.codePointAt(0)
+  )", "128075");
+
+  runTest("Unicode - String.fromCodePoint", R"(
+    String.fromCodePoint(128075)
+  )", "👋");
+
+  runTest("Unicode - String.fromCodePoint multiple", R"(
+    String.fromCodePoint(72, 101, 108, 108, 111)
+  )", "Hello");
+
+  runTest("Unicode - String.fromCharCode", R"(
+    String.fromCharCode(72, 101, 108, 108, 111)
+  )", "Hello");
+
+  runTest("Unicode - Arabic characters", R"(
+    const str = "مرحبا";
+    str.length
+  )", "5");
+
+  runTest("Unicode - mixed scripts", R"(
+    const str = "Hello世界🌍";
+    str.length
+  )", "8");
+
+  runTest("Unicode - surrogate pair emoji", R"(
+    const str = "🎉🎊🎈";
+    str.length
+  )", "3");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

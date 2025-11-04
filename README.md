@@ -166,6 +166,14 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - Array.prototype.filter() - select elements (functional)
   - Array.prototype.reduce() - aggregate values (functional)
   - Array.prototype.forEach() - iterate over elements
+- ✅ **Unicode Support**
+  - Full UTF-8 string handling
+  - Unicode-aware string length (code points, not bytes)
+  - Unicode-aware charAt() and string indexing
+  - String.fromCharCode() and String.fromCodePoint()
+  - String.prototype.charCodeAt() and codePointAt()
+  - Support for emoji, CJK characters, Arabic, and all Unicode scripts
+  - Proper handling of multi-byte UTF-8 sequences
 - ✅ **String methods**
   - String.prototype.charAt() - character at index
   - String.prototype.charCodeAt() - character code at index

@@ -989,6 +989,38 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   env->define("Date", Value(dateConstructor));
 
+  // String constructor with static methods
+  auto stringConstructorFn = std::make_shared<Function>();
+  stringConstructorFn->isNative = true;
+  stringConstructorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(std::string(""));
+    }
+    return Value(args[0].toString());
+  };
+
+  // Wrap in an Object to hold static methods
+  auto stringConstructorObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // The constructor itself
+  stringConstructorObj->properties["constructor"] = Value(stringConstructorFn);
+
+  // String.fromCharCode
+  auto fromCharCode = std::make_shared<Function>();
+  fromCharCode->isNative = true;
+  fromCharCode->nativeFunc = String_fromCharCode;
+  stringConstructorObj->properties["fromCharCode"] = Value(fromCharCode);
+
+  // String.fromCodePoint
+  auto fromCodePoint = std::make_shared<Function>();
+  fromCodePoint->isNative = true;
+  fromCodePoint->nativeFunc = String_fromCodePoint;
+  stringConstructorObj->properties["fromCodePoint"] = Value(fromCodePoint);
+
+  // For simplicity, we can make the Object callable by storing the function
+  env->define("String", Value(stringConstructorObj));
+
   // globalThis - reference to the global object
   // Create a proxy object that reflects the current global environment
   auto globalThisObj = std::make_shared<Object>();

@@ -1,5 +1,7 @@
 #include "interpreter.h"
 #include "array_methods.h"
+#include "string_methods.h"
+#include "unicode.h"
 #include "gc.h"
 #include <iostream>
 #include <cmath>
@@ -1369,7 +1371,41 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::string str = std::get<std::string>(obj.data);
 
     if (propName == "length") {
-      co_return Value(static_cast<double>(str.length()));
+      // Return Unicode code point length, not byte length
+      co_return Value(static_cast<double>(unicode::utf8Length(str)));
+    }
+
+    if (propName == "charAt") {
+      auto charAtFn = std::make_shared<Function>();
+      charAtFn->isNative = true;
+      charAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        std::vector<Value> funcArgs = {Value(str)};
+        funcArgs.insert(funcArgs.end(), args.begin(), args.end());
+        return String_charAt(funcArgs);
+      };
+      co_return Value(charAtFn);
+    }
+
+    if (propName == "charCodeAt") {
+      auto charCodeAtFn = std::make_shared<Function>();
+      charCodeAtFn->isNative = true;
+      charCodeAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        std::vector<Value> funcArgs = {Value(str)};
+        funcArgs.insert(funcArgs.end(), args.begin(), args.end());
+        return String_charCodeAt(funcArgs);
+      };
+      co_return Value(charCodeAtFn);
+    }
+
+    if (propName == "codePointAt") {
+      auto codePointAtFn = std::make_shared<Function>();
+      codePointAtFn->isNative = true;
+      codePointAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        std::vector<Value> funcArgs = {Value(str)};
+        funcArgs.insert(funcArgs.end(), args.begin(), args.end());
+        return String_codePointAt(funcArgs);
+      };
+      co_return Value(codePointAtFn);
     }
 
     if (propName == "includes") {

@@ -1,5 +1,6 @@
 #include "value.h"
 #include "gc.h"
+#include "unicode.h"
 #include <stdexcept>
 #include <algorithm>
 #include <sstream>
@@ -8,7 +9,7 @@
 
 namespace tinyjs {
 
-// String.prototype.charAt
+// String.prototype.charAt (Unicode-aware)
 Value String_charAt(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.charAt called on non-string");
@@ -21,14 +22,14 @@ Value String_charAt(const std::vector<Value>& args) {
         index = static_cast<int>(std::get<double>(args[1].data));
     }
 
-    if (index < 0 || index >= static_cast<int>(str.length())) {
+    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
         return Value(std::string(""));
     }
 
-    return Value(std::string(1, str[index]));
+    return Value(unicode::charAt(str, index));
 }
 
-// String.prototype.charCodeAt
+// String.prototype.charCodeAt (Unicode-aware, returns UTF-16 code unit)
 Value String_charCodeAt(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.charCodeAt called on non-string");
@@ -41,11 +42,35 @@ Value String_charCodeAt(const std::vector<Value>& args) {
         index = static_cast<int>(std::get<double>(args[1].data));
     }
 
-    if (index < 0 || index >= static_cast<int>(str.length())) {
+    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
         return Value(std::numeric_limits<double>::quiet_NaN());
     }
 
-    return Value(static_cast<double>(static_cast<unsigned char>(str[index])));
+    uint32_t codePoint = unicode::codePointAt(str, index);
+    // For BMP characters, return the code point directly
+    // For non-BMP, this returns the full code point (JavaScript would use surrogate pairs)
+    return Value(static_cast<double>(codePoint));
+}
+
+// String.prototype.codePointAt (full Unicode code point)
+Value String_codePointAt(const std::vector<Value>& args) {
+    if (args.empty() || !args[0].isString()) {
+        throw std::runtime_error("String.codePointAt called on non-string");
+    }
+
+    std::string str = std::get<std::string>(args[0].data);
+    int index = 0;
+
+    if (args.size() > 1 && args[1].isNumber()) {
+        index = static_cast<int>(std::get<double>(args[1].data));
+    }
+
+    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
+        return Value(Undefined{});
+    }
+
+    uint32_t codePoint = unicode::codePointAt(str, index);
+    return Value(static_cast<double>(codePoint));
 }
 
 // String.prototype.indexOf
@@ -303,6 +328,30 @@ Value String_trim(const std::vector<Value>& args) {
     }).base(), str.end());
 
     return Value(str);
+}
+
+// String.fromCharCode (static method)
+Value String_fromCharCode(const std::vector<Value>& args) {
+    std::string result;
+    for (const auto& arg : args) {
+        uint32_t code = static_cast<uint32_t>(arg.toNumber());
+        // Treat as UTF-16 code unit, but convert to UTF-8
+        result += unicode::encodeUTF8(code & 0xFFFF);
+    }
+    return Value(result);
+}
+
+// String.fromCodePoint (static method)
+Value String_fromCodePoint(const std::vector<Value>& args) {
+    std::vector<uint32_t> codePoints;
+    for (const auto& arg : args) {
+        double num = arg.toNumber();
+        if (num < 0 || num > 0x10FFFF || num != static_cast<uint32_t>(num)) {
+            throw std::runtime_error("RangeError: Invalid code point");
+        }
+        codePoints.push_back(static_cast<uint32_t>(num));
+    }
+    return Value(unicode::fromCodePoints(codePoints));
 }
 
 } // namespace tinyjs
