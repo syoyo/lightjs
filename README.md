@@ -84,6 +84,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 - ✅ **Async/Await**
   - Full async function support
   - Await expressions with Promise unwrapping
+  - **Top-level await** - Use await at module scope without async function wrapper
   - Promise API (resolve, reject, all)
   - Automatic Promise wrapping for async functions
 - ✅ **ES6 Modules**
@@ -238,6 +239,11 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
   - setInt32(), setUint32(), setFloat32(), setFloat64() - set numeric values
   - setBigInt64(), setBigUint64() - set BigInt values
   - **Full endianness support** (little-endian and big-endian)
+- ✅ **globalThis** - Universal global object reference
+  - Access to all global variables and functions
+  - Consistent across all JavaScript environments
+  - Self-referential (globalThis.globalThis === globalThis)
+  - Provides access to console, constructors, and all built-ins
 
 ### Testing Infrastructure
 - ✅ **Test262 Support**
@@ -604,12 +610,12 @@ let theme = settings?.theme ?? 'light';  // 'light'
 - [ ] **TextEncoder/TextDecoder**
 - [ ] **setTimeout/setInterval** - Timer functions
 - [ ] **queueMicrotask**
-- [ ] **globalThis**
+- [x] **globalThis** (✅ Implemented)
 
 ### Module System Enhancements
-- [ ] **Dynamic imports** - `import()` function
+- [x] **Dynamic imports** - `import()` function (✅ Implemented)
 - [ ] **Import.meta**
-- [ ] **Top-level await**
+- [x] **Top-level await** (✅ Implemented)
 - [ ] **Module namespace objects**
 - [ ] **Circular dependency handling**
 - [ ] **CommonJS interop**

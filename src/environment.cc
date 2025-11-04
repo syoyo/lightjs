@@ -989,6 +989,22 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   env->define("Date", Value(dateConstructor));
 
+  // globalThis - reference to the global object
+  // Create a proxy object that reflects the current global environment
+  auto globalThisObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Copy all current global bindings into globalThis
+  for (const auto& [name, value] : env->bindings_) {
+    globalThisObj->properties[name] = value;
+  }
+
+  // Define globalThis pointing to the global object
+  env->define("globalThis", Value(globalThisObj));
+
+  // Also add globalThis to itself
+  globalThisObj->properties["globalThis"] = Value(globalThisObj);
+
   return env;
 }
 

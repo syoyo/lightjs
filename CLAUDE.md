@@ -28,7 +28,7 @@ make
 cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
-# Run all tests (178 tests)
+# Run all tests (187 tests)
 ./tinyjs_test
 
 # Rebuild after changes
@@ -107,8 +107,10 @@ Implements lexical scoping with parent chain:
 **Global built-ins defined in createGlobal():**
 - `console.log()` - Native function
 - TypedArray constructors (Int8Array, Float16Array, etc.)
+- ArrayBuffer, DataView constructors
 - `crypto` object (sha256, hmac, toHex)
 - `fetch()` - Returns Promise with Response object
+- `globalThis` - Reference to the global object itself
 
 ### ArrayBuffer and DataView Implementation
 
@@ -160,6 +162,8 @@ Full async/await support is implemented:
 - `fetch()` returns a Promise that resolves with Response object
 
 **Important:** When accessing properties on a Promise (e.g., `fetch(url).status`), the interpreter automatically unwraps the fulfilled Promise result. This logic is in `Interpreter::evaluateMember()`.
+
+**Top-level await:** The interpreter supports top-level await out of the box. Since the evaluation engine is coroutine-based, `await` can be used at the module/script level without requiring an async function wrapper. The `evaluateAwait()` method works anywhere in the execution context.
 
 ### HTTP/Fetch Implementation (src/http.cc)
 

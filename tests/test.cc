@@ -1107,6 +1107,50 @@ int main() {
     view.getUint8(0) + "," + view.getUint8(1)
   )", "2,1");
 
+  // globalThis tests
+  runTest("globalThis - exists", R"(
+    typeof globalThis
+  )", "object");
+
+  runTest("globalThis - has console", R"(
+    typeof globalThis.console
+  )", "object");
+
+  runTest("globalThis - can define and access variables", R"(
+    globalThis.myVar = 42;
+    globalThis.myVar
+  )", "42");
+
+  runTest("globalThis - references itself", R"(
+    typeof globalThis.globalThis
+  )", "object");
+
+  runTest("globalThis - has built-in constructors", R"(
+    typeof globalThis.ArrayBuffer
+  )", "function");
+
+  // Top-level await tests
+  runTest("Top-level await - with Promise.resolve", R"(
+    const result = await Promise.resolve(42);
+    result
+  )", "42");
+
+  runTest("Top-level await - with async expression", R"(
+    const value = await Promise.resolve("hello");
+    value
+  )", "hello");
+
+  runTest("Top-level await - multiple awaits", R"(
+    const a = await Promise.resolve(10);
+    const b = await Promise.resolve(20);
+    a + b
+  )", "30");
+
+  runTest("Top-level await - with computation", R"(
+    const num = await Promise.resolve(5);
+    num * num
+  )", "25");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;
