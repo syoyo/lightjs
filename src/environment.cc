@@ -277,6 +277,26 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("URIError", createErrorConstructor(ErrorType::URIError));
   env->define("EvalError", createErrorConstructor(ErrorType::EvalError));
 
+  // WeakMap constructor
+  auto weakMapConstructor = std::make_shared<Function>();
+  weakMapConstructor->isNative = true;
+  weakMapConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    auto wm = std::make_shared<WeakMap>();
+    GarbageCollector::instance().reportAllocation(sizeof(WeakMap));
+    return Value(wm);
+  };
+  env->define("WeakMap", Value(weakMapConstructor));
+
+  // WeakSet constructor
+  auto weakSetConstructor = std::make_shared<Function>();
+  weakSetConstructor->isNative = true;
+  weakSetConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    auto ws = std::make_shared<WeakSet>();
+    GarbageCollector::instance().reportAllocation(sizeof(WeakSet));
+    return Value(ws);
+  };
+  env->define("WeakSet", Value(weakSetConstructor));
+
   // Number object with static methods
   auto numberObj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));

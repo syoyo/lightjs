@@ -27,6 +27,10 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
         if (*gen) refs.push_back(gen->get());
     } else if (auto* proxy = std::get_if<std::shared_ptr<Proxy>>(&value.data)) {
         if (*proxy) refs.push_back(proxy->get());
+    } else if (auto* weakmap = std::get_if<std::shared_ptr<WeakMap>>(&value.data)) {
+        if (*weakmap) refs.push_back(weakmap->get());
+    } else if (auto* weakset = std::get_if<std::shared_ptr<WeakSet>>(&value.data)) {
+        if (*weakset) refs.push_back(weakset->get());
     }
 }
 
@@ -70,6 +74,131 @@ void Set::getReferences(std::vector<GCObject*>& refs) const {
 void Proxy::getReferences(std::vector<GCObject*>& refs) const {
     if (target) addValueReferences(*target, refs);
     if (handler) addValueReferences(*handler, refs);
+}
+
+// WeakMap implementation
+void WeakMap::set(const Value& key, const Value& value) {
+    // WeakMap only accepts objects as keys
+    GCObject* keyObj = nullptr;
+    if (key.isObject()) {
+        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+    } else if (key.isArray()) {
+        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+    } else if (key.isFunction()) {
+        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+    }
+
+    if (keyObj) {
+        entries[keyObj] = value;
+    }
+}
+
+bool WeakMap::has(const Value& key) const {
+    GCObject* keyObj = nullptr;
+    if (key.isObject()) {
+        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+    } else if (key.isArray()) {
+        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+    } else if (key.isFunction()) {
+        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+    }
+
+    return keyObj && entries.find(keyObj) != entries.end();
+}
+
+Value WeakMap::get(const Value& key) const {
+    GCObject* keyObj = nullptr;
+    if (key.isObject()) {
+        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+    } else if (key.isArray()) {
+        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+    } else if (key.isFunction()) {
+        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+    }
+
+    if (keyObj) {
+        auto it = entries.find(keyObj);
+        if (it != entries.end()) {
+            return it->second;
+        }
+    }
+    return Value(Undefined{});
+}
+
+bool WeakMap::deleteKey(const Value& key) {
+    GCObject* keyObj = nullptr;
+    if (key.isObject()) {
+        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+    } else if (key.isArray()) {
+        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+    } else if (key.isFunction()) {
+        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+    }
+
+    if (keyObj) {
+        return entries.erase(keyObj) > 0;
+    }
+    return false;
+}
+
+void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
+    // Note: WeakMap uses weak references for keys, so we don't add them
+    // We only add the values
+    for (const auto& [key, value] : entries) {
+        addValueReferences(value, refs);
+    }
+}
+
+// WeakSet implementation
+bool WeakSet::add(const Value& value) {
+    GCObject* obj = nullptr;
+    if (value.isObject()) {
+        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+    } else if (value.isArray()) {
+        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+    } else if (value.isFunction()) {
+        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+    }
+
+    if (obj) {
+        values.insert(obj);
+        return true;
+    }
+    return false;
+}
+
+bool WeakSet::has(const Value& value) const {
+    GCObject* obj = nullptr;
+    if (value.isObject()) {
+        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+    } else if (value.isArray()) {
+        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+    } else if (value.isFunction()) {
+        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+    }
+
+    return obj && values.find(obj) != values.end();
+}
+
+bool WeakSet::deleteValue(const Value& value) {
+    GCObject* obj = nullptr;
+    if (value.isObject()) {
+        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+    } else if (value.isArray()) {
+        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+    } else if (value.isFunction()) {
+        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+    }
+
+    if (obj) {
+        return values.erase(obj) > 0;
+    }
+    return false;
+}
+
+void WeakSet::getReferences(std::vector<GCObject*>& refs) const {
+    // WeakSet uses weak references, so we don't add them to refs
+    // This allows the GC to collect objects in the WeakSet
 }
 
 } // namespace tinyjs

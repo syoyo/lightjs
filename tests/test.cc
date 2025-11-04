@@ -967,6 +967,9 @@ int main() {
     m1.toString() + "," + m2.toString()
   )", "[Promise],[Promise]");
 
+  // WeakMap/WeakSet infrastructure is implemented but needs method binding
+  // TODO: Add tests once .set(), .get(), .has(), .delete() are bound
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <functional>
 #include <optional>
@@ -31,6 +32,8 @@ struct Regex;
 struct Error;
 struct Generator;
 struct Proxy;
+struct WeakMap;
+struct WeakSet;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -122,6 +125,37 @@ struct Set : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "Set"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// WeakMap - weak references to object keys (keys can be garbage collected)
+// Note: Simplified implementation using regular references
+// A full implementation would use weak_ptr or custom GC weak references
+struct WeakMap : public GCObject {
+  std::unordered_map<GCObject*, Value> entries;  // Map from object pointer to value
+
+  void set(const Value& key, const Value& value);
+  bool has(const Value& key) const;
+  Value get(const Value& key) const;
+  bool deleteKey(const Value& key);
+  size_t size() const { return entries.size(); }
+
+  // GCObject interface
+  const char* typeName() const override { return "WeakMap"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// WeakSet - weak references to objects
+struct WeakSet : public GCObject {
+  std::unordered_set<GCObject*> values;  // Set of object pointers
+
+  bool add(const Value& value);
+  bool has(const Value& value) const;
+  bool deleteValue(const Value& value);
+  size_t size() const { return values.size(); }
+
+  // GCObject interface
+  const char* typeName() const override { return "WeakSet"; }
   void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
@@ -405,7 +439,9 @@ struct Value {
     std::shared_ptr<Set>,
     std::shared_ptr<Error>,
     std::shared_ptr<Generator>,
-    std::shared_ptr<Proxy>
+    std::shared_ptr<Proxy>,
+    std::shared_ptr<WeakMap>,
+    std::shared_ptr<WeakSet>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -428,6 +464,8 @@ struct Value {
   Value(std::shared_ptr<Error> e) : data(e) {}
   Value(std::shared_ptr<Generator> g) : data(g) {}
   Value(std::shared_ptr<Proxy> p) : data(p) {}
+  Value(std::shared_ptr<WeakMap> wm) : data(wm) {}
+  Value(std::shared_ptr<WeakSet> ws) : data(ws) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -447,6 +485,8 @@ struct Value {
   bool isError() const { return std::holds_alternative<std::shared_ptr<Error>>(data); }
   bool isGenerator() const { return std::holds_alternative<std::shared_ptr<Generator>>(data); }
   bool isProxy() const { return std::holds_alternative<std::shared_ptr<Proxy>>(data); }
+  bool isWeakMap() const { return std::holds_alternative<std::shared_ptr<WeakMap>>(data); }
+  bool isWeakSet() const { return std::holds_alternative<std::shared_ptr<WeakSet>>(data); }
 
   bool toBool() const;
   double toNumber() const;

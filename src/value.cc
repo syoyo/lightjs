@@ -117,6 +117,10 @@ std::string Value::toString() const {
       return "[Generator]";
     } else if constexpr (std::is_same_v<T, std::shared_ptr<Proxy>>) {
       return "[Proxy]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<WeakMap>>) {
+      return "[WeakMap]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<WeakSet>>) {
+      return "[WeakSet]";
     } else {
       return "";
     }
