@@ -153,6 +153,13 @@ StmtPtr Parser::parseFunctionDeclaration() {
 
   expect(TokenType::Function);
 
+  // Check for generator function (function*)
+  bool isGenerator = false;
+  if (match(TokenType::Star)) {
+    isGenerator = true;
+    advance();
+  }
+
   if (!match(TokenType::Identifier)) {
     return nullptr;
   }
@@ -213,6 +220,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.restParam = restParam;
   funcDecl.body = std::move(blockStmt->body);
   funcDecl.isAsync = isAsync;
+  funcDecl.isGenerator = isGenerator;
 
   return std::make_unique<Statement>(std::move(funcDecl));
 }
@@ -1100,6 +1108,26 @@ ExprPtr Parser::parseUnary() {
     return std::make_unique<Expression>(AwaitExpr{std::move(argument)});
   }
 
+  if (match(TokenType::Yield)) {
+    advance();
+    bool delegate = false;
+
+    // Check for yield* (delegate to another iterator)
+    if (match(TokenType::Star)) {
+      delegate = true;
+      advance();
+    }
+
+    // yield can be used without an argument
+    ExprPtr argument = nullptr;
+    if (!match(TokenType::Semicolon) && !match(TokenType::RightBrace) &&
+        !match(TokenType::RightParen) && !match(TokenType::Comma)) {
+      argument = parseAssignment();
+    }
+
+    return std::make_unique<Expression>(YieldExpr{std::move(argument), delegate});
+  }
+
   if (match(TokenType::Bang) || match(TokenType::Minus) ||
       match(TokenType::Plus) || match(TokenType::Typeof)) {
 
@@ -1476,6 +1504,13 @@ ExprPtr Parser::parseFunctionExpression() {
 
   expect(TokenType::Function);
 
+  // Check for generator function (function*)
+  bool isGenerator = false;
+  if (match(TokenType::Star)) {
+    isGenerator = true;
+    advance();
+  }
+
   std::string name;
   if (match(TokenType::Identifier)) {
     name = current().value;
@@ -1529,6 +1564,7 @@ ExprPtr Parser::parseFunctionExpression() {
   funcExpr.restParam = restParam;
   funcExpr.name = name;
   funcExpr.isAsync = isAsync;
+  funcExpr.isGenerator = isGenerator;
   if (blockStmt) {
     funcExpr.body = std::move(blockStmt->body);
   }

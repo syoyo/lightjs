@@ -11,6 +11,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"function", TokenType::Function},
   {"async", TokenType::Async},
   {"await", TokenType::Await},
+  {"yield", TokenType::Yield},
   {"return", TokenType::Return},
   {"if", TokenType::If},
   {"else", TokenType::Else},

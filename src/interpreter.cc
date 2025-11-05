@@ -137,6 +137,8 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return co_await evaluateFunction(*node);
   } else if (auto* node = std::get_if<AwaitExpr>(&expr.node)) {
     co_return co_await evaluateAwait(*node);
+  } else if (auto* node = std::get_if<YieldExpr>(&expr.node)) {
+    co_return co_await evaluateYield(*node);
   }
   co_return Value(Undefined{});
 }
@@ -585,6 +587,47 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     auto func = std::get<std::shared_ptr<Function>>(callee.data);
     if (func->isNative) {
       co_return func->nativeFunc(args);
+    }
+
+    // If it's a generator function, return a Generator object
+    if (func->isGenerator) {
+      auto generator = std::make_shared<Generator>(func, func->closure);
+      GarbageCollector::instance().reportAllocation(sizeof(Generator));
+
+      // Store the arguments in a special property so they can be bound when next() is called
+      // For now, we'll create a child environment and bind parameters immediately
+      auto genEnv = std::static_pointer_cast<Environment>(func->closure);
+      genEnv = genEnv->createChild();
+
+      for (size_t i = 0; i < func->params.size(); ++i) {
+        if (i < args.size()) {
+          genEnv->define(func->params[i].name, args[i]);
+        } else if (func->params[i].defaultValue) {
+          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+          auto defaultTask = evaluate(*defaultExpr);
+          while (!defaultTask.done()) {
+            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+          }
+          genEnv->define(func->params[i].name, defaultTask.result());
+        } else {
+          genEnv->define(func->params[i].name, Value(Undefined{}));
+        }
+      }
+
+      // Handle rest parameter
+      if (func->restParam.has_value()) {
+        auto restArr = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        for (size_t i = func->params.size(); i < args.size(); ++i) {
+          restArr->elements.push_back(args[i]);
+        }
+        genEnv->define(*func->restParam, Value(restArr));
+      }
+
+      // Store the bound environment in the generator context
+      generator->context = genEnv;
+
+      co_return Value(generator);
     }
 
     // If it's an async function, wrap the result in a Promise
@@ -1053,6 +1096,121 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto it = objPtr->properties.find(propName);
     if (it != objPtr->properties.end()) {
       co_return it->second;
+    }
+  }
+
+  // Generator methods
+  if (obj.isGenerator()) {
+    auto genPtr = std::get<std::shared_ptr<Generator>>(obj.data);
+
+    if (propName == "next") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
+        auto resultObj = std::make_shared<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+        if (genPtr->state == GeneratorState::Completed) {
+          resultObj->properties["value"] = Value(Undefined{});
+          resultObj->properties["done"] = Value(true);
+          return Value(resultObj);
+        }
+
+        // Execute the generator function (or resume from yield)
+        if (genPtr->state == GeneratorState::SuspendedStart || genPtr->state == GeneratorState::SuspendedYield) {
+          genPtr->state = GeneratorState::Executing;
+
+          // Get the function and execute its body
+          if (genPtr->function && genPtr->context) {
+            auto prevEnv = this->env_;
+            this->env_ = std::static_pointer_cast<Environment>(genPtr->context);
+
+            auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
+            Value result = Value(Undefined{});
+
+            auto prevFlow = this->flow_;
+            this->flow_ = ControlFlow{};
+
+            // Execute the function body starting from yieldIndex
+            size_t startIndex = genPtr->yieldIndex;
+            for (size_t i = startIndex; i < bodyPtr->size(); i++) {
+              auto task = this->evaluate(*(*bodyPtr)[i]);
+              while (!task.done()) {
+                std::coroutine_handle<>::from_address(task.handle.address()).resume();
+              }
+              result = task.result();
+
+              // Check for control flow changes
+              if (this->flow_.type == ControlFlow::Type::Yield) {
+                // We hit a yield - suspend execution
+                genPtr->state = GeneratorState::SuspendedYield;
+                genPtr->currentValue = std::make_shared<Value>(this->flow_.value);
+                genPtr->yieldIndex = i + 1;  // Resume from next statement
+
+                this->flow_ = prevFlow;
+                this->env_ = prevEnv;
+
+                resultObj->properties["value"] = *genPtr->currentValue;
+                resultObj->properties["done"] = Value(false);
+                return Value(resultObj);
+              }
+
+              if (this->flow_.type == ControlFlow::Type::Return) {
+                // Generator returns - mark as completed
+                genPtr->state = GeneratorState::Completed;
+                genPtr->currentValue = std::make_shared<Value>(this->flow_.value);
+                result = this->flow_.value;
+                break;
+              }
+            }
+
+            this->flow_ = prevFlow;
+            this->env_ = prevEnv;
+
+            // If we finished all statements without explicit return
+            if (genPtr->state != GeneratorState::Completed && genPtr->state != GeneratorState::SuspendedYield) {
+              genPtr->state = GeneratorState::Completed;
+              genPtr->currentValue = std::make_shared<Value>(result);
+            }
+
+            resultObj->properties["value"] = *genPtr->currentValue;
+            resultObj->properties["done"] = Value(genPtr->state == GeneratorState::Completed);
+            return Value(resultObj);
+          }
+        }
+
+        // If already completed or in unexpected state
+        genPtr->state = GeneratorState::Completed;
+        resultObj->properties["value"] = Value(Undefined{});
+        resultObj->properties["done"] = Value(true);
+        return Value(resultObj);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "return") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
+        genPtr->state = GeneratorState::Completed;
+        auto resultObj = std::make_shared<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+        resultObj->properties["value"] = args.empty() ? Value(Undefined{}) : args[0];
+        resultObj->properties["done"] = Value(true);
+        return Value(resultObj);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "throw") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
+        genPtr->state = GeneratorState::Completed;
+        // In a full implementation, this would throw inside the generator
+        throw std::runtime_error(args.empty() ? "Generator error" : args[0].toString());
+      };
+      co_return Value(fn);
     }
   }
 
@@ -1668,6 +1826,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   auto func = std::make_shared<Function>();
   func->isNative = false;
   func->isAsync = expr.isAsync;
+  func->isGenerator = expr.isGenerator;
 
   for (const auto& param : expr.params) {
     FunctionParam funcParam;
@@ -1706,6 +1865,24 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
   }
 
   co_return val;
+}
+
+Task Interpreter::evaluateYield(const YieldExpr& expr) {
+  // Evaluate the yielded value
+  Value yieldedValue = Value(Undefined{});
+  if (expr.argument) {
+    auto task = evaluate(*expr.argument);
+    while (!task.done()) {
+      std::coroutine_handle<>::from_address(task.handle.address()).resume();
+    }
+    yieldedValue = task.result();
+  }
+
+  // Set the Yield control flow to suspend execution
+  flow_.type = ControlFlow::Type::Yield;
+  flow_.value = yieldedValue;
+
+  co_return yieldedValue;
 }
 
 Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
@@ -1798,6 +1975,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   auto func = std::make_shared<Function>();
   func->isNative = false;
   func->isAsync = decl.isAsync;
+  func->isGenerator = decl.isGenerator;
 
   for (const auto& param : decl.params) {
     FunctionParam funcParam;
@@ -2089,8 +2267,112 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     }
   }
 
-  // Iterate over array elements
-  if (auto* arrPtr = std::get_if<std::shared_ptr<Array>>(&iterable.data)) {
+  // Iterate over generator
+  if (auto* genPtr = std::get_if<std::shared_ptr<Generator>>(&iterable.data)) {
+    auto generator = *genPtr;
+
+    // Call generator.next() repeatedly until done
+    while (true) {
+      // Inline generator.next() logic
+      Value nextValue = Value(Undefined{});
+      bool isDone = false;
+
+      if (generator->state == GeneratorState::Completed) {
+        break;
+      }
+
+      // Execute the generator function (or resume from yield)
+      if (generator->state == GeneratorState::SuspendedStart ||
+          generator->state == GeneratorState::SuspendedYield) {
+        generator->state = GeneratorState::Executing;
+
+        // Get the function and execute its body
+        if (generator->function && generator->context) {
+          auto prevEnv = env_;
+          env_ = std::static_pointer_cast<Environment>(generator->context);
+
+          auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(generator->function->body);
+
+          auto prevFlow = flow_;
+          flow_ = ControlFlow{};
+
+          // Execute the function body starting from yieldIndex
+          size_t startIndex = generator->yieldIndex;
+          for (size_t i = startIndex; i < bodyPtr->size(); i++) {
+            auto task = evaluate(*(*bodyPtr)[i]);
+            while (!task.done()) {
+              std::coroutine_handle<>::from_address(task.handle.address()).resume();
+            }
+            Value execResult = task.result();
+
+            // Check for control flow changes
+            if (flow_.type == ControlFlow::Type::Yield) {
+              // We hit a yield - suspend execution
+              generator->state = GeneratorState::SuspendedYield;
+              generator->currentValue = std::make_shared<Value>(flow_.value);
+              generator->yieldIndex = i + 1;  // Resume from next statement
+
+              nextValue = *generator->currentValue;
+              isDone = false;
+
+              flow_ = prevFlow;
+              env_ = prevEnv;
+              goto yield_done;
+            }
+
+            if (flow_.type == ControlFlow::Type::Return) {
+              // Generator returns - mark as completed, don't yield the return value
+              generator->state = GeneratorState::Completed;
+              isDone = true;
+              flow_ = prevFlow;
+              env_ = prevEnv;
+              break;
+            }
+          }
+
+          // If we finished all statements without explicit return
+          if (generator->state != GeneratorState::Completed &&
+              generator->state != GeneratorState::SuspendedYield) {
+            generator->state = GeneratorState::Completed;
+            isDone = true;
+          }
+
+          flow_ = prevFlow;
+          env_ = prevEnv;
+        } else {
+          isDone = true;
+        }
+      } else {
+        isDone = true;
+      }
+
+yield_done:
+      if (isDone) {
+        break;
+      }
+
+      // Assign to loop variable
+      env_->set(varName, nextValue);
+
+      // Execute body
+      auto bodyTask = evaluate(*stmt.body);
+      while (!bodyTask.done()) {
+        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+      }
+      result = bodyTask.result();
+
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        flow_.type = ControlFlow::Type::None;
+        continue;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  } else if (auto* arrPtr = std::get_if<std::shared_ptr<Array>>(&iterable.data)) {
+    // Iterate over array elements
     for (const auto& elem : (*arrPtr)->elements) {
       // Assign the element to the loop variable
       env_->set(varName, elem);

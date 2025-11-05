@@ -33,6 +33,7 @@ add_library(tinyjs
   src/math_object.cc
   src/date_object.cc
   src/unicode.cc
+  src/event_loop.cc
 )
 
 target_include_directories(tinyjs PUBLIC
@@ -89,6 +90,48 @@ add_executable(methods_test
 )
 
 target_link_libraries(methods_test tinyjs)
+
+# Event loop test
+add_executable(event_loop_test
+  tests/event_loop_test.cc
+)
+
+target_link_libraries(event_loop_test tinyjs)
+
+# Generator test
+add_executable(generator_test
+  tests/generator_test.cc
+)
+
+target_link_libraries(generator_test tinyjs)
+
+# Simple generator test
+add_executable(generator_simple_test
+  tests/generator_simple_test.cc
+)
+
+target_link_libraries(generator_simple_test tinyjs)
+
+# Multi-yield generator test
+add_executable(generator_multi_yield_test
+  tests/generator_multi_yield_test.cc
+)
+
+target_link_libraries(generator_multi_yield_test tinyjs)
+
+# Generator for...of test
+add_executable(generator_forof_test
+  tests/generator_forof_test.cc
+)
+
+target_link_libraries(generator_forof_test tinyjs)
+
+# REPL (Read-Eval-Print Loop)
+add_executable(tinyjs_repl
+  src/repl.cc
+)
+
+target_link_libraries(tinyjs_repl tinyjs)
 
 # Test262 conformance runner
 add_executable(test262_runner

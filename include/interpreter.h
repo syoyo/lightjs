@@ -96,7 +96,7 @@ private:
   std::shared_ptr<Environment> env_;
 
   struct ControlFlow {
-    enum class Type { None, Return, Break, Continue, Throw };
+    enum class Type { None, Return, Break, Continue, Throw, Yield };
     Type type = Type::None;
     Value value;
   };
@@ -114,6 +114,7 @@ private:
   Task evaluateObject(const ObjectExpr& expr);
   Task evaluateFunction(const FunctionExpr& expr);
   Task evaluateAwait(const AwaitExpr& expr);
+  Task evaluateYield(const YieldExpr& expr);
 
   Task evaluateVarDecl(const VarDeclaration& decl);
   Task evaluateFuncDecl(const FunctionDeclaration& decl);

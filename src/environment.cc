@@ -8,6 +8,7 @@
 #include "string_methods.h"
 #include "math_object.h"
 #include "date_object.h"
+#include "event_loop.h"
 #include <iostream>
 #include <thread>
 #include <limits>
@@ -1036,6 +1037,113 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Also add globalThis to itself
   globalThisObj->properties["globalThis"] = Value(globalThisObj);
+
+  // Timer functions - setTimeout
+  auto setTimeoutFn = std::make_shared<Function>();
+  setTimeoutFn->isNative = true;
+  setTimeoutFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+    int64_t delayMs = args.size() > 1 ? static_cast<int64_t>(args[1].toNumber()) : 0;
+
+    // Create a timer callback that executes the JS function
+    auto& loop = EventLoopContext::instance().getLoop();
+    TimerId id = loop.setTimeout([callback]() -> Value {
+      // Execute the callback function
+      if (callback->isNative && callback->nativeFunc) {
+        return callback->nativeFunc({});
+      }
+      // For non-native functions, we can't easily execute them here
+      // This will be improved when we integrate with the interpreter
+      return Value(Undefined{});
+    }, delayMs);
+
+    return Value(static_cast<double>(id));
+  };
+  env->define("setTimeout", Value(setTimeoutFn));
+
+  // Timer functions - setInterval
+  auto setIntervalFn = std::make_shared<Function>();
+  setIntervalFn->isNative = true;
+  setIntervalFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+    int64_t intervalMs = args.size() > 1 ? static_cast<int64_t>(args[1].toNumber()) : 0;
+
+    // Create an interval timer callback
+    auto& loop = EventLoopContext::instance().getLoop();
+    TimerId id = loop.setInterval([callback]() -> Value {
+      // Execute the callback function
+      if (callback->isNative && callback->nativeFunc) {
+        return callback->nativeFunc({});
+      }
+      return Value(Undefined{});
+    }, intervalMs);
+
+    return Value(static_cast<double>(id));
+  };
+  env->define("setInterval", Value(setIntervalFn));
+
+  // Timer functions - clearTimeout
+  auto clearTimeoutFn = std::make_shared<Function>();
+  clearTimeoutFn->isNative = true;
+  clearTimeoutFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(Undefined{});
+    }
+
+    TimerId id = static_cast<TimerId>(args[0].toNumber());
+    auto& loop = EventLoopContext::instance().getLoop();
+    loop.clearTimer(id);
+
+    return Value(Undefined{});
+  };
+  env->define("clearTimeout", Value(clearTimeoutFn));
+
+  // Timer functions - clearInterval (same implementation as clearTimeout)
+  auto clearIntervalFn = std::make_shared<Function>();
+  clearIntervalFn->isNative = true;
+  clearIntervalFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(Undefined{});
+    }
+
+    TimerId id = static_cast<TimerId>(args[0].toNumber());
+    auto& loop = EventLoopContext::instance().getLoop();
+    loop.clearTimer(id);
+
+    return Value(Undefined{});
+  };
+  env->define("clearInterval", Value(clearIntervalFn));
+
+  // queueMicrotask function
+  auto queueMicrotaskFn = std::make_shared<Function>();
+  queueMicrotaskFn->isNative = true;
+  queueMicrotaskFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+
+    // Queue the microtask
+    auto& loop = EventLoopContext::instance().getLoop();
+    loop.queueMicrotask([callback]() {
+      // Execute the callback function
+      if (callback->isNative && callback->nativeFunc) {
+        callback->nativeFunc({});
+      }
+    });
+
+    return Value(Undefined{});
+  };
+  env->define("queueMicrotask", Value(queueMicrotaskFn));
 
   return env;
 }

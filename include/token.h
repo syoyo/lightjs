@@ -26,6 +26,7 @@ enum class TokenType {
   Function,
   Async,
   Await,
+  Yield,
   Return,
   If,
   Else,
