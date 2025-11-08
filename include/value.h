@@ -22,7 +22,7 @@
 #include <regex>
 #endif
 
-namespace tinyjs {
+namespace lightjs {
 
 struct Value;
 struct Object;

@@ -1,12 +1,12 @@
-# TinyJS Integration Example
+# LightJS Integration Example
 
-This directory demonstrates how to use TinyJS as a library in your C++ applications.
+This directory demonstrates how to use LightJS as a library in your C++ applications.
 
 ## Building the Example
 
-### Method 1: Using Installed TinyJS
+### Method 1: Using Installed LightJS
 
-If you have installed TinyJS system-wide:
+If you have installed LightJS system-wide:
 
 ```bash
 cd examples/integration
@@ -16,14 +16,14 @@ make
 ./simple_app
 ```
 
-### Method 2: Using TinyJS from Source
+### Method 2: Using LightJS from Source
 
-If building from the TinyJS source tree:
+If building from the LightJS source tree:
 
 ```bash
 cd examples/integration
 mkdir build && cd build
-cmake .. -DCMAKE_PREFIX_PATH=/path/to/tinyjs/install
+cmake .. -DCMAKE_PREFIX_PATH=/path/to/lightjs/install
 make
 ./simple_app
 ```
@@ -33,11 +33,11 @@ make
 You can also compile directly:
 
 ```bash
-# With installed TinyJS
-g++ -std=c++20 simple_app.cc $(pkg-config --cflags --libs tinyjs) -o simple_app
+# With installed LightJS
+g++ -std=c++20 simple_app.cc $(pkg-config --cflags --libs lightjs) -o simple_app
 
 # Or with explicit paths
-g++ -std=c++20 simple_app.cc -I/path/to/tinyjs/include -L/path/to/tinyjs/lib -ltinyjs -o simple_app
+g++ -std=c++20 simple_app.cc -I/path/to/lightjs/include -L/path/to/lightjs/lib -llightjs -o simple_app
 ```
 
 ## Integration Methods
@@ -50,33 +50,33 @@ project(MyApp CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
-find_package(TinyJS REQUIRED)
+find_package(LightJS REQUIRED)
 
 add_executable(my_app main.cc)
-target_link_libraries(my_app PRIVATE TinyJS::tinyjs)
+target_link_libraries(my_app PRIVATE LightJS::lightjs)
 ```
 
 ### Using pkg-config
 
 ```bash
 # Get compiler flags
-pkg-config --cflags tinyjs
+pkg-config --cflags lightjs
 
 # Get linker flags
-pkg-config --libs tinyjs
+pkg-config --libs lightjs
 
 # Compile your application
-g++ -std=c++20 $(pkg-config --cflags tinyjs) my_app.cc $(pkg-config --libs tinyjs)
+g++ -std=c++20 $(pkg-config --cflags lightjs) my_app.cc $(pkg-config --libs lightjs)
 ```
 
 ### Direct Linking
 
 ```cpp
-#include <tinyjs.h>
+#include <lightjs.h>
 
 int main() {
-  auto env = tinyjs::Environment::createGlobal();
-  tinyjs::Interpreter interpreter(env);
+  auto env = lightjs::Environment::createGlobal();
+  lightjs::Interpreter interpreter(env);
 
   // Your code here...
 }
@@ -95,15 +95,15 @@ See `simple_app.cc` for complete examples of:
 
 ## Key Classes
 
-- `tinyjs::Lexer` - Tokenize JavaScript source code
-- `tinyjs::Parser` - Parse tokens into AST
-- `tinyjs::Interpreter` - Execute AST using C++20 coroutines
-- `tinyjs::Environment` - Variable scoping and built-in objects
-- `tinyjs::Value` - JavaScript value representation
+- `lightjs::Lexer` - Tokenize JavaScript source code
+- `lightjs::Parser` - Parse tokens into AST
+- `lightjs::Interpreter` - Execute AST using C++20 coroutines
+- `lightjs::Environment` - Variable scoping and built-in objects
+- `lightjs::Value` - JavaScript value representation
 
 ## Notes
 
 - Requires C++20 compiler with coroutine support
-- Link with `-ltinyjs`
-- Include path: `include/tinyjs/`
-- All TinyJS symbols are in the `tinyjs` namespace
+- Link with `-llightjs`
+- Include path: `include/lightjs/`
+- All LightJS symbols are in the `lightjs` namespace

@@ -5,7 +5,7 @@
 #include <iomanip>
 #include <cmath>
 
-namespace tinyjs {
+namespace lightjs {
 
 class JSONParser {
 private:
@@ -381,4 +381,4 @@ Value JSON_stringify(const std::vector<Value>& args) {
     }
 }
 
-} // namespace tinyjs
+} // namespace lightjs

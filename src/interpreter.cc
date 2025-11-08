@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <unordered_set>
 
-namespace tinyjs {
+namespace lightjs {
 
 Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {}
 

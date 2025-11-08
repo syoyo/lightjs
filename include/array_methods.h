@@ -3,7 +3,7 @@
 #include "value.h"
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Array prototype methods
 Value Array_push(const std::vector<Value>& args);
@@ -22,4 +22,4 @@ Value Array_filter(const std::vector<Value>& args);
 Value Array_reduce(const std::vector<Value>& args);
 Value Array_forEach(const std::vector<Value>& args);
 
-} // namespace tinyjs
+} // namespace lightjs

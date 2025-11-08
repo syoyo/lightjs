@@ -10,7 +10,7 @@
 
 namespace fs = std::filesystem;
 
-namespace tinyjs {
+namespace lightjs {
 
 Module::Module(const std::string& path, const std::string& source)
   : path_(path), source_(source), state_(State::Uninstantiated) {}
@@ -298,4 +298,4 @@ std::string ModuleLoader::normalizePath(const std::string& path) {
   }
 }
 
-} // namespace tinyjs
+} // namespace lightjs

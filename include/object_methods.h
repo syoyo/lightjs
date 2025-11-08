@@ -3,7 +3,7 @@
 #include "value.h"
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Object static methods
 Value Object_keys(const std::vector<Value>& args);
@@ -14,4 +14,4 @@ Value Object_hasOwnProperty(const std::vector<Value>& args);
 Value Object_getOwnPropertyNames(const std::vector<Value>& args);
 Value Object_create(const std::vector<Value>& args);
 
-} // namespace tinyjs
+} // namespace lightjs

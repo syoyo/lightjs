@@ -3,7 +3,7 @@
 #include "value.h"
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Math object methods
 Value Math_abs(const std::vector<Value>& args);
@@ -24,4 +24,4 @@ Value Math_log(const std::vector<Value>& args);
 Value Math_log10(const std::vector<Value>& args);
 Value Math_exp(const std::vector<Value>& args);
 
-} // namespace tinyjs
+} // namespace lightjs

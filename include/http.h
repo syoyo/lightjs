@@ -6,7 +6,7 @@
 #include <memory>
 #include <cstdint>
 
-namespace tinyjs {
+namespace lightjs {
 namespace http {
 
 struct URL {

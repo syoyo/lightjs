@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 namespace unicode {
 
 // UTF-8 utilities
@@ -52,4 +52,4 @@ std::vector<uint32_t> toCodePoints(const std::string& str);
 bool isValidUTF8(const std::string& str);
 
 } // namespace unicode
-} // namespace tinyjs
+} // namespace lightjs

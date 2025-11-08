@@ -5,7 +5,7 @@
 #include <iostream>
 #include <cassert>
 
-using namespace tinyjs;
+using namespace lightjs;
 
 void runGeneratorTest(const std::string& testName, const std::string& code, const std::string& expected) {
   std::cout << "Test: " << testName << std::endl;

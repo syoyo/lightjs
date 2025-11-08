@@ -2,7 +2,7 @@
 #include <unordered_map>
 #include <cctype>
 
-namespace tinyjs {
+namespace lightjs {
 
 static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"let", TokenType::Let},

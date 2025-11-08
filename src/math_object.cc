@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Math.abs
 Value Math_abs(const std::vector<Value>& args) {
@@ -258,4 +258,4 @@ Value Math_exp(const std::vector<Value>& args) {
     return Value(std::exp(x));
 }
 
-} // namespace tinyjs
+} // namespace lightjs

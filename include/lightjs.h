@@ -1,28 +1,28 @@
 #pragma once
 
 /**
- * @file tinyjs.h
- * @brief TinyJS - C++20 JavaScript ES2020 Interpreter
+ * @file lightjs.h
+ * @brief LightJS - C++20 JavaScript ES2020 Interpreter
  *
- * This is the main convenience header that includes all public TinyJS APIs.
- * Include this single header to use TinyJS in your application.
+ * This is the main convenience header that includes all public LightJS APIs.
+ * Include this single header to use LightJS in your application.
  *
  * @example
  * ```cpp
- * #include <tinyjs.h>
+ * #include <lightjs.h>
  *
  * int main() {
  *   // Create global environment
- *   auto env = tinyjs::Environment::createGlobal();
+ *   auto env = lightjs::Environment::createGlobal();
  *
  *   // Create interpreter
- *   tinyjs::Interpreter interpreter(env);
+ *   lightjs::Interpreter interpreter(env);
  *
  *   // Parse JavaScript code
- *   tinyjs::Lexer lexer("let x = 40 + 2; x;");
+ *   lightjs::Lexer lexer("let x = 40 + 2; x;");
  *   auto tokens = lexer.tokenize();
  *
- *   tinyjs::Parser parser(tokens);
+ *   lightjs::Parser parser(tokens);
  *   auto program = parser.parse();
  *
  *   // Evaluate
@@ -32,7 +32,7 @@
  *   }
  *
  *   // Get result
- *   tinyjs::Value result = task.result();
+ *   lightjs::Value result = task.result();
  *   std::cout << result.toString() << std::endl; // Output: 42
  *
  *   return 0;
@@ -69,15 +69,15 @@
 #include "simple_regex.h"
 
 /**
- * @namespace tinyjs
- * @brief Main namespace for TinyJS interpreter
+ * @namespace lightjs
+ * @brief Main namespace for LightJS interpreter
  *
- * All TinyJS classes and functions are in this namespace.
+ * All LightJS classes and functions are in this namespace.
  */
-namespace tinyjs {
+namespace lightjs {
 
 /**
- * @brief Get TinyJS version string
+ * @brief Get LightJS version string
  * @return Version string in format "MAJOR.MINOR.PATCH"
  */
 inline const char* version() {
@@ -85,24 +85,24 @@ inline const char* version() {
 }
 
 /**
- * @brief Get TinyJS version major number
+ * @brief Get LightJS version major number
  */
 inline int version_major() {
   return 1;
 }
 
 /**
- * @brief Get TinyJS version minor number
+ * @brief Get LightJS version minor number
  */
 inline int version_minor() {
   return 0;
 }
 
 /**
- * @brief Get TinyJS version patch number
+ * @brief Get LightJS version patch number
  */
 inline int version_patch() {
   return 0;
 }
 
-} // namespace tinyjs
+} // namespace lightjs

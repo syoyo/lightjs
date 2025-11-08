@@ -5,7 +5,7 @@
 #include <vector>
 #include <optional>
 
-namespace tinyjs {
+namespace lightjs {
 
 class Parser {
 public:

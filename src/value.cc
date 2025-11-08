@@ -2,7 +2,7 @@
 #include <sstream>
 #include <cmath>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Initialize static member for Symbol IDs
 size_t Symbol::nextId = 0;

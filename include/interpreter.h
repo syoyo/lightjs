@@ -7,7 +7,7 @@
 #include <optional>
 #include <memory>
 
-namespace tinyjs {
+namespace lightjs {
 
 struct Task {
   struct promise_type {

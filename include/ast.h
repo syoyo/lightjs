@@ -7,7 +7,7 @@
 #include <optional>
 #include <cstdint>
 
-namespace tinyjs {
+namespace lightjs {
 
 struct Expression;
 struct Statement;

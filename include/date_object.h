@@ -3,7 +3,7 @@
 #include "value.h"
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Date constructor and static methods
 Value Date_constructor(const std::vector<Value>& args);
@@ -22,4 +22,4 @@ Value Date_getSeconds(const std::vector<Value>& args);
 Value Date_toString(const std::vector<Value>& args);
 Value Date_toISOString(const std::vector<Value>& args);
 
-} // namespace tinyjs
+} // namespace lightjs

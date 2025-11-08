@@ -3,7 +3,7 @@
 #include "value.h"
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 // String prototype methods
 Value String_charAt(const std::vector<Value>& args);
@@ -24,4 +24,4 @@ Value String_trim(const std::vector<Value>& args);
 Value String_fromCharCode(const std::vector<Value>& args);
 Value String_fromCodePoint(const std::vector<Value>& args);
 
-} // namespace tinyjs
+} // namespace lightjs

@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 
 class Environment;
 class Interpreter;
@@ -97,4 +97,4 @@ private:
   std::string basePath_;
 };
 
-} // namespace tinyjs
+} // namespace lightjs

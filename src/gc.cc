@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <iostream>
 
-namespace tinyjs {
+namespace lightjs {
 
 thread_local bool GarbageCollector::gcDisabled_ = false;
 
@@ -235,4 +235,4 @@ void GarbageCollector::reportDeallocation(size_t bytes) {
     // Track deallocations if needed
 }
 
-} // namespace tinyjs
+} // namespace lightjs

@@ -2,7 +2,7 @@
 #include <sstream>
 #include <iomanip>
 
-namespace tinyjs {
+namespace lightjs {
 namespace crypto {
 
 SHA256::SHA256() {

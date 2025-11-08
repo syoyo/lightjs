@@ -1,6 +1,6 @@
-# TinyJS Library Integration Guide
+# LightJS Library Integration Guide
 
-This guide explains how to use TinyJS as a library in your C++ applications.
+This guide explains how to use LightJS as a library in your C++ applications.
 
 ## Table of Contents
 
@@ -16,7 +16,7 @@ This guide explains how to use TinyJS as a library in your C++ applications.
 ### System-Wide Installation
 
 ```bash
-# Build and install TinyJS
+# Build and install LightJS
 mkdir build && cd build
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
 make -j
@@ -24,11 +24,11 @@ sudo make install
 ```
 
 This installs:
-- Headers to `/usr/local/include/tinyjs/`
-- Library to `/usr/local/lib/libtinyjs.{a,so}`
-- CMake config to `/usr/local/lib/cmake/TinyJS/`
-- pkg-config file to `/usr/local/lib/pkgconfig/tinyjs.pc`
-- REPL binary to `/usr/local/bin/tinyjs`
+- Headers to `/usr/local/include/lightjs/`
+- Library to `/usr/local/lib/liblightjs.{a,so}`
+- CMake config to `/usr/local/lib/cmake/LightJS/`
+- pkg-config file to `/usr/local/lib/pkgconfig/lightjs.pc`
+- REPL binary to `/usr/local/bin/lightjs`
 
 ### Custom Installation Prefix
 
@@ -48,11 +48,11 @@ project(MyApp CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find TinyJS
-find_package(TinyJS REQUIRED)
+# Find LightJS
+find_package(LightJS REQUIRED)
 
 add_executable(my_app main.cc)
-target_link_libraries(my_app PRIVATE TinyJS::tinyjs)
+target_link_libraries(my_app PRIVATE LightJS::lightjs)
 ```
 
 **Benefits:**
@@ -63,22 +63,22 @@ target_link_libraries(my_app PRIVATE TinyJS::tinyjs)
 
 **Usage:**
 ```bash
-cmake .. -DCMAKE_PREFIX_PATH=/path/to/tinyjs/install
+cmake .. -DCMAKE_PREFIX_PATH=/path/to/lightjs/install
 ```
 
 ### 2. pkg-config
 
 ```bash
 # Get compilation flags
-pkg-config --cflags tinyjs
-# Output: -I/usr/local/include/tinyjs -std=c++20
+pkg-config --cflags lightjs
+# Output: -I/usr/local/include/lightjs -std=c++20
 
 # Get linking flags
-pkg-config --libs tinyjs
-# Output: -L/usr/local/lib -ltinyjs
+pkg-config --libs lightjs
+# Output: -L/usr/local/lib -llightjs
 
 # Compile application
-g++ -std=c++20 $(pkg-config --cflags tinyjs) main.cc $(pkg-config --libs tinyjs) -o my_app
+g++ -std=c++20 $(pkg-config --cflags lightjs) main.cc $(pkg-config --libs lightjs) -o my_app
 ```
 
 **Benefits:**
@@ -89,19 +89,19 @@ g++ -std=c++20 $(pkg-config --cflags tinyjs) main.cc $(pkg-config --libs tinyjs)
 ### 3. Manual Linking
 
 ```bash
-g++ -std=c++20 -I/usr/local/include/tinyjs main.cc -L/usr/local/lib -ltinyjs -o my_app
+g++ -std=c++20 -I/usr/local/include/lightjs main.cc -L/usr/local/lib -llightjs -o my_app
 ```
 
 ## CMake Build Options
 
-When building TinyJS from source, you can customize the build:
+When building LightJS from source, you can customize the build:
 
 ```bash
 cmake .. \
-  -DTINYJS_BUILD_TESTS=ON \      # Build test suite (default: ON)
-  -DTINYJS_BUILD_REPL=ON \       # Build REPL executable (default: ON)
-  -DTINYJS_BUILD_EXAMPLES=ON \   # Build examples (default: ON)
-  -DTINYJS_INSTALL=ON \          # Generate install target (default: ON)
+  -DLIGHTJS_BUILD_TESTS=ON \      # Build test suite (default: ON)
+  -DLIGHTJS_BUILD_REPL=ON \       # Build REPL executable (default: ON)
+  -DLIGHTJS_BUILD_EXAMPLES=ON \   # Build examples (default: ON)
+  -DLIGHTJS_INSTALL=ON \          # Generate install target (default: ON)
   -DUSE_SIMPLE_REGEX=OFF         # Use simple regex vs std::regex (default: OFF)
 ```
 
@@ -111,9 +111,9 @@ To build only the library without tests or REPL:
 
 ```bash
 cmake .. \
-  -DTINYJS_BUILD_TESTS=OFF \
-  -DTINYJS_BUILD_REPL=OFF \
-  -DTINYJS_BUILD_EXAMPLES=OFF
+  -DLIGHTJS_BUILD_TESTS=OFF \
+  -DLIGHTJS_BUILD_REPL=OFF \
+  -DLIGHTJS_BUILD_EXAMPLES=OFF
 make
 ```
 
@@ -122,15 +122,15 @@ make
 ### Basic Usage Pattern
 
 ```cpp
-#include <tinyjs.h>
+#include <lightjs.h>
 
-tinyjs::Value evaluate(const std::string& code) {
+lightjs::Value evaluate(const std::string& code) {
   // 1. Tokenize source code
-  tinyjs::Lexer lexer(code);
+  lightjs::Lexer lexer(code);
   auto tokens = lexer.tokenize();
 
   // 2. Parse tokens into AST
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
   if (!program) {
@@ -138,10 +138,10 @@ tinyjs::Value evaluate(const std::string& code) {
   }
 
   // 3. Create environment with built-ins
-  auto env = tinyjs::Environment::createGlobal();
+  auto env = lightjs::Environment::createGlobal();
 
   // 4. Create interpreter
-  tinyjs::Interpreter interpreter(env);
+  lightjs::Interpreter interpreter(env);
 
   // 5. Evaluate using C++20 coroutines
   auto task = interpreter.evaluate(*program);
@@ -185,11 +185,11 @@ tinyjs::Value evaluate(const std::string& code) {
 
 ```cpp
 // Creating values
-tinyjs::Value undef(tinyjs::Undefined{});
-tinyjs::Value null(tinyjs::Null{});
-tinyjs::Value boolean(true);
-tinyjs::Value number(42.0);
-tinyjs::Value string("hello");
+lightjs::Value undef(lightjs::Undefined{});
+lightjs::Value null(lightjs::Null{});
+lightjs::Value boolean(true);
+lightjs::Value number(42.0);
+lightjs::Value string("hello");
 
 // Type checking
 value.isUndefined()
@@ -208,18 +208,18 @@ value.isGenerator()
 ### Example 1: Simple Evaluation
 
 ```cpp
-#include <tinyjs.h>
+#include <lightjs.h>
 #include <iostream>
 
 int main() {
-  tinyjs::Lexer lexer("40 + 2");
+  lightjs::Lexer lexer("40 + 2");
   auto tokens = lexer.tokenize();
 
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
-  auto env = tinyjs::Environment::createGlobal();
-  tinyjs::Interpreter interpreter(env);
+  auto env = lightjs::Environment::createGlobal();
+  lightjs::Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
   while (!task.done()) {
@@ -234,14 +234,14 @@ int main() {
 
 ```cpp
 // Create shared environment
-auto env = tinyjs::Environment::createGlobal();
-tinyjs::Interpreter interpreter(env);
+auto env = lightjs::Environment::createGlobal();
+lightjs::Interpreter interpreter(env);
 
 // Define function
 {
-  tinyjs::Lexer lexer("function greet(name) { return 'Hello, ' + name; }");
+  lightjs::Lexer lexer("function greet(name) { return 'Hello, ' + name; }");
   auto tokens = lexer.tokenize();
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
   auto task = interpreter.evaluate(*program);
@@ -252,9 +252,9 @@ tinyjs::Interpreter interpreter(env);
 
 // Call function later
 {
-  tinyjs::Lexer lexer("greet('World')");
+  lightjs::Lexer lexer("greet('World')");
   auto tokens = lexer.tokenize();
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
   auto task = interpreter.evaluate(*program);
@@ -269,23 +269,23 @@ tinyjs::Interpreter interpreter(env);
 ### Example 3: Custom Native Functions
 
 ```cpp
-auto env = tinyjs::Environment::createGlobal();
+auto env = lightjs::Environment::createGlobal();
 
 // Define custom native function
-auto printFunc = std::make_shared<tinyjs::Function>();
+auto printFunc = std::make_shared<lightjs::Function>();
 printFunc->isNative = true;
-printFunc->nativeFunc = [](const std::vector<tinyjs::Value>& args) -> tinyjs::Value {
+printFunc->nativeFunc = [](const std::vector<lightjs::Value>& args) -> lightjs::Value {
   for (const auto& arg : args) {
     std::cout << arg.toString() << " ";
   }
   std::cout << std::endl;
-  return tinyjs::Value(tinyjs::Undefined{});
+  return lightjs::Value(lightjs::Undefined{});
 };
 
-env->define("print", tinyjs::Value(printFunc));
+env->define("print", lightjs::Value(printFunc));
 
 // Now 'print' is available in JavaScript
-tinyjs::Interpreter interpreter(env);
+lightjs::Interpreter interpreter(env);
 // ... evaluate code that calls print()
 ```
 
@@ -293,10 +293,10 @@ tinyjs::Interpreter interpreter(env);
 
 ```cpp
 try {
-  tinyjs::Lexer lexer(code);
+  lightjs::Lexer lexer(code);
   auto tokens = lexer.tokenize();
 
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
   if (!program) {
@@ -304,8 +304,8 @@ try {
     return;
   }
 
-  auto env = tinyjs::Environment::createGlobal();
-  tinyjs::Interpreter interpreter(env);
+  auto env = lightjs::Environment::createGlobal();
+  lightjs::Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
   while (!task.done()) {
@@ -328,8 +328,8 @@ Creating a global environment is expensive. Reuse it when evaluating multiple sc
 
 ```cpp
 // Good: Create once, reuse
-auto env = tinyjs::Environment::createGlobal();
-tinyjs::Interpreter interpreter(env);
+auto env = lightjs::Environment::createGlobal();
+lightjs::Interpreter interpreter(env);
 
 for (const auto& script : scripts) {
   // Evaluate multiple scripts with same environment
@@ -337,8 +337,8 @@ for (const auto& script : scripts) {
 
 // Bad: Creating environment for each script
 for (const auto& script : scripts) {
-  auto env = tinyjs::Environment::createGlobal(); // Expensive!
-  tinyjs::Interpreter interpreter(env);
+  auto env = lightjs::Environment::createGlobal(); // Expensive!
+  lightjs::Interpreter interpreter(env);
 }
 ```
 
@@ -378,18 +378,18 @@ if (value.isNumber()) {
 
 ### 5. Memory Management
 
-TinyJS uses automatic garbage collection. No manual memory management needed for JavaScript objects.
+LightJS uses automatic garbage collection. No manual memory management needed for JavaScript objects.
 
 ### 6. Thread Safety
 
-TinyJS is not thread-safe. Use separate `Environment` and `Interpreter` instances per thread.
+LightJS is not thread-safe. Use separate `Environment` and `Interpreter` instances per thread.
 
 ## Library Structure
 
 ```
-libtinyjs.{a,so}          # Main library
-include/tinyjs/
-  ├── tinyjs.h            # Convenience header (include this)
+liblightjs.{a,so}          # Main library
+include/lightjs/
+  ├── lightjs.h            # Convenience header (include this)
   ├── lexer.h             # Tokenizer
   ├── parser.h            # Parser
   ├── interpreter.h       # Interpreter
@@ -413,14 +413,14 @@ include/tinyjs/
 
 ## Troubleshooting
 
-**Issue:** `cannot find -ltinyjs`
-- Ensure TinyJS is installed
+**Issue:** `cannot find -llightjs`
+- Ensure LightJS is installed
 - Add library path: `-L/path/to/lib`
 - Set `LD_LIBRARY_PATH` for shared library
 
-**Issue:** `tinyjs.h: No such file or directory`
-- Add include path: `-I/path/to/include/tinyjs`
-- Or use `$(pkg-config --cflags tinyjs)`
+**Issue:** `lightjs.h: No such file or directory`
+- Add include path: `-I/path/to/include/lightjs`
+- Or use `$(pkg-config --cflags lightjs)`
 
 **Issue:** Coroutine errors
 - Ensure C++20 is enabled: `-std=c++20`
@@ -431,4 +431,4 @@ include/tinyjs/
 - See `examples/integration/` for complete examples
 - See `CLAUDE.md` for architecture details
 - See `REPL_USAGE.md` for REPL documentation
-- Run `tinyjs --help` for REPL usage
+- Run `lightjs --help` for REPL usage

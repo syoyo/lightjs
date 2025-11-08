@@ -2,7 +2,7 @@
 #include "lexer.h"
 #include <stdexcept>
 
-namespace tinyjs {
+namespace lightjs {
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 

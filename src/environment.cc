@@ -14,7 +14,7 @@
 #include <limits>
 #include <cmath>
 
-namespace tinyjs {
+namespace lightjs {
 
 Environment::Environment(std::shared_ptr<Environment> parent)
   : parent_(parent) {}

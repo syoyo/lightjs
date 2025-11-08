@@ -5,7 +5,7 @@
 #include <memory>
 #include <optional>
 
-namespace tinyjs {
+namespace lightjs {
 
 class Environment : public std::enable_shared_from_this<Environment> {
 public:

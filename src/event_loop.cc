@@ -2,7 +2,7 @@
 #include <thread>
 #include <algorithm>
 
-namespace tinyjs {
+namespace lightjs {
 
 EventLoop::EventLoop()
   : nextTimerId_(1), running_(false) {}

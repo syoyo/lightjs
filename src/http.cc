@@ -21,7 +21,7 @@
   #define CLOSE_SOCKET close
 #endif
 
-namespace tinyjs {
+namespace lightjs {
 namespace http {
 
 URL URL::parse(const std::string& url) {

@@ -1,15 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(TinyJS
+project(LightJS
   VERSION 1.0.0
   DESCRIPTION "C++20 JavaScript ES2020 Interpreter"
   LANGUAGES CXX
 )
 
 # Project options
-option(TINYJS_BUILD_TESTS "Build TinyJS tests" ON)
-option(TINYJS_BUILD_REPL "Build TinyJS REPL" ON)
-option(TINYJS_BUILD_EXAMPLES "Build TinyJS examples" ON)
-option(TINYJS_INSTALL "Generate install target" ON)
+option(LIGHTJS_BUILD_TESTS "Build LightJS tests" ON)
+option(LIGHTJS_BUILD_REPL "Build LightJS REPL" ON)
+option(LIGHTJS_BUILD_EXAMPLES "Build LightJS examples" ON)
+option(LIGHTJS_INSTALL "Generate install target" ON)
 option(USE_SIMPLE_REGEX "Use simple regex implementation instead of std::regex" OFF)
 
 # C++ standard
@@ -31,10 +31,10 @@ endif()
 include(GNUInstallDirs)
 
 # ==============================================================================
-# TinyJS Core Library
+# LightJS Core Library
 # ==============================================================================
 
-set(TINYJS_CORE_SOURCES
+set(LIGHTJS_CORE_SOURCES
   src/lexer.cc
   src/parser.cc
   src/value.cc
@@ -55,8 +55,8 @@ set(TINYJS_CORE_SOURCES
   src/event_loop.cc
 )
 
-set(TINYJS_PUBLIC_HEADERS
-  include/tinyjs.h
+set(LIGHTJS_PUBLIC_HEADERS
+  include/lightjs.h
   include/ast.h
   include/environment.h
   include/interpreter.h
@@ -80,33 +80,33 @@ set(TINYJS_PUBLIC_HEADERS
 )
 
 # Create main library target
-add_library(tinyjs ${TINYJS_CORE_SOURCES})
-add_library(TinyJS::tinyjs ALIAS tinyjs)
+add_library(lightjs ${LIGHTJS_CORE_SOURCES})
+add_library(LightJS::lightjs ALIAS lightjs)
 
 # Set library properties
-set_target_properties(tinyjs PROPERTIES
+set_target_properties(lightjs PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION 1
-  PUBLIC_HEADER "${TINYJS_PUBLIC_HEADERS}"
-  EXPORT_NAME tinyjs
+  PUBLIC_HEADER "${LIGHTJS_PUBLIC_HEADERS}"
+  EXPORT_NAME lightjs
 )
 
 # Include directories
-target_include_directories(tinyjs
+target_include_directories(lightjs
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/tinyjs>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/lightjs>
 )
 
 # ==============================================================================
 # REPL Executable
 # ==============================================================================
 
-if(TINYJS_BUILD_REPL)
-  add_executable(tinyjs_repl src/repl.cc)
-  target_link_libraries(tinyjs_repl PRIVATE TinyJS::tinyjs)
-  set_target_properties(tinyjs_repl PROPERTIES
-    OUTPUT_NAME tinyjs
+if(LIGHTJS_BUILD_REPL)
+  add_executable(lightjs_repl src/repl.cc)
+  target_link_libraries(lightjs_repl PRIVATE LightJS::lightjs)
+  set_target_properties(lightjs_repl PROPERTIES
+    OUTPUT_NAME lightjs
   )
 endif()
 
@@ -114,40 +114,40 @@ endif()
 # Tests
 # ==============================================================================
 
-if(TINYJS_BUILD_TESTS)
+if(LIGHTJS_BUILD_TESTS)
   enable_testing()
 
   # Helper function to create test executables
-  function(add_tinyjs_test TEST_NAME TEST_SOURCE)
+  function(add_lightjs_test TEST_NAME TEST_SOURCE)
     add_executable(${TEST_NAME} ${TEST_SOURCE})
-    target_link_libraries(${TEST_NAME} PRIVATE TinyJS::tinyjs)
+    target_link_libraries(${TEST_NAME} PRIVATE LightJS::lightjs)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
   endfunction()
 
   # Core functionality tests
-  add_tinyjs_test(tinyjs_test tests/test.cc)
-  add_tinyjs_test(gc_test tests/gc_test.cc)
-  add_tinyjs_test(json_object_test tests/json_object_test.cc)
-  add_tinyjs_test(methods_test tests/methods_test.cc)
+  add_lightjs_test(lightjs_test tests/test.cc)
+  add_lightjs_test(gc_test tests/gc_test.cc)
+  add_lightjs_test(json_object_test tests/json_object_test.cc)
+  add_lightjs_test(methods_test tests/methods_test.cc)
 
   # Event loop tests
-  add_tinyjs_test(event_loop_test tests/event_loop_test.cc)
+  add_lightjs_test(event_loop_test tests/event_loop_test.cc)
 
   # Generator tests
-  add_tinyjs_test(generator_test tests/generator_test.cc)
-  add_tinyjs_test(generator_simple_test tests/generator_simple_test.cc)
-  add_tinyjs_test(generator_multi_yield_test tests/generator_multi_yield_test.cc)
-  add_tinyjs_test(generator_forof_test tests/generator_forof_test.cc)
+  add_lightjs_test(generator_test tests/generator_test.cc)
+  add_lightjs_test(generator_simple_test tests/generator_simple_test.cc)
+  add_lightjs_test(generator_multi_yield_test tests/generator_multi_yield_test.cc)
+  add_lightjs_test(generator_forof_test tests/generator_forof_test.cc)
 
   # Debug tests (not added to CTest suite)
   add_executable(debug_test tests/debug_test.cc)
-  target_link_libraries(debug_test PRIVATE TinyJS::tinyjs)
+  target_link_libraries(debug_test PRIVATE LightJS::lightjs)
 
   add_executable(debug_test2 tests/debug_test2.cc)
-  target_link_libraries(debug_test2 PRIVATE TinyJS::tinyjs)
+  target_link_libraries(debug_test2 PRIVATE LightJS::lightjs)
 
   add_executable(simple_object_test tests/simple_object_test.cc)
-  target_link_libraries(simple_object_test PRIVATE TinyJS::tinyjs)
+  target_link_libraries(simple_object_test PRIVATE LightJS::lightjs)
 
   # Test262 conformance runner
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test262/test262_runner.cc)
@@ -155,7 +155,7 @@ if(TINYJS_BUILD_TESTS)
       test262/test262_runner.cc
       test262/test262_harness.cc
     )
-    target_link_libraries(test262_runner PRIVATE TinyJS::tinyjs)
+    target_link_libraries(test262_runner PRIVATE LightJS::lightjs)
     target_include_directories(test262_runner PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/test262
     )
@@ -166,60 +166,60 @@ endif()
 # Installation
 # ==============================================================================
 
-if(TINYJS_INSTALL)
+if(LIGHTJS_INSTALL)
   # Install library
-  install(TARGETS tinyjs
-    EXPORT TinyJSTargets
+  install(TARGETS lightjs
+    EXPORT LightJSTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tinyjs
+    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lightjs
   )
 
   # Install REPL
-  if(TINYJS_BUILD_REPL)
-    install(TARGETS tinyjs_repl
+  if(LIGHTJS_BUILD_REPL)
+    install(TARGETS lightjs_repl
       RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
   endif()
 
   # Install CMake package configuration
-  install(EXPORT TinyJSTargets
-    FILE TinyJSTargets.cmake
-    NAMESPACE TinyJS::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TinyJS
+  install(EXPORT LightJSTargets
+    FILE LightJSTargets.cmake
+    NAMESPACE LightJS::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LightJS
   )
 
   # Create and install package config file
   include(CMakePackageConfigHelpers)
 
   configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/TinyJSConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/TinyJSConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TinyJS
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/LightJSConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/LightJSConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LightJS
   )
 
   write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/TinyJSConfigVersion.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/LightJSConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
   )
 
   install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/TinyJSConfig.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/TinyJSConfigVersion.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TinyJS
+    ${CMAKE_CURRENT_BINARY_DIR}/LightJSConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/LightJSConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LightJS
   )
 
   # Install pkg-config file
   configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tinyjs.pc.in
-    ${CMAKE_CURRENT_BINARY_DIR}/tinyjs.pc
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lightjs.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/lightjs.pc
     @ONLY
   )
 
   install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/tinyjs.pc
+    ${CMAKE_CURRENT_BINARY_DIR}/lightjs.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
   )
 
@@ -237,7 +237,7 @@ endif()
 # ==============================================================================
 
 message(STATUS "")
-message(STATUS "TinyJS Configuration Summary")
+message(STATUS "LightJS Configuration Summary")
 message(STATUS "============================")
 message(STATUS "Version:           ${PROJECT_VERSION}")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
@@ -246,9 +246,9 @@ message(STATUS "C++ standard:      ${CMAKE_CXX_STANDARD}")
 message(STATUS "Install prefix:    ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")
 message(STATUS "Options:")
-message(STATUS "  Build tests:     ${TINYJS_BUILD_TESTS}")
-message(STATUS "  Build REPL:      ${TINYJS_BUILD_REPL}")
-message(STATUS "  Build examples:  ${TINYJS_BUILD_EXAMPLES}")
-message(STATUS "  Install:         ${TINYJS_INSTALL}")
+message(STATUS "  Build tests:     ${LIGHTJS_BUILD_TESTS}")
+message(STATUS "  Build REPL:      ${LIGHTJS_BUILD_REPL}")
+message(STATUS "  Build examples:  ${LIGHTJS_BUILD_EXAMPLES}")
+message(STATUS "  Install:         ${LIGHTJS_INSTALL}")
 message(STATUS "  Simple regex:    ${USE_SIMPLE_REGEX}")
 message(STATUS "")

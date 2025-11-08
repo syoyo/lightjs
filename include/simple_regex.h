@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-namespace tinyjs {
+namespace lightjs {
 namespace simple_regex {
 
 class Regex {

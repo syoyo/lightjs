@@ -1,7 +1,7 @@
 #include "unicode.h"
 #include <stdexcept>
 
-namespace tinyjs {
+namespace lightjs {
 namespace unicode {
 
 // Get the length of a UTF-8 string in code points
@@ -197,4 +197,4 @@ bool isValidUTF8(const std::string& str) {
 }
 
 } // namespace unicode
-} // namespace tinyjs
+} // namespace lightjs

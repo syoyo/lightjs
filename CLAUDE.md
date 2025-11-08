@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TinyJS is a C++20 JavaScript (ES2020) interpreter featuring:
+LightJS is a C++20 JavaScript (ES2020) interpreter featuring:
 - C++20 coroutine-based async execution model
 - **Full async/await support** for asynchronous programming
 - No C++ exceptions (`-fno-exceptions` removed, but try/catch is used)
@@ -29,7 +29,7 @@ cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
 # Run all tests (197 tests)
-./tinyjs_test
+./lightjs_test
 
 # Rebuild after changes
 make
@@ -115,7 +115,7 @@ Implements lexical scoping with parent chain:
 
 ### Unicode Support (`include/unicode.h`, `src/unicode.cc`)
 
-TinyJS provides full UTF-8 Unicode support:
+LightJS provides full UTF-8 Unicode support:
 - **UTF-8 aware string operations**: All string methods work with Unicode code points, not bytes
 - **String length**: Returns code point count, not byte count (e.g., "👋".length === 1)
 - **Character access**: `charAt()` returns full Unicode characters including emoji
@@ -251,7 +251,7 @@ runTest("Test name", R"(
 
 **When adding features:**
 1. Add test cases to `test.cc` using `runTest()`
-2. Build and verify: `make && ./tinyjs_test`
+2. Build and verify: `make && ./lightjs_test`
 3. All 46 tests must pass before committing
 
 ## Platform Considerations

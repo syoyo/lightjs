@@ -1,8 +1,8 @@
-# TinyJS REPL - Interactive JavaScript Shell
+# LightJS REPL - Interactive JavaScript Shell
 
 ## Overview
 
-The TinyJS REPL (Read-Eval-Print Loop) provides an interactive command-line interface for executing JavaScript code in real-time. It's perfect for:
+The LightJS REPL (Read-Eval-Print Loop) provides an interactive command-line interface for executing JavaScript code in real-time. It's perfect for:
 - Quick experimentation with JavaScript features
 - Testing code snippets
 - Learning JavaScript
@@ -13,18 +13,18 @@ The TinyJS REPL (Read-Eval-Print Loop) provides an interactive command-line inte
 ```bash
 cd build
 cmake ..
-make tinyjs_repl
+make lightjs_repl
 ```
 
 ## Running the REPL
 
 ```bash
-./tinyjs_repl
+./lightjs_repl
 ```
 
 You'll see the welcome message:
 ```
-TinyJS REPL v1.0.0
+LightJS REPL v1.0.0
 Type '.help' for help, '.exit' to quit
 
 >
@@ -90,7 +90,7 @@ Error: ReferenceError: undefinedVariable is not defined
 ```
 
 ### 6. **Full ES2020 Support**
-The REPL supports all TinyJS features:
+The REPL supports all LightJS features:
 
 **Modern Syntax:**
 ```javascript
@@ -213,5 +213,5 @@ Potential improvements:
 
 ## See Also
 
-- [TinyJS README](README.md) - Main project documentation
+- [LightJS README](README.md) - Main project documentation
 - [CLAUDE.md](CLAUDE.md) - Development guidelines

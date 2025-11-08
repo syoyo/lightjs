@@ -8,7 +8,7 @@
 #include <memory>
 #include <mutex>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Forward declarations
 class Interpreter;
