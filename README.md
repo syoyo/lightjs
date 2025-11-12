@@ -314,7 +314,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/lightjs.git
+git clone https://github.com/syoyo/lightjs.git
 cd lightjs
 
 # Create build directory
