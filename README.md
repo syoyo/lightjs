@@ -1,5 +1,7 @@
 # LightJS
 
+W.I.P.
+
 A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScript support planned.
 
 ## Features
@@ -694,7 +696,7 @@ Contributions are welcome! Please focus on:
 
 ## License
 
-[Specify your license here]
+MIT license.
 
 ## Acknowledgments
 
