@@ -2,7 +2,8 @@
 
 W.I.P.
 
-A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScript support planned.
+A modern, compact JavaScript (ES2020) interpreter written in C++20
+(TypeScript support planned.)
 
 [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-❤️-pink?logo=github)](https://github.com/sponsors/syoyo)
 
