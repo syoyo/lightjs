@@ -61,6 +61,7 @@ set(LIGHTJS_CORE_SOURCES
   src/tls_connection.cc
   src/wasm/wasm_memory.cc
   src/wasm/wasm_decoder.cc
+  src/wasm/wasm_interpreter.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS
