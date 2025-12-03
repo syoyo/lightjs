@@ -72,13 +72,42 @@ struct Function : public GCObject {
   bool isNative;
   bool isAsync;
   bool isGenerator;
+  bool isConstructor = false;  // Can be called with 'new'
   NativeFunction nativeFunc;
 
-  Function() : isNative(false), isAsync(false), isGenerator(false) {}
+  Function() : isNative(false), isAsync(false), isGenerator(false), isConstructor(false) {}
 
   // GCObject interface
   const char* typeName() const override { return "Function"; }
   void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// Class structure for ES6 classes
+struct Class : public GCObject {
+  std::string name;
+  std::shared_ptr<Function> constructor;  // The constructor function
+  std::shared_ptr<Class> superClass;       // Parent class (if any)
+  std::unordered_map<std::string, std::shared_ptr<Function>> methods;        // Instance methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> staticMethods;  // Static methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> getters;        // Getter methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> setters;        // Setter methods
+  std::shared_ptr<void> closure;  // Closure environment
+
+  Class() = default;
+  Class(const std::string& n) : name(n) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "Class"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {
+    if (constructor) refs.push_back(constructor.get());
+    if (superClass) refs.push_back(superClass.get());
+    for (const auto& [_, method] : methods) {
+      if (method) refs.push_back(method.get());
+    }
+    for (const auto& [_, method] : staticMethods) {
+      if (method) refs.push_back(method.get());
+    }
+  }
 };
 
 struct Array : public GCObject {
@@ -511,7 +540,8 @@ struct Value {
     std::shared_ptr<WeakMap>,
     std::shared_ptr<WeakSet>,
     std::shared_ptr<ArrayBuffer>,
-    std::shared_ptr<DataView>
+    std::shared_ptr<DataView>,
+    std::shared_ptr<Class>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -538,6 +568,7 @@ struct Value {
   Value(std::shared_ptr<WeakSet> ws) : data(ws) {}
   Value(std::shared_ptr<ArrayBuffer> ab) : data(ab) {}
   Value(std::shared_ptr<DataView> dv) : data(dv) {}
+  Value(std::shared_ptr<Class> c) : data(c) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -561,6 +592,7 @@ struct Value {
   bool isWeakSet() const { return std::holds_alternative<std::shared_ptr<WeakSet>>(data); }
   bool isArrayBuffer() const { return std::holds_alternative<std::shared_ptr<ArrayBuffer>>(data); }
   bool isDataView() const { return std::holds_alternative<std::shared_ptr<DataView>>(data); }
+  bool isClass() const { return std::holds_alternative<std::shared_ptr<Class>>(data); }
 
   bool toBool() const;
   double toNumber() const;

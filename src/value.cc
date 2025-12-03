@@ -645,6 +645,28 @@ Value Object_create(const std::vector<Value>& args) {
   return Value(newObj);
 }
 
+Value Object_fromEntries(const std::vector<Value>& args) {
+  auto newObj = std::make_shared<Object>();
+
+  if (args.empty() || !args[0].isArray()) {
+    return Value(newObj);
+  }
+
+  auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+  for (const auto& entry : arr->elements) {
+    // Each entry should be an array with [key, value]
+    if (entry.isArray()) {
+      auto pair = std::get<std::shared_ptr<Array>>(entry.data);
+      if (pair->elements.size() >= 2) {
+        std::string key = pair->elements[0].toString();
+        newObj->properties[key] = pair->elements[1];
+      }
+    }
+  }
+
+  return Value(newObj);
+}
+
 // Helper function to swap bytes for endianness conversion
 template<typename T>
 T swapEndian(T value) {

@@ -64,6 +64,22 @@ private:
   ExprPtr parsePattern();  // Parse destructuring patterns
   ExprPtr parseArrayPattern();
   ExprPtr parseObjectPattern();
+
+  // Helper to create expression with source location
+  template<typename T>
+  ExprPtr makeExpr(T&& node, const Token& tok) {
+    auto expr = std::make_unique<Expression>(std::forward<T>(node));
+    expr->loc = SourceLocation(tok.line, tok.column);
+    return expr;
+  }
+
+  // Helper to create statement with source location
+  template<typename T>
+  StmtPtr makeStmt(T&& node, const Token& tok) {
+    auto stmt = std::make_unique<Statement>(std::forward<T>(node));
+    stmt->loc = SourceLocation(tok.line, tok.column);
+    return stmt;
+  }
 };
 
 }

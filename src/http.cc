@@ -1,4 +1,5 @@
 #include "http.h"
+#include "tls.h"
 #include <sstream>
 #include <fstream>
 #include <algorithm>
@@ -109,7 +110,9 @@ Response HTTPClient::request(const std::string& method, const std::string& urlSt
 
   if (url.protocol == "file") {
     return fileRequest(url);
-  } else if (url.protocol == "http" || url.protocol == "https") {
+  } else if (url.protocol == "https") {
+    return httpsRequest(url, method, headers, body);
+  } else if (url.protocol == "http") {
     return httpRequest(url, method, headers, body);
   }
 
@@ -210,16 +213,102 @@ std::vector<uint8_t> HTTPClient::receiveData(int sock) {
   return result;
 }
 
+Response HTTPClient::httpsRequest(const URL& url, const std::string& method,
+                                   const std::unordered_map<std::string, std::string>& headers,
+                                   const std::vector<uint8_t>& body) {
+  Response resp;
+
+  int sock = connectSocket(url.host, url.port);
+  if (sock == INVALID_SOCKET) {
+    resp.statusCode = 0;
+    resp.statusText = "Connection failed";
+    return resp;
+  }
+
+  // Create TLS connection with socket callbacks
+  auto tlsConn = std::make_unique<tls::TLSConnection>(
+    [sock](const uint8_t* data, size_t len) -> bool {
+      size_t totalSent = 0;
+      while (totalSent < len) {
+        int sent = send(sock, reinterpret_cast<const char*>(data + totalSent),
+                        static_cast<int>(len - totalSent), 0);
+        if (sent <= 0) return false;
+        totalSent += sent;
+      }
+      return true;
+    },
+    [sock](uint8_t* data, size_t maxLen) -> int {
+      return recv(sock, reinterpret_cast<char*>(data), static_cast<int>(maxLen), 0);
+    }
+  );
+
+  // Perform TLS handshake
+  if (!tlsConn->handshake(url.host)) {
+    closeSocket(sock);
+    resp.statusCode = 0;
+    resp.statusText = "TLS handshake failed: " + tlsConn->getLastError();
+    return resp;
+  }
+
+  // Build HTTP request
+  std::ostringstream request;
+  request << method << " " << url.path;
+  if (!url.query.empty()) {
+    request << "?" << url.query;
+  }
+  request << " HTTP/1.1\r\n";
+  request << "Host: " << url.host << "\r\n";
+  request << "Connection: close\r\n";
+  request << "User-Agent: LightJS/1.0\r\n";
+
+  for (const auto& [key, value] : headers) {
+    request << key << ": " << value << "\r\n";
+  }
+
+  if (!body.empty()) {
+    request << "Content-Length: " << body.size() << "\r\n";
+  }
+
+  request << "\r\n";
+
+  std::string requestStr = request.str();
+  std::vector<uint8_t> requestData(requestStr.begin(), requestStr.end());
+  requestData.insert(requestData.end(), body.begin(), body.end());
+
+  // Send request over TLS
+  if (!tlsConn->send(requestData.data(), requestData.size())) {
+    tlsConn->close();
+    closeSocket(sock);
+    resp.statusCode = 0;
+    resp.statusText = "TLS send failed";
+    return resp;
+  }
+
+  // Receive response over TLS
+  std::vector<uint8_t> responseData;
+  uint8_t buffer[4096];
+  int received;
+
+  while ((received = tlsConn->recv(buffer, sizeof(buffer))) > 0) {
+    responseData.insert(responseData.end(), buffer, buffer + received);
+  }
+
+  tlsConn->close();
+  closeSocket(sock);
+
+  if (responseData.empty()) {
+    resp.statusCode = 0;
+    resp.statusText = "No response";
+    return resp;
+  }
+
+  return parseResponse(responseData);
+}
+
 Response HTTPClient::httpRequest(const URL& url, const std::string& method,
                                   const std::unordered_map<std::string, std::string>& headers,
                                   const std::vector<uint8_t>& body) {
   Response resp;
-
-  if (url.protocol == "https") {
-    resp.statusCode = 501;
-    resp.statusText = "HTTPS not yet implemented";
-    return resp;
-  }
 
   int sock = connectSocket(url.host, url.port);
   if (sock == INVALID_SOCKET) {

@@ -9,6 +9,15 @@
 
 namespace lightjs {
 
+// Source location for error messages
+struct SourceLocation {
+  uint32_t line = 0;
+  uint32_t column = 0;
+
+  SourceLocation() = default;
+  SourceLocation(uint32_t l, uint32_t c) : line(l), column(c) {}
+};
+
 struct Expression;
 struct Statement;
 
@@ -222,6 +231,8 @@ struct Expression {
     ObjectPattern
   > node;
 
+  SourceLocation loc;
+
   template<typename T>
   Expression(T&& n) : node(std::forward<T>(n)) {}
 };
@@ -387,6 +398,8 @@ struct Statement {
     ExportDefaultDeclaration,
     ExportAllDeclaration
   > node;
+
+  SourceLocation loc;
 
   template<typename T>
   Statement(T&& n) : node(std::forward<T>(n)) {}

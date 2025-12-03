@@ -53,6 +53,14 @@ set(LIGHTJS_CORE_SOURCES
   src/date_object.cc
   src/unicode.cc
   src/event_loop.cc
+  src/tls_aes.cc
+  src/tls_gcm.cc
+  src/tls_x25519.cc
+  src/tls_kdf.cc
+  src/tls_x509.cc
+  src/tls_connection.cc
+  src/wasm/wasm_memory.cc
+  src/wasm/wasm_decoder.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS
@@ -77,6 +85,10 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/date_object.h
   include/object_methods.h
   include/simple_regex.h
+  include/tls.h
+  include/wasm/wasm_types.h
+  include/wasm/wasm_runtime.h
+  include/wasm/wasm_decoder.h
 )
 
 # Create main library target
