@@ -13,6 +13,19 @@ namespace lightjs {
 
 Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {}
 
+bool Interpreter::hasError() const {
+  return flow_.type == ControlFlow::Type::Throw;
+}
+
+Value Interpreter::getError() const {
+  return flow_.value;
+}
+
+void Interpreter::clearError() {
+  flow_.type = ControlFlow::Type::None;
+  flow_.value = Value(Undefined{});
+}
+
 Task Interpreter::evaluate(const Program& program) {
   Value result = Value(Undefined{});
   for (const auto& stmt : program.body) {
@@ -30,10 +43,71 @@ Task Interpreter::evaluate(const Program& program) {
 }
 
 Task Interpreter::evaluate(const Statement& stmt) {
+  // Stack overflow protection
+  StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
+  if (guard.overflowed()) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    co_return Value(Undefined{});
+  }
+
   if (auto* node = std::get_if<VarDeclaration>(&stmt.node)) {
     co_return co_await evaluateVarDecl(*node);
   } else if (auto* node = std::get_if<FunctionDeclaration>(&stmt.node)) {
     co_return co_await evaluateFuncDecl(*node);
+  } else if (auto* node = std::get_if<ClassDeclaration>(&stmt.node)) {
+    // Create the class directly
+    auto cls = std::make_shared<Class>(node->id.name);
+    GarbageCollector::instance().reportAllocation(sizeof(Class));
+    cls->closure = env_;
+
+    // Handle superclass
+    if (node->superClass) {
+      auto superTask = evaluate(*node->superClass);
+      while (!superTask.done()) {
+        std::coroutine_handle<>::from_address(superTask.handle.address()).resume();
+      }
+      Value superVal = superTask.result();
+      if (superVal.isClass()) {
+        cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+      }
+    }
+
+    // Process methods
+    for (const auto& method : node->methods) {
+      auto func = std::make_shared<Function>();
+      func->isNative = false;
+      func->isAsync = method.isAsync;
+      func->closure = env_;
+
+      for (const auto& param : method.params) {
+        FunctionParam funcParam;
+        funcParam.name = param.name;
+        func->params.push_back(funcParam);
+      }
+
+      // Store the body reference
+      func->body = std::shared_ptr<void>(
+        const_cast<std::vector<StmtPtr>*>(&method.body),
+        [](void*){} // No-op deleter
+      );
+
+      if (method.kind == MethodDefinition::Kind::Constructor) {
+        cls->constructor = func;
+      } else if (method.isStatic) {
+        cls->staticMethods[method.key.name] = func;
+      } else if (method.kind == MethodDefinition::Kind::Get) {
+        cls->getters[method.key.name] = func;
+      } else if (method.kind == MethodDefinition::Kind::Set) {
+        cls->setters[method.key.name] = func;
+      } else {
+        cls->methods[method.key.name] = func;
+      }
+    }
+
+    Value classVal = Value(cls);
+    env_->define(node->id.name, classVal);
+    co_return classVal;
   } else if (auto* node = std::get_if<ReturnStmt>(&stmt.node)) {
     co_return co_await evaluateReturn(*node);
   } else if (auto* node = std::get_if<ExpressionStmt>(&stmt.node)) {
@@ -83,10 +157,24 @@ Task Interpreter::evaluate(const Statement& stmt) {
 }
 
 Task Interpreter::evaluate(const Expression& expr) {
+  // Stack overflow protection
+  StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
+  if (guard.overflowed()) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    co_return Value(Undefined{});
+  }
+
   if (auto* node = std::get_if<Identifier>(&expr.node)) {
     if (auto val = env_->get(node->name)) {
       co_return *val;
     }
+    // Throw ReferenceError for undefined variables with line info
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(std::make_shared<Error>(
+      ErrorType::ReferenceError,
+      formatError("'" + node->name + "' is not defined", expr.loc)
+    ));
     co_return Value(Undefined{});
   } else if (auto* node = std::get_if<NumberLiteral>(&expr.node)) {
     co_return Value(node->value);
@@ -139,6 +227,27 @@ Task Interpreter::evaluate(const Expression& expr) {
     co_return co_await evaluateAwait(*node);
   } else if (auto* node = std::get_if<YieldExpr>(&expr.node)) {
     co_return co_await evaluateYield(*node);
+  } else if (auto* node = std::get_if<NewExpr>(&expr.node)) {
+    co_return co_await evaluateNew(*node);
+  } else if (auto* node = std::get_if<ClassExpr>(&expr.node)) {
+    co_return co_await evaluateClass(*node);
+  } else if (std::holds_alternative<ThisExpr>(expr.node)) {
+    // Look up 'this' in the current environment
+    if (auto thisVal = env_->get("this")) {
+      co_return *thisVal;
+    }
+    co_return Value(Undefined{});
+  } else if (std::holds_alternative<SuperExpr>(expr.node)) {
+    // Look up '__super__' in the current environment (set by class constructor)
+    if (auto superVal = env_->get("__super__")) {
+      co_return *superVal;
+    }
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(std::make_shared<Error>(
+      ErrorType::ReferenceError,
+      formatError("'super' keyword is not valid here", expr.loc)
+    ));
+    co_return Value(Undefined{});
   }
   co_return Value(Undefined{});
 }
@@ -518,6 +627,14 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
 }
 
 Task Interpreter::evaluateCall(const CallExpr& expr) {
+  // Stack overflow protection
+  StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
+  if (guard.overflowed()) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    co_return Value(Undefined{});
+  }
+
   // Special handling for dynamic import()
   if (auto* id = std::get_if<Identifier>(&expr.callee->node)) {
     if (id->name == "import") {
@@ -548,22 +665,27 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     }
   }
 
-  auto calleeTask = evaluate(*expr.callee);
-  while (!calleeTask.done()) {
-    std::coroutine_handle<>::from_address(calleeTask.handle.address()).resume();
+  // Track the 'this' value for method calls
+  Value thisValue = Value(Undefined{});
+  Value callee;
+
+  // Check if this is a method call (obj.method())
+  if (auto* memberExpr = std::get_if<MemberExpr>(&expr.callee->node)) {
+    // Evaluate the object (receiver)
+    thisValue = co_await evaluate(*memberExpr->object);
+
+    // Now evaluate the full member expression to get the method
+    callee = co_await evaluate(*expr.callee);
+  } else {
+    callee = co_await evaluate(*expr.callee);
   }
-  Value callee = calleeTask.result();
 
   std::vector<Value> args;
   for (const auto& arg : expr.arguments) {
     // Check if this is a spread element
     if (auto* spread = std::get_if<SpreadElement>(&arg->node)) {
       // Evaluate the argument
-      auto argTask = evaluate(*spread->argument);
-      while (!argTask.done()) {
-        std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
-      }
-      Value val = argTask.result();
+      Value val = co_await evaluate(*spread->argument);
 
       // Spread the value into args
       if (val.isArray()) {
@@ -575,11 +697,8 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
         args.push_back(val);
       }
     } else {
-      auto argTask = evaluate(*arg);
-      while (!argTask.done()) {
-        std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
-      }
-      args.push_back(argTask.result());
+      Value argVal = co_await evaluate(*arg);
+      args.push_back(argVal);
     }
   }
 
@@ -704,6 +823,11 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       env_ = std::static_pointer_cast<Environment>(func->closure);
       env_ = env_->createChild();
 
+      // Bind 'this' for method calls
+      if (!thisValue.isUndefined()) {
+        env_->define("this", thisValue);
+      }
+
       for (size_t i = 0; i < func->params.size(); ++i) {
         if (i < args.size()) {
           // Use provided argument
@@ -761,11 +885,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 }
 
 Task Interpreter::evaluateMember(const MemberExpr& expr) {
-  auto objTask = evaluate(*expr.object);
-  while (!objTask.done()) {
-    std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
-  }
-  Value obj = objTask.result();
+  Value obj = co_await evaluate(*expr.object);
 
   // Optional chaining: if object is null or undefined, return undefined
   if (expr.optional && (obj.isNull() || obj.isUndefined())) {
@@ -779,11 +899,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // Compute property name
     std::string propName;
     if (expr.computed) {
-      auto propTask = evaluate(*expr.property);
-      while (!propTask.done()) {
-        std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
-      }
-      propName = propTask.result().toString();
+      Value propVal = co_await evaluate(*expr.property);
+      propName = propVal.toString();
     } else {
       if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
         propName = id->name;
@@ -822,11 +939,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   std::string propName;
   if (expr.computed) {
-    auto propTask = evaluate(*expr.property);
-    while (!propTask.done()) {
-      std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
-    }
-    propName = propTask.result().toString();
+    Value propVal = co_await evaluate(*expr.property);
+    propName = propVal.toString();
   } else {
     if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
       propName = id->name;
@@ -844,6 +958,76 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         return Value("[Promise]");
       };
       co_return Value(toStringFn);
+    }
+
+    // Promise.prototype.then(onFulfilled, onRejected)
+    if (propName == "then") {
+      auto thenFn = std::make_shared<Function>();
+      thenFn->isNative = true;
+      thenFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
+        std::function<Value(Value)> onFulfilled = nullptr;
+        std::function<Value(Value)> onRejected = nullptr;
+
+        // Get onFulfilled callback if provided
+        if (!args.empty() && args[0].isFunction()) {
+          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          onFulfilled = [this, callback](Value val) -> Value {
+            return invokeFunction(callback, {val}, Value(Undefined{}));
+          };
+        }
+
+        // Get onRejected callback if provided
+        if (args.size() > 1 && args[1].isFunction()) {
+          auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+          onRejected = [this, callback](Value val) -> Value {
+            return invokeFunction(callback, {val}, Value(Undefined{}));
+          };
+        }
+
+        auto chainedPromise = promisePtr->then(onFulfilled, onRejected);
+        return Value(chainedPromise);
+      };
+      co_return Value(thenFn);
+    }
+
+    // Promise.prototype.catch(onRejected)
+    if (propName == "catch") {
+      auto catchFn = std::make_shared<Function>();
+      catchFn->isNative = true;
+      catchFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
+        std::function<Value(Value)> onRejected = nullptr;
+
+        if (!args.empty() && args[0].isFunction()) {
+          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          onRejected = [this, callback](Value val) -> Value {
+            return invokeFunction(callback, {val}, Value(Undefined{}));
+          };
+        }
+
+        auto chainedPromise = promisePtr->catch_(onRejected);
+        return Value(chainedPromise);
+      };
+      co_return Value(catchFn);
+    }
+
+    // Promise.prototype.finally(onFinally)
+    if (propName == "finally") {
+      auto finallyFn = std::make_shared<Function>();
+      finallyFn->isNative = true;
+      finallyFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
+        std::function<Value()> onFinally = nullptr;
+
+        if (!args.empty() && args[0].isFunction()) {
+          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          onFinally = [this, callback]() -> Value {
+            return invokeFunction(callback, {}, Value(Undefined{}));
+          };
+        }
+
+        auto chainedPromise = promisePtr->finally(onFinally);
+        return Value(chainedPromise);
+      };
+      co_return Value(finallyFn);
     }
 
     if (promisePtr->state == PromiseState::Fulfilled) {
@@ -1233,17 +1417,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto result = std::make_shared<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
+        // Get thisArg if provided
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
-          // Call the callback function
-          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
-          Value mapped;
-          if (callback->isNative) {
-            mapped = callback->nativeFunc(callArgs);
-          } else {
-            // For non-native functions, we'd need to evaluate them properly
-            // For now, return undefined
-            mapped = Value(Undefined{});
-          }
+          // Call the callback function with (element, index, array)
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          Value mapped = invokeFunction(callback, callArgs, thisArg);
           result->elements.push_back(mapped);
         }
         return Value(result);
@@ -1262,14 +1442,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto result = std::make_shared<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
+        // Get thisArg if provided
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
-          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
-          Value keep;
-          if (callback->isNative) {
-            keep = callback->nativeFunc(callArgs);
-          } else {
-            keep = Value(Undefined{});
-          }
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          Value keep = invokeFunction(callback, callArgs, thisArg);
           if (keep.toBool()) {
             result->elements.push_back(arrPtr->elements[i]);
           }
@@ -1288,11 +1466,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
 
+        // Get thisArg if provided
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
-          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i))};
-          if (callback->isNative) {
-            callback->nativeFunc(callArgs);
-          }
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          invokeFunction(callback, callArgs, thisArg);
         }
         return Value(Undefined{});
       };
@@ -1316,16 +1495,711 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         size_t start = args.size() > 1 ? 0 : 1;
 
         for (size_t i = start; i < arrPtr->elements.size(); ++i) {
-          std::vector<Value> callArgs = {accumulator, arrPtr->elements[i], Value(static_cast<double>(i))};
-          if (callback->isNative) {
-            accumulator = callback->nativeFunc(callArgs);
-          } else {
-            accumulator = Value(Undefined{});
-          }
+          // reduce callback: (accumulator, currentValue, currentIndex, array)
+          std::vector<Value> callArgs = {accumulator, arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          accumulator = invokeFunction(callback, callArgs, Value(Undefined{}));
         }
         return accumulator;
       };
       co_return Value(reduceFn);
+    }
+
+    if (propName == "reduceRight") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("reduceRight requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+
+        if (arrPtr->elements.empty()) {
+          return args.size() > 1 ? args[1] : Value(Undefined{});
+        }
+
+        size_t len = arrPtr->elements.size();
+        Value accumulator = args.size() > 1 ? args[1] : arrPtr->elements[len - 1];
+        int start = args.size() > 1 ? static_cast<int>(len) - 1 : static_cast<int>(len) - 2;
+
+        for (int i = start; i >= 0; --i) {
+          std::vector<Value> callArgs = {accumulator, arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          accumulator = invokeFunction(callback, callArgs, Value(Undefined{}));
+        }
+        return accumulator;
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "find") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("find requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          if (invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return arrPtr->elements[i];
+          }
+        }
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "findIndex") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("findIndex requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          if (invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return Value(static_cast<double>(i));
+          }
+        }
+        return Value(-1.0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "findLast") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("findLast requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = arrPtr->elements.size(); i > 0; --i) {
+          size_t idx = i - 1;
+          std::vector<Value> callArgs = {arrPtr->elements[idx], Value(static_cast<double>(idx)), Value(arrPtr)};
+          if (invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return arrPtr->elements[idx];
+          }
+        }
+        return Value(Undefined{});
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "findLastIndex") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("findLastIndex requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = arrPtr->elements.size(); i > 0; --i) {
+          size_t idx = i - 1;
+          std::vector<Value> callArgs = {arrPtr->elements[idx], Value(static_cast<double>(idx)), Value(arrPtr)};
+          if (invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return Value(static_cast<double>(idx));
+          }
+        }
+        return Value(-1.0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "some") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("some requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          if (invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return Value(true);
+          }
+        }
+        return Value(false);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "every") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("every requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          if (!invokeFunction(callback, callArgs, thisArg).toBool()) {
+            return Value(false);
+          }
+        }
+        return Value(true);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "push") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        for (const auto& arg : args) {
+          arrPtr->elements.push_back(arg);
+        }
+        return Value(static_cast<double>(arrPtr->elements.size()));
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "pop") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (arrPtr->elements.empty()) {
+          return Value(Undefined{});
+        }
+        Value result = arrPtr->elements.back();
+        arrPtr->elements.pop_back();
+        return result;
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "shift") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (arrPtr->elements.empty()) {
+          return Value(Undefined{});
+        }
+        Value result = arrPtr->elements.front();
+        arrPtr->elements.erase(arrPtr->elements.begin());
+        return result;
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "unshift") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        for (size_t i = 0; i < args.size(); ++i) {
+          arrPtr->elements.insert(arrPtr->elements.begin() + i, args[i]);
+        }
+        return Value(static_cast<double>(arrPtr->elements.size()));
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "slice") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        int len = static_cast<int>(arrPtr->elements.size());
+        int start = 0;
+        int end = len;
+
+        if (args.size() > 0 && args[0].isNumber()) {
+          start = static_cast<int>(std::get<double>(args[0].data));
+          if (start < 0) start = std::max(0, len + start);
+          if (start > len) start = len;
+        }
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          end = static_cast<int>(std::get<double>(args[1].data));
+          if (end < 0) end = std::max(0, len + end);
+          if (end > len) end = len;
+        }
+
+        for (int i = start; i < end; ++i) {
+          result->elements.push_back(arrPtr->elements[i]);
+        }
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "splice") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        auto removed = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        int len = static_cast<int>(arrPtr->elements.size());
+        int start = 0;
+        int deleteCount = len;
+
+        if (args.size() > 0 && args[0].isNumber()) {
+          start = static_cast<int>(std::get<double>(args[0].data));
+          if (start < 0) start = std::max(0, len + start);
+          if (start > len) start = len;
+        }
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          deleteCount = std::max(0, static_cast<int>(std::get<double>(args[1].data)));
+          deleteCount = std::min(deleteCount, len - start);
+        }
+
+        // Remove elements
+        for (int i = 0; i < deleteCount; ++i) {
+          removed->elements.push_back(arrPtr->elements[start]);
+          arrPtr->elements.erase(arrPtr->elements.begin() + start);
+        }
+
+        // Insert new elements
+        for (size_t i = 2; i < args.size(); ++i) {
+          arrPtr->elements.insert(arrPtr->elements.begin() + start + (i - 2), args[i]);
+        }
+
+        return Value(removed);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "toSpliced") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        // Copy all elements to new array
+        for (const auto& elem : arrPtr->elements) {
+          result->elements.push_back(elem);
+        }
+
+        int len = static_cast<int>(result->elements.size());
+        int start = 0;
+        int deleteCount = 0;
+
+        if (args.size() > 0 && args[0].isNumber()) {
+          start = static_cast<int>(std::get<double>(args[0].data));
+          if (start < 0) start = std::max(0, len + start);
+          if (start > len) start = len;
+        }
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          deleteCount = std::max(0, static_cast<int>(std::get<double>(args[1].data)));
+          deleteCount = std::min(deleteCount, len - start);
+        }
+
+        // Remove elements
+        for (int i = 0; i < deleteCount; ++i) {
+          result->elements.erase(result->elements.begin() + start);
+        }
+
+        // Insert new elements
+        for (size_t i = 2; i < args.size(); ++i) {
+          result->elements.insert(result->elements.begin() + start + (i - 2), args[i]);
+        }
+
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "join") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        std::string separator = ",";
+        if (args.size() > 0) {
+          separator = args[0].toString();
+        }
+
+        std::string result;
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          if (i > 0) result += separator;
+          if (!arrPtr->elements[i].isUndefined() && !arrPtr->elements[i].isNull()) {
+            result += arrPtr->elements[i].toString();
+          }
+        }
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "indexOf") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(-1.0);
+
+        Value searchElement = args[0];
+        int fromIndex = 0;
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          fromIndex = static_cast<int>(std::get<double>(args[1].data));
+          int len = static_cast<int>(arrPtr->elements.size());
+          if (fromIndex < 0) fromIndex = std::max(0, len + fromIndex);
+        }
+
+        for (size_t i = fromIndex; i < arrPtr->elements.size(); ++i) {
+          if (arrPtr->elements[i].toString() == searchElement.toString()) {
+            return Value(static_cast<double>(i));
+          }
+        }
+        return Value(-1.0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "lastIndexOf") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(-1.0);
+
+        Value searchElement = args[0];
+        int len = static_cast<int>(arrPtr->elements.size());
+        int fromIndex = len - 1;
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          fromIndex = static_cast<int>(std::get<double>(args[1].data));
+          if (fromIndex < 0) fromIndex = len + fromIndex;
+          if (fromIndex >= len) fromIndex = len - 1;
+        }
+
+        for (int i = fromIndex; i >= 0; --i) {
+          if (arrPtr->elements[i].toString() == searchElement.toString()) {
+            return Value(static_cast<double>(i));
+          }
+        }
+        return Value(-1.0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "includes") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+
+        Value searchElement = args[0];
+        int fromIndex = 0;
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          fromIndex = static_cast<int>(std::get<double>(args[1].data));
+          int len = static_cast<int>(arrPtr->elements.size());
+          if (fromIndex < 0) fromIndex = std::max(0, len + fromIndex);
+        }
+
+        for (size_t i = fromIndex; i < arrPtr->elements.size(); ++i) {
+          if (arrPtr->elements[i].toString() == searchElement.toString()) {
+            return Value(true);
+          }
+        }
+        return Value(false);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "at") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Undefined{});
+        int index = static_cast<int>(args[0].toNumber());
+        int len = static_cast<int>(arrPtr->elements.size());
+        if (index < 0) index = len + index;
+        if (index < 0 || index >= len) return Value(Undefined{});
+        return arrPtr->elements[index];
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "reverse") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        std::reverse(arrPtr->elements.begin(), arrPtr->elements.end());
+        return Value(arrPtr);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "sort") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr, this](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          // Default sort: convert to strings and compare lexicographically
+          std::sort(arrPtr->elements.begin(), arrPtr->elements.end(),
+            [](const Value& a, const Value& b) {
+              return a.toString() < b.toString();
+            });
+        } else {
+          // Sort with comparator function
+          auto compareFn = std::get<std::shared_ptr<Function>>(args[0].data);
+          std::sort(arrPtr->elements.begin(), arrPtr->elements.end(),
+            [compareFn, this](const Value& a, const Value& b) {
+              std::vector<Value> compareArgs = {a, b};
+              Value result;
+              if (compareFn->isNative) {
+                result = compareFn->nativeFunc(compareArgs);
+              } else {
+                result = this->invokeFunction(compareFn, compareArgs);
+              }
+              return result.toNumber() < 0;
+            });
+        }
+        return Value(arrPtr);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "toSorted") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr, this](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        result->elements = arrPtr->elements;  // Copy
+
+        if (args.empty() || !args[0].isFunction()) {
+          std::sort(result->elements.begin(), result->elements.end(),
+            [](const Value& a, const Value& b) {
+              return a.toString() < b.toString();
+            });
+        } else {
+          auto compareFn = std::get<std::shared_ptr<Function>>(args[0].data);
+          std::sort(result->elements.begin(), result->elements.end(),
+            [compareFn, this](const Value& a, const Value& b) {
+              std::vector<Value> compareArgs = {a, b};
+              Value r;
+              if (compareFn->isNative) {
+                r = compareFn->nativeFunc(compareArgs);
+              } else {
+                r = this->invokeFunction(compareFn, compareArgs);
+              }
+              return r.toNumber() < 0;
+            });
+        }
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "toReversed") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        result->elements = arrPtr->elements;
+        std::reverse(result->elements.begin(), result->elements.end());
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "at") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Undefined{});
+        int index = static_cast<int>(args[0].toNumber());
+        int size = static_cast<int>(arrPtr->elements.size());
+        if (index < 0) index = size + index;
+        if (index < 0 || index >= size) return Value(Undefined{});
+        return arrPtr->elements[index];
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "with") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) return Value(arrPtr);
+        int index = static_cast<int>(args[0].toNumber());
+        int size = static_cast<int>(arrPtr->elements.size());
+        if (index < 0) index = size + index;
+        if (index < 0 || index >= size) {
+          throw std::runtime_error("Invalid index");
+        }
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        result->elements = arrPtr->elements;
+        result->elements[index] = args[1];
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "concat") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        // Copy original array elements
+        result->elements = arrPtr->elements;
+
+        // Add all arguments
+        for (const auto& arg : args) {
+          if (arg.isArray()) {
+            auto otherArr = std::get<std::shared_ptr<Array>>(arg.data);
+            result->elements.insert(result->elements.end(),
+                                  otherArr->elements.begin(),
+                                  otherArr->elements.end());
+          } else {
+            result->elements.push_back(arg);
+          }
+        }
+
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "flat") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        int depth = 1;
+        if (args.size() > 0 && args[0].isNumber()) {
+          depth = static_cast<int>(std::get<double>(args[0].data));
+        }
+
+        std::function<void(const std::vector<Value>&, int, std::vector<Value>&)> flattenImpl;
+        flattenImpl = [&flattenImpl](const std::vector<Value>& src, int d, std::vector<Value>& dest) {
+          for (const auto& elem : src) {
+            if (d > 0 && elem.isArray()) {
+              auto inner = std::get<std::shared_ptr<Array>>(elem.data);
+              flattenImpl(inner->elements, d - 1, dest);
+            } else {
+              dest.push_back(elem);
+            }
+          }
+        };
+
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        flattenImpl(arrPtr->elements, depth, result->elements);
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "flatMap") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          throw std::runtime_error("flatMap requires a callback function");
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
+          std::vector<Value> callArgs = {arrPtr->elements[i], Value(static_cast<double>(i)), Value(arrPtr)};
+          Value mapped = invokeFunction(callback, callArgs, thisArg);
+
+          if (mapped.isArray()) {
+            auto inner = std::get<std::shared_ptr<Array>>(mapped.data);
+            result->elements.insert(result->elements.end(),
+                                  inner->elements.begin(),
+                                  inner->elements.end());
+          } else {
+            result->elements.push_back(mapped);
+          }
+        }
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "fill") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(arrPtr);
+
+        Value fillValue = args[0];
+        int len = static_cast<int>(arrPtr->elements.size());
+        int start = 0;
+        int end = len;
+
+        if (args.size() > 1 && args[1].isNumber()) {
+          start = static_cast<int>(std::get<double>(args[1].data));
+          if (start < 0) start = std::max(0, len + start);
+          if (start > len) start = len;
+        }
+
+        if (args.size() > 2 && args[2].isNumber()) {
+          end = static_cast<int>(std::get<double>(args[2].data));
+          if (end < 0) end = std::max(0, len + end);
+          if (end > len) end = len;
+        }
+
+        for (int i = start; i < end; ++i) {
+          arrPtr->elements[i] = fillValue;
+        }
+        return Value(arrPtr);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "copyWithin") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(arrPtr);
+
+        int len = static_cast<int>(arrPtr->elements.size());
+        int target = static_cast<int>(std::get<double>(args[0].data));
+        if (target < 0) target = std::max(0, len + target);
+
+        int start = 0;
+        if (args.size() > 1 && args[1].isNumber()) {
+          start = static_cast<int>(std::get<double>(args[1].data));
+          if (start < 0) start = std::max(0, len + start);
+        }
+
+        int end = len;
+        if (args.size() > 2 && args[2].isNumber()) {
+          end = static_cast<int>(std::get<double>(args[2].data));
+          if (end < 0) end = std::max(0, len + end);
+        }
+
+        int count = std::min(end - start, len - target);
+        std::vector<Value> temp(arrPtr->elements.begin() + start, arrPtr->elements.begin() + start + count);
+
+        for (int i = 0; i < count && target + i < len; ++i) {
+          arrPtr->elements[target + i] = temp[i];
+        }
+        return Value(arrPtr);
+      };
+      co_return Value(fn);
     }
 
     try {
@@ -1641,6 +2515,168 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       co_return Value(padEndFn);
     }
 
+    if (propName == "trim") {
+      auto trimFn = std::make_shared<Function>();
+      trimFn->isNative = true;
+      trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t start = 0;
+        size_t end = str.length();
+        while (start < end && std::isspace(static_cast<unsigned char>(str[start]))) {
+          ++start;
+        }
+        while (end > start && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+          --end;
+        }
+        return Value(str.substr(start, end - start));
+      };
+      co_return Value(trimFn);
+    }
+
+    if (propName == "trimStart") {
+      auto trimStartFn = std::make_shared<Function>();
+      trimStartFn->isNative = true;
+      trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t start = 0;
+        while (start < str.length() && std::isspace(static_cast<unsigned char>(str[start]))) {
+          ++start;
+        }
+        return Value(str.substr(start));
+      };
+      co_return Value(trimStartFn);
+    }
+
+    if (propName == "trimEnd") {
+      auto trimEndFn = std::make_shared<Function>();
+      trimEndFn->isNative = true;
+      trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t end = str.length();
+        while (end > 0 && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+          --end;
+        }
+        return Value(str.substr(0, end));
+      };
+      co_return Value(trimEndFn);
+    }
+
+    if (propName == "split") {
+      auto splitFn = std::make_shared<Function>();
+      splitFn->isNative = true;
+      splitFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        auto result = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+        if (args.empty()) {
+          // No separator: return array with entire string
+          result->elements.push_back(Value(str));
+          return Value(result);
+        }
+
+        std::string separator = args[0].toString();
+        int limit = args.size() > 1 ? static_cast<int>(args[1].toNumber()) : -1;
+
+        if (separator.empty()) {
+          // Split into individual characters
+          size_t len = unicode::utf8Length(str);
+          for (size_t i = 0; i < len && (limit < 0 || static_cast<int>(i) < limit); ++i) {
+            result->elements.push_back(Value(unicode::charAt(str, i)));
+          }
+          return Value(result);
+        }
+
+        size_t start = 0;
+        size_t pos;
+        int count = 0;
+        while ((pos = str.find(separator, start)) != std::string::npos) {
+          if (limit >= 0 && count >= limit) break;
+          result->elements.push_back(Value(str.substr(start, pos - start)));
+          start = pos + separator.length();
+          count++;
+        }
+        if (limit < 0 || count < limit) {
+          result->elements.push_back(Value(str.substr(start)));
+        }
+        return Value(result);
+      };
+      co_return Value(splitFn);
+    }
+
+    if (propName == "startsWith") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(true);
+        std::string searchStr = args[0].toString();
+        size_t position = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : 0;
+        if (position > str.length()) return Value(false);
+        return Value(str.compare(position, searchStr.length(), searchStr) == 0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "endsWith") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(true);
+        std::string searchStr = args[0].toString();
+        size_t endPos = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : str.length();
+        if (endPos > str.length()) endPos = str.length();
+        if (searchStr.length() > endPos) return Value(false);
+        return Value(str.compare(endPos - searchStr.length(), searchStr.length(), searchStr) == 0);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "at") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Undefined{});
+        int index = static_cast<int>(args[0].toNumber());
+        int len = static_cast<int>(unicode::utf8Length(str));
+        if (index < 0) index = len + index;
+        if (index < 0 || index >= len) return Value(Undefined{});
+        return Value(unicode::charAt(str, index));
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "normalize") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        // Basic implementation - just returns the string as-is
+        // Full Unicode normalization (NFC, NFD, etc.) is complex
+        return Value(str);
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "localeCompare") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(0.0);
+        std::string other = args[0].toString();
+        int result = str.compare(other);
+        return Value(static_cast<double>(result < 0 ? -1 : (result > 0 ? 1 : 0)));
+      };
+      co_return Value(fn);
+    }
+
+    if (propName == "concat") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        std::string result = str;
+        for (const auto& arg : args) {
+          result += arg.toString();
+        }
+        return Value(result);
+      };
+      co_return Value(fn);
+    }
+
     if (propName == "match") {
       auto matchFn = std::make_shared<Function>();
       matchFn->isNative = true;
@@ -1696,6 +2732,157 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
       };
       co_return Value(replaceFn);
+    }
+
+    if (propName == "replaceAll") {
+      auto replaceAllFn = std::make_shared<Function>();
+      replaceAllFn->isNative = true;
+      replaceAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) return Value(str);
+        std::string search = args[0].toString();
+        std::string replacement = args[1].toString();
+        std::string result = str;
+        if (search.empty()) return Value(result);
+        size_t pos = 0;
+        while ((pos = result.find(search, pos)) != std::string::npos) {
+          result.replace(pos, search.length(), replacement);
+          pos += replacement.length();
+        }
+        return Value(result);
+      };
+      co_return Value(replaceAllFn);
+    }
+
+    if (propName == "at") {
+      auto atFn = std::make_shared<Function>();
+      atFn->isNative = true;
+      atFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Undefined{});
+        int index = static_cast<int>(args[0].toNumber());
+        int len = static_cast<int>(unicode::utf8Length(str));
+        if (index < 0) index = len + index;
+        if (index < 0 || index >= len) return Value(Undefined{});
+        return Value(unicode::charAt(str, index));
+      };
+      co_return Value(atFn);
+    }
+
+    if (propName == "repeat") {
+      auto repeatFn = std::make_shared<Function>();
+      repeatFn->isNative = true;
+      repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(std::string(""));
+        int count = static_cast<int>(args[0].toNumber());
+        if (count < 0) throw std::runtime_error("RangeError: Invalid count value");
+        if (count == 0) return Value(std::string(""));
+        std::string result;
+        result.reserve(str.length() * count);
+        for (int i = 0; i < count; ++i) {
+          result += str;
+        }
+        return Value(result);
+      };
+      co_return Value(repeatFn);
+    }
+
+    if (propName == "padStart") {
+      auto padStartFn = std::make_shared<Function>();
+      padStartFn->isNative = true;
+      padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(str);
+        int targetLength = static_cast<int>(args[0].toNumber());
+        int currentLength = static_cast<int>(unicode::utf8Length(str));
+        if (targetLength <= currentLength) return Value(str);
+        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        if (padString.empty()) return Value(str);
+        int padLength = targetLength - currentLength;
+        std::string padding;
+        while (static_cast<int>(unicode::utf8Length(padding)) < padLength) {
+          padding += padString;
+        }
+        // Trim to exact length
+        std::string result;
+        int count = 0;
+        size_t i = 0;
+        while (i < padding.size() && count < padLength) {
+          std::string ch = unicode::charAt(padding, count);
+          result += ch;
+          count++;
+        }
+        return Value(result + str);
+      };
+      co_return Value(padStartFn);
+    }
+
+    if (propName == "padEnd") {
+      auto padEndFn = std::make_shared<Function>();
+      padEndFn->isNative = true;
+      padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(str);
+        int targetLength = static_cast<int>(args[0].toNumber());
+        int currentLength = static_cast<int>(unicode::utf8Length(str));
+        if (targetLength <= currentLength) return Value(str);
+        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        if (padString.empty()) return Value(str);
+        int padLength = targetLength - currentLength;
+        std::string padding;
+        while (static_cast<int>(unicode::utf8Length(padding)) < padLength) {
+          padding += padString;
+        }
+        // Trim to exact length
+        std::string result;
+        int count = 0;
+        while (count < padLength) {
+          std::string ch = unicode::charAt(padding, count);
+          result += ch;
+          count++;
+        }
+        return Value(str + result);
+      };
+      co_return Value(padEndFn);
+    }
+
+    if (propName == "trim") {
+      auto trimFn = std::make_shared<Function>();
+      trimFn->isNative = true;
+      trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t start = 0;
+        size_t end = str.length();
+        while (start < end && std::isspace(static_cast<unsigned char>(str[start]))) {
+          ++start;
+        }
+        while (end > start && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+          --end;
+        }
+        return Value(str.substr(start, end - start));
+      };
+      co_return Value(trimFn);
+    }
+
+    if (propName == "trimStart") {
+      auto trimStartFn = std::make_shared<Function>();
+      trimStartFn->isNative = true;
+      trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t start = 0;
+        while (start < str.length() && std::isspace(static_cast<unsigned char>(str[start]))) {
+          ++start;
+        }
+        return Value(str.substr(start));
+      };
+      co_return Value(trimStartFn);
+    }
+
+    if (propName == "trimEnd") {
+      auto trimEndFn = std::make_shared<Function>();
+      trimEndFn->isNative = true;
+      trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        size_t end = str.length();
+        while (end > 0 && std::isspace(static_cast<unsigned char>(str[end - 1]))) {
+          --end;
+        }
+        return Value(str.substr(0, end));
+      };
+      co_return Value(trimEndFn);
     }
   }
 
@@ -1885,6 +3072,389 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
   co_return yieldedValue;
 }
 
+Task Interpreter::evaluateNew(const NewExpr& expr) {
+  // Evaluate the callee (constructor)
+  auto calleeTask = evaluate(*expr.callee);
+  while (!calleeTask.done()) {
+    std::coroutine_handle<>::from_address(calleeTask.handle.address()).resume();
+  }
+  Value callee = calleeTask.result();
+
+  // Evaluate arguments
+  std::vector<Value> args;
+  for (const auto& arg : expr.arguments) {
+    auto argTask = evaluate(*arg);
+    while (!argTask.done()) {
+      std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
+    }
+    args.push_back(argTask.result());
+  }
+
+  // Handle Class constructor
+  if (callee.isClass()) {
+    auto cls = std::get<std::shared_ptr<Class>>(callee.data);
+
+    // Create the new instance object
+    auto instance = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+    // Set up prototype chain - copy methods to instance
+    for (const auto& [name, method] : cls->methods) {
+      instance->properties[name] = Value(method);
+    }
+
+    // If class has a superclass, inherit its methods
+    if (cls->superClass) {
+      for (const auto& [name, method] : cls->superClass->methods) {
+        if (instance->properties.find(name) == instance->properties.end()) {
+          instance->properties[name] = Value(method);
+        }
+      }
+    }
+
+    // Execute constructor if it exists
+    if (cls->constructor) {
+      auto prevEnv = env_;
+      env_ = std::static_pointer_cast<Environment>(cls->closure);
+      env_ = env_->createChild();
+
+      // Bind 'this' to the new instance
+      env_->define("this", Value(instance));
+
+      // Bind super class if exists
+      if (cls->superClass) {
+        env_->define("__super__", Value(cls->superClass));
+      }
+
+      // Bind parameters
+      auto func = cls->constructor;
+      for (size_t i = 0; i < func->params.size(); ++i) {
+        if (i < args.size()) {
+          env_->define(func->params[i].name, args[i]);
+        } else if (func->params[i].defaultValue) {
+          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+          auto defaultTask = evaluate(*defaultExpr);
+          while (!defaultTask.done()) {
+            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+          }
+          env_->define(func->params[i].name, defaultTask.result());
+        } else {
+          env_->define(func->params[i].name, Value(Undefined{}));
+        }
+      }
+
+      // Handle rest parameter
+      if (func->restParam.has_value()) {
+        auto restArr = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+        for (size_t i = func->params.size(); i < args.size(); ++i) {
+          restArr->elements.push_back(args[i]);
+        }
+        env_->define(*func->restParam, Value(restArr));
+      }
+
+      // Execute constructor body
+      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+      auto prevFlow = flow_;
+      flow_ = ControlFlow{};
+
+      for (const auto& stmt : *bodyPtr) {
+        auto stmtTask = evaluate(*stmt);
+        while (!stmtTask.done()) {
+          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+        }
+
+        if (flow_.type == ControlFlow::Type::Return) {
+          break;
+        }
+      }
+
+      flow_ = prevFlow;
+      env_ = prevEnv;
+    }
+
+    co_return Value(instance);
+  }
+
+  // Handle Function constructor (regular constructor function)
+  if (callee.isFunction()) {
+    auto func = std::get<std::shared_ptr<Function>>(callee.data);
+
+    if (func->isNative) {
+      // Native constructors (e.g., Array, Object, Map, etc.)
+      co_return func->nativeFunc(args);
+    }
+
+    // Create the new instance object
+    auto instance = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+    // Set up execution environment
+    auto prevEnv = env_;
+    env_ = std::static_pointer_cast<Environment>(func->closure);
+    env_ = env_->createChild();
+
+    // Bind 'this' to the new instance
+    env_->define("this", Value(instance));
+
+    // Bind parameters
+    for (size_t i = 0; i < func->params.size(); ++i) {
+      if (i < args.size()) {
+        env_->define(func->params[i].name, args[i]);
+      } else if (func->params[i].defaultValue) {
+        auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+        auto defaultTask = evaluate(*defaultExpr);
+        while (!defaultTask.done()) {
+          std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+        }
+        env_->define(func->params[i].name, defaultTask.result());
+      } else {
+        env_->define(func->params[i].name, Value(Undefined{}));
+      }
+    }
+
+    // Handle rest parameter
+    if (func->restParam.has_value()) {
+      auto restArr = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      for (size_t i = func->params.size(); i < args.size(); ++i) {
+        restArr->elements.push_back(args[i]);
+      }
+      env_->define(*func->restParam, Value(restArr));
+    }
+
+    // Execute function body
+    auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+    Value result = Value(Undefined{});
+    auto prevFlow = flow_;
+    flow_ = ControlFlow{};
+
+    for (const auto& stmt : *bodyPtr) {
+      auto stmtTask = evaluate(*stmt);
+      while (!stmtTask.done()) {
+        std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+      }
+      result = stmtTask.result();
+
+      if (flow_.type == ControlFlow::Type::Return) {
+        // If constructor returns an object, use that; otherwise use the instance
+        if (flow_.value.isObject()) {
+          instance = std::get<std::shared_ptr<Object>>(flow_.value.data);
+        }
+        break;
+      }
+    }
+
+    flow_ = prevFlow;
+    env_ = prevEnv;
+
+    co_return Value(instance);
+  }
+
+  // Not a constructor
+  flow_.type = ControlFlow::Type::Throw;
+  flow_.value = Value(std::make_shared<Error>(
+    ErrorType::TypeError,
+    "Value is not a constructor"
+  ));
+  co_return Value(Undefined{});
+}
+
+Task Interpreter::evaluateClass(const ClassExpr& expr) {
+  auto cls = std::make_shared<Class>(expr.name);
+  GarbageCollector::instance().reportAllocation(sizeof(Class));
+  cls->closure = env_;
+
+  // Handle superclass
+  if (expr.superClass) {
+    auto superTask = evaluate(*expr.superClass);
+    while (!superTask.done()) {
+      std::coroutine_handle<>::from_address(superTask.handle.address()).resume();
+    }
+    Value superVal = superTask.result();
+    if (superVal.isClass()) {
+      cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+    }
+  }
+
+  // Process methods
+  for (const auto& method : expr.methods) {
+    // Create function from method definition
+    auto func = std::make_shared<Function>();
+    func->isNative = false;
+    func->isAsync = method.isAsync;
+    func->closure = env_;
+
+    for (const auto& param : method.params) {
+      FunctionParam funcParam;
+      funcParam.name = param.name;
+      func->params.push_back(funcParam);
+    }
+
+    // Store the body - we need to cast away const for the shared_ptr
+    func->body = std::shared_ptr<void>(
+      const_cast<std::vector<StmtPtr>*>(&method.body),
+      [](void*){} // No-op deleter since we don't own the memory
+    );
+
+    if (method.kind == MethodDefinition::Kind::Constructor) {
+      cls->constructor = func;
+    } else if (method.isStatic) {
+      cls->staticMethods[method.key.name] = func;
+    } else if (method.kind == MethodDefinition::Kind::Get) {
+      cls->getters[method.key.name] = func;
+    } else if (method.kind == MethodDefinition::Kind::Set) {
+      cls->setters[method.key.name] = func;
+    } else {
+      cls->methods[method.key.name] = func;
+    }
+  }
+
+  co_return Value(cls);
+}
+
+// Helper for recursively binding destructuring patterns
+void Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst) {
+  if (auto* id = std::get_if<Identifier>(&pattern.node)) {
+    // Simple identifier
+    env_->define(id->name, value, isConst);
+  } else if (auto* arrayPat = std::get_if<ArrayPattern>(&pattern.node)) {
+    // Array destructuring
+    std::shared_ptr<Array> arr;
+    if (value.isArray()) {
+      arr = std::get<std::shared_ptr<Array>>(value.data);
+    } else {
+      // Create empty array for non-array values
+      arr = std::make_shared<Array>();
+    }
+
+    for (size_t i = 0; i < arrayPat->elements.size(); ++i) {
+      if (!arrayPat->elements[i]) continue;  // Skip holes
+
+      Value elemValue = (i < arr->elements.size()) ? arr->elements[i] : Value(Undefined{});
+
+      // Recursively bind (handles nested patterns)
+      bindDestructuringPattern(*arrayPat->elements[i], elemValue, isConst);
+    }
+
+    // Handle rest element
+    if (arrayPat->rest) {
+      auto restArr = std::make_shared<Array>();
+      for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
+        restArr->elements.push_back(arr->elements[i]);
+      }
+      bindDestructuringPattern(*arrayPat->rest, Value(restArr), isConst);
+    }
+  } else if (auto* objPat = std::get_if<ObjectPattern>(&pattern.node)) {
+    // Object destructuring
+    std::shared_ptr<Object> obj;
+    if (value.isObject()) {
+      obj = std::get<std::shared_ptr<Object>>(value.data);
+    } else {
+      // Create empty object for non-object values
+      obj = std::make_shared<Object>();
+    }
+
+    std::unordered_set<std::string> extractedKeys;
+
+    for (const auto& prop : objPat->properties) {
+      std::string keyName;
+      if (auto* keyId = std::get_if<Identifier>(&prop.key->node)) {
+        keyName = keyId->name;
+      } else if (auto* keyStr = std::get_if<StringLiteral>(&prop.key->node)) {
+        keyName = keyStr->value;
+      } else {
+        continue;
+      }
+
+      extractedKeys.insert(keyName);
+      Value propValue = obj->properties.count(keyName) ? obj->properties[keyName] : Value(Undefined{});
+
+      // Recursively bind (handles nested patterns)
+      bindDestructuringPattern(*prop.value, propValue, isConst);
+    }
+
+    // Handle rest properties
+    if (objPat->rest) {
+      auto restObj = std::make_shared<Object>();
+      for (const auto& [key, val] : obj->properties) {
+        if (extractedKeys.find(key) == extractedKeys.end()) {
+          restObj->properties[key] = val;
+        }
+      }
+      bindDestructuringPattern(*objPat->rest, Value(restObj), isConst);
+    }
+  }
+  // Other node types are ignored (error case in real JS)
+}
+
+// Helper to invoke a JavaScript function synchronously (used by native array methods for callbacks)
+Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue) {
+  if (func->isNative) {
+    return func->nativeFunc(args);
+  }
+
+  // Save current environment
+  auto prevEnv = env_;
+  env_ = std::static_pointer_cast<Environment>(func->closure);
+  env_ = env_->createChild();
+
+  // Bind 'this' if provided
+  if (!thisValue.isUndefined()) {
+    env_->define("this", thisValue);
+  }
+
+  // Bind parameters
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    if (i < args.size()) {
+      env_->define(func->params[i].name, args[i]);
+    } else if (func->params[i].defaultValue) {
+      auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+      auto defaultTask = evaluate(*defaultExpr);
+      while (!defaultTask.done()) {
+        std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+      }
+      env_->define(func->params[i].name, defaultTask.result());
+    } else {
+      env_->define(func->params[i].name, Value(Undefined{}));
+    }
+  }
+
+  // Handle rest parameter
+  if (func->restParam.has_value()) {
+    auto restArr = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+    for (size_t i = func->params.size(); i < args.size(); ++i) {
+      restArr->elements.push_back(args[i]);
+    }
+    env_->define(*func->restParam, Value(restArr));
+  }
+
+  // Execute function body
+  auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+  Value result = Value(Undefined{});
+
+  auto prevFlow = flow_;
+  flow_ = ControlFlow{};
+
+  for (const auto& stmt : *bodyPtr) {
+    auto stmtTask = evaluate(*stmt);
+    while (!stmtTask.done()) {
+      std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+    }
+    result = stmtTask.result();
+
+    if (flow_.type == ControlFlow::Type::Return) {
+      result = flow_.value;
+      break;
+    }
+  }
+
+  flow_ = prevFlow;
+  env_ = prevEnv;
+  return result;
+}
+
 Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
   for (const auto& declarator : decl.declarations) {
     Value value = Value(Undefined{});
@@ -1896,80 +3466,13 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
       value = task.result();
     }
 
-    // Handle different pattern types
-    if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
-      env_->define(id->name, value, decl.kind == VarDeclaration::Kind::Const);
-    } else if (auto* arrayPat = std::get_if<ArrayPattern>(&declarator.pattern->node)) {
-      // Destructure array
-      if (!value.isArray()) {
-        // Convert to array-like if possible
-        continue;
-      }
-      auto arr = std::get<std::shared_ptr<Array>>(value.data);
-      for (size_t i = 0; i < arrayPat->elements.size(); ++i) {
-        if (!arrayPat->elements[i]) continue;  // Skip holes
-
-        Value elemValue = i < arr->elements.size() ? arr->elements[i] : Value(Undefined{});
-
-        if (auto* elemId = std::get_if<Identifier>(&arrayPat->elements[i]->node)) {
-          env_->define(elemId->name, elemValue, decl.kind == VarDeclaration::Kind::Const);
-        }
-        // TODO: Handle nested patterns
-      }
-
-      // Handle rest element
-      if (arrayPat->rest) {
-        auto restArr = std::make_shared<Array>();
-        for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
-          restArr->elements.push_back(arr->elements[i]);
-        }
-        if (auto* restId = std::get_if<Identifier>(&arrayPat->rest->node)) {
-          env_->define(restId->name, Value(restArr), decl.kind == VarDeclaration::Kind::Const);
-        }
-      }
-    } else if (auto* objPat = std::get_if<ObjectPattern>(&declarator.pattern->node)) {
-      // Destructure object
-      if (!value.isObject()) {
-        continue;
-      }
-      auto obj = std::get<std::shared_ptr<Object>>(value.data);
-      std::unordered_set<std::string> extractedKeys;
-
-      for (const auto& prop : objPat->properties) {
-        std::string keyName;
-        if (auto* keyId = std::get_if<Identifier>(&prop.key->node)) {
-          keyName = keyId->name;
-        } else if (auto* keyStr = std::get_if<StringLiteral>(&prop.key->node)) {
-          keyName = keyStr->value;
-        } else {
-          continue;
-        }
-
-        extractedKeys.insert(keyName);
-        Value propValue = obj->properties.count(keyName) ? obj->properties[keyName] : Value(Undefined{});
-
-        if (auto* valId = std::get_if<Identifier>(&prop.value->node)) {
-          env_->define(valId->name, propValue, decl.kind == VarDeclaration::Kind::Const);
-        }
-        // TODO: Handle nested patterns
-      }
-
-      // Handle rest properties
-      if (objPat->rest) {
-        auto restObj = std::make_shared<Object>();
-        for (const auto& [key, val] : obj->properties) {
-          if (extractedKeys.find(key) == extractedKeys.end()) {
-            restObj->properties[key] = val;
-          }
-        }
-        if (auto* restId = std::get_if<Identifier>(&objPat->rest->node)) {
-          env_->define(restId->name, Value(restObj), decl.kind == VarDeclaration::Kind::Const);
-        }
-      }
-    }
+    // Use the unified destructuring helper
+    bool isConst = (decl.kind == VarDeclaration::Kind::Const);
+    bindDestructuringPattern(*declarator.pattern, value, isConst);
   }
   co_return Value(Undefined{});
 }
+
 
 Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   auto func = std::make_shared<Function>();
