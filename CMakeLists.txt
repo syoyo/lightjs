@@ -62,6 +62,7 @@ set(LIGHTJS_CORE_SOURCES
   src/wasm/wasm_memory.cc
   src/wasm/wasm_decoder.cc
   src/wasm/wasm_interpreter.cc
+  src/wasm_js.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS
@@ -90,6 +91,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/wasm/wasm_types.h
   include/wasm/wasm_runtime.h
   include/wasm/wasm_decoder.h
+  include/wasm_js.h
 )
 
 # Create main library target

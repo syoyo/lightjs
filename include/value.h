@@ -36,6 +36,8 @@ struct WeakMap;
 struct WeakSet;
 struct ArrayBuffer;
 struct DataView;
+struct WasmInstanceJS;
+struct WasmMemoryJS;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -541,7 +543,9 @@ struct Value {
     std::shared_ptr<WeakSet>,
     std::shared_ptr<ArrayBuffer>,
     std::shared_ptr<DataView>,
-    std::shared_ptr<Class>
+    std::shared_ptr<Class>,
+    std::shared_ptr<WasmInstanceJS>,
+    std::shared_ptr<WasmMemoryJS>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -569,6 +573,8 @@ struct Value {
   Value(std::shared_ptr<ArrayBuffer> ab) : data(ab) {}
   Value(std::shared_ptr<DataView> dv) : data(dv) {}
   Value(std::shared_ptr<Class> c) : data(c) {}
+  Value(std::shared_ptr<WasmInstanceJS> wi) : data(wi) {}
+  Value(std::shared_ptr<WasmMemoryJS> wm) : data(wm) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -593,6 +599,8 @@ struct Value {
   bool isArrayBuffer() const { return std::holds_alternative<std::shared_ptr<ArrayBuffer>>(data); }
   bool isDataView() const { return std::holds_alternative<std::shared_ptr<DataView>>(data); }
   bool isClass() const { return std::holds_alternative<std::shared_ptr<Class>>(data); }
+  bool isWasmInstance() const { return std::holds_alternative<std::shared_ptr<WasmInstanceJS>>(data); }
+  bool isWasmMemory() const { return std::holds_alternative<std::shared_ptr<WasmMemoryJS>>(data); }
 
   bool toBool() const;
   double toNumber() const;

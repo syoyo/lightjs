@@ -118,6 +118,9 @@ public:
     // Binary sections (for lazy parsing if needed)
     std::vector<uint8_t> customSections;
     std::vector<uint8_t> dataSections;
+
+    // Data count (from DataCount section for validation)
+    uint32_t dataCount = 0;
 };
 
 // WASM instance (instantiated module with state)

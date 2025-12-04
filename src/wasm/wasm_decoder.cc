@@ -621,6 +621,9 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
         uint32_t sectionSize = readVarU32();
         size_t sectionStart = pos_;
 
+        // Track current section for error reporting
+        currentSection_ = sectionId;
+
         switch (static_cast<SectionId>(sectionId)) {
             case SectionId::Type:
                 if (!decodeTypeSection(*module)) return std::nullopt;
@@ -646,11 +649,17 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
             case SectionId::Start:
                 if (!decodeStartSection(*module)) return std::nullopt;
                 break;
+            case SectionId::Element:
+                if (!decodeElementSection(*module)) return std::nullopt;
+                break;
             case SectionId::Code:
                 if (!decodeCodeSection(*module)) return std::nullopt;
                 break;
             case SectionId::Data:
                 if (!decodeDataSection(*module)) return std::nullopt;
+                break;
+            case SectionId::DataCount:
+                if (!decodeDataCountSection(*module)) return std::nullopt;
                 break;
             case SectionId::Custom:
             default:
@@ -663,6 +672,9 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
         if (pos_ != sectionStart + sectionSize) {
             pos_ = sectionStart + sectionSize;
         }
+
+        // Reset section tracking
+        currentSection_ = 255;
     }
 
     if (!error_.empty()) {
@@ -670,6 +682,55 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
     }
 
     return module;
+}
+
+// Element section - initializes table elements
+bool WasmDecoder::decodeElementSection(WasmModule& module) {
+    uint32_t count = readVarU32();
+
+    for (uint32_t i = 0; i < count; ++i) {
+        // Element segment structure (simplified):
+        // - flags (u32)
+        // - table index or type
+        // - offset expression
+        // - init expressions or function indices
+
+        uint32_t flags = readVarU32();
+
+        // For now, skip element segments as they're for advanced table initialization
+        // Full implementation would decode based on flags:
+        // - bit 0: passive/declarative
+        // - bit 1: has explicit table index
+        // - bit 2: has elem type and init expressions
+
+        if (flags == 0) {
+            // Active segment with implicit table 0
+            // Read offset expression
+            auto offsetExpr = decodeExpression();
+            // Read function indices
+            uint32_t funcCount = readVarU32();
+            for (uint32_t j = 0; j < funcCount; ++j) {
+                readVarU32();  // Skip function index
+            }
+        } else {
+            // Other modes - skip for now
+            setError("Unsupported element segment mode: " + std::to_string(flags));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// DataCount section - validates data segment count
+bool WasmDecoder::decodeDataCountSection(WasmModule& module) {
+    uint32_t count = readVarU32();
+
+    // The data count section simply provides a hint for validation
+    // We don't need to store it, but we validate it matches data section later
+    module.dataCount = count;
+
+    return true;
 }
 
 } // namespace wasm

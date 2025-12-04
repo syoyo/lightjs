@@ -11,6 +11,7 @@
 #include "event_loop.h"
 #include "module.h"
 #include "interpreter.h"
+#include "wasm_js.h"
 #include <iostream>
 #include <thread>
 #include <limits>
@@ -116,7 +117,34 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (args.empty()) {
         return Value(std::make_shared<TypedArray>(type, 0));
       }
-      size_t length = static_cast<size_t>(args[0].toNumber());
+
+      // Check if first argument is an array
+      if (std::holds_alternative<std::shared_ptr<Array>>(args[0].data)) {
+        auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+        auto typedArray = std::make_shared<TypedArray>(type, arr->elements.size());
+
+        // Fill the typed array with values from the regular array
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+          double val = arr->elements[i].toNumber();
+          typedArray->setElement(i, val);
+        }
+
+        return Value(typedArray);
+      }
+
+      // Otherwise treat as length
+      double lengthNum = args[0].toNumber();
+      if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
+        // Invalid length, return empty array
+        return Value(std::make_shared<TypedArray>(type, 0));
+      }
+
+      size_t length = static_cast<size_t>(lengthNum);
+      // Sanity check: prevent allocating huge arrays
+      if (length > 1000000000) { // 1GB limit
+        return Value(std::make_shared<TypedArray>(type, 0));
+      }
+
       return Value(std::make_shared<TypedArray>(type, length));
     };
     return Value(func);
@@ -1215,6 +1243,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // For simplicity, we can make the Object callable by storing the function
   env->define("String", Value(stringConstructorObj));
+
+  // WebAssembly global object
+  env->define("WebAssembly", wasm_js::createWebAssemblyGlobal());
 
   // globalThis - reference to the global object
   // Create a proxy object that reflects the current global environment

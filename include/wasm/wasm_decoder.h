@@ -61,16 +61,44 @@ private:
     std::optional<Instruction> decodeInstruction();
     std::vector<Instruction> decodeExpression();
 
-    // Error handling
+    // Section decoding for Element and DataCount
+    bool decodeElementSection(WasmModule& module);
+    bool decodeDataCountSection(WasmModule& module);
+
+    // Error handling with context
+    const char* sectionName(uint8_t sectionId) const {
+        switch (sectionId) {
+            case 0: return "Custom";
+            case 1: return "Type";
+            case 2: return "Import";
+            case 3: return "Function";
+            case 4: return "Table";
+            case 5: return "Memory";
+            case 6: return "Global";
+            case 7: return "Export";
+            case 8: return "Start";
+            case 9: return "Element";
+            case 10: return "Code";
+            case 11: return "Data";
+            case 12: return "DataCount";
+            default: return "Unknown";
+        }
+    }
+
     void setError(const std::string& msg) {
         if (error_.empty()) {
-            error_ = msg + " at offset " + std::to_string(pos_);
+            std::string context = msg + " at offset " + std::to_string(pos_);
+            if (currentSection_ != 255) {
+                context += " in " + std::string(sectionName(currentSection_)) + " section";
+            }
+            error_ = context;
         }
     }
 
     const std::vector<uint8_t>& data_;
     size_t pos_;
     std::string error_;
+    uint8_t currentSection_ = 255;  // Track current section for better error messages
 };
 
 } // namespace wasm
