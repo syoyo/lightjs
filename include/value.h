@@ -514,6 +514,20 @@ struct TypedArray : public GCObject {
   int64_t getBigIntElement(size_t index) const;
   void setBigIntElement(size_t index, int64_t value);
 
+  // Bulk operations (SIMD-accelerated when USE_SIMD=1)
+  // Copy elements from another TypedArray with type conversion
+  void copyFrom(const TypedArray& source, size_t srcOffset, size_t dstOffset, size_t count);
+
+  // Fill all elements with a single value
+  void fill(double value);
+  void fill(double value, size_t start, size_t end);
+
+  // Set multiple elements from a double array
+  void setElements(const double* values, size_t offset, size_t count);
+
+  // Get multiple elements to a double array
+  void getElements(double* values, size_t offset, size_t count) const;
+
   // GCObject interface
   const char* typeName() const override { return "TypedArray"; }
   void getReferences(std::vector<GCObject*>& refs) const override {}

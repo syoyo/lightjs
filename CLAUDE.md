@@ -28,6 +28,10 @@ make
 cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
+# Build with SIMD optimizations (SSE2/AVX2 on x86, NEON/SVE on ARM64)
+cmake .. -DUSE_SIMD=ON
+make
+
 # Run all tests (197 tests)
 ./lightjs_test
 
@@ -164,6 +168,48 @@ TypedArrays store binary data in `std::vector<uint8_t>` with typed accessors:
 **When adding new TypedArray types:** Update `TypedArrayType` enum, `elementSize()`, and both get/set methods in `value.cc`.
 
 **Future enhancement:** TypedArrays can be updated to share ArrayBuffer backing store instead of maintaining separate buffers.
+
+### SIMD Optimizations (`include/simd.h`, `src/simd.cc`)
+
+LightJS supports optional SIMD acceleration for TypedArray operations:
+
+**Build with SIMD:**
+```bash
+cmake .. -DUSE_SIMD=ON
+make
+```
+
+**Supported platforms:**
+- **x86/x64:** SSE2, SSE4.2, AVX2+FMA (auto-detected, up to AMD Zen2)
+- **ARM64:** NEON (always available), SVE (optional)
+
+**Optimized operations:**
+- **Type conversions:** Float32→Int32, Int32→Float32, Float64→Int32, Float32→Uint8, Float32→Int16, etc.
+- **Uint8Clamped:** SIMD-accelerated clamping for image processing
+- **Float16 batch:** Optimized F16↔F32 conversion for ML workloads
+- **Memory operations:** SIMD-accelerated memcpy for large buffers
+- **Fill operations:** Fast array initialization
+
+**TypedArray bulk methods (SIMD-accelerated when enabled):**
+```cpp
+// Copy with type conversion (SIMD path for common conversions)
+typedArray.copyFrom(source, srcOffset, dstOffset, count);
+
+// Fill array (SIMD for Float32/Int32/Uint32)
+typedArray.fill(value);
+typedArray.fill(value, start, end);
+
+// Bulk get/set
+typedArray.setElements(doubleArray, offset, count);
+typedArray.getElements(doubleArray, offset, count);
+```
+
+**Implementation notes:**
+- All SIMD code is guarded with `#if USE_SIMD` preprocessor checks
+- Scalar fallbacks always exist for non-SIMD builds
+- Vector width is 256-bit for AVX2, 128-bit for SSE2/NEON
+- No AVX-512 (not available on Zen2)
+- No F16C hardware conversion (for broader compatibility)
 
 ### Async/Await and Promise API
 

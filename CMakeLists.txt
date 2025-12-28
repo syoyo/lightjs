@@ -11,6 +11,7 @@ option(LIGHTJS_BUILD_REPL "Build LightJS REPL" ON)
 option(LIGHTJS_BUILD_EXAMPLES "Build LightJS examples" ON)
 option(LIGHTJS_INSTALL "Generate install target" ON)
 option(USE_SIMPLE_REGEX "Use simple regex implementation instead of std::regex" OFF)
+option(USE_SIMD "Enable SIMD optimizations (SSE2/AVX2 on x86, NEON/SVE on ARM64)" OFF)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 20)
@@ -25,6 +26,71 @@ if(USE_SIMPLE_REGEX)
   add_compile_definitions(USE_SIMPLE_REGEX=1)
 else()
   add_compile_definitions(USE_SIMPLE_REGEX=0)
+endif()
+
+# SIMD configuration
+if(USE_SIMD)
+  add_compile_definitions(USE_SIMD=1)
+
+  # Detect architecture
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i686|i386)")
+    set(SIMD_ARCH "x86")
+    add_compile_definitions(SIMD_ARCH_X86=1)
+
+    # Check for AVX2 support (up to Zen2)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+    check_cxx_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
+    check_cxx_compiler_flag("-msse4.2" COMPILER_SUPPORTS_SSE42)
+    check_cxx_compiler_flag("-msse2" COMPILER_SUPPORTS_SSE2)
+
+    if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+      add_compile_definitions(SIMD_AVX2=1)
+      set(SIMD_FLAGS "-mavx2 -mfma")
+      message(STATUS "SIMD: AVX2+FMA enabled (x86)")
+    elseif(COMPILER_SUPPORTS_SSE42)
+      add_compile_definitions(SIMD_SSE42=1)
+      set(SIMD_FLAGS "-msse4.2")
+      message(STATUS "SIMD: SSE4.2 enabled (x86)")
+    elseif(COMPILER_SUPPORTS_SSE2)
+      add_compile_definitions(SIMD_SSE2=1)
+      set(SIMD_FLAGS "-msse2")
+      message(STATUS "SIMD: SSE2 enabled (x86)")
+    else()
+      message(WARNING "SIMD: No supported x86 SIMD instructions found")
+      set(USE_SIMD OFF)
+    endif()
+
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
+    set(SIMD_ARCH "arm64")
+    add_compile_definitions(SIMD_ARCH_ARM64=1)
+
+    # Check for SVE support
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=armv8.2-a+sve" COMPILER_SUPPORTS_SVE)
+
+    if(COMPILER_SUPPORTS_SVE)
+      add_compile_definitions(SIMD_SVE=1)
+      set(SIMD_FLAGS "-march=armv8.2-a+sve")
+      message(STATUS "SIMD: SVE enabled (ARM64)")
+    else()
+      # NEON is always available on ARM64
+      add_compile_definitions(SIMD_NEON=1)
+      set(SIMD_FLAGS "")
+      message(STATUS "SIMD: NEON enabled (ARM64)")
+    endif()
+
+  else()
+    message(WARNING "SIMD: Unsupported architecture ${CMAKE_SYSTEM_PROCESSOR}")
+    set(USE_SIMD OFF)
+  endif()
+
+  # Apply SIMD flags if set
+  if(USE_SIMD AND SIMD_FLAGS)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SIMD_FLAGS}")
+  endif()
+else()
+  add_compile_definitions(USE_SIMD=0)
 endif()
 
 # Include GNUInstallDirs for standard installation paths
@@ -63,6 +129,7 @@ set(LIGHTJS_CORE_SOURCES
   src/wasm/wasm_decoder.cc
   src/wasm/wasm_interpreter.cc
   src/wasm_js.cc
+  src/simd.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS
@@ -88,6 +155,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/object_methods.h
   include/simple_regex.h
   include/tls.h
+  include/simd.h
   include/wasm/wasm_types.h
   include/wasm/wasm_runtime.h
   include/wasm/wasm_decoder.h
@@ -266,4 +334,9 @@ message(STATUS "  Build REPL:      ${LIGHTJS_BUILD_REPL}")
 message(STATUS "  Build examples:  ${LIGHTJS_BUILD_EXAMPLES}")
 message(STATUS "  Install:         ${LIGHTJS_INSTALL}")
 message(STATUS "  Simple regex:    ${USE_SIMPLE_REGEX}")
+message(STATUS "  SIMD:            ${USE_SIMD}")
+if(USE_SIMD)
+  message(STATUS "  SIMD arch:       ${SIMD_ARCH}")
+  message(STATUS "  SIMD flags:      ${SIMD_FLAGS}")
+endif()
 message(STATUS "")
