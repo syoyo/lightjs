@@ -13,6 +13,66 @@ option(LIGHTJS_INSTALL "Generate install target" ON)
 option(USE_SIMPLE_REGEX "Use simple regex implementation instead of std::regex" OFF)
 option(USE_SIMD "Enable SIMD optimizations (SSE2/AVX2 on x86, NEON/SVE on ARM64)" OFF)
 
+# Cross-compilation options for ARM64
+option(CROSS_COMPILE_ARM64 "Cross-compile for ARM64 with NEON" OFF)
+option(CROSS_COMPILE_A64FX "Cross-compile for Fujitsu A64FX with SVE (512-bit)" OFF)
+
+# ==============================================================================
+# Cross-compilation configuration
+# ==============================================================================
+
+if(CROSS_COMPILE_A64FX)
+  # A64FX implies ARM64 cross-compilation with SVE
+  set(CROSS_COMPILE_ARM64 ON)
+  set(CROSS_COMPILE_TARGET "a64fx")
+  message(STATUS "Cross-compiling for Fujitsu A64FX (ARM64 + SVE 512-bit)")
+elseif(CROSS_COMPILE_ARM64)
+  set(CROSS_COMPILE_TARGET "arm64")
+  message(STATUS "Cross-compiling for ARM64 with NEON")
+endif()
+
+if(CROSS_COMPILE_ARM64)
+  # Set cross-compilation variables
+  set(CMAKE_SYSTEM_NAME Linux)
+  set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+  # Try to find aarch64 cross-compiler if not already set
+  if(NOT CMAKE_CXX_COMPILER)
+    find_program(AARCH64_CXX_COMPILER
+      NAMES aarch64-linux-gnu-g++ aarch64-unknown-linux-gnu-g++ aarch64-linux-g++
+    )
+    if(AARCH64_CXX_COMPILER)
+      set(CMAKE_CXX_COMPILER ${AARCH64_CXX_COMPILER})
+      message(STATUS "Found ARM64 cross-compiler: ${AARCH64_CXX_COMPILER}")
+    else()
+      message(WARNING "ARM64 cross-compiler not found. Set CMAKE_CXX_COMPILER manually.")
+    endif()
+
+    find_program(AARCH64_C_COMPILER
+      NAMES aarch64-linux-gnu-gcc aarch64-unknown-linux-gnu-gcc aarch64-linux-gcc
+    )
+    if(AARCH64_C_COMPILER)
+      set(CMAKE_C_COMPILER ${AARCH64_C_COMPILER})
+    endif()
+  endif()
+
+  # Enable SIMD automatically for cross-compilation
+  set(USE_SIMD ON)
+
+  # Set architecture-specific flags
+  if(CROSS_COMPILE_A64FX)
+    # A64FX: ARMv8.2-A with SVE (512-bit vector length)
+    # -mcpu=a64fx provides optimal tuning for Fujitsu A64FX
+    set(CROSS_COMPILE_FLAGS "-mcpu=a64fx -march=armv8.2-a+sve")
+    add_compile_definitions(TARGET_A64FX=1)
+    add_compile_definitions(SVE_VECTOR_LENGTH=512)
+  else()
+    # Generic ARM64 with NEON (ARMv8-A baseline)
+    set(CROSS_COMPILE_FLAGS "-march=armv8-a")
+    add_compile_definitions(TARGET_ARM64_GENERIC=1)
+  endif()
+endif()
+
 # C++ standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,8 +92,26 @@ endif()
 if(USE_SIMD)
   add_compile_definitions(USE_SIMD=1)
 
-  # Detect architecture
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i686|i386)")
+  # Cross-compilation: use pre-determined settings
+  if(CROSS_COMPILE_ARM64)
+    set(SIMD_ARCH "arm64")
+    add_compile_definitions(SIMD_ARCH_ARM64=1)
+
+    if(CROSS_COMPILE_A64FX)
+      # A64FX with SVE (512-bit)
+      add_compile_definitions(SIMD_SVE=1)
+      add_compile_definitions(SIMD_NEON=1)  # A64FX also supports NEON
+      set(SIMD_FLAGS "${CROSS_COMPILE_FLAGS}")
+      message(STATUS "SIMD: SVE+NEON enabled (A64FX cross-compile)")
+    else()
+      # Generic ARM64 with NEON
+      add_compile_definitions(SIMD_NEON=1)
+      set(SIMD_FLAGS "${CROSS_COMPILE_FLAGS}")
+      message(STATUS "SIMD: NEON enabled (ARM64 cross-compile)")
+    endif()
+
+  # Native compilation: detect architecture
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i686|i386)")
     set(SIMD_ARCH "x86")
     add_compile_definitions(SIMD_ARCH_X86=1)
 
@@ -338,5 +416,15 @@ message(STATUS "  SIMD:            ${USE_SIMD}")
 if(USE_SIMD)
   message(STATUS "  SIMD arch:       ${SIMD_ARCH}")
   message(STATUS "  SIMD flags:      ${SIMD_FLAGS}")
+endif()
+if(CROSS_COMPILE_ARM64)
+  message(STATUS "")
+  message(STATUS "Cross-compilation:")
+  message(STATUS "  Target:          ${CROSS_COMPILE_TARGET}")
+  message(STATUS "  System:          ${CMAKE_SYSTEM_NAME}")
+  message(STATUS "  Processor:       ${CMAKE_SYSTEM_PROCESSOR}")
+  if(CROSS_COMPILE_A64FX)
+    message(STATUS "  SVE vector len:  512 bits")
+  endif()
 endif()
 message(STATUS "")

@@ -32,6 +32,14 @@ make
 cmake .. -DUSE_SIMD=ON
 make
 
+# Cross-compile for ARM64 with NEON
+cmake .. -DCROSS_COMPILE_ARM64=ON
+make
+
+# Cross-compile for Fujitsu A64FX with SVE (512-bit)
+cmake .. -DCROSS_COMPILE_A64FX=ON
+make
+
 # Run all tests (197 tests)
 ./lightjs_test
 
@@ -210,6 +218,23 @@ typedArray.getElements(doubleArray, offset, count);
 - Vector width is 256-bit for AVX2, 128-bit for SSE2/NEON
 - No AVX-512 (not available on Zen2)
 - No F16C hardware conversion (for broader compatibility)
+
+**Cross-compilation for ARM64:**
+```bash
+# Generic ARM64 with NEON (requires aarch64-linux-gnu-g++)
+cmake .. -DCROSS_COMPILE_ARM64=ON
+
+# Fujitsu A64FX with SVE 512-bit (for Fugaku supercomputer)
+cmake .. -DCROSS_COMPILE_A64FX=ON
+
+# With custom cross-compiler
+cmake .. -DCROSS_COMPILE_A64FX=ON -DCMAKE_CXX_COMPILER=/path/to/aarch64-linux-gnu-g++
+```
+
+Cross-compilation automatically:
+- Sets `CMAKE_SYSTEM_PROCESSOR` to `aarch64`
+- Enables SIMD with appropriate flags (`-march=armv8-a` or `-mcpu=a64fx`)
+- Defines `TARGET_A64FX=1` and `SVE_VECTOR_LENGTH=512` for A64FX builds
 
 ### Async/Await and Promise API
 
