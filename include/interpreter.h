@@ -97,11 +97,63 @@ private:
 
   struct ControlFlow {
     enum class Type { None, Return, Break, Continue, Throw, Yield };
+    enum class ResumeMode { None, Next, Return, Throw };
+
     Type type = Type::None;
     Value value;
+    ResumeMode resumeMode = ResumeMode::None;
+    Value resumeValue = Value(Undefined{});
+
+    void reset() {
+      type = Type::None;
+      value = Value(Undefined{});
+      resumeMode = ResumeMode::None;
+      resumeValue = Value(Undefined{});
+    }
+
+    void setYield(const Value& v) {
+      type = Type::Yield;
+      value = v;
+    }
+
+    void prepareResume(ResumeMode mode, const Value& v) {
+      resumeMode = mode;
+      resumeValue = v;
+    }
+
+    ResumeMode takeResumeMode() {
+      auto mode = resumeMode;
+      resumeMode = ResumeMode::None;
+      return mode;
+    }
+
+    Value takeResumeValue() {
+      Value v = resumeValue;
+      resumeValue = Value(Undefined{});
+      return v;
+    }
   };
 
   ControlFlow flow_;
+
+  struct IteratorRecord {
+    enum class Kind { Generator, Array, String, IteratorObject };
+    Kind kind = Kind::Array;
+    std::shared_ptr<Generator> generator;
+    std::shared_ptr<Array> array;
+    std::shared_ptr<Object> iteratorObject;
+    std::string stringValue;
+    size_t index = 0;
+  };
+
+  static Value makeIteratorResult(const Value& value, bool done);
+  static Value createIteratorFactory(const std::shared_ptr<Array>& arrPtr);
+  Value runGeneratorNext(const std::shared_ptr<Generator>& generator,
+                         ControlFlow::ResumeMode mode = ControlFlow::ResumeMode::None,
+                         const Value& resumeValue = Value(Undefined{}));
+  std::optional<IteratorRecord> getIterator(const Value& iterable);
+  Value iteratorNext(IteratorRecord& record);
+  Value callFunction(const Value& callee, const std::vector<Value>& args);
 
   Task evaluateBinary(const BinaryExpr& expr);
   Task evaluateUnary(const UnaryExpr& expr);

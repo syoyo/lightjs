@@ -55,6 +55,7 @@ private:
   ExprPtr parsePostfix();
   ExprPtr parseCall();
   ExprPtr parseMember();
+  ExprPtr parseMemberSuffix(ExprPtr expr);
   ExprPtr parsePrimary();
   ExprPtr parseArrayExpression();
   ExprPtr parseObjectExpression();

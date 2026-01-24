@@ -919,6 +919,68 @@ int main() {
     obj[sym]
   )", "42");
 
+  runTest("Symbol.iterator exists", R"(
+    typeof Symbol.iterator
+  )", "symbol");
+
+  runTest("Array Symbol.iterator returns function", R"(
+    const iterFn = [1, 2, 3][Symbol.iterator];
+    typeof iterFn;
+  )", "function");
+
+  runTest("Array Symbol.iterator produces iterator", R"(
+    const iter = [10, 20][Symbol.iterator]();
+    const first = iter.next();
+    first.value;
+  )", "10");
+
+  runTest("String Symbol.iterator produces iterator", R"(
+    const iter = "ok"[Symbol.iterator]();
+    const step = iter.next();
+    step.value;
+  )", "o");
+
+  runTest("String Symbol.iterator chained value", R"(
+    const iter = "ok"[Symbol.iterator]();
+    iter.next().value;
+  )", "o");
+
+  runTest("Custom object generator iterator", R"(
+    const obj = {
+      *[Symbol.iterator]() {
+        yield 1;
+        yield 2;
+      }
+    };
+    let sum = 0;
+    for (const n of obj) {
+      sum = sum + n;
+    }
+    sum;
+  )", "3");
+
+  runTest("Iterator object without this", R"(
+    const iter = {
+      [Symbol.iterator]() {
+        const data = [0, 1, 2];
+        let index = 0;
+        return {
+          next() {
+            if (index < data.length) {
+              return { value: data[index++], done: false };
+            }
+            return { value: undefined, done: true };
+          }
+        };
+      }
+    };
+    let total = 0;
+    for (const val of iter) {
+      total = total + val;
+    }
+    total;
+  )", "3");
+
   // Error types
   runTest("Error - basic constructor", R"(
     const err = Error("Something went wrong");

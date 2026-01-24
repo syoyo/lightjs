@@ -53,6 +53,7 @@ set(TINYJS_CORE_SOURCES
   src/date_object.cc
   src/unicode.cc
   src/event_loop.cc
+  src/symbols.cc
 )
 
 set(TINYJS_PUBLIC_HEADERS
@@ -122,6 +123,7 @@ if(TINYJS_BUILD_TESTS)
     add_executable(${TEST_NAME} ${TEST_SOURCE})
     target_link_libraries(${TEST_NAME} PRIVATE TinyJS::tinyjs)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 60)
   endfunction()
 
   # Core functionality tests

@@ -1170,29 +1170,34 @@ ExprPtr Parser::parsePostfix() {
 }
 
 ExprPtr Parser::parseCall() {
-  auto expr = parseMember();
+  auto expr = parsePrimary();
+  expr = parseMemberSuffix(std::move(expr));
 
-  while (match(TokenType::LeftParen)) {
-    advance();
-    std::vector<ExprPtr> args;
+  while (true) {
+    if (match(TokenType::LeftParen)) {
+      advance();
+      std::vector<ExprPtr> args;
 
-    while (!match(TokenType::RightParen)) {
-      if (!args.empty()) {
-        expect(TokenType::Comma);
+      while (!match(TokenType::RightParen)) {
+        if (!args.empty()) {
+          expect(TokenType::Comma);
+        }
+
+        if (match(TokenType::DotDotDot)) {
+          advance();
+          auto arg = parseExpression();
+          args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
+        } else {
+          args.push_back(parseExpression());
+        }
       }
 
-      // Check for spread element in arguments
-      if (match(TokenType::DotDotDot)) {
-        advance();
-        auto arg = parseExpression();
-        args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
-      } else {
-        args.push_back(parseExpression());
-      }
+      expect(TokenType::RightParen);
+      expr = std::make_unique<Expression>(CallExpr{std::move(expr), std::move(args)});
+      expr = parseMemberSuffix(std::move(expr));
+    } else {
+      break;
     }
-
-    expect(TokenType::RightParen);
-    expr = std::make_unique<Expression>(CallExpr{std::move(expr), std::move(args)});
   }
 
   return expr;
@@ -1200,12 +1205,14 @@ ExprPtr Parser::parseCall() {
 
 ExprPtr Parser::parseMember() {
   auto expr = parsePrimary();
+  return parseMemberSuffix(std::move(expr));
+}
 
+ExprPtr Parser::parseMemberSuffix(ExprPtr expr) {
   while (true) {
     if (match(TokenType::Dot) || match(TokenType::QuestionDot)) {
       bool isOptional = match(TokenType::QuestionDot);
       advance();
-      // Accept identifiers OR keywords as property names
       if (match(TokenType::Identifier) || match(TokenType::From) || match(TokenType::Of)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
@@ -1230,7 +1237,6 @@ ExprPtr Parser::parseMember() {
       break;
     }
   }
-
   return expr;
 }
 

@@ -73,6 +73,7 @@ struct Function : public GCObject {
   bool isAsync;
   bool isGenerator;
   NativeFunction nativeFunc;
+  std::unordered_map<std::string, Value> properties;
 
   Function() : isNative(false), isAsync(false), isGenerator(false) {}
 

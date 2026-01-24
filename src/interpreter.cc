@@ -3,6 +3,7 @@
 #include "string_methods.h"
 #include "unicode.h"
 #include "gc.h"
+#include "symbols.h"
 #include <iostream>
 #include <cmath>
 #include <sstream>
@@ -475,6 +476,32 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       co_return right;
     }
 
+    if (obj.isFunction()) {
+      auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+      if (expr.op == AssignmentExpr::Op::Assign) {
+        funcPtr->properties[propName] = right;
+      } else {
+        Value current = funcPtr->properties[propName];
+        switch (expr.op) {
+          case AssignmentExpr::Op::AddAssign:
+            funcPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+            break;
+          case AssignmentExpr::Op::SubAssign:
+            funcPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
+            break;
+          case AssignmentExpr::Op::MulAssign:
+            funcPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
+            break;
+          case AssignmentExpr::Op::DivAssign:
+            funcPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
+            break;
+          default:
+            funcPtr->properties[propName] = right;
+        }
+      }
+      co_return right;
+    }
+
     if (obj.isArray()) {
       auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
       try {
@@ -584,177 +611,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   }
 
   if (callee.isFunction()) {
-    auto func = std::get<std::shared_ptr<Function>>(callee.data);
-    if (func->isNative) {
-      co_return func->nativeFunc(args);
-    }
-
-    // If it's a generator function, return a Generator object
-    if (func->isGenerator) {
-      auto generator = std::make_shared<Generator>(func, func->closure);
-      GarbageCollector::instance().reportAllocation(sizeof(Generator));
-
-      // Store the arguments in a special property so they can be bound when next() is called
-      // For now, we'll create a child environment and bind parameters immediately
-      auto genEnv = std::static_pointer_cast<Environment>(func->closure);
-      genEnv = genEnv->createChild();
-
-      for (size_t i = 0; i < func->params.size(); ++i) {
-        if (i < args.size()) {
-          genEnv->define(func->params[i].name, args[i]);
-        } else if (func->params[i].defaultValue) {
-          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
-          auto defaultTask = evaluate(*defaultExpr);
-          while (!defaultTask.done()) {
-            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-          }
-          genEnv->define(func->params[i].name, defaultTask.result());
-        } else {
-          genEnv->define(func->params[i].name, Value(Undefined{}));
-        }
-      }
-
-      // Handle rest parameter
-      if (func->restParam.has_value()) {
-        auto restArr = std::make_shared<Array>();
-        GarbageCollector::instance().reportAllocation(sizeof(Array));
-        for (size_t i = func->params.size(); i < args.size(); ++i) {
-          restArr->elements.push_back(args[i]);
-        }
-        genEnv->define(*func->restParam, Value(restArr));
-      }
-
-      // Store the bound environment in the generator context
-      generator->context = genEnv;
-
-      co_return Value(generator);
-    }
-
-    // If it's an async function, wrap the result in a Promise
-    if (func->isAsync) {
-      auto promise = std::make_shared<Promise>();
-
-      // Execute the function body
-      auto prevEnv = env_;
-      env_ = std::static_pointer_cast<Environment>(func->closure);
-      env_ = env_->createChild();
-
-      for (size_t i = 0; i < func->params.size(); ++i) {
-        if (i < args.size()) {
-          // Use provided argument
-          env_->define(func->params[i].name, args[i]);
-        } else if (func->params[i].defaultValue) {
-          // Evaluate default value
-          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
-          auto defaultTask = evaluate(*defaultExpr);
-          while (!defaultTask.done()) {
-            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-          }
-          env_->define(func->params[i].name, defaultTask.result());
-        } else {
-          // No default value, parameter is undefined
-          env_->define(func->params[i].name, Value(Undefined{}));
-        }
-      }
-
-      // Handle rest parameter
-      if (func->restParam.has_value()) {
-        auto restArr = std::make_shared<Array>();
-        GarbageCollector::instance().reportAllocation(sizeof(Array));
-        for (size_t i = func->params.size(); i < args.size(); ++i) {
-          restArr->elements.push_back(args[i]);
-        }
-        env_->define(*func->restParam, Value(restArr));
-      }
-
-      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
-      Value result = Value(Undefined{});
-
-      auto prevFlow = flow_;
-      flow_ = ControlFlow{};
-
-      try {
-        for (const auto& stmt : *bodyPtr) {
-          auto stmtTask = evaluate(*stmt);
-          while (!stmtTask.done()) {
-            std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-          }
-          result = stmtTask.result();
-
-          if (flow_.type == ControlFlow::Type::Return) {
-            result = flow_.value;
-            break;
-          }
-        }
-
-        // Resolve the promise with the result
-        promise->resolve(result);
-      } catch (const std::exception& e) {
-        // Reject the promise if there's an error
-        promise->reject(Value(std::string(e.what())));
-      }
-
-      flow_ = prevFlow;
-      env_ = prevEnv;
-
-      co_return Value(promise);
-    } else {
-      // Regular synchronous function
-      auto prevEnv = env_;
-      env_ = std::static_pointer_cast<Environment>(func->closure);
-      env_ = env_->createChild();
-
-      for (size_t i = 0; i < func->params.size(); ++i) {
-        if (i < args.size()) {
-          // Use provided argument
-          env_->define(func->params[i].name, args[i]);
-        } else if (func->params[i].defaultValue) {
-          // Evaluate default value
-          auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
-          auto defaultTask = evaluate(*defaultExpr);
-          while (!defaultTask.done()) {
-            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-          }
-          env_->define(func->params[i].name, defaultTask.result());
-        } else {
-          // No default value, parameter is undefined
-          env_->define(func->params[i].name, Value(Undefined{}));
-        }
-      }
-
-      // Handle rest parameter
-      if (func->restParam.has_value()) {
-        auto restArr = std::make_shared<Array>();
-        GarbageCollector::instance().reportAllocation(sizeof(Array));
-        for (size_t i = func->params.size(); i < args.size(); ++i) {
-          restArr->elements.push_back(args[i]);
-        }
-        env_->define(*func->restParam, Value(restArr));
-      }
-
-      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
-      Value result = Value(Undefined{});
-
-      auto prevFlow = flow_;
-      flow_ = ControlFlow{};
-
-      for (const auto& stmt : *bodyPtr) {
-        auto stmtTask = evaluate(*stmt);
-        while (!stmtTask.done()) {
-          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-        }
-        result = stmtTask.result();
-
-        if (flow_.type == ControlFlow::Type::Return) {
-          result = flow_.value;
-          break;
-        }
-      }
-
-      flow_ = prevFlow;
-      env_ = prevEnv;
-      co_return result;
-    }
+    co_return callFunction(callee, args);
   }
 
   co_return Value(Undefined{});
@@ -766,6 +623,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
   }
   Value obj = objTask.result();
+  std::string propName;
+  if (expr.computed) {
+    auto propTask = evaluate(*expr.property);
+    while (!propTask.done()) {
+      std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
+    }
+    propName = propTask.result().toString();
+  } else {
+    if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
+      propName = id->name;
+    }
+  }
 
   // Optional chaining: if object is null or undefined, return undefined
   if (expr.optional && (obj.isNull() || obj.isUndefined())) {
@@ -820,18 +689,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     co_return Value(Undefined{});
   }
 
-  std::string propName;
-  if (expr.computed) {
-    auto propTask = evaluate(*expr.property);
-    while (!propTask.done()) {
-      std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
-    }
-    propName = propTask.result().toString();
-  } else {
-    if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
-      propName = id->name;
-    }
-  }
+  const auto& iteratorKey = WellKnownSymbols::iteratorKey();
 
   if (obj.isPromise()) {
     auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
@@ -1099,91 +957,37 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
   }
 
+  if (obj.isFunction()) {
+    auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+    auto it = funcPtr->properties.find(propName);
+    if (it != funcPtr->properties.end()) {
+      co_return it->second;
+    }
+  }
+
   // Generator methods
   if (obj.isGenerator()) {
     auto genPtr = std::get<std::shared_ptr<Generator>>(obj.data);
+
+    if (propName == iteratorKey) {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [genPtr](const std::vector<Value>&) -> Value {
+        return Value(genPtr);
+      };
+      co_return Value(fn);
+    }
 
     if (propName == "next") {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
-        auto resultObj = std::make_shared<Object>();
-        GarbageCollector::instance().reportAllocation(sizeof(Object));
-
-        if (genPtr->state == GeneratorState::Completed) {
-          resultObj->properties["value"] = Value(Undefined{});
-          resultObj->properties["done"] = Value(true);
-          return Value(resultObj);
+        Value resumeValue = args.empty() ? Value(Undefined{}) : args[0];
+        auto mode = ControlFlow::ResumeMode::Next;
+        if (genPtr->state == GeneratorState::SuspendedStart) {
+          resumeValue = Value(Undefined{});
         }
-
-        // Execute the generator function (or resume from yield)
-        if (genPtr->state == GeneratorState::SuspendedStart || genPtr->state == GeneratorState::SuspendedYield) {
-          genPtr->state = GeneratorState::Executing;
-
-          // Get the function and execute its body
-          if (genPtr->function && genPtr->context) {
-            auto prevEnv = this->env_;
-            this->env_ = std::static_pointer_cast<Environment>(genPtr->context);
-
-            auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
-            Value result = Value(Undefined{});
-
-            auto prevFlow = this->flow_;
-            this->flow_ = ControlFlow{};
-
-            // Execute the function body starting from yieldIndex
-            size_t startIndex = genPtr->yieldIndex;
-            for (size_t i = startIndex; i < bodyPtr->size(); i++) {
-              auto task = this->evaluate(*(*bodyPtr)[i]);
-              while (!task.done()) {
-                std::coroutine_handle<>::from_address(task.handle.address()).resume();
-              }
-              result = task.result();
-
-              // Check for control flow changes
-              if (this->flow_.type == ControlFlow::Type::Yield) {
-                // We hit a yield - suspend execution
-                genPtr->state = GeneratorState::SuspendedYield;
-                genPtr->currentValue = std::make_shared<Value>(this->flow_.value);
-                genPtr->yieldIndex = i + 1;  // Resume from next statement
-
-                this->flow_ = prevFlow;
-                this->env_ = prevEnv;
-
-                resultObj->properties["value"] = *genPtr->currentValue;
-                resultObj->properties["done"] = Value(false);
-                return Value(resultObj);
-              }
-
-              if (this->flow_.type == ControlFlow::Type::Return) {
-                // Generator returns - mark as completed
-                genPtr->state = GeneratorState::Completed;
-                genPtr->currentValue = std::make_shared<Value>(this->flow_.value);
-                result = this->flow_.value;
-                break;
-              }
-            }
-
-            this->flow_ = prevFlow;
-            this->env_ = prevEnv;
-
-            // If we finished all statements without explicit return
-            if (genPtr->state != GeneratorState::Completed && genPtr->state != GeneratorState::SuspendedYield) {
-              genPtr->state = GeneratorState::Completed;
-              genPtr->currentValue = std::make_shared<Value>(result);
-            }
-
-            resultObj->properties["value"] = *genPtr->currentValue;
-            resultObj->properties["done"] = Value(genPtr->state == GeneratorState::Completed);
-            return Value(resultObj);
-          }
-        }
-
-        // If already completed or in unexpected state
-        genPtr->state = GeneratorState::Completed;
-        resultObj->properties["value"] = Value(Undefined{});
-        resultObj->properties["done"] = Value(true);
-        return Value(resultObj);
+        return this->runGeneratorNext(genPtr, mode, resumeValue);
       };
       co_return Value(fn);
     }
@@ -1192,12 +996,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
+        Value returnValue = args.empty() ? Value(Undefined{}) : args[0];
         genPtr->state = GeneratorState::Completed;
-        auto resultObj = std::make_shared<Object>();
-        GarbageCollector::instance().reportAllocation(sizeof(Object));
-        resultObj->properties["value"] = args.empty() ? Value(Undefined{}) : args[0];
-        resultObj->properties["done"] = Value(true);
-        return Value(resultObj);
+        genPtr->currentValue = std::make_shared<Value>(returnValue);
+        return makeIteratorResult(returnValue, true);
       };
       co_return Value(fn);
     }
@@ -1207,17 +1009,21 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
         genPtr->state = GeneratorState::Completed;
-        // In a full implementation, this would throw inside the generator
         throw std::runtime_error(args.empty() ? "Generator error" : args[0].toString());
       };
       co_return Value(fn);
     }
   }
 
+  // Array iterator helpers continue below
   if (obj.isArray()) {
     auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
     if (propName == "length") {
       co_return Value(static_cast<double>(arrPtr->elements.size()));
+    }
+
+    if (propName == iteratorKey) {
+      co_return createIteratorFactory(arrPtr);
     }
 
     // Array higher-order methods
@@ -1533,6 +1339,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       co_return Value(static_cast<double>(unicode::utf8Length(str)));
     }
 
+    if (propName == iteratorKey) {
+      auto charArray = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      for (char c : str) {
+        charArray->elements.push_back(Value(std::string(1, c)));
+      }
+      co_return createIteratorFactory(charArray);
+    }
+
     if (propName == "charAt") {
       auto charAtFn = std::make_shared<Function>();
       charAtFn->isNative = true;
@@ -1700,6 +1515,337 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   co_return Value(Undefined{});
+}
+
+Value Interpreter::makeIteratorResult(const Value& value, bool done) {
+  auto resultObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  resultObj->properties["value"] = value;
+  resultObj->properties["done"] = Value(done);
+  return Value(resultObj);
+}
+
+Value Interpreter::createIteratorFactory(const std::shared_ptr<Array>& arrPtr) {
+  auto iteratorFactory = std::make_shared<Function>();
+  iteratorFactory->isNative = true;
+  iteratorFactory->nativeFunc = [arrPtr](const std::vector<Value>&) -> Value {
+    auto iteratorObj = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto state = std::make_shared<size_t>(0);
+    auto nextFn = std::make_shared<Function>();
+    nextFn->isNative = true;
+    nextFn->nativeFunc = [arrPtr, state](const std::vector<Value>&) -> Value {
+      if (!arrPtr || *state >= arrPtr->elements.size()) {
+        return Interpreter::makeIteratorResult(Value(Undefined{}), true);
+      }
+      Value value = arrPtr->elements[(*state)++];
+      return Interpreter::makeIteratorResult(value, false);
+    };
+    iteratorObj->properties["next"] = Value(nextFn);
+    return Value(iteratorObj);
+  };
+  return Value(iteratorFactory);
+}
+Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
+                                    ControlFlow::ResumeMode mode,
+                                    const Value& resumeValue) {
+  if (!genPtr) {
+    return makeIteratorResult(Value(Undefined{}), true);
+  }
+
+  if (genPtr->state == GeneratorState::Completed) {
+    return makeIteratorResult(Value(Undefined{}), true);
+  }
+
+  if (genPtr->state == GeneratorState::SuspendedStart ||
+      genPtr->state == GeneratorState::SuspendedYield) {
+    genPtr->state = GeneratorState::Executing;
+
+    if (genPtr->function && genPtr->context) {
+      auto prevEnv = env_;
+      env_ = std::static_pointer_cast<Environment>(genPtr->context);
+
+      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
+      Value result = Value(Undefined{});
+
+      auto prevFlow = flow_;
+      flow_.reset();
+      if (mode != ControlFlow::ResumeMode::None) {
+        flow_.prepareResume(mode, resumeValue);
+      }
+
+      size_t startIndex = genPtr->yieldIndex;
+      for (size_t i = startIndex; i < bodyPtr->size(); i++) {
+        auto task = evaluate(*(*bodyPtr)[i]);
+        while (!task.done()) {
+          std::coroutine_handle<>::from_address(task.handle.address()).resume();
+        }
+        result = task.result();
+
+        if (flow_.type == ControlFlow::Type::Yield) {
+          genPtr->state = GeneratorState::SuspendedYield;
+          genPtr->currentValue = std::make_shared<Value>(flow_.value);
+          genPtr->yieldIndex = i + 1;
+
+          flow_ = prevFlow;
+          env_ = prevEnv;
+
+          return makeIteratorResult(*genPtr->currentValue, false);
+        }
+
+        if (flow_.type == ControlFlow::Type::Return) {
+          genPtr->state = GeneratorState::Completed;
+          genPtr->currentValue = std::make_shared<Value>(flow_.value);
+          result = flow_.value;
+          break;
+        }
+      }
+
+      flow_ = prevFlow;
+      env_ = prevEnv;
+
+      if (genPtr->state != GeneratorState::Completed &&
+          genPtr->state != GeneratorState::SuspendedYield) {
+        genPtr->state = GeneratorState::Completed;
+        genPtr->currentValue = std::make_shared<Value>(result);
+      }
+
+      return makeIteratorResult(*genPtr->currentValue,
+                                genPtr->state == GeneratorState::Completed);
+    }
+  }
+
+  genPtr->state = GeneratorState::Completed;
+  return makeIteratorResult(Value(Undefined{}), true);
+}
+
+std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value& iterable) {
+  auto buildRecord = [&](const Value& value) -> std::optional<IteratorRecord> {
+    IteratorRecord record;
+    if (value.isGenerator()) {
+      record.kind = IteratorRecord::Kind::Generator;
+      record.generator = std::get<std::shared_ptr<Generator>>(value.data);
+      return record;
+    }
+    if (value.isArray()) {
+      record.kind = IteratorRecord::Kind::Array;
+      record.array = std::get<std::shared_ptr<Array>>(value.data);
+      record.index = 0;
+      return record;
+    }
+    if (value.isString()) {
+      record.kind = IteratorRecord::Kind::String;
+      record.stringValue = std::get<std::string>(value.data);
+      record.index = 0;
+      return record;
+    }
+    if (value.isObject()) {
+      record.kind = IteratorRecord::Kind::IteratorObject;
+      record.iteratorObject = std::get<std::shared_ptr<Object>>(value.data);
+      return record;
+    }
+    return std::nullopt;
+  };
+
+  if (auto direct = buildRecord(iterable)) {
+    return direct;
+  }
+
+  const auto& iteratorKey = WellKnownSymbols::iteratorKey();
+
+  auto tryObjectIterator = [&](const Value& target) -> std::optional<IteratorRecord> {
+    Value method;
+    bool hasMethod = false;
+    std::shared_ptr<Object> targetObj;
+
+    if (target.isObject()) {
+      targetObj = std::get<std::shared_ptr<Object>>(target.data);
+      auto it = targetObj->properties.find(iteratorKey);
+      if (it != targetObj->properties.end()) {
+        method = it->second;
+        hasMethod = method.isFunction();
+      } else if (targetObj->properties.find("next") != targetObj->properties.end()) {
+        IteratorRecord record;
+        record.kind = IteratorRecord::Kind::IteratorObject;
+        record.iteratorObject = targetObj;
+        return record;
+      }
+    } else if (target.isFunction()) {
+      auto funcPtr = std::get<std::shared_ptr<Function>>(target.data);
+      auto it = funcPtr->properties.find(iteratorKey);
+      if (it != funcPtr->properties.end() && it->second.isFunction()) {
+        method = it->second;
+        hasMethod = true;
+      }
+    }
+
+    if (hasMethod) {
+      auto iterValue = callFunction(method, {});
+      if (iterValue.isObject()) {
+        auto iterObj = std::get<std::shared_ptr<Object>>(iterValue.data);
+        IteratorRecord record;
+        record.kind = IteratorRecord::Kind::IteratorObject;
+        record.iteratorObject = iterObj;
+        return record;
+      }
+      if (auto nested = buildRecord(iterValue)) {
+        return nested;
+      }
+    }
+
+    return std::nullopt;
+  };
+
+  if (auto custom = tryObjectIterator(iterable)) {
+    return custom;
+  }
+
+  return std::nullopt;
+}
+
+Value Interpreter::iteratorNext(IteratorRecord& record) {
+  switch (record.kind) {
+    case IteratorRecord::Kind::Generator:
+      return runGeneratorNext(record.generator);
+    case IteratorRecord::Kind::Array: {
+      if (!record.array || record.index >= record.array->elements.size()) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      Value value = record.array->elements[record.index++];
+      return makeIteratorResult(value, false);
+    }
+    case IteratorRecord::Kind::String: {
+      if (record.index >= record.stringValue.size()) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      char c = record.stringValue[record.index++];
+      return makeIteratorResult(Value(std::string(1, c)), false);
+    }
+    case IteratorRecord::Kind::IteratorObject: {
+      if (!record.iteratorObject) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      auto nextIt = record.iteratorObject->properties.find("next");
+      if (nextIt == record.iteratorObject->properties.end() || !nextIt->second.isFunction()) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      return callFunction(nextIt->second, {});
+    }
+  }
+
+  return makeIteratorResult(Value(Undefined{}), true);
+}
+
+Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& args) {
+  if (!callee.isFunction()) {
+    return Value(Undefined{});
+  }
+
+  auto func = std::get<std::shared_ptr<Function>>(callee.data);
+
+  auto bindParameters = [&](std::shared_ptr<Environment>& targetEnv) {
+    for (size_t i = 0; i < func->params.size(); ++i) {
+      if (i < args.size()) {
+        targetEnv->define(func->params[i].name, args[i]);
+      } else if (func->params[i].defaultValue) {
+        auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
+        auto defaultTask = evaluate(*defaultExpr);
+        while (!defaultTask.done()) {
+          std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
+        }
+        targetEnv->define(func->params[i].name, defaultTask.result());
+      } else {
+        targetEnv->define(func->params[i].name, Value(Undefined{}));
+      }
+    }
+
+    if (func->restParam.has_value()) {
+      auto restArr = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      for (size_t i = func->params.size(); i < args.size(); ++i) {
+        restArr->elements.push_back(args[i]);
+      }
+      targetEnv->define(*func->restParam, Value(restArr));
+    }
+  };
+
+  if (func->isNative) {
+    return func->nativeFunc(args);
+  }
+
+  if (func->isGenerator) {
+    auto generator = std::make_shared<Generator>(func, func->closure);
+    GarbageCollector::instance().reportAllocation(sizeof(Generator));
+    auto genEnv = std::static_pointer_cast<Environment>(func->closure);
+    genEnv = genEnv->createChild();
+    bindParameters(genEnv);
+    generator->context = genEnv;
+    return Value(generator);
+  }
+
+  if (func->isAsync) {
+    auto promise = std::make_shared<Promise>();
+    auto prevEnv = env_;
+    env_ = std::static_pointer_cast<Environment>(func->closure);
+    env_ = env_->createChild();
+    bindParameters(env_);
+
+    auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+    Value result = Value(Undefined{});
+
+    auto prevFlow = flow_;
+    flow_ = ControlFlow{};
+
+    try {
+      for (const auto& stmt : *bodyPtr) {
+        auto stmtTask = evaluate(*stmt);
+        while (!stmtTask.done()) {
+          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+        }
+        result = stmtTask.result();
+
+        if (flow_.type == ControlFlow::Type::Return) {
+          result = flow_.value;
+          break;
+        }
+      }
+      promise->resolve(result);
+    } catch (const std::exception& e) {
+      promise->reject(Value(std::string(e.what())));
+    }
+
+    flow_ = prevFlow;
+    env_ = prevEnv;
+    return Value(promise);
+  }
+
+  auto prevEnv = env_;
+  env_ = std::static_pointer_cast<Environment>(func->closure);
+  env_ = env_->createChild();
+  bindParameters(env_);
+
+  auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+  Value result = Value(Undefined{});
+
+  auto prevFlow = flow_;
+  flow_ = ControlFlow{};
+
+  for (const auto& stmt : *bodyPtr) {
+    auto stmtTask = evaluate(*stmt);
+    while (!stmtTask.done()) {
+      std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
+    }
+    result = stmtTask.result();
+
+    if (flow_.type == ControlFlow::Type::Return) {
+      result = flow_.value;
+      break;
+    }
+  }
+
+  flow_ = prevFlow;
+  env_ = prevEnv;
+  return result;
 }
 
 Task Interpreter::evaluateConditional(const ConditionalExpr& expr) {
@@ -1879,8 +2025,7 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
   }
 
   // Set the Yield control flow to suspend execution
-  flow_.type = ControlFlow::Type::Yield;
-  flow_.value = yieldedValue;
+  flow_.setYield(yieldedValue);
 
   co_return yieldedValue;
 }
@@ -2267,136 +2412,30 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     }
   }
 
-  // Iterate over generator
-  if (auto* genPtr = std::get_if<std::shared_ptr<Generator>>(&iterable.data)) {
-    auto generator = *genPtr;
-
-    // Call generator.next() repeatedly until done
+  auto iteratorOpt = getIterator(iterable);
+  if (iteratorOpt.has_value()) {
+    auto iterator = std::move(*iteratorOpt);
     while (true) {
-      // Inline generator.next() logic
-      Value nextValue = Value(Undefined{});
-      bool isDone = false;
-
-      if (generator->state == GeneratorState::Completed) {
+      Value stepResult = iteratorNext(iterator);
+      if (!stepResult.isObject()) {
         break;
       }
 
-      // Execute the generator function (or resume from yield)
-      if (generator->state == GeneratorState::SuspendedStart ||
-          generator->state == GeneratorState::SuspendedYield) {
-        generator->state = GeneratorState::Executing;
-
-        // Get the function and execute its body
-        if (generator->function && generator->context) {
-          auto prevEnv = env_;
-          env_ = std::static_pointer_cast<Environment>(generator->context);
-
-          auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(generator->function->body);
-
-          auto prevFlow = flow_;
-          flow_ = ControlFlow{};
-
-          // Execute the function body starting from yieldIndex
-          size_t startIndex = generator->yieldIndex;
-          for (size_t i = startIndex; i < bodyPtr->size(); i++) {
-            auto task = evaluate(*(*bodyPtr)[i]);
-            while (!task.done()) {
-              std::coroutine_handle<>::from_address(task.handle.address()).resume();
-            }
-            Value execResult = task.result();
-
-            // Check for control flow changes
-            if (flow_.type == ControlFlow::Type::Yield) {
-              // We hit a yield - suspend execution
-              generator->state = GeneratorState::SuspendedYield;
-              generator->currentValue = std::make_shared<Value>(flow_.value);
-              generator->yieldIndex = i + 1;  // Resume from next statement
-
-              nextValue = *generator->currentValue;
-              isDone = false;
-
-              flow_ = prevFlow;
-              env_ = prevEnv;
-              goto yield_done;
-            }
-
-            if (flow_.type == ControlFlow::Type::Return) {
-              // Generator returns - mark as completed, don't yield the return value
-              generator->state = GeneratorState::Completed;
-              isDone = true;
-              flow_ = prevFlow;
-              env_ = prevEnv;
-              break;
-            }
-          }
-
-          // If we finished all statements without explicit return
-          if (generator->state != GeneratorState::Completed &&
-              generator->state != GeneratorState::SuspendedYield) {
-            generator->state = GeneratorState::Completed;
-            isDone = true;
-          }
-
-          flow_ = prevFlow;
-          env_ = prevEnv;
-        } else {
-          isDone = true;
-        }
-      } else {
-        isDone = true;
+      auto resultObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+      bool isDone = false;
+      if (auto doneIt = resultObj->properties.find("done"); doneIt != resultObj->properties.end()) {
+        isDone = doneIt->second.toBool();
       }
-
-yield_done:
       if (isDone) {
         break;
       }
 
-      // Assign to loop variable
-      env_->set(varName, nextValue);
-
-      // Execute body
-      auto bodyTask = evaluate(*stmt.body);
-      while (!bodyTask.done()) {
-        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
+      Value currentValue = Value(Undefined{});
+      if (auto valueIt = resultObj->properties.find("value"); valueIt != resultObj->properties.end()) {
+        currentValue = valueIt->second;
       }
-      result = bodyTask.result();
 
-      if (flow_.type == ControlFlow::Type::Break) {
-        flow_.type = ControlFlow::Type::None;
-        break;
-      } else if (flow_.type == ControlFlow::Type::Continue) {
-        flow_.type = ControlFlow::Type::None;
-        continue;
-      } else if (flow_.type != ControlFlow::Type::None) {
-        break;
-      }
-    }
-  } else if (auto* arrPtr = std::get_if<std::shared_ptr<Array>>(&iterable.data)) {
-    // Iterate over array elements
-    for (const auto& elem : (*arrPtr)->elements) {
-      // Assign the element to the loop variable
-      env_->set(varName, elem);
-
-      auto bodyTask = evaluate(*stmt.body);
-      while (!bodyTask.done()) {
-        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-      }
-      result = bodyTask.result();
-
-      if (flow_.type == ControlFlow::Type::Break) {
-        flow_.type = ControlFlow::Type::None;
-        break;
-      } else if (flow_.type == ControlFlow::Type::Continue) {
-        flow_.type = ControlFlow::Type::None;
-        continue;
-      } else if (flow_.type != ControlFlow::Type::None) {
-        break;
-      }
-    }
-  } else if (auto* strPtr = std::get_if<std::string>(&iterable.data)) {
-    // Iterate over string characters
-    for (char c : *strPtr) {
-      env_->set(varName, Value(std::string(1, c)));
+      env_->set(varName, currentValue);
 
       auto bodyTask = evaluate(*stmt.body);
       while (!bodyTask.done()) {

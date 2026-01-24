@@ -9,6 +9,7 @@
 #include "math_object.h"
 #include "date_object.h"
 #include "event_loop.h"
+#include "symbols.h"
 #include <iostream>
 #include <thread>
 #include <limits>
@@ -93,6 +94,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string description = args.empty() ? "" : args[0].toString();
     return Value(Symbol(description));
   };
+  symbolFn->properties["iterator"] = WellKnownSymbols::iterator();
   env->define("Symbol", Value(symbolFn));
 
   auto createTypedArrayConstructor = [](TypedArrayType type) {

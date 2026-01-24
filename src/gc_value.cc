@@ -35,8 +35,11 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
 }
 
 void Function::getReferences(std::vector<GCObject*>& refs) const {
-    // Functions may reference other objects through closures
-    // This would need to be implemented based on closure structure
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+    // Closures would add references here when implemented
 }
 
 void Array::getReferences(std::vector<GCObject*>& refs) const {
