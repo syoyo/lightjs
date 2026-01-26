@@ -65,6 +65,18 @@ public:
   static void clearShapeCache();
 
 private:
+  // Hash function for vector<string> (must be defined before use)
+  struct VectorHash {
+    size_t operator()(const std::vector<std::string>& vec) const {
+      size_t hash = 0;
+      for (const auto& str : vec) {
+        // Simple hash combining
+        hash ^= std::hash<std::string>{}(str) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+
   ShapeId id_;
   std::vector<std::string> properties_;  // Property names in order
   std::unordered_map<std::string, size_t> propertyMap_;  // Name -> offset
@@ -76,18 +88,6 @@ private:
   // Global shape cache and ID counter
   static ShapeId nextShapeId_;
   static std::unordered_map<std::vector<std::string>, std::shared_ptr<ObjectShape>, VectorHash> shapeCache_;
-
-  // Hash function for vector<string>
-  struct VectorHash {
-    size_t operator()(const std::vector<std::string>& vec) const {
-      size_t hash = 0;
-      for (const auto& str : vec) {
-        // Simple hash combining
-        hash ^= std::hash<std::string>{}(str) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-      }
-      return hash;
-    }
-  };
 };
 
 /**

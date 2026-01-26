@@ -1,4 +1,5 @@
 #include "lexer.h"
+#include "string_table.h"
 #include <unordered_map>
 #include <cctype>
 
@@ -186,6 +187,13 @@ std::optional<Token> Lexer::readString(char quote) {
     advance();
   }
 
+  // Intern string literals for memory efficiency (especially for object keys)
+  // Only intern small strings (< 256 chars) to avoid memory bloat
+  if (str.length() < 256) {
+    auto internedStr = StringTable::instance().intern(str);
+    return Token(TokenType::String, internedStr, startLine, startColumn);
+  }
+
   return Token(TokenType::String, str, startLine, startColumn);
 }
 
@@ -239,10 +247,14 @@ std::optional<Token> Lexer::readIdentifier() {
 
   auto it = keywords.find(ident);
   if (it != keywords.end()) {
-    return Token(it->second, ident, startLine, startColumn);
+    // Keywords: intern for memory efficiency
+    auto internedKeyword = StringTable::instance().intern(ident);
+    return Token(it->second, internedKeyword, startLine, startColumn);
   }
 
-  return Token(TokenType::Identifier, ident, startLine, startColumn);
+  // Regular identifiers: intern for property name deduplication
+  auto internedIdent = StringTable::instance().intern(ident);
+  return Token(TokenType::Identifier, internedIdent, startLine, startColumn);
 }
 
 std::optional<Token> Lexer::readRegex() {

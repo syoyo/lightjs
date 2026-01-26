@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <cstdint>
+#include <memory>
 
 namespace lightjs {
 
@@ -115,6 +116,7 @@ enum class TokenType {
 struct Token {
   TokenType type;
   std::string value;
+  std::shared_ptr<std::string> internedValue;  // For interned strings (identifiers)
   uint32_t line;
   uint32_t column;
 
@@ -123,6 +125,20 @@ struct Token {
     : type(t), value(v), line(l), column(c) {}
   Token(TokenType t, uint32_t l, uint32_t c)
     : type(t), line(l), column(c) {}
+
+  // Constructor for interned strings
+  Token(TokenType t, std::shared_ptr<std::string> interned, uint32_t l, uint32_t c)
+    : type(t), internedValue(interned), value(*interned), line(l), column(c) {}
+
+  // Get the string value (interned or regular)
+  const std::string& getString() const {
+    return internedValue ? *internedValue : value;
+  }
+
+  // Check if this token has an interned value
+  bool isInterned() const {
+    return internedValue != nullptr;
+  }
 };
 
 }

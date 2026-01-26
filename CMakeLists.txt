@@ -331,6 +331,9 @@ if(LIGHTJS_BUILD_TESTS)
   add_lightjs_test(generator_multi_yield_test tests/generator_multi_yield_test.cc)
   add_lightjs_test(generator_forof_test tests/generator_forof_test.cc)
 
+  # String interning test
+  add_lightjs_test(string_interning_test tests/string_interning_test.cc)
+
   # Debug tests (not added to CTest suite)
   add_executable(debug_test tests/debug_test.cc)
   target_link_libraries(debug_test PRIVATE LightJS::lightjs)
