@@ -200,6 +200,7 @@ set(LIGHTJS_CORE_SOURCES
   src/symbols.cc
   src/string_table.cc
   src/error_formatter.cc
+  src/object_shape.cc
   src/text_encoding.cc
   src/url.cc
   src/fs.cc
@@ -240,6 +241,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/simple_regex.h
   include/string_table.h
   include/error_formatter.h
+  include/object_shape.h
   include/text_encoding.h
   include/url.h
   include/fs.h
