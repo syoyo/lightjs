@@ -9,7 +9,7 @@ namespace lightjs {
 
 Value TextEncoder::encode(const std::string& input) {
   // Convert string to UTF-8 bytes (already UTF-8, just copy bytes)
-  auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8Array, input.size());
+  auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8, input.size());
 
   for (size_t i = 0; i < input.size(); i++) {
     array->setElement(i, static_cast<uint8_t>(input[i]));
@@ -19,7 +19,7 @@ Value TextEncoder::encode(const std::string& input) {
 }
 
 Value TextEncoder::encodeInto(const std::string& source, std::shared_ptr<TypedArray> dest) {
-  if (!dest || dest->type != TypedArrayType::Uint8Array) {
+  if (!dest || dest->type != TypedArrayType::Uint8) {
     throw std::runtime_error("TextEncoder.encodeInto: destination must be Uint8Array");
   }
 
@@ -85,13 +85,13 @@ Value TextDecoder::decode(const Value& input) {
   const uint8_t* bytes = nullptr;
   size_t length = 0;
 
-  if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&input.value)) {
-    bytes = (*typedArray)->data.data();
+  if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&input.data)) {
+    bytes = (*typedArray)->buffer.data();
     length = (*typedArray)->length * (*typedArray)->elementSize();
-  } else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&input.value)) {
+  } else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&input.data)) {
     bytes = (*arrayBuffer)->data.data();
     length = (*arrayBuffer)->byteLength;
-  } else if (auto* dataView = std::get_if<std::shared_ptr<DataView>>(&input.value)) {
+  } else if (auto* dataView = std::get_if<std::shared_ptr<DataView>>(&input.data)) {
     if ((*dataView)->buffer) {
       bytes = (*dataView)->buffer->data.data() + (*dataView)->byteOffset;
       length = (*dataView)->byteLength;
@@ -138,7 +138,7 @@ std::shared_ptr<Function> createTextEncoderConstructor() {
 
       std::string source = args[0].toString();
 
-      auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&args[1].value);
+      auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&args[1].data);
       if (!typedArray) {
         throw std::runtime_error("TextEncoder.encodeInto: second argument must be Uint8Array");
       }
@@ -172,16 +172,16 @@ std::shared_ptr<Function> createTextDecoderConstructor() {
 
     // Parse options argument
     if (args.size() > 1) {
-      auto* optionsObj = std::get_if<std::shared_ptr<Object>>(&args[1].value);
+      auto* optionsObj = std::get_if<std::shared_ptr<Object>>(&args[1].data);
       if (optionsObj) {
         auto fatalIt = (*optionsObj)->properties.find("fatal");
         if (fatalIt != (*optionsObj)->properties.end()) {
-          fatal = fatalIt->second.isTruthy();
+          fatal = fatalIt->second.toBool();
         }
 
         auto ignoreBOMIt = (*optionsObj)->properties.find("ignoreBOM");
         if (ignoreBOMIt != (*optionsObj)->properties.end()) {
-          ignoreBOM = ignoreBOMIt->second.isTruthy();
+          ignoreBOM = ignoreBOMIt->second.toBool();
         }
       }
     }

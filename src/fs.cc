@@ -33,7 +33,7 @@ Value readFileSync(const std::string& path, const std::string& encoding) {
     }
 
     // Otherwise return as Uint8Array
-    auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8Array, contents.size());
+    auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8, contents.size());
     for (size_t i = 0; i < contents.size(); i++) {
       array->setElement(i, static_cast<uint8_t>(contents[i]));
     }
@@ -52,17 +52,17 @@ void writeFileSync(const std::string& path, const Value& data) {
     }
 
     // Handle string data
-    if (auto* str = std::get_if<std::string>(&data.value)) {
+    if (auto* str = std::get_if<std::string>(&data.data)) {
       file << *str;
     }
     // Handle TypedArray data
-    else if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&data.value)) {
+    else if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&data.data)) {
       for (size_t i = 0; i < (*typedArray)->length; i++) {
         file.put(static_cast<char>((*typedArray)->getElement(i)));
       }
     }
     // Handle ArrayBuffer data
-    else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&data.value)) {
+    else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&data.data)) {
       file.write(reinterpret_cast<const char*>((*arrayBuffer)->data.data()),
                  (*arrayBuffer)->byteLength);
     }
@@ -83,7 +83,7 @@ void appendFileSync(const std::string& path, const Value& data) {
       throw std::runtime_error("Cannot open file for appending: " + path);
     }
 
-    if (auto* str = std::get_if<std::string>(&data.value)) {
+    if (auto* str = std::get_if<std::string>(&data.data)) {
       file << *str;
     } else {
       file << data.toString();
@@ -197,12 +197,12 @@ Value readFile(const std::string& path, const std::string& encoding) {
   try {
     Value result = readFileSync(path, encoding);
     promise->state = PromiseState::Fulfilled;
-    promise->result = std::make_shared<Value>(result);
+    promise->result = result;
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
     auto error = std::make_shared<Error>(ErrorType::Error);
     error->message = e.what();
-    promise->result = std::make_shared<Value>(std::shared_ptr<Error>(error));
+    promise->result = Value(error);
   }
 
   return Value(promise);
@@ -214,12 +214,12 @@ Value writeFile(const std::string& path, const Value& data) {
   try {
     writeFileSync(path, data);
     promise->state = PromiseState::Fulfilled;
-    promise->result = std::make_shared<Value>(Undefined{});
+    promise->result = Value(Undefined{});
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
     auto error = std::make_shared<Error>(ErrorType::Error);
     error->message = e.what();
-    promise->result = std::make_shared<Value>(std::shared_ptr<Error>(error));
+    promise->result = Value(error);
   }
 
   return Value(promise);
@@ -231,12 +231,12 @@ Value appendFile(const std::string& path, const Value& data) {
   try {
     appendFileSync(path, data);
     promise->state = PromiseState::Fulfilled;
-    promise->result = std::make_shared<Value>(Undefined{});
+    promise->result = Value(Undefined{});
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
     auto error = std::make_shared<Error>(ErrorType::Error);
     error->message = e.what();
-    promise->result = std::make_shared<Value>(std::shared_ptr<Error>(error));
+    promise->result = Value(error);
   }
 
   return Value(promise);
@@ -316,10 +316,10 @@ std::shared_ptr<Object> createFSModule() {
     }
     bool recursive = false;
     if (args.size() > 1) {
-      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].value)) {
+      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].data)) {
         auto it = (*obj)->properties.find("recursive");
         if (it != (*obj)->properties.end()) {
-          recursive = it->second.isTruthy();
+          recursive = it->second.toBool();
         }
       }
     }
@@ -337,10 +337,10 @@ std::shared_ptr<Object> createFSModule() {
     }
     bool recursive = false;
     if (args.size() > 1) {
-      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].value)) {
+      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].data)) {
         auto it = (*obj)->properties.find("recursive");
         if (it != (*obj)->properties.end()) {
-          recursive = it->second.isTruthy();
+          recursive = it->second.toBool();
         }
       }
     }

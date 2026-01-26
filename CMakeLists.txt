@@ -283,6 +283,20 @@ if(LIGHTJS_BUILD_REPL)
 endif()
 
 # ==============================================================================
+# Benchmark Executable
+# ==============================================================================
+
+option(LIGHTJS_BUILD_BENCHMARKS "Build LightJS benchmarks" ON)
+
+if(LIGHTJS_BUILD_BENCHMARKS)
+  add_executable(lightjs_bench benchmarks/bench_runner.cc)
+  target_link_libraries(lightjs_bench PRIVATE LightJS::lightjs)
+  set_target_properties(lightjs_bench PROPERTIES
+    OUTPUT_NAME bench
+  )
+endif()
+
+# ==============================================================================
 # Tests
 # ==============================================================================
 
