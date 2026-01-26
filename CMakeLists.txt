@@ -198,6 +198,8 @@ set(LIGHTJS_CORE_SOURCES
   src/unicode.cc
   src/event_loop.cc
   src/symbols.cc
+  src/string_table.cc
+  src/error_formatter.cc
   src/tls_aes.cc
   src/tls_gcm.cc
   src/tls_x25519.cc
@@ -233,6 +235,8 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/date_object.h
   include/object_methods.h
   include/simple_regex.h
+  include/string_table.h
+  include/error_formatter.h
   include/tls.h
   include/simd.h
   include/wasm/wasm_types.h
