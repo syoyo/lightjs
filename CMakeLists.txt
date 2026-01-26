@@ -287,6 +287,9 @@ if(LIGHTJS_BUILD_TESTS)
     set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 60)
   endfunction()
 
+  # Create test fixture file for fetch tests
+  file(WRITE ${CMAKE_BINARY_DIR}/test.txt "Hello from file!\n")
+
   # Core functionality tests
   add_lightjs_test(lightjs_test tests/test.cc)
   add_lightjs_test(gc_test tests/gc_test.cc)
