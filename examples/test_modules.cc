@@ -4,11 +4,11 @@
 #include <iostream>
 #include <filesystem>
 
-using namespace tinyjs;
+using namespace lightjs;
 namespace fs = std::filesystem;
 
 int main() {
-  std::cout << "=== TinyJS Module System Test ===" << std::endl << std::endl;
+  std::cout << "=== LightJS Module System Test ===" << std::endl << std::endl;
 
   // Set up module loader
   ModuleLoader loader;

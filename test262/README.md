@@ -1,10 +1,10 @@
-# Test262 Support for TinyJS
+# Test262 Support for LightJS
 
-This directory contains the test262 conformance testing framework for TinyJS.
+This directory contains the test262 conformance testing framework for LightJS.
 
 ## Overview
 
-Test262 is the official ECMAScript conformance test suite. This framework allows TinyJS to run test262 tests to validate its JavaScript implementation compliance.
+Test262 is the official ECMAScript conformance test suite. This framework allows LightJS to run test262 tests to validate its JavaScript implementation compliance.
 
 ## Components
 
@@ -127,7 +127,7 @@ Results include execution time and can be exported to CSV for analysis.
 
 To add support for new test262 features:
 
-1. Implement missing language features in TinyJS core
+1. Implement missing language features in LightJS core
 2. Add required harness functions to `test262_harness.cc`
 3. Update metadata parsing if needed
 4. Test with relevant test262 suite sections
@@ -135,7 +135,7 @@ To add support for new test262 features:
 ## Example Output
 
 ```
-TinyJS Test262 Conformance Runner
+LightJS Test262 Conformance Runner
 ==================================
 Test262 path: ../test262
 Running tests in: test/language/expressions

@@ -6,7 +6,7 @@
 #include <fstream>
 #include <sstream>
 
-using namespace tinyjs;
+using namespace lightjs;
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {

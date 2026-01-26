@@ -47,7 +47,7 @@ void runTest(const std::string& name, const std::string& code, const std::string
 }
 
 int main() {
-  std::cout << "=== TinyJS C++20 Test Suite ===" << std::endl << std::endl;
+  std::cout << "=== LightJS C++20 Test Suite ===" << std::endl << std::endl;
 
   runTest("Basic arithmetic", "2 + 3 * 4", "14");
 
@@ -133,9 +133,9 @@ int main() {
 
   runTest("String concatenation", R"(
     let greeting = "Hello, ";
-    let name = "TinyJS";
+    let name = "LightJS";
     greeting + name
-  )", "Hello, TinyJS");
+  )", "Hello, LightJS");
 
   runTest("BigInt literal", R"(
     let big = 9007199254740991n;
@@ -313,17 +313,17 @@ int main() {
   )", "object");
 
   runTest("Fetch file protocol", R"(
-    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    let resp = fetch("file://./test.txt");
     resp.status
   )", "200");
 
   runTest("Fetch file protocol - ok property", R"(
-    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    let resp = fetch("file://./test.txt");
     resp.ok
   )", "true");
 
   runTest("Fetch file protocol - text method", R"(
-    let resp = fetch("file:///home/syoyo/work/tinyjs/build/test.txt");
+    let resp = fetch("file://./test.txt");
     resp.text()
   )", "Hello from file!\n");
 

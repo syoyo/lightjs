@@ -52,8 +52,8 @@ void runTest(const std::string& name, const std::string& code, const std::string
 }
 
 int main() {
-    std::cout << "TinyJS Array/String/Math/Date Methods Test" << std::endl;
-    std::cout << "==========================================" << std::endl << std::endl;
+    std::cout << "LightJS Array/String/Math/Date Methods Test" << std::endl;
+    std::cout << "============================================" << std::endl << std::endl;
 
     // Math object tests
     runTest("Math.PI", "Math.PI;", "3.14159");

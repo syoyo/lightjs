@@ -424,8 +424,8 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::cout << "TinyJS Test262 Conformance Runner\n";
-  std::cout << "==================================\n";
+  std::cout << "LightJS Test262 Conformance Runner\n";
+  std::cout << "===================================\n";
   std::cout << "Test262 path: " << test262Path << std::endl;
   std::cout << "Running tests in: " << testPath << std::endl;
   if (!filter.empty()) {

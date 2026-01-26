@@ -5,7 +5,7 @@
 #include <iostream>
 #include <string>
 
-using namespace tinyjs;
+using namespace lightjs;
 
 void runAsyncTest(const std::string& name, const std::string& code) {
   std::cout << "=== " << name << " ===" << std::endl;
@@ -42,7 +42,7 @@ void runAsyncTest(const std::string& name, const std::string& code) {
 }
 
 int main() {
-  std::cout << "=== TinyJS Async/Await Test Suite ===" << std::endl << std::endl;
+  std::cout << "=== LightJS Async/Await Test Suite ===" << std::endl << std::endl;
 
   runAsyncTest("Basic async function", R"(
     async function getValue() {

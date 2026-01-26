@@ -325,7 +325,7 @@ Response HTTPClient::httpRequest(const URL& url, const std::string& method,
   request << " HTTP/1.1\r\n";
   request << "Host: " << url.host << "\r\n";
   request << "Connection: close\r\n";
-  request << "User-Agent: TinyJS/1.0\r\n";
+  request << "User-Agent: LightJS/1.0\r\n";
 
   for (const auto& [key, value] : headers) {
     request << key << ": " << value << "\r\n";

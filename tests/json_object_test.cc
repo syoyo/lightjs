@@ -52,8 +52,8 @@ void runTest(const std::string& name, const std::string& code, const std::string
 }
 
 int main() {
-    std::cout << "TinyJS JSON and Object Methods Test" << std::endl;
-    std::cout << "====================================" << std::endl << std::endl;
+    std::cout << "LightJS JSON and Object Methods Test" << std::endl;
+    std::cout << "=====================================" << std::endl << std::endl;
 
     // JSON.stringify tests
     runTest("JSON.stringify simple object", R"(

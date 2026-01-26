@@ -10,8 +10,8 @@
 using namespace lightjs;
 
 int main() {
-    std::cout << "TinyJS Garbage Collection Test\n";
-    std::cout << "==============================\n\n";
+    std::cout << "LightJS Garbage Collection Test\n";
+    std::cout << "================================\n\n";
 
     // Create a script that allocates memory
     std::string code = R"(
