@@ -7,7 +7,7 @@
 #include <sstream>
 #include <coroutine>
 
-using namespace tinyjs;
+using namespace lightjs;
 
 // Check if input looks incomplete (unbalanced braces/parens)
 bool isInputComplete(const std::string& input) {
@@ -42,7 +42,7 @@ bool isInputComplete(const std::string& input) {
 }
 
 void printHelp() {
-  std::cout << "\nTinyJS REPL - Interactive JavaScript Shell\n";
+  std::cout << "\nLightJS REPL - Interactive JavaScript Shell\n";
   std::cout << "==========================================\n";
   std::cout << "Commands:\n";
   std::cout << "  .help    - Show this help message\n";
@@ -69,7 +69,7 @@ int main() {
   auto env = Environment::createGlobal();
   Interpreter interpreter(env);
 
-  std::cout << "TinyJS REPL v1.0.0\n";
+  std::cout << "LightJS REPL v1.0.0\n";
   std::cout << "Type '.help' for help, '.exit' to quit\n\n";
 
   std::string input;

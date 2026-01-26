@@ -22,7 +22,7 @@
 #include <regex>
 #endif
 
-namespace tinyjs {
+namespace lightjs {
 
 struct Value;
 struct Object;
@@ -36,6 +36,8 @@ struct WeakMap;
 struct WeakSet;
 struct ArrayBuffer;
 struct DataView;
+struct WasmInstanceJS;
+struct WasmMemoryJS;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -72,14 +74,43 @@ struct Function : public GCObject {
   bool isNative;
   bool isAsync;
   bool isGenerator;
+  bool isConstructor = false;  // Can be called with 'new'
   NativeFunction nativeFunc;
   std::unordered_map<std::string, Value> properties;
 
-  Function() : isNative(false), isAsync(false), isGenerator(false) {}
+  Function() : isNative(false), isAsync(false), isGenerator(false), isConstructor(false) {}
 
   // GCObject interface
   const char* typeName() const override { return "Function"; }
   void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// Class structure for ES6 classes
+struct Class : public GCObject {
+  std::string name;
+  std::shared_ptr<Function> constructor;  // The constructor function
+  std::shared_ptr<Class> superClass;       // Parent class (if any)
+  std::unordered_map<std::string, std::shared_ptr<Function>> methods;        // Instance methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> staticMethods;  // Static methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> getters;        // Getter methods
+  std::unordered_map<std::string, std::shared_ptr<Function>> setters;        // Setter methods
+  std::shared_ptr<void> closure;  // Closure environment
+
+  Class() = default;
+  Class(const std::string& n) : name(n) {}
+
+  // GCObject interface
+  const char* typeName() const override { return "Class"; }
+  void getReferences(std::vector<GCObject*>& refs) const override {
+    if (constructor) refs.push_back(constructor.get());
+    if (superClass) refs.push_back(superClass.get());
+    for (const auto& [_, method] : methods) {
+      if (method) refs.push_back(method.get());
+    }
+    for (const auto& [_, method] : staticMethods) {
+      if (method) refs.push_back(method.get());
+    }
+  }
 };
 
 struct Array : public GCObject {
@@ -484,6 +515,20 @@ struct TypedArray : public GCObject {
   int64_t getBigIntElement(size_t index) const;
   void setBigIntElement(size_t index, int64_t value);
 
+  // Bulk operations (SIMD-accelerated when USE_SIMD=1)
+  // Copy elements from another TypedArray with type conversion
+  void copyFrom(const TypedArray& source, size_t srcOffset, size_t dstOffset, size_t count);
+
+  // Fill all elements with a single value
+  void fill(double value);
+  void fill(double value, size_t start, size_t end);
+
+  // Set multiple elements from a double array
+  void setElements(const double* values, size_t offset, size_t count);
+
+  // Get multiple elements to a double array
+  void getElements(double* values, size_t offset, size_t count) const;
+
   // GCObject interface
   const char* typeName() const override { return "TypedArray"; }
   void getReferences(std::vector<GCObject*>& refs) const override {}
@@ -512,7 +557,10 @@ struct Value {
     std::shared_ptr<WeakMap>,
     std::shared_ptr<WeakSet>,
     std::shared_ptr<ArrayBuffer>,
-    std::shared_ptr<DataView>
+    std::shared_ptr<DataView>,
+    std::shared_ptr<Class>,
+    std::shared_ptr<WasmInstanceJS>,
+    std::shared_ptr<WasmMemoryJS>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -539,6 +587,9 @@ struct Value {
   Value(std::shared_ptr<WeakSet> ws) : data(ws) {}
   Value(std::shared_ptr<ArrayBuffer> ab) : data(ab) {}
   Value(std::shared_ptr<DataView> dv) : data(dv) {}
+  Value(std::shared_ptr<Class> c) : data(c) {}
+  Value(std::shared_ptr<WasmInstanceJS> wi) : data(wi) {}
+  Value(std::shared_ptr<WasmMemoryJS> wm) : data(wm) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -562,6 +613,9 @@ struct Value {
   bool isWeakSet() const { return std::holds_alternative<std::shared_ptr<WeakSet>>(data); }
   bool isArrayBuffer() const { return std::holds_alternative<std::shared_ptr<ArrayBuffer>>(data); }
   bool isDataView() const { return std::holds_alternative<std::shared_ptr<DataView>>(data); }
+  bool isClass() const { return std::holds_alternative<std::shared_ptr<Class>>(data); }
+  bool isWasmInstance() const { return std::holds_alternative<std::shared_ptr<WasmInstanceJS>>(data); }
+  bool isWasmMemory() const { return std::holds_alternative<std::shared_ptr<WasmMemoryJS>>(data); }
 
   bool toBool() const;
   double toNumber() const;

@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <algorithm>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Array.prototype.push
 Value Array_push(const std::vector<Value>& args) {
@@ -361,4 +361,4 @@ Value Array_forEach(const std::vector<Value>& args) {
     return Value(Undefined{});
 }
 
-} // namespace tinyjs
+} // namespace lightjs

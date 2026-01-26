@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <memory>
 
-namespace tinyjs {
+namespace lightjs {
 
 void installTest262Harness(std::shared_ptr<Environment> env) {
   // Test262 Error constructor
@@ -335,4 +335,4 @@ std::shared_ptr<Environment> createTest262Environment() {
   return env;
 }
 
-} // namespace tinyjs
+} // namespace lightjs

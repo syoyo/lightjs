@@ -1,8 +1,9 @@
 #include "value.h"
+#include "simd.h"
 #include <sstream>
 #include <cmath>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Initialize static member for Symbol IDs
 size_t Symbol::nextId = 0;
@@ -240,6 +241,234 @@ void TypedArray::setBigIntElement(size_t index, int64_t value) {
     default:
       setElement(index, static_cast<double>(value));
       break;
+  }
+}
+
+// =============================================================================
+// TypedArray bulk operations (SIMD-accelerated)
+// =============================================================================
+
+void TypedArray::copyFrom(const TypedArray& source, size_t srcOffset, size_t dstOffset, size_t count) {
+  // Validate bounds
+  if (srcOffset >= source.length || dstOffset >= length) return;
+  count = std::min(count, std::min(source.length - srcOffset, length - dstOffset));
+  if (count == 0) return;
+
+  // Fast path: same type, just memcpy
+  if (type == source.type) {
+    size_t bytesToCopy = count * elementSize();
+    size_t srcByteOffset = source.byteOffset + srcOffset * source.elementSize();
+    size_t dstByteOffset = byteOffset + dstOffset * elementSize();
+    simd::memcpySIMD(&buffer[dstByteOffset], &source.buffer[srcByteOffset], bytesToCopy);
+    return;
+  }
+
+  // Type conversion paths with SIMD acceleration
+#if USE_SIMD
+  // Float32 -> Int32
+  if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Int32) {
+    const float* src = reinterpret_cast<const float*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    int32_t* dst = reinterpret_cast<int32_t*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertFloat32ToInt32(src, dst, count);
+    return;
+  }
+
+  // Int32 -> Float32
+  if (source.type == TypedArrayType::Int32 && type == TypedArrayType::Float32) {
+    const int32_t* src = reinterpret_cast<const int32_t*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    float* dst = reinterpret_cast<float*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertInt32ToFloat32(src, dst, count);
+    return;
+  }
+
+  // Float64 -> Int32
+  if (source.type == TypedArrayType::Float64 && type == TypedArrayType::Int32) {
+    const double* src = reinterpret_cast<const double*>(&source.buffer[source.byteOffset + srcOffset * 8]);
+    int32_t* dst = reinterpret_cast<int32_t*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertFloat64ToInt32(src, dst, count);
+    return;
+  }
+
+  // Uint8 -> Float32
+  if (source.type == TypedArrayType::Uint8 && type == TypedArrayType::Float32) {
+    const uint8_t* src = &source.buffer[source.byteOffset + srcOffset];
+    float* dst = reinterpret_cast<float*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertUint8ToFloat32(src, dst, count);
+    return;
+  }
+
+  // Float32 -> Uint8
+  if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Uint8) {
+    const float* src = reinterpret_cast<const float*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    uint8_t* dst = &buffer[byteOffset + dstOffset];
+    simd::convertFloat32ToUint8(src, dst, count);
+    return;
+  }
+
+  // Float32 -> Uint8Clamped
+  if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Uint8Clamped) {
+    const float* src = reinterpret_cast<const float*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    uint8_t* dst = &buffer[byteOffset + dstOffset];
+    simd::clampFloat32ToUint8(src, dst, count);
+    return;
+  }
+
+  // Int16 -> Float32
+  if (source.type == TypedArrayType::Int16 && type == TypedArrayType::Float32) {
+    const int16_t* src = reinterpret_cast<const int16_t*>(&source.buffer[source.byteOffset + srcOffset * 2]);
+    float* dst = reinterpret_cast<float*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertInt16ToFloat32(src, dst, count);
+    return;
+  }
+
+  // Float32 -> Int16
+  if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Int16) {
+    const float* src = reinterpret_cast<const float*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    int16_t* dst = reinterpret_cast<int16_t*>(&buffer[byteOffset + dstOffset * 2]);
+    simd::convertFloat32ToInt16(src, dst, count);
+    return;
+  }
+
+  // Float32 -> Float16 (batch)
+  if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Float16) {
+    const float* src = reinterpret_cast<const float*>(&source.buffer[source.byteOffset + srcOffset * 4]);
+    uint16_t* dst = reinterpret_cast<uint16_t*>(&buffer[byteOffset + dstOffset * 2]);
+    simd::convertFloat32ToFloat16Batch(src, dst, count);
+    return;
+  }
+
+  // Float16 -> Float32 (batch)
+  if (source.type == TypedArrayType::Float16 && type == TypedArrayType::Float32) {
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(&source.buffer[source.byteOffset + srcOffset * 2]);
+    float* dst = reinterpret_cast<float*>(&buffer[byteOffset + dstOffset * 4]);
+    simd::convertFloat16ToFloat32Batch(src, dst, count);
+    return;
+  }
+#endif
+
+  // Generic fallback: element-by-element conversion
+  for (size_t i = 0; i < count; ++i) {
+    double val = source.getElement(srcOffset + i);
+    setElement(dstOffset + i, val);
+  }
+}
+
+void TypedArray::fill(double value) {
+  fill(value, 0, length);
+}
+
+void TypedArray::fill(double value, size_t start, size_t end) {
+  if (start >= length) return;
+  end = std::min(end, length);
+  if (start >= end) return;
+
+  size_t count = end - start;
+
+#if USE_SIMD
+  // SIMD-accelerated fill for common types
+  switch (type) {
+    case TypedArrayType::Float32: {
+      float* ptr = reinterpret_cast<float*>(&buffer[byteOffset + start * 4]);
+      simd::fillFloat32(ptr, static_cast<float>(value), count);
+      return;
+    }
+    case TypedArrayType::Int32: {
+      int32_t* ptr = reinterpret_cast<int32_t*>(&buffer[byteOffset + start * 4]);
+      simd::fillInt32(ptr, static_cast<int32_t>(value), count);
+      return;
+    }
+    case TypedArrayType::Uint32: {
+      int32_t* ptr = reinterpret_cast<int32_t*>(&buffer[byteOffset + start * 4]);
+      simd::fillInt32(ptr, static_cast<int32_t>(static_cast<uint32_t>(value)), count);
+      return;
+    }
+    default:
+      break;
+  }
+#endif
+
+  // Scalar fallback
+  for (size_t i = start; i < end; ++i) {
+    setElement(i, value);
+  }
+}
+
+void TypedArray::setElements(const double* values, size_t offset, size_t count) {
+  if (offset >= length) return;
+  count = std::min(count, length - offset);
+  if (count == 0) return;
+
+#if USE_SIMD
+  // SIMD-accelerated bulk set for Float32
+  if (type == TypedArrayType::Float32) {
+    // Convert doubles to floats first
+    float* dst = reinterpret_cast<float*>(&buffer[byteOffset + offset * 4]);
+    for (size_t i = 0; i < count; ++i) {
+      dst[i] = static_cast<float>(values[i]);
+    }
+    return;
+  }
+
+  // SIMD-accelerated bulk set for Int32
+  if (type == TypedArrayType::Int32) {
+    // Convert doubles to int32 using SIMD where possible
+    // For now, use scalar since input is double and we'd need temp buffer
+    int32_t* dst = reinterpret_cast<int32_t*>(&buffer[byteOffset + offset * 4]);
+    for (size_t i = 0; i < count; ++i) {
+      dst[i] = static_cast<int32_t>(values[i]);
+    }
+    return;
+  }
+
+  // Float64 can be directly copied
+  if (type == TypedArrayType::Float64) {
+    double* dst = reinterpret_cast<double*>(&buffer[byteOffset + offset * 8]);
+    simd::memcpySIMD(dst, values, count * sizeof(double));
+    return;
+  }
+#endif
+
+  // Scalar fallback
+  for (size_t i = 0; i < count; ++i) {
+    setElement(offset + i, values[i]);
+  }
+}
+
+void TypedArray::getElements(double* values, size_t offset, size_t count) const {
+  if (offset >= length) return;
+  count = std::min(count, length - offset);
+  if (count == 0) return;
+
+#if USE_SIMD
+  // Float64 can be directly copied
+  if (type == TypedArrayType::Float64) {
+    const double* src = reinterpret_cast<const double*>(&buffer[byteOffset + offset * 8]);
+    simd::memcpySIMD(values, src, count * sizeof(double));
+    return;
+  }
+
+  // Float32 -> double conversion
+  if (type == TypedArrayType::Float32) {
+    const float* src = reinterpret_cast<const float*>(&buffer[byteOffset + offset * 4]);
+    for (size_t i = 0; i < count; ++i) {
+      values[i] = static_cast<double>(src[i]);
+    }
+    return;
+  }
+
+  // Int32 -> double conversion
+  if (type == TypedArrayType::Int32) {
+    const int32_t* src = reinterpret_cast<const int32_t*>(&buffer[byteOffset + offset * 4]);
+    for (size_t i = 0; i < count; ++i) {
+      values[i] = static_cast<double>(src[i]);
+    }
+    return;
+  }
+#endif
+
+  // Scalar fallback
+  for (size_t i = 0; i < count; ++i) {
+    values[i] = getElement(offset + i);
   }
 }
 
@@ -638,6 +867,28 @@ Value Object_create(const std::vector<Value>& args) {
         if (valueIt != desc->properties.end()) {
           newObj->properties[key] = valueIt->second;
         }
+      }
+    }
+  }
+
+  return Value(newObj);
+}
+
+Value Object_fromEntries(const std::vector<Value>& args) {
+  auto newObj = std::make_shared<Object>();
+
+  if (args.empty() || !args[0].isArray()) {
+    return Value(newObj);
+  }
+
+  auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+  for (const auto& entry : arr->elements) {
+    // Each entry should be an array with [key, value]
+    if (entry.isArray()) {
+      auto pair = std::get<std::shared_ptr<Array>>(entry.data);
+      if (pair->elements.size() >= 2) {
+        std::string key = pair->elements[0].toString();
+        newObj->properties[key] = pair->elements[1];
       }
     }
   }

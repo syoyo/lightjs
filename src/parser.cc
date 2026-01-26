@@ -2,7 +2,7 @@
 #include "lexer.h"
 #include <stdexcept>
 
-namespace tinyjs {
+namespace lightjs {
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 
@@ -84,16 +84,23 @@ StmtPtr Parser::parseStatement() {
       return parseForStatement();
     case TokenType::Switch:
       return parseSwitchStatement();
-    case TokenType::Break:
+    case TokenType::Break: {
+      const Token& tok = current();
       advance();
       consumeSemicolon();
-      return std::make_unique<Statement>(BreakStmt{});
-    case TokenType::Continue:
+      return makeStmt(BreakStmt{}, tok);
+    }
+    case TokenType::Continue: {
+      const Token& tok = current();
       advance();
       consumeSemicolon();
-      return std::make_unique<Statement>(ContinueStmt{});
-    case TokenType::Throw:
-      return std::make_unique<Statement>(ThrowStmt{parseExpression()});
+      return makeStmt(ContinueStmt{}, tok);
+    }
+    case TokenType::Throw: {
+      const Token& tok = current();
+      advance();
+      return makeStmt(ThrowStmt{parseExpression()}, tok);
+    }
     case TokenType::Try:
       return parseTryStatement();
     case TokenType::Import:
@@ -108,6 +115,7 @@ StmtPtr Parser::parseStatement() {
 }
 
 StmtPtr Parser::parseVarDeclaration() {
+  const Token& startTok = current();
   VarDeclaration::Kind kind;
   switch (current().type) {
     case TokenType::Let: kind = VarDeclaration::Kind::Let; break;
@@ -141,10 +149,11 @@ StmtPtr Parser::parseVarDeclaration() {
   } while (match(TokenType::Comma));
 
   consumeSemicolon();
-  return std::make_unique<Statement>(std::move(decl));
+  return makeStmt(std::move(decl), startTok);
 }
 
 StmtPtr Parser::parseFunctionDeclaration() {
+  const Token& startTok = current();
   bool isAsync = false;
   if (match(TokenType::Async)) {
     isAsync = true;
@@ -222,7 +231,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.isAsync = isAsync;
   funcDecl.isGenerator = isGenerator;
 
-  return std::make_unique<Statement>(std::move(funcDecl));
+  return makeStmt(std::move(funcDecl), startTok);
 }
 
 StmtPtr Parser::parseClassDeclaration() {
@@ -315,6 +324,7 @@ StmtPtr Parser::parseClassDeclaration() {
 }
 
 StmtPtr Parser::parseReturnStatement() {
+  const Token& startTok = current();
   expect(TokenType::Return);
 
   ExprPtr argument = nullptr;
@@ -323,10 +333,11 @@ StmtPtr Parser::parseReturnStatement() {
   }
 
   consumeSemicolon();
-  return std::make_unique<Statement>(ReturnStmt{std::move(argument)});
+  return makeStmt(ReturnStmt{std::move(argument)}, startTok);
 }
 
 StmtPtr Parser::parseIfStatement() {
+  const Token& startTok = current();
   expect(TokenType::If);
   expect(TokenType::LeftParen);
   auto test = parseExpression();
@@ -340,21 +351,22 @@ StmtPtr Parser::parseIfStatement() {
     alternate = parseStatement();
   }
 
-  return std::make_unique<Statement>(IfStmt{
+  return makeStmt(IfStmt{
     std::move(test),
     std::move(consequent),
     std::move(alternate)
-  });
+  }, startTok);
 }
 
 StmtPtr Parser::parseWhileStatement() {
+  const Token& startTok = current();
   expect(TokenType::While);
   expect(TokenType::LeftParen);
   auto test = parseExpression();
   expect(TokenType::RightParen);
   auto body = parseStatement();
 
-  return std::make_unique<Statement>(WhileStmt{std::move(test), std::move(body)});
+  return makeStmt(WhileStmt{std::move(test), std::move(body)}, startTok);
 }
 
 StmtPtr Parser::parseForStatement() {
@@ -1173,6 +1185,8 @@ ExprPtr Parser::parseCall() {
   auto expr = parsePrimary();
   expr = parseMemberSuffix(std::move(expr));
 
+  // Loop to handle both calls and member access after calls
+  // This enables chaining like: arr.slice(1).length or obj.method().prop.method2()
   while (true) {
     if (match(TokenType::LeftParen)) {
       advance();
@@ -1183,6 +1197,7 @@ ExprPtr Parser::parseCall() {
           expect(TokenType::Comma);
         }
 
+        // Check for spread element in arguments
         if (match(TokenType::DotDotDot)) {
           advance();
           auto arg = parseExpression();
@@ -1194,6 +1209,7 @@ ExprPtr Parser::parseCall() {
 
       expect(TokenType::RightParen);
       expr = std::make_unique<Expression>(CallExpr{std::move(expr), std::move(args)});
+      // Handle member access after a call (e.g., arr.slice(1).length)
       expr = parseMemberSuffix(std::move(expr));
     } else {
       break;
@@ -1213,7 +1229,13 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr) {
     if (match(TokenType::Dot) || match(TokenType::QuestionDot)) {
       bool isOptional = match(TokenType::QuestionDot);
       advance();
-      if (match(TokenType::Identifier) || match(TokenType::From) || match(TokenType::Of)) {
+      // Accept identifiers OR keywords as property names
+      // Keywords like catch, finally, class, etc. can be property names in JS
+      if (match(TokenType::Identifier) || match(TokenType::From) || match(TokenType::Of) ||
+          match(TokenType::Catch) || match(TokenType::Finally) || match(TokenType::Class) ||
+          match(TokenType::In) || match(TokenType::Typeof) || match(TokenType::New) ||
+          match(TokenType::Default) || match(TokenType::Static) || match(TokenType::Get) ||
+          match(TokenType::Set) || match(TokenType::Throw) || match(TokenType::This)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
         MemberExpr member;
@@ -1242,25 +1264,29 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr) {
 
 ExprPtr Parser::parsePrimary() {
   if (match(TokenType::Number)) {
-    double value = std::stod(current().value);
+    const Token& tok = current();
+    double value = std::stod(tok.value);
     advance();
-    return std::make_unique<Expression>(NumberLiteral{value});
+    return makeExpr(NumberLiteral{value}, tok);
   }
 
   if (match(TokenType::BigInt)) {
-    int64_t value = std::stoll(current().value);
+    const Token& tok = current();
+    int64_t value = std::stoll(tok.value);
     advance();
-    return std::make_unique<Expression>(BigIntLiteral{value});
+    return makeExpr(BigIntLiteral{value}, tok);
   }
 
   if (match(TokenType::String)) {
-    std::string value = current().value;
+    const Token& tok = current();
+    std::string value = tok.value;
     advance();
-    return std::make_unique<Expression>(StringLiteral{value});
+    return makeExpr(StringLiteral{value}, tok);
   }
 
   if (match(TokenType::TemplateLiteral)) {
-    std::string content = current().value;
+    const Token& tok = current();
+    std::string content = tok.value;
     advance();
 
     // Parse the template literal content to extract quasis and expressions
@@ -1303,37 +1329,49 @@ ExprPtr Parser::parsePrimary() {
     }
     quasis.push_back(currentQuasi);
 
-    return std::make_unique<Expression>(TemplateLiteral{std::move(quasis), std::move(expressions)});
+    return makeExpr(TemplateLiteral{std::move(quasis), std::move(expressions)}, tok);
   }
 
   if (match(TokenType::Regex)) {
-    std::string value = current().value;
+    const Token& tok = current();
+    std::string value = tok.value;
     advance();
     size_t sep = value.find("||");
     std::string pattern = value.substr(0, sep);
     std::string flags = (sep != std::string::npos) ? value.substr(sep + 2) : "";
-    return std::make_unique<Expression>(RegexLiteral{pattern, flags});
+    return makeExpr(RegexLiteral{pattern, flags}, tok);
   }
 
   if (match(TokenType::True)) {
+    const Token& tok = current();
     advance();
-    return std::make_unique<Expression>(BoolLiteral{true});
+    return makeExpr(BoolLiteral{true}, tok);
   }
 
   if (match(TokenType::False)) {
+    const Token& tok = current();
     advance();
-    return std::make_unique<Expression>(BoolLiteral{false});
+    return makeExpr(BoolLiteral{false}, tok);
   }
 
   if (match(TokenType::Null)) {
+    const Token& tok = current();
     advance();
-    return std::make_unique<Expression>(NullLiteral{});
+    return makeExpr(NullLiteral{}, tok);
+  }
+
+  // Handle 'undefined' keyword as identifier (it's defined in global scope)
+  if (match(TokenType::Undefined)) {
+    const Token& tok = current();
+    advance();
+    return makeExpr(Identifier{"undefined"}, tok);
   }
 
   if (match(TokenType::Identifier)) {
-    std::string name = current().value;
+    const Token& tok = current();
+    std::string name = tok.value;
     advance();
-    return std::make_unique<Expression>(Identifier{name});
+    return makeExpr(Identifier{name}, tok);
   }
 
   // Dynamic import: import(specifier)
@@ -1455,6 +1493,20 @@ ExprPtr Parser::parseObjectExpression() {
     } else {
       ExprPtr key;
       bool isComputed = false;
+      bool isGenerator = false;
+      bool isAsync = false;
+
+      // Check for async method
+      if (match(TokenType::Async)) {
+        isAsync = true;
+        advance();
+      }
+
+      // Check for generator method: *methodName() or *[computed]()
+      if (match(TokenType::Star)) {
+        isGenerator = true;
+        advance();
+      }
 
       // Check for computed property name [expr]
       if (match(TokenType::LeftBracket)) {
@@ -1467,8 +1519,8 @@ ExprPtr Parser::parseObjectExpression() {
         key = std::make_unique<Expression>(Identifier{identName});
         advance();
 
-        // Check for shorthand property notation
-        if (match(TokenType::Comma) || match(TokenType::RightBrace)) {
+        // Check for shorthand property notation (only if not generator/async)
+        if (!isGenerator && !isAsync && (match(TokenType::Comma) || match(TokenType::RightBrace))) {
           // Shorthand: {x} means {x: x}
           ObjectProperty prop;
           prop.key = std::move(key);
@@ -1485,15 +1537,71 @@ ExprPtr Parser::parseObjectExpression() {
         advance();
       }
 
-      expect(TokenType::Colon);
-      auto value = parseExpression();
+      // Check for shorthand method syntax: key() { ... } or key(params) { ... }
+      if (match(TokenType::LeftParen)) {
+        // This is a method shorthand
+        advance();
+        std::vector<Parameter> params;
 
-      ObjectProperty prop;
-      prop.key = std::move(key);
-      prop.value = std::move(value);
-      prop.isSpread = false;
-      prop.isComputed = isComputed;
-      properties.push_back(std::move(prop));
+        while (!match(TokenType::RightParen) && !match(TokenType::EndOfFile)) {
+          if (!params.empty()) {
+            expect(TokenType::Comma);
+          }
+          if (match(TokenType::Identifier)) {
+            Parameter param;
+            param.name = Identifier{current().value};
+            advance();
+            // Check for default value
+            if (match(TokenType::Equal)) {
+              advance();
+              param.defaultValue = parseExpression();
+            }
+            params.push_back(std::move(param));
+          } else if (!match(TokenType::RightParen)) {
+            // Unknown token in parameter list, skip it
+            advance();
+          }
+        }
+        expect(TokenType::RightParen);
+
+        // Parse function body
+        expect(TokenType::LeftBrace);
+        std::vector<StmtPtr> body;
+        while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+          if (auto stmt = parseStatement()) {
+            body.push_back(std::move(stmt));
+          } else {
+            // Prevent infinite loop if parseStatement returns null
+            break;
+          }
+        }
+        expect(TokenType::RightBrace);
+
+        // Create FunctionExpr for the method
+        FunctionExpr funcExpr;
+        funcExpr.params = std::move(params);
+        funcExpr.body = std::move(body);
+        funcExpr.isGenerator = isGenerator;
+        funcExpr.isAsync = isAsync;
+
+        ObjectProperty prop;
+        prop.key = std::move(key);
+        prop.value = std::make_unique<Expression>(std::move(funcExpr));
+        prop.isSpread = false;
+        prop.isComputed = isComputed;
+        properties.push_back(std::move(prop));
+      } else {
+        // Regular property with colon
+        expect(TokenType::Colon);
+        auto value = parseExpression();
+
+        ObjectProperty prop;
+        prop.key = std::move(key);
+        prop.value = std::move(value);
+        prop.isSpread = false;
+        prop.isComputed = isComputed;
+        properties.push_back(std::move(prop));
+      }
     }
   }
 

@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <limits>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Date object implementation
 struct Date : public Object {
@@ -249,4 +249,4 @@ Value Date_toISOString(const std::vector<Value>& args) {
     return Value(date.toISOString());
 }
 
-} // namespace tinyjs
+} // namespace lightjs

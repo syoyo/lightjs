@@ -14,7 +14,7 @@
 #include <iomanip>
 
 namespace fs = std::filesystem;
-using namespace tinyjs;
+using namespace lightjs;
 
 struct Test262Result {
   std::string testPath;
@@ -213,7 +213,7 @@ private:
       }
 
       // Execution
-      auto env = tinyjs::createTest262Environment();
+      auto env = lightjs::createTest262Environment();
       Interpreter interpreter(env);
 
       auto task = interpreter.evaluate(*program);

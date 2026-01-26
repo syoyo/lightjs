@@ -5,7 +5,7 @@
 #include "interpreter.h"
 #include "environment.h"
 
-using namespace tinyjs;
+using namespace lightjs;
 
 void runTest(const std::string& name, const std::string& code, const std::string& expected = "") {
     std::cout << "Test: " << name << std::endl;

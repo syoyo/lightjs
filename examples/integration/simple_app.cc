@@ -1,39 +1,39 @@
 /**
  * @file simple_app.cc
- * @brief Example application using TinyJS as a library
+ * @brief Example application using LightJS as a library
  *
- * This demonstrates how to embed TinyJS in your C++ application.
+ * This demonstrates how to embed LightJS in your C++ application.
  * Compile with:
- *   g++ -std=c++20 simple_app.cc -ltinyjs -o simple_app
+ *   g++ -std=c++20 simple_app.cc -llightjs -o simple_app
  * Or use CMake (see CMakeLists.txt in this directory)
  */
 
-#include <tinyjs.h>
+#include <lightjs.h>
 #include <iostream>
 #include <string>
 
 /**
  * Helper function to evaluate JavaScript code and return the result
  */
-tinyjs::Value evaluateJS(const std::string& code) {
+lightjs::Value evaluateJS(const std::string& code) {
   // Create lexer and tokenize
-  tinyjs::Lexer lexer(code);
+  lightjs::Lexer lexer(code);
   auto tokens = lexer.tokenize();
 
   // Parse tokens into AST
-  tinyjs::Parser parser(tokens);
+  lightjs::Parser parser(tokens);
   auto program = parser.parse();
 
   if (!program) {
     std::cerr << "Parse error!" << std::endl;
-    return tinyjs::Value(tinyjs::Undefined{});
+    return lightjs::Value(lightjs::Undefined{});
   }
 
   // Create global environment with all built-ins
-  auto env = tinyjs::Environment::createGlobal();
+  auto env = lightjs::Environment::createGlobal();
 
   // Create interpreter
-  tinyjs::Interpreter interpreter(env);
+  lightjs::Interpreter interpreter(env);
 
   // Evaluate the program using C++20 coroutines
   auto task = interpreter.evaluate(*program);
@@ -45,7 +45,7 @@ tinyjs::Value evaluateJS(const std::string& code) {
 }
 
 int main() {
-  std::cout << "TinyJS Integration Example v" << tinyjs::version() << "\n";
+  std::cout << "LightJS Integration Example v" << lightjs::version() << "\n";
   std::cout << "========================================\n\n";
 
   // Example 1: Simple arithmetic
@@ -127,14 +127,14 @@ int main() {
   {
     std::cout << "Example 6: Persistent Environment\n";
 
-    auto env = tinyjs::Environment::createGlobal();
-    tinyjs::Interpreter interpreter(env);
+    auto env = lightjs::Environment::createGlobal();
+    lightjs::Interpreter interpreter(env);
 
     // Define variable in first call
     {
-      tinyjs::Lexer lexer("let counter = 0;");
+      lightjs::Lexer lexer("let counter = 0;");
       auto tokens = lexer.tokenize();
-      tinyjs::Parser parser(tokens);
+      lightjs::Parser parser(tokens);
       auto program = parser.parse();
 
       auto task = interpreter.evaluate(*program);
@@ -145,9 +145,9 @@ int main() {
 
     // Use variable in second call
     {
-      tinyjs::Lexer lexer("counter = counter + 10; counter;");
+      lightjs::Lexer lexer("counter = counter + 10; counter;");
       auto tokens = lexer.tokenize();
-      tinyjs::Parser parser(tokens);
+      lightjs::Parser parser(tokens);
       auto program = parser.parse();
 
       auto task = interpreter.evaluate(*program);

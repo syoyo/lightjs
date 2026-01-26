@@ -10,12 +10,27 @@
 #include "date_object.h"
 #include "event_loop.h"
 #include "symbols.h"
+#include "module.h"
+#include "interpreter.h"
+#include "wasm_js.h"
 #include <iostream>
 #include <thread>
 #include <limits>
 #include <cmath>
 
-namespace tinyjs {
+namespace lightjs {
+
+// Global module loader and interpreter for dynamic imports
+static std::shared_ptr<ModuleLoader> g_moduleLoader;
+static Interpreter* g_interpreter = nullptr;
+
+void setGlobalModuleLoader(std::shared_ptr<ModuleLoader> loader) {
+  g_moduleLoader = loader;
+}
+
+void setGlobalInterpreter(Interpreter* interpreter) {
+  g_interpreter = interpreter;
+}
 
 Environment::Environment(std::shared_ptr<Environment> parent)
   : parent_(parent) {}
@@ -104,7 +119,34 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (args.empty()) {
         return Value(std::make_shared<TypedArray>(type, 0));
       }
-      size_t length = static_cast<size_t>(args[0].toNumber());
+
+      // Check if first argument is an array
+      if (std::holds_alternative<std::shared_ptr<Array>>(args[0].data)) {
+        auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+        auto typedArray = std::make_shared<TypedArray>(type, arr->elements.size());
+
+        // Fill the typed array with values from the regular array
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+          double val = arr->elements[i].toNumber();
+          typedArray->setElement(i, val);
+        }
+
+        return Value(typedArray);
+      }
+
+      // Otherwise treat as length
+      double lengthNum = args[0].toNumber();
+      if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
+        // Invalid length, return empty array
+        return Value(std::make_shared<TypedArray>(type, 0));
+      }
+
+      size_t length = static_cast<size_t>(lengthNum);
+      // Sanity check: prevent allocating huge arrays
+      if (length > 1000000000) { // 1GB limit
+        return Value(std::make_shared<TypedArray>(type, 0));
+      }
+
       return Value(std::make_shared<TypedArray>(type, length));
     };
     return Value(func);
@@ -265,22 +307,55 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     auto promise = std::make_shared<Promise>();
 
     try {
-      // For now, create a simple module namespace object
-      // In a full implementation, this would:
-      // 1. Load the module file
-      // 2. Parse and evaluate it
-      // 3. Return the module's exports as a namespace object
+      // Use global module loader if available
+      if (g_moduleLoader && g_interpreter) {
+        // Resolve the module path
+        std::string resolvedPath = g_moduleLoader->resolvePath(specifier);
 
-      auto moduleNamespace = std::make_shared<Object>();
-      GarbageCollector::instance().reportAllocation(sizeof(Object));
+        // Load the module
+        auto module = g_moduleLoader->loadModule(resolvedPath);
+        if (!module) {
+          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
+          promise->reject(Value(err));
+          return Value(promise);
+        }
 
-      // Placeholder: Set a default export marker
-      moduleNamespace->properties["__esModule"] = Value(true);
-      moduleNamespace->properties["__moduleSpecifier"] = Value(specifier);
+        // Instantiate the module
+        if (!module->instantiate(g_moduleLoader.get())) {
+          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to instantiate module: " + specifier);
+          promise->reject(Value(err));
+          return Value(promise);
+        }
 
-      // TODO: Actually load and evaluate the module
-      // For now, we'll just resolve with an empty namespace
-      promise->resolve(Value(moduleNamespace));
+        // Evaluate the module
+        if (!module->evaluate(g_interpreter)) {
+          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to evaluate module: " + specifier);
+          promise->reject(Value(err));
+          return Value(promise);
+        }
+
+        // Create namespace object from exports
+        auto moduleNamespace = std::make_shared<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+        moduleNamespace->properties["__esModule"] = Value(true);
+
+        auto exports = module->getAllExports();
+        for (const auto& [name, value] : exports) {
+          moduleNamespace->properties[name] = value;
+        }
+
+        promise->resolve(Value(moduleNamespace));
+      } else {
+        // Fallback: create a placeholder namespace (for cases where module loader isn't set up)
+        auto moduleNamespace = std::make_shared<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+        moduleNamespace->properties["__esModule"] = Value(true);
+        moduleNamespace->properties["__moduleSpecifier"] = Value(specifier);
+        promise->resolve(Value(moduleNamespace));
+      }
+    } catch (const std::exception& e) {
+      auto err = std::make_shared<Error>(ErrorType::Error, std::string("Failed to load module: ") + e.what());
+      promise->reject(Value(err));
     } catch (...) {
       auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
       promise->reject(Value(err));
@@ -536,12 +611,38 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   numberObj->properties["isFinite"] = Value(isFiniteFn);
 
+  // Number.isInteger
+  auto isIntegerFn = std::make_shared<Function>();
+  isIntegerFn->isNative = true;
+  isIntegerFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isNumber()) return Value(false);
+    double num = std::get<double>(args[0].data);
+    return Value(std::isfinite(num) && std::floor(num) == num);
+  };
+  numberObj->properties["isInteger"] = Value(isIntegerFn);
+
+  // Number.isSafeInteger
+  auto isSafeIntegerFn = std::make_shared<Function>();
+  isSafeIntegerFn->isNative = true;
+  isSafeIntegerFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isNumber()) return Value(false);
+    double num = std::get<double>(args[0].data);
+    // Safe integers are integers in range [-(2^53-1), 2^53-1]
+    const double MAX_SAFE_INTEGER = 9007199254740991.0;  // 2^53 - 1
+    return Value(std::isfinite(num) && std::floor(num) == num &&
+                 num >= -MAX_SAFE_INTEGER && num <= MAX_SAFE_INTEGER);
+  };
+  numberObj->properties["isSafeInteger"] = Value(isSafeIntegerFn);
+
   // Number constants
   numberObj->properties["MAX_VALUE"] = Value(std::numeric_limits<double>::max());
   numberObj->properties["MIN_VALUE"] = Value(std::numeric_limits<double>::min());
   numberObj->properties["POSITIVE_INFINITY"] = Value(std::numeric_limits<double>::infinity());
   numberObj->properties["NEGATIVE_INFINITY"] = Value(-std::numeric_limits<double>::infinity());
   numberObj->properties["NaN"] = Value(std::numeric_limits<double>::quiet_NaN());
+  numberObj->properties["MAX_SAFE_INTEGER"] = Value(9007199254740991.0);  // 2^53 - 1
+  numberObj->properties["MIN_SAFE_INTEGER"] = Value(-9007199254740991.0);  // -(2^53 - 1)
+  numberObj->properties["EPSILON"] = Value(2.220446049250313e-16);  // 2^-52
 
   env->define("Number", Value(numberObj));
 
@@ -814,6 +915,36 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectCreate->nativeFunc = Object_create;
   objectConstructor->properties["create"] = Value(objectCreate);
 
+  // Object.fromEntries - converts array of [key, value] pairs to object
+  auto objectFromEntries = std::make_shared<Function>();
+  objectFromEntries->isNative = true;
+  objectFromEntries->nativeFunc = Object_fromEntries;
+  objectConstructor->properties["fromEntries"] = Value(objectFromEntries);
+
+  // Object.hasOwn - checks if object has own property
+  auto objectHasOwn = std::make_shared<Function>();
+  objectHasOwn->isNative = true;
+  objectHasOwn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+    std::string key = args[1].toString();
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      return Value(obj->properties.find(key) != obj->properties.end());
+    }
+    if (args[0].isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+      // Check numeric index
+      try {
+        size_t idx = std::stoul(key);
+        return Value(idx < arr->elements.size());
+      } catch (...) {
+        return Value(false);
+      }
+    }
+    return Value(false);
+  };
+  objectConstructor->properties["hasOwn"] = Value(objectHasOwn);
+
   // Object.freeze - makes an object immutable
   auto objectFreeze = std::make_shared<Function>();
   objectFreeze->isNative = true;
@@ -864,6 +995,57 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(obj->sealed);
   };
   objectConstructor->properties["isSealed"] = Value(objectIsSealed);
+
+  // Object.is - SameValue comparison (handles NaN and -0 correctly)
+  auto objectIs = std::make_shared<Function>();
+  objectIs->isNative = true;
+  objectIs->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+    const Value& a = args[0];
+    const Value& b = args[1];
+
+    // Check for same type
+    if (a.data.index() != b.data.index()) return Value(false);
+
+    // Handle numbers specially (NaN === NaN, +0 !== -0)
+    if (a.isNumber() && b.isNumber()) {
+      double x = a.toNumber();
+      double y = b.toNumber();
+      // NaN is equal to NaN in Object.is
+      if (std::isnan(x) && std::isnan(y)) return Value(true);
+      // +0 and -0 are different in Object.is
+      if (x == 0 && y == 0) {
+        return Value(std::signbit(x) == std::signbit(y));
+      }
+      return Value(x == y);
+    }
+
+    // For other types, use regular equality
+    if (a.isUndefined() && b.isUndefined()) return Value(true);
+    if (a.isNull() && b.isNull()) return Value(true);
+    if (a.isBool() && b.isBool()) {
+      return Value(std::get<bool>(a.data) == std::get<bool>(b.data));
+    }
+    if (a.isString() && b.isString()) {
+      return Value(std::get<std::string>(a.data) == std::get<std::string>(b.data));
+    }
+    // For objects, check reference equality
+    if (a.isObject() && b.isObject()) {
+      return Value(std::get<std::shared_ptr<Object>>(a.data).get() ==
+                   std::get<std::shared_ptr<Object>>(b.data).get());
+    }
+    if (a.isArray() && b.isArray()) {
+      return Value(std::get<std::shared_ptr<Array>>(a.data).get() ==
+                   std::get<std::shared_ptr<Array>>(b.data).get());
+    }
+    if (a.isFunction() && b.isFunction()) {
+      return Value(std::get<std::shared_ptr<Function>>(a.data).get() ==
+                   std::get<std::shared_ptr<Function>>(b.data).get());
+    }
+
+    return Value(false);
+  };
+  objectConstructor->properties["is"] = Value(objectIs);
 
   env->define("Object", Value(objectConstructor));
 
@@ -967,6 +1149,46 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   mathExp->nativeFunc = Math_exp;
   mathObj->properties["exp"] = Value(mathExp);
 
+  auto mathCbrt = std::make_shared<Function>();
+  mathCbrt->isNative = true;
+  mathCbrt->nativeFunc = Math_cbrt;
+  mathObj->properties["cbrt"] = Value(mathCbrt);
+
+  auto mathLog2 = std::make_shared<Function>();
+  mathLog2->isNative = true;
+  mathLog2->nativeFunc = Math_log2;
+  mathObj->properties["log2"] = Value(mathLog2);
+
+  auto mathHypot = std::make_shared<Function>();
+  mathHypot->isNative = true;
+  mathHypot->nativeFunc = Math_hypot;
+  mathObj->properties["hypot"] = Value(mathHypot);
+
+  auto mathExpm1 = std::make_shared<Function>();
+  mathExpm1->isNative = true;
+  mathExpm1->nativeFunc = Math_expm1;
+  mathObj->properties["expm1"] = Value(mathExpm1);
+
+  auto mathLog1p = std::make_shared<Function>();
+  mathLog1p->isNative = true;
+  mathLog1p->nativeFunc = Math_log1p;
+  mathObj->properties["log1p"] = Value(mathLog1p);
+
+  auto mathFround = std::make_shared<Function>();
+  mathFround->isNative = true;
+  mathFround->nativeFunc = Math_fround;
+  mathObj->properties["fround"] = Value(mathFround);
+
+  auto mathClz32 = std::make_shared<Function>();
+  mathClz32->isNative = true;
+  mathClz32->nativeFunc = Math_clz32;
+  mathObj->properties["clz32"] = Value(mathClz32);
+
+  auto mathImul = std::make_shared<Function>();
+  mathImul->isNative = true;
+  mathImul->nativeFunc = Math_imul;
+  mathObj->properties["imul"] = Value(mathImul);
+
   env->define("Math", Value(mathObj));
 
   // Date constructor
@@ -1023,6 +1245,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // For simplicity, we can make the Object callable by storing the function
   env->define("String", Value(stringConstructorObj));
+
+  // WebAssembly global object
+  env->define("WebAssembly", wasm_js::createWebAssemblyGlobal());
 
   // globalThis - reference to the global object
   // Create a proxy object that reflects the current global environment

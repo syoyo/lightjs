@@ -1,0 +1,25 @@
+@PACKAGE_INIT@
+
+# LightJS CMake Configuration File
+# This file provides the LightJS::lightjs target for use in other CMake projects
+
+include(CMakeFindDependencyMacro)
+
+# Find dependencies if any
+# (Currently LightJS has no external dependencies)
+
+# Include the targets file
+include("${CMAKE_CURRENT_LIST_DIR}/LightJSTargets.cmake")
+
+# Set variables for compatibility
+set(LightJS_FOUND TRUE)
+set(LightJS_VERSION @PROJECT_VERSION@)
+set(LightJS_INCLUDE_DIRS "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@/lightjs")
+set(LightJS_LIBRARIES LightJS::lightjs)
+
+check_required_components(LightJS)
+
+# Print found message
+if(NOT LightJS_FIND_QUIETLY)
+  message(STATUS "Found LightJS: ${LightJS_VERSION}")
+endif()

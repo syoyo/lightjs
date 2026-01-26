@@ -6,7 +6,12 @@
 #include <memory>
 #include <cstdint>
 
-namespace tinyjs {
+namespace lightjs {
+
+namespace tls {
+class TLSConnection;
+}
+
 namespace http {
 
 struct URL {
@@ -49,6 +54,9 @@ private:
   Response httpRequest(const URL& url, const std::string& method,
                        const std::unordered_map<std::string, std::string>& headers,
                        const std::vector<uint8_t>& body);
+  Response httpsRequest(const URL& url, const std::string& method,
+                        const std::unordered_map<std::string, std::string>& headers,
+                        const std::vector<uint8_t>& body);
   Response fileRequest(const URL& url);
 
   int connectSocket(const std::string& host, uint16_t port);

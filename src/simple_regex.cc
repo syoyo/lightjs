@@ -1,6 +1,6 @@
 #include "simple_regex.h"
 
-namespace tinyjs {
+namespace lightjs {
 namespace simple_regex {
 
 Regex::Regex(const std::string& pattern, bool caseInsensitive)

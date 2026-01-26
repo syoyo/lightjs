@@ -4,7 +4,7 @@
 #include <string_view>
 #include <cstdint>
 
-namespace tinyjs {
+namespace lightjs {
 
 enum class TokenType {
   EndOfFile,

@@ -7,7 +7,7 @@
 #include <regex>
 #include <limits>
 
-namespace tinyjs {
+namespace lightjs {
 
 // String.prototype.charAt (Unicode-aware)
 Value String_charAt(const std::vector<Value>& args) {
@@ -354,4 +354,4 @@ Value String_fromCodePoint(const std::vector<Value>& args) {
     return Value(unicode::fromCodePoints(codePoints));
 }
 
-} // namespace tinyjs
+} // namespace lightjs

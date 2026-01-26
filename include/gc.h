@@ -8,7 +8,7 @@
 #include <atomic>
 #include <chrono>
 
-namespace tinyjs {
+namespace lightjs {
 
 // Forward declarations
 class Value;
@@ -199,4 +199,4 @@ private:
     bool wasEnabled_;
 };
 
-} // namespace tinyjs
+} // namespace lightjs

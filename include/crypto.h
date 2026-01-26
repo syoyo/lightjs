@@ -6,7 +6,7 @@
 #include <vector>
 #include <string>
 
-namespace tinyjs {
+namespace lightjs {
 namespace crypto {
 
 constexpr uint32_t rotr(uint32_t x, uint32_t n) {

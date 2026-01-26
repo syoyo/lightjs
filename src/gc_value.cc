@@ -1,7 +1,7 @@
 #include "value.h"
 #include "gc.h"
 
-namespace tinyjs {
+namespace lightjs {
 
 // Helper to extract GCObject pointers from Values
 static void addValueReferences(const Value& value, std::vector<GCObject*>& refs) {
@@ -204,4 +204,4 @@ void WeakSet::getReferences(std::vector<GCObject*>& refs) const {
     // This allows the GC to collect objects in the WeakSet
 }
 
-} // namespace tinyjs
+} // namespace lightjs

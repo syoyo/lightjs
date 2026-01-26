@@ -1,6 +1,11 @@
-# TinyJS
+# LightJS
 
-A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScript support planned.
+W.I.P.
+
+A modern, compact JavaScript (ES2020) interpreter written in C++20
+(TypeScript support planned.)
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-❤️-pink?logo=github)](https://github.com/sponsors/syoyo)
 
 ## Features
 
@@ -314,8 +319,8 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20 with TypeScri
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/tinyjs.git
-cd tinyjs
+git clone https://github.com/syoyo/lightjs.git
+cd lightjs
 
 # Create build directory
 mkdir build && cd build
@@ -330,7 +335,7 @@ cmake .. -DUSE_SIMPLE_REGEX=ON
 make -j$(nproc)
 
 # Run tests
-./tinyjs_test
+./lightjs_test
 ```
 
 ### Running Test262 Conformance Tests
@@ -353,7 +358,7 @@ make -j$(nproc)
 #include "interpreter.h"
 #include "environment.h"
 
-using namespace tinyjs;
+using namespace lightjs;
 
 int main() {
     std::string code = R"(
@@ -667,7 +672,7 @@ let theme = settings?.theme ?? 'light';  // 'light'
 ## Project Structure
 
 ```
-tinyjs/
+lightjs/
 ├── include/          # Public headers
 │   ├── ast.h        # AST node definitions
 │   ├── lexer.h      # Tokenization
@@ -694,7 +699,7 @@ Contributions are welcome! Please focus on:
 
 ## License
 
-[Specify your license here]
+MIT license.
 
 ## Acknowledgments
 

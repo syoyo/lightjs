@@ -7,7 +7,7 @@
 #include "environment.h"
 #include "gc.h"
 
-using namespace tinyjs;
+using namespace lightjs;
 
 int main() {
     std::cout << "TinyJS Garbage Collection Test\n";

@@ -1,6 +1,6 @@
 #include "symbols.h"
 
-namespace tinyjs {
+namespace lightjs {
 
 const Value& WellKnownSymbols::iterator() {
   static Value symbolIterator(Symbol("Symbol.iterator"));

@@ -3,9 +3,9 @@
 #include "environment.h"
 #include <memory>
 
-namespace tinyjs {
+namespace lightjs {
 
 void installTest262Harness(std::shared_ptr<Environment> env);
 std::shared_ptr<Environment> createTest262Environment();
 
-} // namespace tinyjs
+} // namespace lightjs

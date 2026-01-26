@@ -5,7 +5,15 @@
 #include <memory>
 #include <optional>
 
-namespace tinyjs {
+namespace lightjs {
+
+// Forward declarations
+class ModuleLoader;
+class Interpreter;
+
+// Set global module loader for dynamic imports
+void setGlobalModuleLoader(std::shared_ptr<ModuleLoader> loader);
+void setGlobalInterpreter(Interpreter* interpreter);
 
 class Environment : public std::enable_shared_from_this<Environment> {
 public:

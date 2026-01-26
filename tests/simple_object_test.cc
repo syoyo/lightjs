@@ -5,7 +5,7 @@
 #include "interpreter.h"
 #include "environment.h"
 
-using namespace tinyjs;
+using namespace lightjs;
 
 int main() {
     std::cout << "Simple Object Test" << std::endl;

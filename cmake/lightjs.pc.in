@@ -3,10 +3,10 @@ exec_prefix=${prefix}
 libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
 includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 
-Name: TinyJS
+Name: LightJS
 Description: @PROJECT_DESCRIPTION@
 Version: @PROJECT_VERSION@
-URL: https://github.com/syoyo/tinyjs
+URL: https://github.com/syoyo/lightjs
 
-Cflags: -I${includedir}/tinyjs -std=c++20
-Libs: -L${libdir} -ltinyjs
+Cflags: -I${includedir}/lightjs -std=c++20
+Libs: -L${libdir} -llightjs

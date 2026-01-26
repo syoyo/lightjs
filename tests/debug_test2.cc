@@ -6,7 +6,7 @@
 #include "environment.h"
 #include "object_methods.h"
 
-using namespace tinyjs;
+using namespace lightjs;
 
 int main() {
     std::cout << "Debug Test 2 - Direct function call" << std::endl;

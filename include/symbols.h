@@ -2,7 +2,7 @@
 
 #include "value.h"
 
-namespace tinyjs {
+namespace lightjs {
 
 class WellKnownSymbols {
 public:

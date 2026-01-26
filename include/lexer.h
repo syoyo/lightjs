@@ -5,7 +5,7 @@
 #include <string_view>
 #include <optional>
 
-namespace tinyjs {
+namespace lightjs {
 
 class Lexer {
 public:

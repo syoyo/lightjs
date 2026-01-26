@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TinyJS is a C++20 JavaScript (ES2020) interpreter featuring:
+LightJS is a C++20 JavaScript (ES2020) interpreter featuring:
 - C++20 coroutine-based async execution model
 - **Full async/await support** for asynchronous programming
 - No C++ exceptions (`-fno-exceptions` removed, but try/catch is used)
@@ -28,8 +28,20 @@ make
 cmake .. -DUSE_SIMPLE_REGEX=ON
 make
 
+# Build with SIMD optimizations (SSE2/AVX2 on x86, NEON/SVE on ARM64)
+cmake .. -DUSE_SIMD=ON
+make
+
+# Cross-compile for ARM64 with NEON
+cmake .. -DCROSS_COMPILE_ARM64=ON
+make
+
+# Cross-compile for Fujitsu A64FX with SVE (512-bit)
+cmake .. -DCROSS_COMPILE_A64FX=ON
+make
+
 # Run all tests (197 tests)
-./tinyjs_test
+./lightjs_test
 
 # Rebuild after changes
 make
@@ -115,7 +127,7 @@ Implements lexical scoping with parent chain:
 
 ### Unicode Support (`include/unicode.h`, `src/unicode.cc`)
 
-TinyJS provides full UTF-8 Unicode support:
+LightJS provides full UTF-8 Unicode support:
 - **UTF-8 aware string operations**: All string methods work with Unicode code points, not bytes
 - **String length**: Returns code point count, not byte count (e.g., "👋".length === 1)
 - **Character access**: `charAt()` returns full Unicode characters including emoji
@@ -164,6 +176,65 @@ TypedArrays store binary data in `std::vector<uint8_t>` with typed accessors:
 **When adding new TypedArray types:** Update `TypedArrayType` enum, `elementSize()`, and both get/set methods in `value.cc`.
 
 **Future enhancement:** TypedArrays can be updated to share ArrayBuffer backing store instead of maintaining separate buffers.
+
+### SIMD Optimizations (`include/simd.h`, `src/simd.cc`)
+
+LightJS supports optional SIMD acceleration for TypedArray operations:
+
+**Build with SIMD:**
+```bash
+cmake .. -DUSE_SIMD=ON
+make
+```
+
+**Supported platforms:**
+- **x86/x64:** SSE2, SSE4.2, AVX2+FMA (auto-detected, up to AMD Zen2)
+- **ARM64:** NEON (always available), SVE (optional)
+
+**Optimized operations:**
+- **Type conversions:** Float32→Int32, Int32→Float32, Float64→Int32, Float32→Uint8, Float32→Int16, etc.
+- **Uint8Clamped:** SIMD-accelerated clamping for image processing
+- **Float16 batch:** Optimized F16↔F32 conversion for ML workloads
+- **Memory operations:** SIMD-accelerated memcpy for large buffers
+- **Fill operations:** Fast array initialization
+
+**TypedArray bulk methods (SIMD-accelerated when enabled):**
+```cpp
+// Copy with type conversion (SIMD path for common conversions)
+typedArray.copyFrom(source, srcOffset, dstOffset, count);
+
+// Fill array (SIMD for Float32/Int32/Uint32)
+typedArray.fill(value);
+typedArray.fill(value, start, end);
+
+// Bulk get/set
+typedArray.setElements(doubleArray, offset, count);
+typedArray.getElements(doubleArray, offset, count);
+```
+
+**Implementation notes:**
+- All SIMD code is guarded with `#if USE_SIMD` preprocessor checks
+- Scalar fallbacks always exist for non-SIMD builds
+- Vector width is 256-bit for AVX2, 128-bit for SSE2/NEON
+- No AVX-512 (not available on Zen2)
+- No F16C hardware conversion (for broader compatibility)
+
+**Cross-compilation for ARM64:**
+```bash
+# Generic ARM64 with NEON (requires aarch64-linux-gnu-g++)
+cmake .. -DCROSS_COMPILE_ARM64=ON
+
+# Fujitsu A64FX with SVE 512-bit (for Fugaku supercomputer)
+cmake .. -DCROSS_COMPILE_A64FX=ON
+
+# With custom cross-compiler
+cmake .. -DCROSS_COMPILE_A64FX=ON -DCMAKE_CXX_COMPILER=/path/to/aarch64-linux-gnu-g++
+```
+
+Cross-compilation automatically:
+- Sets `CMAKE_SYSTEM_PROCESSOR` to `aarch64`
+- Enables SIMD with appropriate flags (`-march=armv8-a` or `-mcpu=a64fx`)
+- Defines `TARGET_A64FX=1` and `SVE_VECTOR_LENGTH=512` for A64FX builds
 
 ### Async/Await and Promise API
 
@@ -251,7 +322,7 @@ runTest("Test name", R"(
 
 **When adding features:**
 1. Add test cases to `test.cc` using `runTest()`
-2. Build and verify: `make && ./tinyjs_test`
+2. Build and verify: `make && ./lightjs_test`
 3. All 46 tests must pass before committing
 
 ## Platform Considerations

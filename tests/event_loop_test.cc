@@ -8,7 +8,7 @@
 #include <chrono>
 #include <thread>
 
-using namespace tinyjs;
+using namespace lightjs;
 
 void testBasicTimeout() {
   std::cout << "Testing basic setTimeout..." << std::endl;
