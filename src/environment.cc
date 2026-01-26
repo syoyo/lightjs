@@ -13,6 +13,9 @@
 #include "module.h"
 #include "interpreter.h"
 #include "wasm_js.h"
+#include "text_encoding.h"
+#include "url.h"
+#include "fs.h"
 #include <iostream>
 #include <thread>
 #include <limits>
@@ -1371,6 +1374,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   };
   env->define("queueMicrotask", Value(queueMicrotaskFn));
+
+  // TextEncoder and TextDecoder
+  env->define("TextEncoder", Value(createTextEncoderConstructor()));
+  env->define("TextDecoder", Value(createTextDecoderConstructor()));
+
+  // URL and URLSearchParams
+  env->define("URL", Value(createURLConstructor()));
+  env->define("URLSearchParams", Value(createURLSearchParamsConstructor()));
+
+  // File System module (fs)
+  globalThisObj->properties["fs"] = Value(createFSModule());
 
   return env;
 }

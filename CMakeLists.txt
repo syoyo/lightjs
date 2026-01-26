@@ -200,6 +200,9 @@ set(LIGHTJS_CORE_SOURCES
   src/symbols.cc
   src/string_table.cc
   src/error_formatter.cc
+  src/text_encoding.cc
+  src/url.cc
+  src/fs.cc
   src/tls_aes.cc
   src/tls_gcm.cc
   src/tls_x25519.cc
@@ -237,6 +240,9 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/simple_regex.h
   include/string_table.h
   include/error_formatter.h
+  include/text_encoding.h
+  include/url.h
+  include/fs.h
   include/tls.h
   include/simd.h
   include/wasm/wasm_types.h
