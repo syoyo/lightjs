@@ -566,6 +566,109 @@ bool Set::deleteValue(const Value& value) {
   return false;
 }
 
+// WeakMap implementation
+static GCObject* extractObjectPointer(const Value& val) {
+  // WeakMap/WeakSet can only use objects as keys
+  if (auto* obj = std::get_if<std::shared_ptr<Object>>(&val.value)) {
+    return obj->get();
+  } else if (auto* arr = std::get_if<std::shared_ptr<Array>>(&val.value)) {
+    return arr->get();
+  } else if (auto* func = std::get_if<std::shared_ptr<Function>>(&val.value)) {
+    return func->get();
+  } else if (auto* map = std::get_if<std::shared_ptr<Map>>(&val.value)) {
+    return map->get();
+  } else if (auto* set = std::get_if<std::shared_ptr<Set>>(&val.value)) {
+    return set->get();
+  }
+  // Not an object type
+  return nullptr;
+}
+
+void WeakMap::set(const Value& key, const Value& value) {
+  GCObject* keyPtr = extractObjectPointer(key);
+  if (!keyPtr) {
+    throw std::runtime_error("WeakMap key must be an object");
+  }
+  entries[keyPtr] = value;
+}
+
+bool WeakMap::has(const Value& key) const {
+  GCObject* keyPtr = extractObjectPointer(key);
+  if (!keyPtr) return false;
+  return entries.find(keyPtr) != entries.end();
+}
+
+Value WeakMap::get(const Value& key) const {
+  GCObject* keyPtr = extractObjectPointer(key);
+  if (!keyPtr) return Value(Undefined{});
+
+  auto it = entries.find(keyPtr);
+  if (it != entries.end()) {
+    return it->second;
+  }
+  return Value(Undefined{});
+}
+
+bool WeakMap::deleteKey(const Value& key) {
+  GCObject* keyPtr = extractObjectPointer(key);
+  if (!keyPtr) return false;
+
+  auto it = entries.find(keyPtr);
+  if (it != entries.end()) {
+    entries.erase(it);
+    return true;
+  }
+  return false;
+}
+
+void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
+  // Do NOT add keys to references - they are weak references
+  // Only add values
+  for (const auto& [key, value] : entries) {
+    if (auto* obj = std::get_if<std::shared_ptr<Object>>(&value.value)) {
+      refs.push_back(obj->get());
+    } else if (auto* arr = std::get_if<std::shared_ptr<Array>>(&value.value)) {
+      refs.push_back(arr->get());
+    } else if (auto* func = std::get_if<std::shared_ptr<Function>>(&value.value)) {
+      refs.push_back(func->get());
+    }
+    // Add other GC types as needed
+  }
+}
+
+// WeakSet implementation
+bool WeakSet::add(const Value& value) {
+  GCObject* valuePtr = extractObjectPointer(value);
+  if (!valuePtr) {
+    throw std::runtime_error("WeakSet value must be an object");
+  }
+  values.insert(valuePtr);
+  return true;
+}
+
+bool WeakSet::has(const Value& value) const {
+  GCObject* valuePtr = extractObjectPointer(value);
+  if (!valuePtr) return false;
+  return values.find(valuePtr) != values.end();
+}
+
+bool WeakSet::deleteValue(const Value& value) {
+  GCObject* valuePtr = extractObjectPointer(value);
+  if (!valuePtr) return false;
+
+  auto it = values.find(valuePtr);
+  if (it != values.end()) {
+    values.erase(it);
+    return true;
+  }
+  return false;
+}
+
+void WeakSet::getReferences(std::vector<GCObject*>& refs) const {
+  // Do NOT add values to references - they are weak references
+  // WeakSet does not hold strong references to its values
+}
+
 // Promise implementation
 void Promise::resolve(Value val) {
   if (state != PromiseState::Pending) return;
