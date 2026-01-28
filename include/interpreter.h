@@ -3,9 +3,11 @@
 #include "ast.h"
 #include "value.h"
 #include "environment.h"
+#include "error_formatter.h"
 #include <coroutine>
 #include <optional>
 #include <memory>
+#include <iostream>
 
 namespace lightjs {
 
@@ -105,6 +107,7 @@ public:
 private:
   std::shared_ptr<Environment> env_;
   size_t stackDepth_ = 0;
+  StackTraceManager stackTrace_;
 
   // RAII helper for stack depth tracking
   struct StackGuard {
@@ -225,6 +228,32 @@ private:
       return msg + " at line " + std::to_string(loc.line) + ", column " + std::to_string(loc.column);
     }
     return msg;
+  }
+
+  // Helper to throw error with stack trace
+  void throwError(ErrorType type, const std::string& message) {
+    auto error = std::make_shared<Error>(type, message);
+    // Format stack trace using ErrorFormatter
+    error->stack = ErrorFormatter::formatError(
+      error->getName(),
+      message,
+      stackTrace_.getStackTrace()
+    );
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = Value(error);
+  }
+
+  // Helper to push stack frame (RAII)
+  StackFrameGuard pushStackFrame(const std::string& functionName,
+                                  const std::string& filename = "<script>",
+                                  uint32_t line = 0,
+                                  uint32_t column = 0) {
+    StackFrame frame;
+    frame.functionName = functionName;
+    frame.filename = filename;
+    frame.line = line;
+    frame.column = column;
+    return StackFrameGuard(stackTrace_, frame);
   }
 };
 

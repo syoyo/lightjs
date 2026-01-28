@@ -47,8 +47,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
   // Stack overflow protection
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
     co_return Value(Undefined{});
   }
 
@@ -161,8 +160,7 @@ Task Interpreter::evaluate(const Expression& expr) {
   // Stack overflow protection
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
     co_return Value(Undefined{});
   }
 
@@ -171,11 +169,7 @@ Task Interpreter::evaluate(const Expression& expr) {
       co_return *val;
     }
     // Throw ReferenceError for undefined variables with line info
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = Value(std::make_shared<Error>(
-      ErrorType::ReferenceError,
-      formatError("'" + node->name + "' is not defined", expr.loc)
-    ));
+    throwError(ErrorType::ReferenceError, formatError("'" + node->name + "' is not defined", expr.loc));
     co_return Value(Undefined{});
   } else if (auto* node = std::get_if<NumberLiteral>(&expr.node)) {
     co_return Value(node->value);
@@ -243,11 +237,7 @@ Task Interpreter::evaluate(const Expression& expr) {
     if (auto superVal = env_->get("__super__")) {
       co_return *superVal;
     }
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = Value(std::make_shared<Error>(
-      ErrorType::ReferenceError,
-      formatError("'super' keyword is not valid here", expr.loc)
-    ));
+    throwError(ErrorType::ReferenceError, formatError("'super' keyword is not valid here", expr.loc));
     co_return Value(Undefined{});
   }
   co_return Value(Undefined{});
@@ -657,8 +647,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   // Stack overflow protection
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = Value(std::make_shared<Error>(ErrorType::RangeError, "Maximum call stack size exceeded"));
+    throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
     co_return Value(Undefined{});
   }
 
@@ -733,6 +722,8 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     co_return callFunction(callee, args, thisValue);
   }
 
+  // Throw TypeError if trying to call a non-function
+  throwError(ErrorType::TypeError, callee.toString() + " is not a function");
   co_return Value(Undefined{});
 }
 
@@ -2988,6 +2979,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   }
 
   if (func->isAsync) {
+    // Push stack frame for async function calls
+    auto stackFrame = pushStackFrame("<async>");
+
     auto promise = std::make_shared<Promise>();
     auto prevEnv = env_;
     env_ = std::static_pointer_cast<Environment>(func->closure);
@@ -3012,16 +3006,30 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
           result = flow_.value;
           break;
         }
+
+        // Preserve throw flow control (errors)
+        if (flow_.type == ControlFlow::Type::Throw) {
+          promise->reject(flow_.value);
+          break;
+        }
       }
-      promise->resolve(result);
+      if (flow_.type != ControlFlow::Type::Throw) {
+        promise->resolve(result);
+      }
     } catch (const std::exception& e) {
       promise->reject(Value(std::string(e.what())));
     }
 
-    flow_ = prevFlow;
+    // Don't restore flow if an error was thrown - preserve the error
+    if (flow_.type != ControlFlow::Type::Throw) {
+      flow_ = prevFlow;
+    }
     env_ = prevEnv;
     return Value(promise);
   }
+
+  // Push stack frame for JavaScript function calls
+  auto stackFrame = pushStackFrame("<function>");
 
   auto prevEnv = env_;
   env_ = std::static_pointer_cast<Environment>(func->closure);
@@ -3045,9 +3053,17 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       result = flow_.value;
       break;
     }
+
+    // Preserve throw flow control (errors)
+    if (flow_.type == ControlFlow::Type::Throw) {
+      break;
+    }
   }
 
-  flow_ = prevFlow;
+  // Don't restore flow if an error was thrown - preserve the error
+  if (flow_.type != ControlFlow::Type::Throw) {
+    flow_ = prevFlow;
+  }
   env_ = prevEnv;
   return result;
 }
@@ -3670,6 +3686,11 @@ Task Interpreter::evaluateReturn(const ReturnStmt& stmt) {
       std::coroutine_handle<>::from_address(task.handle.address()).resume();
     }
     result = task.result();
+
+    // If an error was thrown during argument evaluation, preserve it
+    if (flow_.type == ControlFlow::Type::Throw) {
+      co_return result;
+    }
   }
   flow_.type = ControlFlow::Type::Return;
   flow_.value = result;

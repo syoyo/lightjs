@@ -334,6 +334,9 @@ if(LIGHTJS_BUILD_TESTS)
   # String interning test
   add_lightjs_test(string_interning_test tests/string_interning_test.cc)
 
+  # Error formatting test
+  add_lightjs_test(error_formatting_test tests/error_formatting_test.cc)
+
   # Debug tests (not added to CTest suite)
   add_executable(debug_test tests/debug_test.cc)
   target_link_libraries(debug_test PRIVATE LightJS::lightjs)
