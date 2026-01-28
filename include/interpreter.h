@@ -230,6 +230,10 @@ private:
     return msg;
   }
 
+  // Check heap memory limit and throw error if exceeded
+  // Returns true if allocation is safe, sets error and returns false otherwise
+  bool checkMemoryLimit(size_t additionalBytes = 0);
+
   // Helper to throw error with stack trace
   void throwError(ErrorType type, const std::string& message) {
     auto error = std::make_shared<Error>(type, message);

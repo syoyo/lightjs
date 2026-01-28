@@ -27,6 +27,31 @@ void Interpreter::clearError() {
   flow_.value = Value(Undefined{});
 }
 
+bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
+  auto& gc = GarbageCollector::instance();
+
+  if (!gc.checkHeapLimit(additionalBytes)) {
+    // Try to free memory first
+    gc.collect();
+
+    // Check again after collection
+    if (!gc.checkHeapLimit(additionalBytes)) {
+      // Format memory statistics for error message
+      size_t currentUsage = gc.getCurrentMemoryUsage();
+      size_t heapLimit = gc.getHeapLimit();
+
+      std::stringstream ss;
+      ss << "JavaScript heap out of memory (";
+      ss << (currentUsage / (1024 * 1024)) << " MB used, ";
+      ss << (heapLimit / (1024 * 1024)) << " MB limit)";
+
+      throwError(ErrorType::RangeError, ss.str());
+      return false;
+    }
+  }
+  return true;
+}
+
 Task Interpreter::evaluate(const Program& program) {
   Value result = Value(Undefined{});
   for (const auto& stmt : program.body) {
@@ -3090,6 +3115,11 @@ Task Interpreter::evaluateConditional(const ConditionalExpr& expr) {
 }
 
 Task Interpreter::evaluateArray(const ArrayExpr& expr) {
+  // Check memory limit before allocation
+  if (!checkMemoryLimit(sizeof(Array))) {
+    co_return Value(Undefined{});
+  }
+
   auto arr = std::make_shared<Array>();
   GarbageCollector::instance().reportAllocation(sizeof(Array));
   for (const auto& elem : expr.elements) {
@@ -3130,6 +3160,11 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 }
 
 Task Interpreter::evaluateObject(const ObjectExpr& expr) {
+  // Check memory limit before allocation
+  if (!checkMemoryLimit(sizeof(Object))) {
+    co_return Value(Undefined{});
+  }
+
   auto obj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
@@ -3251,6 +3286,11 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
 }
 
 Task Interpreter::evaluateNew(const NewExpr& expr) {
+  // Check memory limit before potential allocation
+  if (!checkMemoryLimit(sizeof(Object))) {
+    co_return Value(Undefined{});
+  }
+
   // Evaluate the callee (constructor)
   auto calleeTask = evaluate(*expr.callee);
   while (!calleeTask.done()) {

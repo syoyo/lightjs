@@ -337,6 +337,9 @@ if(LIGHTJS_BUILD_TESTS)
   # Error formatting test
   add_lightjs_test(error_formatting_test tests/error_formatting_test.cc)
 
+  # Memory limit test
+  add_lightjs_test(memory_limit_test tests/memory_limit_test.cc)
+
   # Debug tests (not added to CTest suite)
   add_executable(debug_test tests/debug_test.cc)
   target_link_libraries(debug_test PRIVATE LightJS::lightjs)

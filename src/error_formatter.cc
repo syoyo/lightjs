@@ -141,9 +141,18 @@ std::string ErrorFormatter::formatError(
   // Error header: "ErrorType: message"
   oss << errorType << ": " << message << "\n";
 
-  // Stack trace
-  for (const auto& frame : stackTrace) {
-    oss << frame.toString() << "\n";
+  // Stack trace (limit to MAX_STACK_FRAMES to prevent excessive output)
+  constexpr size_t MAX_STACK_FRAMES = 10;
+  size_t frameCount = stackTrace.size();
+  size_t displayCount = std::min(frameCount, MAX_STACK_FRAMES);
+
+  for (size_t i = 0; i < displayCount; i++) {
+    oss << stackTrace[i].toString() << "\n";
+  }
+
+  // Show how many frames were omitted
+  if (frameCount > MAX_STACK_FRAMES) {
+    oss << "  ... " << (frameCount - MAX_STACK_FRAMES) << " more frames\n";
   }
 
   // Source context (if available)

@@ -7,8 +7,26 @@
 #include <functional>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <string>
+#include <stdexcept>
 
 namespace lightjs {
+
+// Memory limit configuration (Node.js-like behavior)
+struct MemoryLimits {
+    // Default heap limit: 2GB
+    static constexpr size_t DEFAULT_HEAP_LIMIT = 2ULL * 1024 * 1024 * 1024;
+    // Extended heap limit for systems with 16GB+ RAM: 4GB
+    static constexpr size_t EXTENDED_HEAP_LIMIT = 4ULL * 1024 * 1024 * 1024;
+    // Threshold for extended limit (16GB system RAM)
+    static constexpr size_t EXTENDED_LIMIT_THRESHOLD = 16ULL * 1024 * 1024 * 1024;
+
+    // Detect system memory and return appropriate limit
+    static size_t getDefaultHeapLimit();
+    // Get total system memory in bytes
+    static size_t getSystemMemory();
+};
 
 // Forward declarations
 class Value;
@@ -23,12 +41,15 @@ class Module;
 
 // Garbage Collection Statistics
 struct GCStats {
-    size_t totalAllocated = 0;
-    size_t totalFreed = 0;
-    size_t currentlyAllocated = 0;
-    size_t peakAllocated = 0;
+    size_t totalAllocated = 0;       // Total bytes allocated over time
+    size_t totalFreed = 0;           // Total bytes freed over time
+    size_t currentlyAllocated = 0;   // Current bytes in use
+    size_t peakAllocated = 0;        // Peak bytes ever allocated
+    size_t objectCount = 0;          // Current number of GC objects
+    size_t peakObjectCount = 0;      // Peak number of GC objects
     size_t collectionsTriggered = 0;
     size_t cyclesDetected = 0;
+    size_t heapLimitExceeded = 0;    // Number of times heap limit was hit
     std::chrono::microseconds totalGCTime{0};
     std::chrono::microseconds lastGCTime{0};
 };
@@ -135,6 +156,13 @@ public:
     void setAutoCollect(bool enabled) { autoCollectEnabled_ = enabled; }
     bool isAutoCollectEnabled() const { return autoCollectEnabled_; }
 
+    // Heap limit configuration (Node.js-like behavior)
+    // Default: 2GB, or 4GB on systems with 16GB+ RAM
+    void setHeapLimit(size_t bytes) { heapLimit_ = bytes; }
+    size_t getHeapLimit() const { return heapLimit_; }
+    bool isHeapLimitEnabled() const { return heapLimitEnabled_; }
+    void setHeapLimitEnabled(bool enabled) { heapLimitEnabled_ = enabled; }
+
     // Statistics
     const GCStats& getStats() const { return stats_; }
     void resetStats() { stats_ = GCStats{}; }
@@ -143,6 +171,29 @@ public:
     size_t getCurrentMemoryUsage() const;
     void reportAllocation(size_t bytes);
     void reportDeallocation(size_t bytes);
+
+    // Check if heap limit would be exceeded by an allocation
+    // Returns true if allocation is OK, false if limit exceeded
+    bool checkHeapLimit(size_t additionalBytes = 0) const;
+
+    // Exception thrown when heap limit is exceeded
+    class HeapLimitExceededException : public std::exception {
+    public:
+        HeapLimitExceededException(size_t current, size_t limit, size_t requested)
+            : current_(current), limit_(limit), requested_(requested) {
+            message_ = "FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed - "
+                       "JavaScript heap out of memory";
+        }
+        const char* what() const noexcept override { return message_.c_str(); }
+        size_t currentUsage() const { return current_; }
+        size_t heapLimit() const { return limit_; }
+        size_t requestedSize() const { return requested_; }
+    private:
+        size_t current_;
+        size_t limit_;
+        size_t requested_;
+        std::string message_;
+    };
 
 private:
     GarbageCollector();
@@ -177,6 +228,10 @@ private:
     size_t bytesAllocatedSinceGC_ = 0;
     bool autoCollectEnabled_ = true;
     bool collectInProgress_ = false;
+
+    // Heap limit settings (Node.js-like behavior)
+    size_t heapLimit_ = MemoryLimits::getDefaultHeapLimit();
+    bool heapLimitEnabled_ = true;
 
     GCStats stats_;
 

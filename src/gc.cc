@@ -2,8 +2,81 @@
 #include "value.h"
 #include <algorithm>
 #include <iostream>
+#include <fstream>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 
 namespace lightjs {
+
+// ============================================================================
+// MemoryLimits implementation
+// ============================================================================
+
+size_t MemoryLimits::getSystemMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        return static_cast<size_t>(memStatus.ullTotalPhys);
+    }
+    return 0;
+#elif defined(__APPLE__)
+    int64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        return static_cast<size_t>(memsize);
+    }
+    return 0;
+#elif defined(__linux__)
+    // Try /proc/meminfo first (more accurate)
+    std::ifstream meminfo("/proc/meminfo");
+    if (meminfo.is_open()) {
+        std::string line;
+        while (std::getline(meminfo, line)) {
+            if (line.find("MemTotal:") == 0) {
+                size_t kb = 0;
+                // Parse "MemTotal:       xxxxx kB"
+                size_t pos = line.find(':');
+                if (pos != std::string::npos) {
+                    std::string numPart = line.substr(pos + 1);
+                    // Skip whitespace
+                    size_t start = numPart.find_first_not_of(" \t");
+                    if (start != std::string::npos) {
+                        kb = std::stoull(numPart.substr(start));
+                        return kb * 1024;  // Convert KB to bytes
+                    }
+                }
+            }
+        }
+    }
+    // Fallback to sysconf
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long pageSize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && pageSize > 0) {
+        return static_cast<size_t>(pages) * static_cast<size_t>(pageSize);
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+size_t MemoryLimits::getDefaultHeapLimit() {
+    size_t systemMem = getSystemMemory();
+
+    // Node.js behavior: 4GB for systems with 16GB+ RAM, otherwise 2GB
+    if (systemMem >= EXTENDED_LIMIT_THRESHOLD) {
+        return EXTENDED_HEAP_LIMIT;
+    }
+    return DEFAULT_HEAP_LIMIT;
+}
 
 thread_local bool GarbageCollector::gcDisabled_ = false;
 
@@ -49,8 +122,12 @@ GarbageCollector::GarbageCollector() {}
 void GarbageCollector::registerObject(GCObject* obj) {
     if (!obj || gcDisabled_) return;
     objects_.insert(obj);
-    stats_.currentlyAllocated++;
-    stats_.totalAllocated++;
+    stats_.objectCount++;
+    stats_.totalAllocated += sizeof(GCObject);  // Base object size
+    stats_.currentlyAllocated += sizeof(GCObject);
+    if (stats_.objectCount > stats_.peakObjectCount) {
+        stats_.peakObjectCount = stats_.objectCount;
+    }
     if (stats_.currentlyAllocated > stats_.peakAllocated) {
         stats_.peakAllocated = stats_.currentlyAllocated;
     }
@@ -59,8 +136,11 @@ void GarbageCollector::registerObject(GCObject* obj) {
 void GarbageCollector::unregisterObject(GCObject* obj) {
     if (!obj) return;
     objects_.erase(obj);
-    stats_.currentlyAllocated--;
-    stats_.totalFreed++;
+    stats_.objectCount--;
+    if (stats_.currentlyAllocated >= sizeof(GCObject)) {
+        stats_.currentlyAllocated -= sizeof(GCObject);
+    }
+    stats_.totalFreed += sizeof(GCObject);
 }
 
 void GarbageCollector::collect() {
@@ -221,18 +301,37 @@ void GarbageCollector::strongConnect(
 }
 
 size_t GarbageCollector::getCurrentMemoryUsage() const {
-    // This is a simple approximation
-    // In a real implementation, you'd track actual memory usage
-    return stats_.currentlyAllocated * sizeof(GCObject);
+    return stats_.currentlyAllocated;
+}
+
+bool GarbageCollector::checkHeapLimit(size_t additionalBytes) const {
+    if (!heapLimitEnabled_) return true;
+    return (stats_.currentlyAllocated + additionalBytes) <= heapLimit_;
 }
 
 void GarbageCollector::reportAllocation(size_t bytes) {
+    // Track the allocation
+    stats_.currentlyAllocated += bytes;
+    stats_.totalAllocated += bytes;
     bytesAllocatedSinceGC_ += bytes;
+
+    if (stats_.currentlyAllocated > stats_.peakAllocated) {
+        stats_.peakAllocated = stats_.currentlyAllocated;
+    }
+
+    // Track if we exceeded the heap limit
+    if (heapLimitEnabled_ && stats_.currentlyAllocated > heapLimit_) {
+        stats_.heapLimitExceeded++;
+    }
+
     collectIfNeeded();
 }
 
 void GarbageCollector::reportDeallocation(size_t bytes) {
-    // Track deallocations if needed
+    if (stats_.currentlyAllocated >= bytes) {
+        stats_.currentlyAllocated -= bytes;
+    }
+    stats_.totalFreed += bytes;
 }
 
 } // namespace lightjs
