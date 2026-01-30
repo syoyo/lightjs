@@ -307,7 +307,8 @@ inline void convertFloat64ToInt32(const double* src, int32_t* dst, size_t count)
   size_t i = 0;
   for (; i + 2 <= count; i += 2) {
     float64x2_t doubles = vld1q_f64(src + i);
-    int32x2_t ints = vcvt_s32_f64(doubles);
+    int64x2_t ints64 = vcvtq_s64_f64(doubles);
+    int32x2_t ints = vmovn_s64(ints64);
     vst1_s32(dst + i, ints);
   }
   for (; i < count; ++i) {
