@@ -34,11 +34,8 @@ int main() {
         Interpreter interpreter(env);
 
         auto task = interpreter.evaluate(*program);
-        while (!task.done()) {
-            std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
-
-        Value result = task.result();
+                Value result;
+        LIGHTJS_RUN_TASK(task, result);
         std::cout << "Final result type: " << (int)result.data.index() << std::endl;
         std::cout << "Final result: " << result.toString() << std::endl;
 

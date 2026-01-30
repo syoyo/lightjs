@@ -25,11 +25,8 @@ void runTest(const std::string& testName, const std::string& code, const std::st
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
-
-  Value result = task.result();
+    Value result;
+  LIGHTJS_RUN_TASK(task, result);
   std::string resultStr = result.toString();
 
   std::cout << "  Result: " << resultStr << std::endl;

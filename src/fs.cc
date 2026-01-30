@@ -1,4 +1,5 @@
 #include "fs.h"
+#include "fs_compat.h"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -7,12 +8,6 @@
 
 namespace lightjs {
 namespace fs {
-
-// Helper to convert filesystem error to string
-static std::string fsErrorMessage(const std::string& operation, const std::string& path,
-                                   const std::filesystem::filesystem_error& e) {
-  return operation + " failed for '" + path + "': " + e.what();
-}
 
 // Synchronous implementations
 
@@ -95,38 +90,36 @@ void appendFileSync(const std::string& path, const Value& data) {
 }
 
 bool existsSync(const std::string& path) {
-  return std::filesystem::exists(path);
+  return fs_compat::exists(path);
 }
 
 void unlinkSync(const std::string& path) {
-  try {
-    std::filesystem::remove(path);
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error(fsErrorMessage("unlinkSync", path, e));
+  if (!fs_compat::remove(path)) {
+    throw std::runtime_error("unlinkSync failed for '" + path + "'");
   }
 }
 
 void mkdirSync(const std::string& path, bool recursive) {
-  try {
-    if (recursive) {
-      std::filesystem::create_directories(path);
-    } else {
-      std::filesystem::create_directory(path);
-    }
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error(fsErrorMessage("mkdirSync", path, e));
+  bool success;
+  if (recursive) {
+    success = fs_compat::createDirectories(path);
+  } else {
+    success = fs_compat::createDirectory(path);
+  }
+  if (!success) {
+    throw std::runtime_error("mkdirSync failed for '" + path + "'");
   }
 }
 
 void rmdirSync(const std::string& path, bool recursive) {
-  try {
-    if (recursive) {
-      std::filesystem::remove_all(path);
-    } else {
-      std::filesystem::remove(path);
+  if (recursive) {
+    if (fs_compat::removeAll(path) < 0) {
+      throw std::runtime_error("rmdirSync (recursive) failed for '" + path + "'");
     }
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error(fsErrorMessage("rmdirSync", path, e));
+  } else {
+    if (!fs_compat::remove(path)) {
+      throw std::runtime_error("rmdirSync failed for '" + path + "'");
+    }
   }
 }
 
@@ -134,13 +127,14 @@ Value readdirSync(const std::string& path) {
   try {
     auto arr = std::make_shared<Array>();
 
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-      arr->elements.push_back(Value(entry.path().filename().string()));
+    auto entries = fs_compat::readDirectory(path);
+    for (const auto& entry : entries) {
+      arr->elements.push_back(Value(entry.name));
     }
 
     return Value(arr);
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error(fsErrorMessage("readdirSync", path, e));
+  } catch (const std::exception& e) {
+    throw std::runtime_error("readdirSync failed for '" + path + "': " + e.what());
   }
 }
 
@@ -148,44 +142,34 @@ Value statSync(const std::string& path) {
   try {
     auto stats = std::make_shared<Object>();
 
-    auto status = std::filesystem::status(path);
-    auto fileSize = std::filesystem::file_size(path);
-    auto modTime = std::filesystem::last_write_time(path);
+    auto status = fs_compat::getStatus(path);
+    if (!status.exists) {
+      throw std::runtime_error("ENOENT: no such file or directory");
+    }
 
-    stats->properties["size"] = Value(static_cast<double>(fileSize));
-    stats->properties["isFile"] = Value(std::filesystem::is_regular_file(path));
-    stats->properties["isDirectory"] = Value(std::filesystem::is_directory(path));
-    stats->properties["isSymbolicLink"] = Value(std::filesystem::is_symlink(path));
+    stats->properties["size"] = Value(static_cast<double>(status.fileSize));
+    stats->properties["isFile"] = Value(status.isFile);
+    stats->properties["isDirectory"] = Value(status.isDirectory);
+    stats->properties["isSymbolicLink"] = Value(status.isSymlink);
 
-    // Convert file time to Unix timestamp (milliseconds)
-    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-      modTime - std::filesystem::file_time_type::clock::now() +
-      std::chrono::system_clock::now()
-    );
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      sctp.time_since_epoch()
-    ).count();
-    stats->properties["mtimeMs"] = Value(static_cast<double>(ms));
+    // Convert to milliseconds
+    stats->properties["mtimeMs"] = Value(static_cast<double>(status.lastWriteTime * 1000));
 
     return Value(stats);
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error(fsErrorMessage("statSync", path, e));
+  } catch (const std::exception& e) {
+    throw std::runtime_error("statSync failed for '" + path + "': " + e.what());
   }
 }
 
 void copyFileSync(const std::string& src, const std::string& dest) {
-  try {
-    std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error("copyFileSync failed: " + std::string(e.what()));
+  if (!fs_compat::copyFile(src, dest, true)) {
+    throw std::runtime_error("copyFileSync failed: cannot copy '" + src + "' to '" + dest + "'");
   }
 }
 
 void renameSync(const std::string& oldPath, const std::string& newPath) {
-  try {
-    std::filesystem::rename(oldPath, newPath);
-  } catch (const std::filesystem::filesystem_error& e) {
-    throw std::runtime_error("renameSync failed: " + std::string(e.what()));
+  if (!fs_compat::rename(oldPath, newPath)) {
+    throw std::runtime_error("renameSync failed: cannot rename '" + oldPath + "' to '" + newPath + "'");
   }
 }
 

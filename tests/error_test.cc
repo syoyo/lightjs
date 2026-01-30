@@ -32,9 +32,7 @@ void testError(const std::string& name, const std::string& code) {
   Interpreter interp(env);
 
   auto task = interp.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
   auto result = task.result();
 
   // Check if interpreter has a thrown error

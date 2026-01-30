@@ -34,19 +34,11 @@ int main() {
 
   auto task = interpreter.evaluate(*program);
 
-  std::cout << "Task created, entering loop...\n";
+  std::cout << "Task created, running...\n";
 
-  int iterations = 0;
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    iterations++;
-    if (iterations > 1000) {
-      std::cerr << "Too many iterations!\n";
-      break;
-    }
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
-  std::cout << "Loop done after " << iterations << " iterations\n";
+  std::cout << "Task done\n";
   std::cout << "Has error: " << interpreter.hasError() << "\n";
 
   if (interpreter.hasError()) {

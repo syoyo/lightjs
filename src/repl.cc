@@ -5,11 +5,10 @@
 #include <iostream>
 #include <string>
 #include <sstream>
-#include <coroutine>
 #include <fstream>
-#include <filesystem>
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
 
 using namespace lightjs;
 
@@ -149,7 +148,11 @@ void printHelp() {
 void printVersion() {
   std::cout << "\nLightJS REPL v1.0.0\n";
   std::cout << "JavaScript Engine: ES2020\n";
+#if LIGHTJS_HAS_COROUTINES
   std::cout << "Build: C++20 coroutine-based interpreter\n";
+#else
+  std::cout << "Build: C++17 compatibility mode\n";
+#endif
   std::cout << "Features: Async/await, Generators, WebAssembly, TLS 1.3\n\n";
 }
 
@@ -188,9 +191,7 @@ int main(int argc, char* argv[]) {
       }
 
       auto task = interpreter.evaluate(*program);
-      while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(task);
       // File mode: exit after execution
       return 0;
     } catch (const std::exception& e) {
@@ -266,8 +267,8 @@ int main(int argc, char* argv[]) {
       if (input == ".history") {
         const auto& entries = history.getEntries();
         std::cout << "\nCommand history (" << entries.size() << " entries):\n";
-        size_t start = entries.size() > 20 ? entries.size() - 20 : 0;
-        for (size_t i = start; i < entries.size(); i++) {
+        size_t histStart = entries.size() > 20 ? entries.size() - 20 : 0;
+        for (size_t i = histStart; i < entries.size(); i++) {
           std::cout << "  " << (i + 1) << ": " << entries[i] << "\n";
         }
         std::cout << "\n";
@@ -305,9 +306,7 @@ int main(int argc, char* argv[]) {
           }
 
           auto task = interpreter.evaluate(*program);
-          while (!task.done()) {
-            std::coroutine_handle<>::from_address(task.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(task);
           std::cout << "Loaded and executed '" << filename << "'\n";
         } catch (const std::exception& e) {
           std::cout << "Error loading file: " << e.what() << "\n";
@@ -365,11 +364,8 @@ int main(int argc, char* argv[]) {
 
       // Execute the program
       auto task = interpreter.evaluate(*program);
-      while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-      }
-
-      Value result = task.result();
+      Value result;
+      LIGHTJS_RUN_TASK(task, result);
 
       // Auto-print result if it's not undefined (expression result)
       if (!result.isUndefined()) {

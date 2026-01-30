@@ -6,6 +6,7 @@
 #include "symbols.h"
 #include <iostream>
 #include <cmath>
+#include <climits>
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
@@ -56,16 +57,13 @@ Task Interpreter::evaluate(const Program& program) {
   Value result = Value(Undefined{});
   for (const auto& stmt : program.body) {
     auto task = evaluate(*stmt);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-    result = task.result();
+  LIGHTJS_RUN_TASK(task, result);
 
     if (flow_.type != ControlFlow::Type::None) {
       break;
     }
   }
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluate(const Statement& stmt) {
@@ -73,13 +71,13 @@ Task Interpreter::evaluate(const Statement& stmt) {
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
     throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   if (auto* node = std::get_if<VarDeclaration>(&stmt.node)) {
-    co_return co_await evaluateVarDecl(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateVarDecl(*node)));
   } else if (auto* node = std::get_if<FunctionDeclaration>(&stmt.node)) {
-    co_return co_await evaluateFuncDecl(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFuncDecl(*node)));
   } else if (auto* node = std::get_if<ClassDeclaration>(&stmt.node)) {
     // Create the class directly
     auto cls = std::make_shared<Class>(node->id.name);
@@ -89,10 +87,8 @@ Task Interpreter::evaluate(const Statement& stmt) {
     // Handle superclass
     if (node->superClass) {
       auto superTask = evaluate(*node->superClass);
-      while (!superTask.done()) {
-        std::coroutine_handle<>::from_address(superTask.handle.address()).resume();
-      }
-      Value superVal = superTask.result();
+  Value superVal;
+  LIGHTJS_RUN_TASK(superTask, superVal);
       if (superVal.isClass()) {
         cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
       }
@@ -132,53 +128,51 @@ Task Interpreter::evaluate(const Statement& stmt) {
 
     Value classVal = Value(cls);
     env_->define(node->id.name, classVal);
-    co_return classVal;
+    LIGHTJS_RETURN(classVal);
   } else if (auto* node = std::get_if<ReturnStmt>(&stmt.node)) {
-    co_return co_await evaluateReturn(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateReturn(*node)));
   } else if (auto* node = std::get_if<ExpressionStmt>(&stmt.node)) {
-    co_return co_await evaluateExprStmt(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExprStmt(*node)));
   } else if (auto* node = std::get_if<BlockStmt>(&stmt.node)) {
-    co_return co_await evaluateBlock(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateBlock(*node)));
   } else if (auto* node = std::get_if<IfStmt>(&stmt.node)) {
-    co_return co_await evaluateIf(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateIf(*node)));
   } else if (auto* node = std::get_if<WhileStmt>(&stmt.node)) {
-    co_return co_await evaluateWhile(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateWhile(*node)));
   } else if (auto* node = std::get_if<DoWhileStmt>(&stmt.node)) {
-    co_return co_await evaluateDoWhile(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateDoWhile(*node)));
   } else if (auto* node = std::get_if<ForStmt>(&stmt.node)) {
-    co_return co_await evaluateFor(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFor(*node)));
   } else if (auto* node = std::get_if<ForInStmt>(&stmt.node)) {
-    co_return co_await evaluateForIn(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateForIn(*node)));
   } else if (auto* node = std::get_if<ForOfStmt>(&stmt.node)) {
-    co_return co_await evaluateForOf(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateForOf(*node)));
   } else if (auto* node = std::get_if<SwitchStmt>(&stmt.node)) {
-    co_return co_await evaluateSwitch(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateSwitch(*node)));
   } else if (std::holds_alternative<BreakStmt>(stmt.node)) {
     flow_.type = ControlFlow::Type::Break;
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   } else if (std::holds_alternative<ContinueStmt>(stmt.node)) {
     flow_.type = ControlFlow::Type::Continue;
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<ThrowStmt>(&stmt.node)) {
     auto task = evaluate(*node->argument);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(task);
     flow_.type = ControlFlow::Type::Throw;
     flow_.value = task.result();
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<TryStmt>(&stmt.node)) {
-    co_return co_await evaluateTry(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateTry(*node)));
   } else if (auto* node = std::get_if<ImportDeclaration>(&stmt.node)) {
-    co_return co_await evaluateImport(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateImport(*node)));
   } else if (auto* node = std::get_if<ExportNamedDeclaration>(&stmt.node)) {
-    co_return co_await evaluateExportNamed(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportNamed(*node)));
   } else if (auto* node = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
-    co_return co_await evaluateExportDefault(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportDefault(*node)));
   } else if (auto* node = std::get_if<ExportAllDeclaration>(&stmt.node)) {
-    co_return co_await evaluateExportAll(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportAll(*node)));
   }
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluate(const Expression& expr) {
@@ -186,22 +180,22 @@ Task Interpreter::evaluate(const Expression& expr) {
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
     throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   if (auto* node = std::get_if<Identifier>(&expr.node)) {
     if (auto val = env_->get(node->name)) {
-      co_return *val;
+      LIGHTJS_RETURN(*val);
     }
     // Throw ReferenceError for undefined variables with line info
     throwError(ErrorType::ReferenceError, formatError("'" + node->name + "' is not defined", expr.loc));
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<NumberLiteral>(&expr.node)) {
-    co_return Value(node->value);
+    LIGHTJS_RETURN(Value(node->value));
   } else if (auto* node = std::get_if<BigIntLiteral>(&expr.node)) {
-    co_return Value(BigInt(node->value));
+    LIGHTJS_RETURN(Value(BigInt(node->value)));
   } else if (auto* node = std::get_if<StringLiteral>(&expr.node)) {
-    co_return Value(node->value);
+    LIGHTJS_RETURN(Value(node->value));
   } else if (auto* node = std::get_if<TemplateLiteral>(&expr.node)) {
     // Evaluate template literal with interpolation
     std::string result;
@@ -209,267 +203,259 @@ Task Interpreter::evaluate(const Expression& expr) {
       result += node->quasis[i];
       if (i < node->expressions.size()) {
         auto exprTask = evaluate(*node->expressions[i]);
-        while (!exprTask.done()) {
-          std::coroutine_handle<>::from_address(exprTask.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(exprTask);
         result += exprTask.result().toString();
       }
     }
-    co_return Value(result);
+    LIGHTJS_RETURN(Value(result));
   } else if (auto* node = std::get_if<RegexLiteral>(&expr.node)) {
     auto regex = std::make_shared<Regex>(node->pattern, node->flags);
-    co_return Value(regex);
+    LIGHTJS_RETURN(Value(regex));
   } else if (auto* node = std::get_if<BoolLiteral>(&expr.node)) {
-    co_return Value(node->value);
+    LIGHTJS_RETURN(Value(node->value));
   } else if (std::holds_alternative<NullLiteral>(expr.node)) {
-    co_return Value(Null{});
+    LIGHTJS_RETURN(Value(Null{}));
   } else if (auto* node = std::get_if<BinaryExpr>(&expr.node)) {
-    co_return co_await evaluateBinary(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateBinary(*node)));
   } else if (auto* node = std::get_if<UnaryExpr>(&expr.node)) {
-    co_return co_await evaluateUnary(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateUnary(*node)));
   } else if (auto* node = std::get_if<AssignmentExpr>(&expr.node)) {
-    co_return co_await evaluateAssignment(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateAssignment(*node)));
   } else if (auto* node = std::get_if<UpdateExpr>(&expr.node)) {
-    co_return co_await evaluateUpdate(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateUpdate(*node)));
   } else if (auto* node = std::get_if<CallExpr>(&expr.node)) {
-    co_return co_await evaluateCall(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateCall(*node)));
   } else if (auto* node = std::get_if<MemberExpr>(&expr.node)) {
-    co_return co_await evaluateMember(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateMember(*node)));
   } else if (auto* node = std::get_if<ConditionalExpr>(&expr.node)) {
-    co_return co_await evaluateConditional(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateConditional(*node)));
   } else if (auto* node = std::get_if<ArrayExpr>(&expr.node)) {
-    co_return co_await evaluateArray(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateArray(*node)));
   } else if (auto* node = std::get_if<ObjectExpr>(&expr.node)) {
-    co_return co_await evaluateObject(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateObject(*node)));
   } else if (auto* node = std::get_if<FunctionExpr>(&expr.node)) {
-    co_return co_await evaluateFunction(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFunction(*node)));
   } else if (auto* node = std::get_if<AwaitExpr>(&expr.node)) {
-    co_return co_await evaluateAwait(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateAwait(*node)));
   } else if (auto* node = std::get_if<YieldExpr>(&expr.node)) {
-    co_return co_await evaluateYield(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateYield(*node)));
   } else if (auto* node = std::get_if<NewExpr>(&expr.node)) {
-    co_return co_await evaluateNew(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateNew(*node)));
   } else if (auto* node = std::get_if<ClassExpr>(&expr.node)) {
-    co_return co_await evaluateClass(*node);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateClass(*node)));
   } else if (std::holds_alternative<ThisExpr>(expr.node)) {
     // Look up 'this' in the current environment
     if (auto thisVal = env_->get("this")) {
-      co_return *thisVal;
+      LIGHTJS_RETURN(*thisVal);
     }
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   } else if (std::holds_alternative<SuperExpr>(expr.node)) {
     // Look up '__super__' in the current environment (set by class constructor)
     if (auto superVal = env_->get("__super__")) {
-      co_return *superVal;
+      LIGHTJS_RETURN(*superVal);
     }
     throwError(ErrorType::ReferenceError, formatError("'super' keyword is not valid here", expr.loc));
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   auto leftTask = evaluate(*expr.left);
-  while (!leftTask.done()) {
-    std::coroutine_handle<>::from_address(leftTask.handle.address()).resume();
-  }
-  Value left = leftTask.result();
+  Value left;
+  LIGHTJS_RUN_TASK(leftTask, left);
 
   auto rightTask = evaluate(*expr.right);
-  while (!rightTask.done()) {
-    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
-  }
-  Value right = rightTask.result();
+  Value right;
+  LIGHTJS_RUN_TASK(rightTask, right);
 
   switch (expr.op) {
     case BinaryExpr::Op::Add:
       if (left.isString() || right.isString()) {
-        co_return Value(left.toString() + right.toString());
+        LIGHTJS_RETURN(Value(left.toString() + right.toString()));
       }
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(BigInt(left.toBigInt() + right.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() + right.toBigInt())));
       }
-      co_return Value(left.toNumber() + right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() + right.toNumber()));
     case BinaryExpr::Op::Sub:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(BigInt(left.toBigInt() - right.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() - right.toBigInt())));
       }
-      co_return Value(left.toNumber() - right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() - right.toNumber()));
     case BinaryExpr::Op::Mul:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(BigInt(left.toBigInt() * right.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() * right.toBigInt())));
       }
-      co_return Value(left.toNumber() * right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() * right.toNumber()));
     case BinaryExpr::Op::Div:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(BigInt(left.toBigInt() / right.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() / right.toBigInt())));
       }
-      co_return Value(left.toNumber() / right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() / right.toNumber()));
     case BinaryExpr::Op::Mod:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(BigInt(left.toBigInt() % right.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() % right.toBigInt())));
       }
-      co_return Value(std::fmod(left.toNumber(), right.toNumber()));
+      LIGHTJS_RETURN(Value(std::fmod(left.toNumber(), right.toNumber())));
     case BinaryExpr::Op::Exp:
       if (left.isBigInt() && right.isBigInt()) {
         // BigInt exponentiation
         int64_t base = left.toBigInt();
         int64_t exp = right.toBigInt();
         if (exp < 0) {
-          co_return Value(0.0);  // Negative exponents for BigInt return 0
+          LIGHTJS_RETURN(Value(0.0));  // Negative exponents for BigInt return 0
         }
         int64_t result = 1;
         for (int64_t i = 0; i < exp; ++i) {
           result *= base;
         }
-        co_return Value(BigInt(result));
+        LIGHTJS_RETURN(Value(BigInt(result)));
       }
-      co_return Value(std::pow(left.toNumber(), right.toNumber()));
+      LIGHTJS_RETURN(Value(std::pow(left.toNumber(), right.toNumber())));
     case BinaryExpr::Op::Less:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() < right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() < right.toBigInt()));
       }
-      co_return Value(left.toNumber() < right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() < right.toNumber()));
     case BinaryExpr::Op::Greater:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() > right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() > right.toBigInt()));
       }
-      co_return Value(left.toNumber() > right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() > right.toNumber()));
     case BinaryExpr::Op::LessEqual:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() <= right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() <= right.toBigInt()));
       }
-      co_return Value(left.toNumber() <= right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() <= right.toNumber()));
     case BinaryExpr::Op::GreaterEqual:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() >= right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() >= right.toBigInt()));
       }
-      co_return Value(left.toNumber() >= right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() >= right.toNumber()));
     case BinaryExpr::Op::Equal:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() == right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() == right.toBigInt()));
       }
-      co_return Value(left.toNumber() == right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() == right.toNumber()));
     case BinaryExpr::Op::NotEqual:
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() != right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() != right.toBigInt()));
       }
-      co_return Value(left.toNumber() != right.toNumber());
+      LIGHTJS_RETURN(Value(left.toNumber() != right.toNumber()));
     case BinaryExpr::Op::StrictEqual: {
       // Strict equality requires same type
       if (left.data.index() != right.data.index()) {
-        co_return Value(false);
+        LIGHTJS_RETURN(Value(false));
       }
 
       if (left.isSymbol() && right.isSymbol()) {
         auto& lsym = std::get<Symbol>(left.data);
         auto& rsym = std::get<Symbol>(right.data);
-        co_return Value(lsym.id == rsym.id);
+        LIGHTJS_RETURN(Value(lsym.id == rsym.id));
       }
 
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() == right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() == right.toBigInt()));
       }
 
       if (left.isNumber() && right.isNumber()) {
-        co_return Value(left.toNumber() == right.toNumber());
+        LIGHTJS_RETURN(Value(left.toNumber() == right.toNumber()));
       }
 
       if (left.isString() && right.isString()) {
-        co_return Value(std::get<std::string>(left.data) == std::get<std::string>(right.data));
+        LIGHTJS_RETURN(Value(std::get<std::string>(left.data) == std::get<std::string>(right.data)));
       }
 
       if (left.isBool() && right.isBool()) {
-        co_return Value(std::get<bool>(left.data) == std::get<bool>(right.data));
+        LIGHTJS_RETURN(Value(std::get<bool>(left.data) == std::get<bool>(right.data)));
       }
 
       if ((left.isNull() && right.isNull()) || (left.isUndefined() && right.isUndefined())) {
-        co_return Value(true);
+        LIGHTJS_RETURN(Value(true));
       }
 
       // For objects, arrays, functions - compare by reference
       // We already checked the types are the same
-      co_return Value(false);
+      LIGHTJS_RETURN(Value(false));
     }
     case BinaryExpr::Op::StrictNotEqual: {
       // Reuse StrictEqual logic
       if (left.data.index() != right.data.index()) {
-        co_return Value(true);
+        LIGHTJS_RETURN(Value(true));
       }
 
       if (left.isSymbol() && right.isSymbol()) {
         auto& lsym = std::get<Symbol>(left.data);
         auto& rsym = std::get<Symbol>(right.data);
-        co_return Value(lsym.id != rsym.id);
+        LIGHTJS_RETURN(Value(lsym.id != rsym.id));
       }
 
       if (left.isBigInt() && right.isBigInt()) {
-        co_return Value(left.toBigInt() != right.toBigInt());
+        LIGHTJS_RETURN(Value(left.toBigInt() != right.toBigInt()));
       }
 
       if (left.isNumber() && right.isNumber()) {
-        co_return Value(left.toNumber() != right.toNumber());
+        LIGHTJS_RETURN(Value(left.toNumber() != right.toNumber()));
       }
 
       if (left.isString() && right.isString()) {
-        co_return Value(std::get<std::string>(left.data) != std::get<std::string>(right.data));
+        LIGHTJS_RETURN(Value(std::get<std::string>(left.data) != std::get<std::string>(right.data)));
       }
 
       if (left.isBool() && right.isBool()) {
-        co_return Value(std::get<bool>(left.data) != std::get<bool>(right.data));
+        LIGHTJS_RETURN(Value(std::get<bool>(left.data) != std::get<bool>(right.data)));
       }
 
       if ((left.isNull() && right.isNull()) || (left.isUndefined() && right.isUndefined())) {
-        co_return Value(false);
+        LIGHTJS_RETURN(Value(false));
       }
 
       // For objects, arrays, functions - compare by reference
       // We already checked the types are the same
-      co_return Value(true);
+      LIGHTJS_RETURN(Value(true));
     }
     case BinaryExpr::Op::LogicalAnd:
-      co_return left.toBool() ? right : left;
+      LIGHTJS_RETURN(left.toBool() ? right : left);
     case BinaryExpr::Op::LogicalOr:
-      co_return left.toBool() ? left : right;
+      LIGHTJS_RETURN(left.toBool() ? left : right);
     case BinaryExpr::Op::NullishCoalescing:
       // Return right if left is null or undefined, otherwise return left
-      co_return (left.isNull() || left.isUndefined()) ? right : left;
+      LIGHTJS_RETURN((left.isNull() || left.isUndefined()) ? right : left);
   }
 
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
   auto argTask = evaluate(*expr.argument);
-  while (!argTask.done()) {
-    std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
-  }
-  Value arg = argTask.result();
+  Value arg;
+  LIGHTJS_RUN_TASK(argTask, arg);
 
   switch (expr.op) {
     case UnaryExpr::Op::Not:
-      co_return Value(!arg.toBool());
+      LIGHTJS_RETURN(Value(!arg.toBool()));
     case UnaryExpr::Op::Minus:
       if (arg.isBigInt()) {
-        co_return Value(BigInt(-arg.toBigInt()));
+        LIGHTJS_RETURN(Value(BigInt(-arg.toBigInt())));
       }
-      co_return Value(-arg.toNumber());
+      LIGHTJS_RETURN(Value(-arg.toNumber()));
     case UnaryExpr::Op::Plus:
-      co_return Value(arg.toNumber());
+      LIGHTJS_RETURN(Value(arg.toNumber()));
     case UnaryExpr::Op::Typeof: {
-      if (arg.isUndefined()) co_return Value("undefined");
-      if (arg.isNull()) co_return Value("object");
-      if (arg.isBool()) co_return Value("boolean");
-      if (arg.isNumber()) co_return Value("number");
-      if (arg.isBigInt()) co_return Value("bigint");
-      if (arg.isSymbol()) co_return Value("symbol");
-      if (arg.isString()) co_return Value("string");
-      if (arg.isFunction()) co_return Value("function");
-      co_return Value("object");
+      if (arg.isUndefined()) LIGHTJS_RETURN(Value("undefined"));
+      if (arg.isNull()) LIGHTJS_RETURN(Value("object"));
+      if (arg.isBool()) LIGHTJS_RETURN(Value("boolean"));
+      if (arg.isNumber()) LIGHTJS_RETURN(Value("number"));
+      if (arg.isBigInt()) LIGHTJS_RETURN(Value("bigint"));
+      if (arg.isSymbol()) LIGHTJS_RETURN(Value("symbol"));
+      if (arg.isString()) LIGHTJS_RETURN(Value("string"));
+      if (arg.isFunction()) LIGHTJS_RETURN(Value("function"));
+      LIGHTJS_RETURN(Value("object"));
     }
   }
 
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
@@ -492,29 +478,25 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
         if (shouldAssign) {
           auto rightTask = evaluate(*expr.right);
-          while (!rightTask.done()) {
-            std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
-          }
-          Value right = rightTask.result();
+  Value right;
+  LIGHTJS_RUN_TASK(rightTask, right);
           env_->set(id->name, right);
-          co_return right;
+          LIGHTJS_RETURN(right);
         } else {
-          co_return *current;
+          LIGHTJS_RETURN(*current);
         }
       }
     }
   }
 
   auto rightTask = evaluate(*expr.right);
-  while (!rightTask.done()) {
-    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
-  }
-  Value right = rightTask.result();
+  Value right;
+  LIGHTJS_RUN_TASK(rightTask, right);
 
   if (auto* id = std::get_if<Identifier>(&expr.left->node)) {
     if (expr.op == AssignmentExpr::Op::Assign) {
       env_->set(id->name, right);
-      co_return right;
+      LIGHTJS_RETURN(right);
     }
 
     if (auto current = env_->get(id->name)) {
@@ -536,23 +518,19 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           result = right;
       }
       env_->set(id->name, result);
-      co_return result;
+      LIGHTJS_RETURN(result);
     }
   }
 
   if (auto* member = std::get_if<MemberExpr>(&expr.left->node)) {
     auto objTask = evaluate(*member->object);
-    while (!objTask.done()) {
-      std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
-    }
-    Value obj = objTask.result();
+  Value obj;
+  LIGHTJS_RUN_TASK(objTask, obj);
 
     std::string propName;
     if (member->computed) {
       auto propTask = evaluate(*member->property);
-      while (!propTask.done()) {
-        std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(propTask);
       propName = propTask.result().toString();
     } else {
       if (auto* id = std::get_if<Identifier>(&member->property->node)) {
@@ -566,14 +544,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       // Check if object is frozen (can't modify any properties)
       if (objPtr->frozen) {
         // In strict mode this would throw, but we'll silently fail
-        co_return right;
+        LIGHTJS_RETURN(right);
       }
 
       // Check if object is sealed (can't add new properties)
       bool isNewProperty = objPtr->properties.find(propName) == objPtr->properties.end();
       if (objPtr->sealed && isNewProperty) {
         // Can't add new properties to sealed object
-        co_return right;
+        LIGHTJS_RETURN(right);
       }
 
       if (expr.op == AssignmentExpr::Op::Assign) {
@@ -597,7 +575,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             objPtr->properties[propName] = right;
         }
       }
-      co_return right;
+      LIGHTJS_RETURN(right);
     }
 
     if (obj.isFunction()) {
@@ -623,7 +601,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             funcPtr->properties[propName] = right;
         }
       }
-      co_return right;
+      LIGHTJS_RETURN(right);
     }
 
     if (obj.isArray()) {
@@ -634,7 +612,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           arrPtr->elements.resize(idx + 1, Value(Undefined{}));
         }
         arrPtr->elements[idx] = right;
-        co_return right;
+        LIGHTJS_RETURN(right);
       } catch (...) {}
     }
 
@@ -647,12 +625,12 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         } else {
           taPtr->setElement(idx, right.toNumber());
         }
-        co_return right;
+        LIGHTJS_RETURN(right);
       } catch (...) {}
     }
   }
 
-  co_return right;
+  LIGHTJS_RETURN(right);
 }
 
 Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
@@ -661,11 +639,11 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
       double num = current->toNumber();
       double newVal = (expr.op == UpdateExpr::Op::Increment) ? num + 1 : num - 1;
       env_->set(id->name, Value(newVal));
-      co_return expr.prefix ? Value(newVal) : Value(num);
+      LIGHTJS_RETURN(expr.prefix ? Value(newVal) : Value(num));
     }
   }
 
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateCall(const CallExpr& expr) {
@@ -673,7 +651,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   StackGuard guard(stackDepth_, MAX_STACK_DEPTH);
   if (guard.overflowed()) {
     throwError(ErrorType::RangeError, "Maximum call stack size exceeded");
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   // Special handling for dynamic import()
@@ -686,15 +664,13 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
         std::vector<Value> args;
         for (const auto& arg : expr.arguments) {
           auto argTask = evaluate(*arg);
-          while (!argTask.done()) {
-            std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(argTask);
           args.push_back(argTask.result());
         }
 
         auto func = std::get<std::shared_ptr<Function>>(importFunc->data);
         if (func->isNative) {
-          co_return func->nativeFunc(args);
+          LIGHTJS_RETURN(func->nativeFunc(args));
         }
       }
 
@@ -702,7 +678,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       auto promise = std::make_shared<Promise>();
       auto err = std::make_shared<Error>(ErrorType::ReferenceError, "import is not defined");
       promise->reject(Value(err));
-      co_return Value(promise);
+      LIGHTJS_RETURN(Value(promise));
     }
   }
 
@@ -713,12 +689,12 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   // Check if this is a method call (obj.method())
   if (auto* memberExpr = std::get_if<MemberExpr>(&expr.callee->node)) {
     // Evaluate the object (receiver)
-    thisValue = co_await evaluate(*memberExpr->object);
+    thisValue = LIGHTJS_AWAIT(evaluate(*memberExpr->object));
 
     // Now evaluate the full member expression to get the method
-    callee = co_await evaluate(*expr.callee);
+    callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
   } else {
-    callee = co_await evaluate(*expr.callee);
+    callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
   }
 
   std::vector<Value> args;
@@ -726,7 +702,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     // Check if this is a spread element
     if (auto* spread = std::get_if<SpreadElement>(&arg->node)) {
       // Evaluate the argument
-      Value val = co_await evaluate(*spread->argument);
+      Value val = LIGHTJS_AWAIT(evaluate(*spread->argument));
 
       // Spread the value into args
       if (val.isArray()) {
@@ -738,32 +714,28 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
         args.push_back(val);
       }
     } else {
-      Value argVal = co_await evaluate(*arg);
+      Value argVal = LIGHTJS_AWAIT(evaluate(*arg));
       args.push_back(argVal);
     }
   }
 
   if (callee.isFunction()) {
-    co_return callFunction(callee, args, thisValue);
+    LIGHTJS_RETURN(callFunction(callee, args, thisValue));
   }
 
   // Throw TypeError if trying to call a non-function
   throwError(ErrorType::TypeError, callee.toString() + " is not a function");
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateMember(const MemberExpr& expr) {
   auto objTask = evaluate(*expr.object);
-  while (!objTask.done()) {
-    std::coroutine_handle<>::from_address(objTask.handle.address()).resume();
-  }
-  Value obj = objTask.result();
+  Value obj;
+  LIGHTJS_RUN_TASK(objTask, obj);
   std::string propName;
   if (expr.computed) {
     auto propTask = evaluate(*expr.property);
-    while (!propTask.done()) {
-      std::coroutine_handle<>::from_address(propTask.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(propTask);
     propName = propTask.result().toString();
   } else {
     if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
@@ -773,7 +745,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // Optional chaining: if object is null or undefined, return undefined
   if (expr.optional && (obj.isNull() || obj.isUndefined())) {
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   // Proxy trap handling - intercept get operations
@@ -783,7 +755,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // Compute property name
     std::string propName;
     if (expr.computed) {
-      Value propVal = co_await evaluate(*expr.property);
+      Value propVal = LIGHTJS_AWAIT(evaluate(*expr.property));
       propName = propVal.toString();
     } else {
       if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
@@ -805,7 +777,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             Value(propName),
             obj  // receiver is the proxy itself
           };
-          co_return getTrap->nativeFunc(trapArgs);
+          LIGHTJS_RETURN(getTrap->nativeFunc(trapArgs));
         }
       }
     }
@@ -815,10 +787,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
       auto it = targetObj->properties.find(propName);
       if (it != targetObj->properties.end()) {
-        co_return it->second;
+        LIGHTJS_RETURN(it->second);
       }
     }
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   const auto& iteratorKey = WellKnownSymbols::iteratorKey();
@@ -833,7 +805,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       toStringFn->nativeFunc = [](const std::vector<Value>&) -> Value {
         return Value("[Promise]");
       };
-      co_return Value(toStringFn);
+      LIGHTJS_RETURN(Value(toStringFn));
     }
 
     // Promise.prototype.then(onFulfilled, onRejected)
@@ -863,7 +835,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto chainedPromise = promisePtr->then(onFulfilled, onRejected);
         return Value(chainedPromise);
       };
-      co_return Value(thenFn);
+      LIGHTJS_RETURN(Value(thenFn));
     }
 
     // Promise.prototype.catch(onRejected)
@@ -883,7 +855,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto chainedPromise = promisePtr->catch_(onRejected);
         return Value(chainedPromise);
       };
-      co_return Value(catchFn);
+      LIGHTJS_RETURN(Value(catchFn));
     }
 
     // Promise.prototype.finally(onFinally)
@@ -903,7 +875,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto chainedPromise = promisePtr->finally(onFinally);
         return Value(chainedPromise);
       };
-      co_return Value(finallyFn);
+      LIGHTJS_RETURN(Value(finallyFn));
     }
 
     if (promisePtr->state == PromiseState::Fulfilled) {
@@ -912,7 +884,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto objPtr = std::get<std::shared_ptr<Object>>(resolvedValue.data);
         auto it = objPtr->properties.find(propName);
         if (it != objPtr->properties.end()) {
-          co_return it->second;
+          LIGHTJS_RETURN(it->second);
         }
       }
     }
@@ -922,7 +894,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   if (obj.isArrayBuffer()) {
     auto bufferPtr = std::get<std::shared_ptr<ArrayBuffer>>(obj.data);
     if (propName == "byteLength") {
-      co_return Value(static_cast<double>(bufferPtr->byteLength));
+      LIGHTJS_RETURN(Value(static_cast<double>(bufferPtr->byteLength)));
     }
   }
 
@@ -931,13 +903,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto viewPtr = std::get<std::shared_ptr<DataView>>(obj.data);
 
     if (propName == "buffer") {
-      co_return Value(viewPtr->buffer);
+      LIGHTJS_RETURN(Value(viewPtr->buffer));
     }
     if (propName == "byteOffset") {
-      co_return Value(static_cast<double>(viewPtr->byteOffset));
+      LIGHTJS_RETURN(Value(static_cast<double>(viewPtr->byteOffset)));
     }
     if (propName == "byteLength") {
-      co_return Value(static_cast<double>(viewPtr->byteLength));
+      LIGHTJS_RETURN(Value(static_cast<double>(viewPtr->byteLength)));
     }
 
     // DataView get methods
@@ -948,7 +920,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (args.empty()) throw std::runtime_error("getInt8 requires offset");
         return Value(static_cast<double>(viewPtr->getInt8(static_cast<size_t>(args[0].toNumber()))));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint8") {
       auto fn = std::make_shared<Function>();
@@ -957,7 +929,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (args.empty()) throw std::runtime_error("getUint8 requires offset");
         return Value(static_cast<double>(viewPtr->getUint8(static_cast<size_t>(args[0].toNumber()))));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getInt16") {
       auto fn = std::make_shared<Function>();
@@ -967,7 +939,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint16") {
       auto fn = std::make_shared<Function>();
@@ -977,7 +949,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getInt32") {
       auto fn = std::make_shared<Function>();
@@ -987,7 +959,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint32") {
       auto fn = std::make_shared<Function>();
@@ -997,7 +969,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getFloat32") {
       auto fn = std::make_shared<Function>();
@@ -1007,7 +979,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getFloat32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getFloat64") {
       auto fn = std::make_shared<Function>();
@@ -1017,7 +989,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(viewPtr->getFloat64(static_cast<size_t>(args[0].toNumber()), littleEndian));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getBigInt64") {
       auto fn = std::make_shared<Function>();
@@ -1027,7 +999,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(viewPtr->getBigInt64(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getBigUint64") {
       auto fn = std::make_shared<Function>();
@@ -1037,7 +1009,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(static_cast<int64_t>(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     // DataView set methods
@@ -1049,7 +1021,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setInt8(static_cast<size_t>(args[0].toNumber()), static_cast<int8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint8") {
       auto fn = std::make_shared<Function>();
@@ -1059,7 +1031,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setUint8(static_cast<size_t>(args[0].toNumber()), static_cast<uint8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setInt16") {
       auto fn = std::make_shared<Function>();
@@ -1070,7 +1042,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setInt16(static_cast<size_t>(args[0].toNumber()), static_cast<int16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint16") {
       auto fn = std::make_shared<Function>();
@@ -1081,7 +1053,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setUint16(static_cast<size_t>(args[0].toNumber()), static_cast<uint16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setInt32") {
       auto fn = std::make_shared<Function>();
@@ -1092,7 +1064,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setInt32(static_cast<size_t>(args[0].toNumber()), static_cast<int32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint32") {
       auto fn = std::make_shared<Function>();
@@ -1103,7 +1075,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setUint32(static_cast<size_t>(args[0].toNumber()), static_cast<uint32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setFloat32") {
       auto fn = std::make_shared<Function>();
@@ -1114,7 +1086,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setFloat32(static_cast<size_t>(args[0].toNumber()), static_cast<float>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setFloat64") {
       auto fn = std::make_shared<Function>();
@@ -1125,7 +1097,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setFloat64(static_cast<size_t>(args[0].toNumber()), args[1].toNumber(), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setBigInt64") {
       auto fn = std::make_shared<Function>();
@@ -1136,7 +1108,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), args[1].toBigInt(), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setBigUint64") {
       auto fn = std::make_shared<Function>();
@@ -1147,7 +1119,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), static_cast<uint64_t>(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
   }
 
@@ -1155,7 +1127,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
     auto it = objPtr->properties.find(propName);
     if (it != objPtr->properties.end()) {
-      co_return it->second;
+      LIGHTJS_RETURN(it->second);
     }
   }
 
@@ -1163,7 +1135,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
     auto it = funcPtr->properties.find(propName);
     if (it != funcPtr->properties.end()) {
-      co_return it->second;
+      LIGHTJS_RETURN(it->second);
     }
   }
 
@@ -1177,7 +1149,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->nativeFunc = [genPtr](const std::vector<Value>&) -> Value {
         return Value(genPtr);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "next") {
@@ -1191,7 +1163,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return this->runGeneratorNext(genPtr, mode, resumeValue);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "return") {
@@ -1203,7 +1175,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         genPtr->currentValue = std::make_shared<Value>(returnValue);
         return makeIteratorResult(returnValue, true);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "throw") {
@@ -1213,7 +1185,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         genPtr->state = GeneratorState::Completed;
         throw std::runtime_error(args.empty() ? "Generator error" : args[0].toString());
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
   }
 
@@ -1221,11 +1193,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   if (obj.isArray()) {
     auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
     if (propName == "length") {
-      co_return Value(static_cast<double>(arrPtr->elements.size()));
+      LIGHTJS_RETURN(Value(static_cast<double>(arrPtr->elements.size())));
     }
 
     if (propName == iteratorKey) {
-      co_return createIteratorFactory(arrPtr);
+      LIGHTJS_RETURN(createIteratorFactory(arrPtr));
     }
 
     // Array higher-order methods
@@ -1252,7 +1224,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(mapFn);
+      LIGHTJS_RETURN(Value(mapFn));
     }
 
     if (propName == "filter") {
@@ -1278,7 +1250,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(filterFn);
+      LIGHTJS_RETURN(Value(filterFn));
     }
 
     if (propName == "forEach") {
@@ -1299,7 +1271,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(Undefined{});
       };
-      co_return Value(forEachFn);
+      LIGHTJS_RETURN(Value(forEachFn));
     }
 
     if (propName == "reduce") {
@@ -1325,7 +1297,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return accumulator;
       };
-      co_return Value(reduceFn);
+      LIGHTJS_RETURN(Value(reduceFn));
     }
 
     if (propName == "reduceRight") {
@@ -1351,7 +1323,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return accumulator;
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "find") {
@@ -1372,7 +1344,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "findIndex") {
@@ -1393,7 +1365,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(-1.0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "findLast") {
@@ -1415,7 +1387,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(Undefined{});
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "findLastIndex") {
@@ -1437,7 +1409,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(-1.0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "some") {
@@ -1458,7 +1430,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(false);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "every") {
@@ -1479,7 +1451,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(true);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "push") {
@@ -1491,7 +1463,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(static_cast<double>(arrPtr->elements.size()));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "pop") {
@@ -1505,7 +1477,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         arrPtr->elements.pop_back();
         return result;
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "shift") {
@@ -1519,7 +1491,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         arrPtr->elements.erase(arrPtr->elements.begin());
         return result;
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "unshift") {
@@ -1531,7 +1503,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(static_cast<double>(arrPtr->elements.size()));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "slice") {
@@ -1562,7 +1534,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "splice") {
@@ -1600,7 +1572,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         return Value(removed);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "toSpliced") {
@@ -1642,7 +1614,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "join") {
@@ -1663,7 +1635,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "indexOf") {
@@ -1688,7 +1660,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(-1.0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "lastIndexOf") {
@@ -1714,7 +1686,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(-1.0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "includes") {
@@ -1739,7 +1711,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(false);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "at") {
@@ -1753,7 +1725,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (index < 0 || index >= len) return Value(Undefined{});
         return arrPtr->elements[index];
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "reverse") {
@@ -1763,7 +1735,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         std::reverse(arrPtr->elements.begin(), arrPtr->elements.end());
         return Value(arrPtr);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "sort") {
@@ -1793,7 +1765,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(arrPtr);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "toSorted") {
@@ -1825,7 +1797,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "toReversed") {
@@ -1838,7 +1810,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         std::reverse(result->elements.begin(), result->elements.end());
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "at") {
@@ -1852,7 +1824,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (index < 0 || index >= size) return Value(Undefined{});
         return arrPtr->elements[index];
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "with") {
@@ -1872,7 +1844,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         result->elements[index] = args[1];
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "concat") {
@@ -1899,7 +1871,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "flat") {
@@ -1928,7 +1900,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         flattenImpl(arrPtr->elements, depth, result->elements);
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "flatMap") {
@@ -1959,7 +1931,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "fill") {
@@ -1990,7 +1962,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(arrPtr);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "copyWithin") {
@@ -2023,13 +1995,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(arrPtr);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     try {
       size_t idx = std::stoul(propName);
       if (idx < arrPtr->elements.size()) {
-        co_return arrPtr->elements[idx];
+        LIGHTJS_RETURN(arrPtr->elements[idx]);
       }
     } catch (...) {}
   }
@@ -2037,18 +2009,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   if (obj.isTypedArray()) {
     auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
     if (propName == "length") {
-      co_return Value(static_cast<double>(taPtr->length));
+      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->length)));
     }
     if (propName == "byteLength") {
-      co_return Value(static_cast<double>(taPtr->buffer.size()));
+      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->buffer.size())));
     }
     try {
       size_t idx = std::stoul(propName);
       if (idx < taPtr->length) {
         if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
-          co_return Value(BigInt(taPtr->getBigIntElement(idx)));
+          LIGHTJS_RETURN(Value(BigInt(taPtr->getBigIntElement(idx))));
         } else {
-          co_return Value(taPtr->getElement(idx));
+          LIGHTJS_RETURN(Value(taPtr->getElement(idx)));
         }
       }
     } catch (...) {}
@@ -2069,7 +2041,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         return Value(std::regex_search(str, regexPtr->regex));
 #endif
       };
-      co_return Value(testFn);
+      LIGHTJS_RETURN(Value(testFn));
     }
 
     if (propName == "exec") {
@@ -2099,15 +2071,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
         return Value(Null{});
       };
-      co_return Value(execFn);
+      LIGHTJS_RETURN(Value(execFn));
     }
 
     if (propName == "source") {
-      co_return Value(regexPtr->pattern);
+      LIGHTJS_RETURN(Value(regexPtr->pattern));
     }
 
     if (propName == "flags") {
-      co_return Value(regexPtr->flags);
+      LIGHTJS_RETURN(Value(regexPtr->flags));
     }
   }
 
@@ -2120,15 +2092,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       toStringFn->nativeFunc = [errorPtr](const std::vector<Value>&) -> Value {
         return Value(errorPtr->toString());
       };
-      co_return Value(toStringFn);
+      LIGHTJS_RETURN(Value(toStringFn));
     }
 
     if (propName == "name") {
-      co_return Value(errorPtr->getName());
+      LIGHTJS_RETURN(Value(errorPtr->getName()));
     }
 
     if (propName == "message") {
-      co_return Value(errorPtr->message);
+      LIGHTJS_RETURN(Value(errorPtr->message));
     }
   }
 
@@ -2147,7 +2119,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         oss << std::fixed << std::setprecision(digits) << num;
         return Value(oss.str());
       };
-      co_return Value(toFixedFn);
+      LIGHTJS_RETURN(Value(toFixedFn));
     }
 
     if (propName == "toPrecision") {
@@ -2165,7 +2137,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         oss << std::setprecision(precision) << num;
         return Value(oss.str());
       };
-      co_return Value(toPrecisionFn);
+      LIGHTJS_RETURN(Value(toPrecisionFn));
     }
 
     if (propName == "toExponential") {
@@ -2180,7 +2152,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         oss << std::scientific << std::setprecision(digits) << num;
         return Value(oss.str());
       };
-      co_return Value(toExponentialFn);
+      LIGHTJS_RETURN(Value(toExponentialFn));
     }
 
     if (propName == "toString") {
@@ -2219,7 +2191,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(std::to_string(num));
       };
-      co_return Value(toStringFn);
+      LIGHTJS_RETURN(Value(toStringFn));
     }
   }
 
@@ -2228,7 +2200,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     if (propName == "length") {
       // Return Unicode code point length, not byte length
-      co_return Value(static_cast<double>(unicode::utf8Length(str)));
+      LIGHTJS_RETURN(Value(static_cast<double>(unicode::utf8Length(str))));
     }
 
     if (propName == iteratorKey) {
@@ -2237,7 +2209,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       for (char c : str) {
         charArray->elements.push_back(Value(std::string(1, c)));
       }
-      co_return createIteratorFactory(charArray);
+      LIGHTJS_RETURN(createIteratorFactory(charArray));
     }
 
     if (propName == "charAt") {
@@ -2248,7 +2220,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         funcArgs.insert(funcArgs.end(), args.begin(), args.end());
         return String_charAt(funcArgs);
       };
-      co_return Value(charAtFn);
+      LIGHTJS_RETURN(Value(charAtFn));
     }
 
     if (propName == "charCodeAt") {
@@ -2259,7 +2231,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         funcArgs.insert(funcArgs.end(), args.begin(), args.end());
         return String_charCodeAt(funcArgs);
       };
-      co_return Value(charCodeAtFn);
+      LIGHTJS_RETURN(Value(charCodeAtFn));
     }
 
     if (propName == "codePointAt") {
@@ -2270,7 +2242,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         funcArgs.insert(funcArgs.end(), args.begin(), args.end());
         return String_codePointAt(funcArgs);
       };
-      co_return Value(codePointAtFn);
+      LIGHTJS_RETURN(Value(codePointAtFn));
     }
 
     if (propName == "includes") {
@@ -2285,7 +2257,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.find(searchStr, position) != std::string::npos);
       };
-      co_return Value(includesFn);
+      LIGHTJS_RETURN(Value(includesFn));
     }
 
     if (propName == "repeat") {
@@ -2301,7 +2273,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(repeatFn);
+      LIGHTJS_RETURN(Value(repeatFn));
     }
 
     if (propName == "padStart") {
@@ -2323,7 +2295,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         result = result.substr(0, padLength) + str;
         return Value(result);
       };
-      co_return Value(padStartFn);
+      LIGHTJS_RETURN(Value(padStartFn));
     }
 
     if (propName == "padEnd") {
@@ -2345,7 +2317,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         result = result.substr(0, targetLength);
         return Value(result);
       };
-      co_return Value(padEndFn);
+      LIGHTJS_RETURN(Value(padEndFn));
     }
 
     if (propName == "trim") {
@@ -2362,7 +2334,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(start, end - start));
       };
-      co_return Value(trimFn);
+      LIGHTJS_RETURN(Value(trimFn));
     }
 
     if (propName == "trimStart") {
@@ -2375,7 +2347,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(start));
       };
-      co_return Value(trimStartFn);
+      LIGHTJS_RETURN(Value(trimStartFn));
     }
 
     if (propName == "trimEnd") {
@@ -2388,7 +2360,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(0, end));
       };
-      co_return Value(trimEndFn);
+      LIGHTJS_RETURN(Value(trimEndFn));
     }
 
     if (propName == "split") {
@@ -2430,7 +2402,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(splitFn);
+      LIGHTJS_RETURN(Value(splitFn));
     }
 
     if (propName == "startsWith") {
@@ -2443,7 +2415,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (position > str.length()) return Value(false);
         return Value(str.compare(position, searchStr.length(), searchStr) == 0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "endsWith") {
@@ -2457,7 +2429,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (searchStr.length() > endPos) return Value(false);
         return Value(str.compare(endPos - searchStr.length(), searchStr.length(), searchStr) == 0);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "at") {
@@ -2471,7 +2443,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (index < 0 || index >= len) return Value(Undefined{});
         return Value(unicode::charAt(str, index));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "normalize") {
@@ -2482,7 +2454,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         // Full Unicode normalization (NFC, NFD, etc.) is complex
         return Value(str);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "localeCompare") {
@@ -2494,7 +2466,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         int result = str.compare(other);
         return Value(static_cast<double>(result < 0 ? -1 : (result > 0 ? 1 : 0)));
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "concat") {
@@ -2507,7 +2479,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(fn);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "match") {
@@ -2537,7 +2509,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
         return Value(Null{});
       };
-      co_return Value(matchFn);
+      LIGHTJS_RETURN(Value(matchFn));
     }
 
     if (propName == "replace") {
@@ -2564,7 +2536,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           return Value(result);
         }
       };
-      co_return Value(replaceFn);
+      LIGHTJS_RETURN(Value(replaceFn));
     }
 
     if (propName == "replaceAll") {
@@ -2583,7 +2555,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(replaceAllFn);
+      LIGHTJS_RETURN(Value(replaceAllFn));
     }
 
     if (propName == "at") {
@@ -2597,7 +2569,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (index < 0 || index >= len) return Value(Undefined{});
         return Value(unicode::charAt(str, index));
       };
-      co_return Value(atFn);
+      LIGHTJS_RETURN(Value(atFn));
     }
 
     if (propName == "repeat") {
@@ -2615,7 +2587,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
-      co_return Value(repeatFn);
+      LIGHTJS_RETURN(Value(repeatFn));
     }
 
     if (propName == "padStart") {
@@ -2644,7 +2616,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result + str);
       };
-      co_return Value(padStartFn);
+      LIGHTJS_RETURN(Value(padStartFn));
     }
 
     if (propName == "padEnd") {
@@ -2672,7 +2644,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str + result);
       };
-      co_return Value(padEndFn);
+      LIGHTJS_RETURN(Value(padEndFn));
     }
 
     if (propName == "trim") {
@@ -2689,7 +2661,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(start, end - start));
       };
-      co_return Value(trimFn);
+      LIGHTJS_RETURN(Value(trimFn));
     }
 
     if (propName == "trimStart") {
@@ -2702,7 +2674,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(start));
       };
-      co_return Value(trimStartFn);
+      LIGHTJS_RETURN(Value(trimStartFn));
     }
 
     if (propName == "trimEnd") {
@@ -2715,11 +2687,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str.substr(0, end));
       };
-      co_return Value(trimEndFn);
+      LIGHTJS_RETURN(Value(trimEndFn));
     }
   }
 
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Value Interpreter::makeIteratorResult(const Value& value, bool done) {
@@ -2782,10 +2754,7 @@ Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
       size_t startIndex = genPtr->yieldIndex;
       for (size_t i = startIndex; i < bodyPtr->size(); i++) {
         auto task = evaluate(*(*bodyPtr)[i]);
-        while (!task.done()) {
-          std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
-        result = task.result();
+  LIGHTJS_RUN_TASK(task, result);
 
         if (flow_.type == ControlFlow::Type::Yield) {
           genPtr->state = GeneratorState::SuspendedYield;
@@ -2970,9 +2939,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       } else if (func->params[i].defaultValue) {
         auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
         auto defaultTask = evaluate(*defaultExpr);
-        while (!defaultTask.done()) {
-          std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(defaultTask);
         targetEnv->define(func->params[i].name, defaultTask.result());
       } else {
         targetEnv->define(func->params[i].name, Value(Undefined{}));
@@ -3022,10 +2989,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     try {
       for (const auto& stmt : *bodyPtr) {
         auto stmtTask = evaluate(*stmt);
-        while (!stmtTask.done()) {
-          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-        }
-        result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
         if (flow_.type == ControlFlow::Type::Return) {
           result = flow_.value;
@@ -3069,10 +3033,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
 
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
-    while (!stmtTask.done()) {
-      std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-    }
-    result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
     if (flow_.type == ControlFlow::Type::Return) {
       result = flow_.value;
@@ -3095,29 +3056,23 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
 
 Task Interpreter::evaluateConditional(const ConditionalExpr& expr) {
   auto testTask = evaluate(*expr.test);
-  while (!testTask.done()) {
-    std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(testTask);
 
   if (testTask.result().toBool()) {
     auto consTask = evaluate(*expr.consequent);
-    while (!consTask.done()) {
-      std::coroutine_handle<>::from_address(consTask.handle.address()).resume();
-    }
-    co_return consTask.result();
+    LIGHTJS_RUN_TASK_VOID(consTask);
+    LIGHTJS_RETURN(consTask.result());
   } else {
     auto altTask = evaluate(*expr.alternate);
-    while (!altTask.done()) {
-      std::coroutine_handle<>::from_address(altTask.handle.address()).resume();
-    }
-    co_return altTask.result();
+    LIGHTJS_RUN_TASK_VOID(altTask);
+    LIGHTJS_RETURN(altTask.result());
   }
 }
 
 Task Interpreter::evaluateArray(const ArrayExpr& expr) {
   // Check memory limit before allocation
   if (!checkMemoryLimit(sizeof(Array))) {
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   auto arr = std::make_shared<Array>();
@@ -3127,10 +3082,8 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
     if (auto* spread = std::get_if<SpreadElement>(&elem->node)) {
       // Evaluate the argument
       auto task = evaluate(*spread->argument);
-      while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-      }
-      Value val = task.result();
+  Value val;
+  LIGHTJS_RUN_TASK(task, val);
 
       // Spread the value into the array
       if (val.isArray()) {
@@ -3150,19 +3103,17 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
       }
     } else {
       auto task = evaluate(*elem);
-      while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(task);
       arr->elements.push_back(task.result());
     }
   }
-  co_return Value(arr);
+  LIGHTJS_RETURN(Value(arr));
 }
 
 Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   // Check memory limit before allocation
   if (!checkMemoryLimit(sizeof(Object))) {
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   auto obj = std::make_shared<Object>();
@@ -3172,10 +3123,8 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
     if (prop.isSpread) {
       // Handle spread syntax: ...sourceObj
       auto spreadTask = evaluate(*prop.value);
-      while (!spreadTask.done()) {
-        std::coroutine_handle<>::from_address(spreadTask.handle.address()).resume();
-      }
-      Value spreadVal = spreadTask.result();
+  Value spreadVal;
+  LIGHTJS_RUN_TASK(spreadTask, spreadVal);
 
       // Copy properties from spread object
       if (spreadVal.isObject()) {
@@ -3193,9 +3142,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
         if (prop.isComputed) {
           // For computed property names, evaluate the expression
           auto keyTask = evaluate(*prop.key);
-          while (!keyTask.done()) {
-            std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(keyTask);
           key = keyTask.result().toString();
         } else if (auto* ident = std::get_if<Identifier>(&prop.key->node)) {
           key = ident->name;
@@ -3206,21 +3153,17 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
         } else {
           // Fallback: evaluate as expression
           auto keyTask = evaluate(*prop.key);
-          while (!keyTask.done()) {
-            std::coroutine_handle<>::from_address(keyTask.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(keyTask);
           key = keyTask.result().toString();
         }
       }
 
       auto valTask = evaluate(*prop.value);
-      while (!valTask.done()) {
-        std::coroutine_handle<>::from_address(valTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(valTask);
       obj->properties[key] = valTask.result();
     }
   }
-  co_return Value(obj);
+  LIGHTJS_RETURN(Value(obj));
 }
 
 Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
@@ -3245,27 +3188,25 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
   func->closure = env_;
 
-  co_return Value(func);
+  LIGHTJS_RETURN(Value(func));
 }
 
 Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
   auto task = evaluate(*expr.argument);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
-  Value val = task.result();
+  Value val;
+  LIGHTJS_RUN_TASK(task, val);
 
   if (val.isPromise()) {
     auto promise = std::get<std::shared_ptr<Promise>>(val.data);
     if (promise->state == PromiseState::Fulfilled) {
-      co_return promise->result;
+      LIGHTJS_RETURN(promise->result);
     } else if (promise->state == PromiseState::Rejected) {
-      co_return promise->result;
+      LIGHTJS_RETURN(promise->result);
     }
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  co_return val;
+  LIGHTJS_RETURN(val);
 }
 
 Task Interpreter::evaluateYield(const YieldExpr& expr) {
@@ -3273,38 +3214,31 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
   Value yieldedValue = Value(Undefined{});
   if (expr.argument) {
     auto task = evaluate(*expr.argument);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-    yieldedValue = task.result();
+  LIGHTJS_RUN_TASK(task, yieldedValue);
   }
 
   // Set the Yield control flow to suspend execution
   flow_.setYield(yieldedValue);
 
-  co_return yieldedValue;
+  LIGHTJS_RETURN(yieldedValue);
 }
 
 Task Interpreter::evaluateNew(const NewExpr& expr) {
   // Check memory limit before potential allocation
   if (!checkMemoryLimit(sizeof(Object))) {
-    co_return Value(Undefined{});
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   // Evaluate the callee (constructor)
   auto calleeTask = evaluate(*expr.callee);
-  while (!calleeTask.done()) {
-    std::coroutine_handle<>::from_address(calleeTask.handle.address()).resume();
-  }
-  Value callee = calleeTask.result();
+  Value callee;
+  LIGHTJS_RUN_TASK(calleeTask, callee);
 
   // Evaluate arguments
   std::vector<Value> args;
   for (const auto& arg : expr.arguments) {
     auto argTask = evaluate(*arg);
-    while (!argTask.done()) {
-      std::coroutine_handle<>::from_address(argTask.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(argTask);
     args.push_back(argTask.result());
   }
 
@@ -3352,9 +3286,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
         } else if (func->params[i].defaultValue) {
           auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
           auto defaultTask = evaluate(*defaultExpr);
-          while (!defaultTask.done()) {
-            std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(defaultTask);
           env_->define(func->params[i].name, defaultTask.result());
         } else {
           env_->define(func->params[i].name, Value(Undefined{}));
@@ -3378,9 +3310,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 
       for (const auto& stmt : *bodyPtr) {
         auto stmtTask = evaluate(*stmt);
-        while (!stmtTask.done()) {
-          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(stmtTask);
 
         if (flow_.type == ControlFlow::Type::Return) {
           break;
@@ -3391,7 +3321,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
       env_ = prevEnv;
     }
 
-    co_return Value(instance);
+    LIGHTJS_RETURN(Value(instance));
   }
 
   // Handle Function constructor (regular constructor function)
@@ -3400,7 +3330,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 
     if (func->isNative) {
       // Native constructors (e.g., Array, Object, Map, etc.)
-      co_return func->nativeFunc(args);
+      LIGHTJS_RETURN(func->nativeFunc(args));
     }
 
     // Create the new instance object
@@ -3422,9 +3352,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
       } else if (func->params[i].defaultValue) {
         auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
         auto defaultTask = evaluate(*defaultExpr);
-        while (!defaultTask.done()) {
-          std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(defaultTask);
         env_->define(func->params[i].name, defaultTask.result());
       } else {
         env_->define(func->params[i].name, Value(Undefined{}));
@@ -3449,10 +3377,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 
     for (const auto& stmt : *bodyPtr) {
       auto stmtTask = evaluate(*stmt);
-      while (!stmtTask.done()) {
-        std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-      }
-      result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
       if (flow_.type == ControlFlow::Type::Return) {
         // If constructor returns an object, use that; otherwise use the instance
@@ -3466,7 +3391,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     flow_ = prevFlow;
     env_ = prevEnv;
 
-    co_return Value(instance);
+    LIGHTJS_RETURN(Value(instance));
   }
 
   // Not a constructor
@@ -3475,7 +3400,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     ErrorType::TypeError,
     "Value is not a constructor"
   ));
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateClass(const ClassExpr& expr) {
@@ -3486,10 +3411,8 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
   // Handle superclass
   if (expr.superClass) {
     auto superTask = evaluate(*expr.superClass);
-    while (!superTask.done()) {
-      std::coroutine_handle<>::from_address(superTask.handle.address()).resume();
-    }
-    Value superVal = superTask.result();
+  Value superVal;
+  LIGHTJS_RUN_TASK(superTask, superVal);
     if (superVal.isClass()) {
       cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
     }
@@ -3528,7 +3451,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
   }
 
-  co_return Value(cls);
+  LIGHTJS_RETURN(Value(cls));
 }
 
 // Helper for recursively binding destructuring patterns
@@ -3629,9 +3552,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
     } else if (func->params[i].defaultValue) {
       auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
       auto defaultTask = evaluate(*defaultExpr);
-      while (!defaultTask.done()) {
-        std::coroutine_handle<>::from_address(defaultTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(defaultTask);
       env_->define(func->params[i].name, defaultTask.result());
     } else {
       env_->define(func->params[i].name, Value(Undefined{}));
@@ -3657,10 +3578,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
 
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
-    while (!stmtTask.done()) {
-      std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-    }
-    result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
     if (flow_.type == ControlFlow::Type::Return) {
       result = flow_.value;
@@ -3678,17 +3596,14 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     Value value = Value(Undefined{});
     if (declarator.init) {
       auto task = evaluate(*declarator.init);
-      while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-      }
-      value = task.result();
+  LIGHTJS_RUN_TASK(task, value);
     }
 
     // Use the unified destructuring helper
     bool isConst = (decl.kind == VarDeclaration::Kind::Const);
     bindDestructuringPattern(*declarator.pattern, value, isConst);
   }
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 
@@ -3715,34 +3630,29 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->closure = env_;
 
   env_->define(decl.id.name, Value(func));
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateReturn(const ReturnStmt& stmt) {
   Value result = Value(Undefined{});
   if (stmt.argument) {
     auto task = evaluate(*stmt.argument);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-    result = task.result();
+  LIGHTJS_RUN_TASK(task, result);
 
     // If an error was thrown during argument evaluation, preserve it
     if (flow_.type == ControlFlow::Type::Throw) {
-      co_return result;
+      LIGHTJS_RETURN(result);
     }
   }
   flow_.type = ControlFlow::Type::Return;
   flow_.value = result;
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateExprStmt(const ExpressionStmt& stmt) {
   auto task = evaluate(*stmt.expression);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
-  co_return task.result();
+  LIGHTJS_RUN_TASK_VOID(task);
+  LIGHTJS_RETURN(task.result());
 }
 
 Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
@@ -3752,10 +3662,7 @@ Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
   Value result = Value(Undefined{});
   for (const auto& s : stmt.body) {
     auto task = evaluate(*s);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-    result = task.result();
+  LIGHTJS_RUN_TASK(task, result);
 
     if (flow_.type != ControlFlow::Type::None) {
       break;
@@ -3763,30 +3670,24 @@ Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
   }
 
   env_ = prevEnv;
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateIf(const IfStmt& stmt) {
   auto testTask = evaluate(*stmt.test);
-  while (!testTask.done()) {
-    std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(testTask);
 
   if (testTask.result().toBool()) {
     auto consTask = evaluate(*stmt.consequent);
-    while (!consTask.done()) {
-      std::coroutine_handle<>::from_address(consTask.handle.address()).resume();
-    }
-    co_return consTask.result();
+    LIGHTJS_RUN_TASK_VOID(consTask);
+    LIGHTJS_RETURN(consTask.result());
   } else if (stmt.alternate) {
     auto altTask = evaluate(*stmt.alternate);
-    while (!altTask.done()) {
-      std::coroutine_handle<>::from_address(altTask.handle.address()).resume();
-    }
-    co_return altTask.result();
+    LIGHTJS_RUN_TASK_VOID(altTask);
+    LIGHTJS_RETURN(altTask.result());
   }
 
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
@@ -3794,19 +3695,14 @@ Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
 
   while (true) {
     auto testTask = evaluate(*stmt.test);
-    while (!testTask.done()) {
-      std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(testTask);
 
     if (!testTask.result().toBool()) {
       break;
     }
 
     auto bodyTask = evaluate(*stmt.body);
-    while (!bodyTask.done()) {
-      std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-    }
-    result = bodyTask.result();
+  LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
       flow_.type = ControlFlow::Type::None;
@@ -3819,7 +3715,7 @@ Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
     }
   }
 
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateFor(const ForStmt& stmt) {
@@ -3828,9 +3724,7 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
 
   if (stmt.init) {
     auto initTask = evaluate(*stmt.init);
-    while (!initTask.done()) {
-      std::coroutine_handle<>::from_address(initTask.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(initTask);
   }
 
   Value result = Value(Undefined{});
@@ -3838,19 +3732,14 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   while (true) {
     if (stmt.test) {
       auto testTask = evaluate(*stmt.test);
-      while (!testTask.done()) {
-        std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(testTask);
       if (!testTask.result().toBool()) {
         break;
       }
     }
 
     auto bodyTask = evaluate(*stmt.body);
-    while (!bodyTask.done()) {
-      std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-    }
-    result = bodyTask.result();
+  LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
       flow_.type = ControlFlow::Type::None;
@@ -3863,14 +3752,12 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
 
     if (stmt.update) {
       auto updateTask = evaluate(*stmt.update);
-      while (!updateTask.done()) {
-        std::coroutine_handle<>::from_address(updateTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(updateTask);
     }
   }
 
   env_ = prevEnv;
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
@@ -3878,10 +3765,7 @@ Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
 
   do {
     auto bodyTask = evaluate(*stmt.body);
-    while (!bodyTask.done()) {
-      std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-    }
-    result = bodyTask.result();
+  LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
       flow_.type = ControlFlow::Type::None;
@@ -3893,16 +3777,14 @@ Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
     }
 
     auto testTask = evaluate(*stmt.test);
-    while (!testTask.done()) {
-      std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(testTask);
 
     if (!testTask.result().toBool()) {
       break;
     }
   } while (true);
 
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
@@ -3911,10 +3793,8 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
 
   // Evaluate the right-hand side (the object to iterate over)
   auto rightTask = evaluate(*stmt.right);
-  while (!rightTask.done()) {
-    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
-  }
-  Value obj = rightTask.result();
+  Value obj;
+  LIGHTJS_RUN_TASK(rightTask, obj);
 
   Value result = Value(Undefined{});
 
@@ -3942,10 +3822,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       env_->set(varName, Value(key));
 
       auto bodyTask = evaluate(*stmt.body);
-      while (!bodyTask.done()) {
-        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-      }
-      result = bodyTask.result();
+  LIGHTJS_RUN_TASK(bodyTask, result);
 
       if (flow_.type == ControlFlow::Type::Break) {
         flow_.type = ControlFlow::Type::None;
@@ -3960,7 +3837,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   }
 
   env_ = prevEnv;
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
@@ -3969,10 +3846,8 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
 
   // Evaluate the right-hand side (the iterable to iterate over)
   auto rightTask = evaluate(*stmt.right);
-  while (!rightTask.done()) {
-    std::coroutine_handle<>::from_address(rightTask.handle.address()).resume();
-  }
-  Value iterable = rightTask.result();
+  Value iterable;
+  LIGHTJS_RUN_TASK(rightTask, iterable);
 
   Value result = Value(Undefined{});
 
@@ -4019,10 +3894,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       env_->set(varName, currentValue);
 
       auto bodyTask = evaluate(*stmt.body);
-      while (!bodyTask.done()) {
-        std::coroutine_handle<>::from_address(bodyTask.handle.address()).resume();
-      }
-      result = bodyTask.result();
+  LIGHTJS_RUN_TASK(bodyTask, result);
 
       if (flow_.type == ControlFlow::Type::Break) {
         flow_.type = ControlFlow::Type::None;
@@ -4037,16 +3909,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   }
 
   env_ = prevEnv;
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
   // Evaluate the discriminant
   auto discriminantTask = evaluate(*stmt.discriminant);
-  while (!discriminantTask.done()) {
-    std::coroutine_handle<>::from_address(discriminantTask.handle.address()).resume();
-  }
-  Value discriminant = discriminantTask.result();
+  Value discriminant;
+  LIGHTJS_RUN_TASK(discriminantTask, discriminant);
 
   Value result = Value(Undefined{});
   bool foundMatch = false;
@@ -4068,10 +3938,8 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 
     if (caseClause.test) {
       auto testTask = evaluate(*caseClause.test);
-      while (!testTask.done()) {
-        std::coroutine_handle<>::from_address(testTask.handle.address()).resume();
-      }
-      Value testValue = testTask.result();
+  Value testValue;
+  LIGHTJS_RUN_TASK(testTask, testValue);
 
       // Perform strict equality check
       bool isEqual = false;
@@ -4098,16 +3966,13 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
     if (foundMatch) {
       for (const auto& consequentStmt : caseClause.consequent) {
         auto stmtTask = evaluate(*consequentStmt);
-        while (!stmtTask.done()) {
-          std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-        }
-        result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
         if (flow_.type == ControlFlow::Type::Break) {
           flow_.type = ControlFlow::Type::None;
-          co_return result;
+          LIGHTJS_RETURN(result);
         } else if (flow_.type != ControlFlow::Type::None) {
-          co_return result;
+          LIGHTJS_RETURN(result);
         }
       }
     }
@@ -4118,21 +3983,18 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
     const auto& defaultCase = stmt.cases[defaultIndex];
     for (const auto& consequentStmt : defaultCase.consequent) {
       auto stmtTask = evaluate(*consequentStmt);
-      while (!stmtTask.done()) {
-        std::coroutine_handle<>::from_address(stmtTask.handle.address()).resume();
-      }
-      result = stmtTask.result();
+  LIGHTJS_RUN_TASK(stmtTask, result);
 
       if (flow_.type == ControlFlow::Type::Break) {
         flow_.type = ControlFlow::Type::None;
-        co_return result;
+        LIGHTJS_RETURN(result);
       } else if (flow_.type != ControlFlow::Type::None) {
-        co_return result;
+        LIGHTJS_RETURN(result);
       }
     }
   }
 
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateTry(const TryStmt& stmt) {
@@ -4141,10 +4003,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
 
   for (const auto& s : stmt.block) {
     auto task = evaluate(*s);
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-    result = task.result();
+  LIGHTJS_RUN_TASK(task, result);
 
     if (flow_.type == ControlFlow::Type::Throw && stmt.hasHandler) {
       auto catchEnv = env_->createChild();
@@ -4159,10 +4018,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
 
       for (const auto& catchStmt : stmt.handler.body) {
         auto catchTask = evaluate(*catchStmt);
-        while (!catchTask.done()) {
-          std::coroutine_handle<>::from_address(catchTask.handle.address()).resume();
-        }
-        result = catchTask.result();
+  LIGHTJS_RUN_TASK(catchTask, result);
       }
 
       env_ = prevEnv;
@@ -4177,45 +4033,41 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   if (stmt.hasFinalizer) {
     for (const auto& finalStmt : stmt.finalizer) {
       auto finalTask = evaluate(*finalStmt);
-      while (!finalTask.done()) {
-        std::coroutine_handle<>::from_address(finalTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(finalTask);
     }
   }
 
-  co_return result;
+  LIGHTJS_RETURN(result);
 }
 
 Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
   // Import evaluation is handled at the module level during instantiation
   // This is just a placeholder as imports are resolved before execution
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateExportNamed(const ExportNamedDeclaration& stmt) {
   // If there's a declaration, evaluate it
   if (stmt.declaration) {
-    co_return co_await evaluate(*stmt.declaration);
+    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluate(*stmt.declaration)));
   }
 
   // Export bindings are handled at the module level
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateExportDefault(const ExportDefaultDeclaration& stmt) {
   // Evaluate the expression being exported
   auto task = evaluate(*stmt.declaration);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   // The module system will capture this value
-  co_return task.result();
+  LIGHTJS_RETURN(task.result());
 }
 
 Task Interpreter::evaluateExportAll(const ExportAllDeclaration& stmt) {
   // Re-exports are handled at the module level
-  co_return Value(Undefined{});
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 }

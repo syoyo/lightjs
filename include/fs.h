@@ -3,7 +3,6 @@
 #include "value.h"
 #include <string>
 #include <memory>
-#include <filesystem>
 
 namespace lightjs {
 

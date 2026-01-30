@@ -20,9 +20,7 @@ std::pair<Value, bool> runScript(const char* script) {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   return {interpreter.hasError() ? interpreter.getError() : task.result(),
           interpreter.hasError()};

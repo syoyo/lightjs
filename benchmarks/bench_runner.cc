@@ -8,8 +8,6 @@
 #include <chrono>
 #include <iomanip>
 #include <vector>
-#include <coroutine>
-
 using namespace lightjs;
 using namespace std::chrono;
 
@@ -53,18 +51,14 @@ public:
 
       // Warm-up run
       auto warmupTask = interpreter.evaluate(*program);
-      while (!warmupTask.done()) {
-        std::coroutine_handle<>::from_address(warmupTask.handle.address()).resume();
-      }
+      LIGHTJS_RUN_TASK_VOID(warmupTask);
 
       // Timed runs
       auto startTime = high_resolution_clock::now();
 
       for (size_t i = 0; i < iterations; ++i) {
         auto task = interpreter.evaluate(*program);
-        while (!task.done()) {
-          std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(task);
       }
 
       auto endTime = high_resolution_clock::now();

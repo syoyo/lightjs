@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.14)
 project(LightJS
   VERSION 1.0.0
-  DESCRIPTION "C++20 JavaScript ES2020 Interpreter"
+  DESCRIPTION "C++17/C++20 JavaScript ES2020 Interpreter"
   LANGUAGES CXX
 )
 
@@ -12,6 +12,7 @@ option(LIGHTJS_BUILD_EXAMPLES "Build LightJS examples" ON)
 option(LIGHTJS_INSTALL "Generate install target" ON)
 option(USE_SIMPLE_REGEX "Use simple regex implementation instead of std::regex" OFF)
 option(USE_SIMD "Enable SIMD optimizations (SSE2/AVX2 on x86, NEON/SVE on ARM64)" OFF)
+option(LIGHTJS_USE_CPP17 "Build with C++17 instead of C++20 (uses compatibility layer)" OFF)
 
 # Cross-compilation options for ARM64
 option(CROSS_COMPILE_ARM64 "Cross-compile for ARM64 with NEON" OFF)
@@ -73,8 +74,15 @@ if(CROSS_COMPILE_ARM64)
   endif()
 endif()
 
-# C++ standard
-set(CMAKE_CXX_STANDARD 20)
+# C++ standard configuration
+if(LIGHTJS_USE_CPP17)
+  set(CMAKE_CXX_STANDARD 17)
+  add_compile_definitions(LIGHTJS_FORCE_CPP17_MODE=1)
+  message(STATUS "Building with C++17 compatibility mode")
+else()
+  set(CMAKE_CXX_STANDARD 20)
+  message(STATUS "Building with C++20 (coroutines enabled)")
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -204,6 +212,7 @@ set(LIGHTJS_CORE_SOURCES
   src/text_encoding.cc
   src/url.cc
   src/fs.cc
+  src/fs_compat.cc
   src/tls_aes.cc
   src/tls_gcm.cc
   src/tls_x25519.cc
@@ -220,6 +229,7 @@ set(LIGHTJS_CORE_SOURCES
 set(LIGHTJS_PUBLIC_HEADERS
   include/lightjs.h
   include/ast.h
+  include/compat.h
   include/environment.h
   include/interpreter.h
   include/lexer.h
@@ -245,6 +255,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/text_encoding.h
   include/url.h
   include/fs.h
+  include/fs_compat.h
   include/tls.h
   include/simd.h
   include/wasm/wasm_types.h
@@ -453,6 +464,7 @@ message(STATUS "  Build examples:  ${LIGHTJS_BUILD_EXAMPLES}")
 message(STATUS "  Install:         ${LIGHTJS_INSTALL}")
 message(STATUS "  Simple regex:    ${USE_SIMPLE_REGEX}")
 message(STATUS "  SIMD:            ${USE_SIMD}")
+message(STATUS "  C++17 mode:      ${LIGHTJS_USE_CPP17}")
 if(USE_SIMD)
   message(STATUS "  SIMD arch:       ${SIMD_ARCH}")
   message(STATUS "  SIMD flags:      ${SIMD_FLAGS}")

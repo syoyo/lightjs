@@ -39,9 +39,7 @@ int main(int argc, char* argv[]) {
     Interpreter interpreter(env);
 
     auto task = interpreter.evaluate(*program);
-    while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(task);
 
     return 0;
 }

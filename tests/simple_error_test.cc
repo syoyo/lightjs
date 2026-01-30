@@ -22,9 +22,7 @@ int main() {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   std::cout << "hasError: " << interpreter.hasError() << "\n";
 

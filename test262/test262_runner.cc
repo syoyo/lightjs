@@ -219,11 +219,8 @@ private:
       auto task = interpreter.evaluate(*program);
 
       try {
-        while (!task.done()) {
-          std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
-
-        Value finalResult = task.result();
+                Value finalResult;
+        LIGHTJS_RUN_TASK(task, finalResult);
         result.phase = "runtime";
 
         // For async tests, check if the result is a Promise

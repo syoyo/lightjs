@@ -39,9 +39,7 @@ void testStackTrace() {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   // Check if error was thrown
   if (interpreter.hasError()) {
@@ -104,9 +102,7 @@ void testStackOverflowError() {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   // Check if error was thrown
   if (interpreter.hasError()) {
@@ -165,9 +161,7 @@ void testTypeError() {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   // Check if error was thrown
   if (interpreter.hasError()) {

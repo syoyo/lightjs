@@ -27,11 +27,8 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
     auto task = interpreter.evaluate(*program);
 
-    while (!task.done()) {
-      std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
-
-    Value result = task.result();
+        Value result;
+    LIGHTJS_RUN_TASK(task, result);
     std::cout << "  Result: " << result.toString() << std::endl;
 
     if (!expected.empty() && result.toString() != expected) {

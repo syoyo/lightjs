@@ -3,12 +3,10 @@
 #include "parser.h"
 #include "interpreter.h"
 #include "environment.h"
+#include "fs_compat.h"
 #include <fstream>
 #include <sstream>
-#include <filesystem>
 #include <iostream>
-
-namespace fs = std::filesystem;
 
 namespace lightjs {
 
@@ -135,9 +133,7 @@ bool Module::evaluate(Interpreter* interpreter) {
         if (exportNamed->declaration) {
           // Export declaration (export const x = 1)
           auto task = interpreter->evaluate(*exportNamed->declaration);
-          while (!task.done()) {
-            std::coroutine_handle<>::from_address(task.handle.address()).resume();
-          }
+          LIGHTJS_RUN_TASK_VOID(task);
 
           // Extract exported bindings
           if (auto* varDecl = std::get_if<VarDeclaration>(&exportNamed->declaration->node)) {
@@ -168,21 +164,19 @@ bool Module::evaluate(Interpreter* interpreter) {
       } else if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt->node)) {
         // Export default
         auto task = interpreter->evaluate(*exportDefault->declaration);
-        while (!task.done()) {
-          std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
-        defaultExport_ = task.result();
+        Value result;
+        LIGHTJS_RUN_TASK(task, result);
+        defaultExport_ = result;
         exports_["default"] = *defaultExport_;
       } else if (auto* exportAll = std::get_if<ExportAllDeclaration>(&stmt->node)) {
         // Export all (export * from "module")
         // This requires re-exporting from another module
         // Implementation would go here
+        (void)exportAll;  // Suppress unused variable warning
       } else {
         // Regular statement
         auto task = interpreter->evaluate(*stmt);
-        while (!task.done()) {
-          std::coroutine_handle<>::from_address(task.handle.address()).resume();
-        }
+        LIGHTJS_RUN_TASK_VOID(task);
       }
     }
   } catch (const std::exception& e) {
@@ -244,31 +238,37 @@ std::shared_ptr<Module> ModuleLoader::loadModule(const std::string& path) {
 }
 
 std::string ModuleLoader::resolvePath(const std::string& specifier, const std::string& parentPath) {
-  fs::path resolved;
+  std::string resolved;
 
   // Handle relative paths
-  if (specifier.starts_with("./") || specifier.starts_with("../")) {
-    fs::path parent = parentPath.empty() ? fs::current_path() : fs::path(parentPath).parent_path();
-    resolved = parent / specifier;
+  if (specifier.size() >= 2 && specifier[0] == '.' && specifier[1] == '/') {
+    // ./relative path
+    std::string parent = parentPath.empty() ? fs_compat::currentPath() : fs_compat::parentPath(parentPath);
+    resolved = fs_compat::joinPath(parent, specifier.substr(2));
+  } else if (specifier.size() >= 3 && specifier[0] == '.' && specifier[1] == '.' && specifier[2] == '/') {
+    // ../relative path
+    std::string parent = parentPath.empty() ? fs_compat::currentPath() : fs_compat::parentPath(parentPath);
+    resolved = fs_compat::joinPath(parent, specifier);
   }
   // Handle absolute paths
-  else if (specifier.starts_with("/")) {
-    resolved = fs::path(specifier);
+  else if (!specifier.empty() && specifier[0] == '/') {
+    resolved = specifier;
   }
   // Handle node_modules style imports (simplified)
   else {
-    resolved = fs::path(basePath_) / "node_modules" / specifier;
-    if (!fs::exists(resolved)) {
-      resolved = fs::path(basePath_) / specifier;
+    resolved = fs_compat::joinPath(fs_compat::joinPath(basePath_, "node_modules"), specifier);
+    if (!fs_compat::exists(resolved)) {
+      resolved = fs_compat::joinPath(basePath_, specifier);
     }
   }
 
   // Add .js extension if not present
-  if (resolved.extension().empty()) {
+  std::string ext = fs_compat::extension(resolved);
+  if (ext.empty()) {
     resolved += ".js";
   }
 
-  return resolved.string();
+  return resolved;
 }
 
 std::shared_ptr<Module> ModuleLoader::getCachedModule(const std::string& path) {
@@ -292,9 +292,9 @@ std::optional<std::string> ModuleLoader::readFile(const std::string& path) {
 
 std::string ModuleLoader::normalizePath(const std::string& path) {
   try {
-    return fs::canonical(path).string();
-  } catch (const fs::filesystem_error&) {
-    return fs::absolute(path).string();
+    return fs_compat::canonicalPath(path);
+  } catch (...) {
+    return fs_compat::absolutePath(path);
   }
 }
 

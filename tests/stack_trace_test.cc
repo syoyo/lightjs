@@ -27,9 +27,7 @@ int main() {
   Interpreter interpreter(env);
 
   auto task = interpreter.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   auto result = task.result();
   std::cout << "Result: " << result.toString() << "\n";

@@ -84,9 +84,7 @@ int main() {
     std::cout << "Executing script...\n\n";
 
     auto task = interpreter.evaluate(*program);
-    while (!task.done()) {
-        std::coroutine_handle<>::from_address(task.handle.address()).resume();
-    }
+    LIGHTJS_RUN_TASK_VOID(task);
 
     std::cout << "\nGC stats after execution:\n";
     stats = gc.getStats();

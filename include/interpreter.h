@@ -4,12 +4,22 @@
 #include "value.h"
 #include "environment.h"
 #include "error_formatter.h"
-#include <coroutine>
+#include "compat.h"
 #include <optional>
 #include <memory>
 #include <iostream>
 
+#if LIGHTJS_HAS_COROUTINES
+#include <coroutine>
+#endif
+
 namespace lightjs {
+
+#if LIGHTJS_HAS_COROUTINES
+
+// ============================================================================
+// C++20 Coroutine-based Task implementation
+// ============================================================================
 
 struct Task {
   struct promise_type {
@@ -82,6 +92,90 @@ struct Task {
     return result();
   }
 };
+
+// C++20 macros for coroutine operations
+#define LIGHTJS_RETURN(val) co_return (val)
+#define LIGHTJS_AWAIT(task) co_await (task)
+
+// Run a task to completion and store result
+#define LIGHTJS_RUN_TASK(taskvar, outvar) \
+  do { \
+    while (!(taskvar).done()) { \
+      std::coroutine_handle<>::from_address((taskvar).handle.address()).resume(); \
+    } \
+    (outvar) = (taskvar).result(); \
+  } while (0)
+
+// Run a task to completion without storing result
+#define LIGHTJS_RUN_TASK_VOID(task) \
+  do { \
+    while (!(task).done()) { \
+      std::coroutine_handle<>::from_address((task).handle.address()).resume(); \
+    } \
+  } while (0)
+
+#else
+
+// ============================================================================
+// C++17 Simple Task implementation (synchronous execution)
+// ============================================================================
+
+/**
+ * C++17 Task - A simple Value wrapper for synchronous execution.
+ *
+ * LightJS uses synchronous execution with manual coroutine resumption.
+ * All tasks run to completion immediately, so in C++17 mode we can
+ * simply wrap the Value directly without actual coroutines.
+ */
+class Task {
+  Value result_;
+  bool done_ = true;
+
+public:
+  Task() : result_(Value(Undefined{})), done_(true) {}
+  explicit Task(Value v) : result_(std::move(v)), done_(true) {}
+
+  // Move semantics
+  Task(Task&& other) noexcept : result_(std::move(other.result_)), done_(other.done_) {
+    other.done_ = true;
+  }
+
+  Task& operator=(Task&& other) noexcept {
+    if (this != &other) {
+      result_ = std::move(other.result_);
+      done_ = other.done_;
+      other.done_ = true;
+    }
+    return *this;
+  }
+
+  // No copy
+  Task(const Task&) = delete;
+  Task& operator=(const Task&) = delete;
+
+  Value result() const { return result_; }
+  bool done() const { return done_; }
+};
+
+// Helper to create a completed Task
+inline Task makeTask(Value v) {
+  return Task(std::move(v));
+}
+
+// Helper to extract value from a Task (no-op in C++17 mode since tasks are always done)
+inline Value runTask(Task&& t) {
+  return t.result();
+}
+
+// C++17 macros - direct returns since execution is synchronous
+#define LIGHTJS_RETURN(val) return makeTask(val)
+#define LIGHTJS_AWAIT(task) runTask(task)
+
+// In C++17 mode, tasks are always immediately done
+#define LIGHTJS_RUN_TASK(taskvar, outvar) (outvar) = (taskvar).result()
+#define LIGHTJS_RUN_TASK_VOID(taskvar) ((void)(taskvar))
+
+#endif // LIGHTJS_HAS_COROUTINES
 
 class Interpreter {
 public:

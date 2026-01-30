@@ -24,9 +24,7 @@ bool runTest(const std::string& name, const std::string& code, const std::string
   Interpreter interp(env);
 
   auto task = interp.evaluate(*program);
-  while (!task.done()) {
-    std::coroutine_handle<>::from_address(task.handle.address()).resume();
-  }
+  LIGHTJS_RUN_TASK_VOID(task);
 
   // Check for errors
   if (interp.hasError()) {
