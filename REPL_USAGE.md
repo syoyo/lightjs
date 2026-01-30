@@ -77,9 +77,20 @@ Multi-line detection works for:
 
 - `.help` - Display help message
 - `.exit` or `.quit` - Exit the REPL
+- `.load <file>` - Load and execute a JavaScript file
+- `.save <file>` - Save session history to a file
+- `.clear` - Reset the environment
+- `.history` - Show command history
+- `.version` - Show version information
 - `Ctrl+D` - EOF signal (also exits)
 
-### 5. **Error Handling**
+### 5. **Command History**
+
+The REPL saves command history to `~/.lightjs_history`:
+- History persists across sessions
+- Use up/down arrows to navigate history (if readline available)
+
+### 6. **Error Handling**
 Syntax and runtime errors are caught and displayed:
 
 ```javascript
@@ -89,7 +100,7 @@ Parse error: Invalid syntax
 Error: ReferenceError: undefinedVariable is not defined
 ```
 
-### 6. **Full ES2020 Support**
+### 7. **Full ES2020 Support**
 The REPL supports all LightJS features:
 
 **Modern Syntax:**
@@ -195,21 +206,9 @@ Hello, World!
 
 ## Limitations
 
-- No command history (up/down arrow navigation)
 - No tab completion
 - No syntax highlighting
 - No editing of previous lines in multi-line mode
-- Some complex features may cause crashes (report bugs!)
-
-## Future Enhancements
-
-Potential improvements:
-- readline integration for history/editing
-- Tab completion for variables and functions
-- Syntax highlighting
-- .load command to load files
-- .save command to save session
-- Better error messages with line numbers
 
 ## See Also
 
