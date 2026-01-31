@@ -224,6 +224,7 @@ set(LIGHTJS_CORE_SOURCES
   src/wasm/wasm_interpreter.cc
   src/wasm_js.cc
   src/simd.cc
+  src/streams.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS
@@ -262,6 +263,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/wasm/wasm_runtime.h
   include/wasm/wasm_decoder.h
   include/wasm_js.h
+  include/streams.h
 )
 
 # Create main library target

@@ -12,4 +12,24 @@ const std::string& WellKnownSymbols::iteratorKey() {
   return key;
 }
 
+const Value& WellKnownSymbols::asyncIterator() {
+  static Value symbolAsyncIterator(Symbol("Symbol.asyncIterator"));
+  return symbolAsyncIterator;
+}
+
+const std::string& WellKnownSymbols::asyncIteratorKey() {
+  static const std::string key = WellKnownSymbols::asyncIterator().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::toStringTag() {
+  static Value symbolToStringTag(Symbol("Symbol.toStringTag"));
+  return symbolToStringTag;
+}
+
+const std::string& WellKnownSymbols::toStringTagKey() {
+  static const std::string key = WellKnownSymbols::toStringTag().toString();
+  return key;
+}
+
 }

@@ -1,5 +1,6 @@
 #include "value.h"
 #include "simd.h"
+#include "streams.h"
 #include <sstream>
 #include <cmath>
 
@@ -126,6 +127,12 @@ std::string Value::toString() const {
       return "[ArrayBuffer]";
     } else if constexpr (std::is_same_v<T, std::shared_ptr<DataView>>) {
       return "[DataView]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<ReadableStream>>) {
+      return "[ReadableStream]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<WritableStream>>) {
+      return "[WritableStream]";
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<TransformStream>>) {
+      return "[TransformStream]";
     } else {
       return "";
     }

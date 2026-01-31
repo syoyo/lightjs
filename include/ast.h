@@ -6,6 +6,7 @@
 #include <variant>
 #include <optional>
 #include <cstdint>
+#include "object_shape.h"
 
 namespace lightjs {
 
@@ -61,7 +62,8 @@ struct BinaryExpr {
     Add, Sub, Mul, Div, Mod, Exp,  // Exp for exponentiation
     Equal, NotEqual, StrictEqual, StrictNotEqual,
     Less, Greater, LessEqual, GreaterEqual,
-    LogicalAnd, LogicalOr, NullishCoalescing
+    LogicalAnd, LogicalOr, NullishCoalescing,
+    In, Instanceof  // Property/type checking operators
   };
   Op op;
   ExprPtr left;
@@ -69,7 +71,7 @@ struct BinaryExpr {
 };
 
 struct UnaryExpr {
-  enum class Op { Not, Minus, Plus, Typeof };
+  enum class Op { Not, Minus, Plus, Typeof, Delete };
   Op op;
   ExprPtr argument;
 };
@@ -98,6 +100,7 @@ struct MemberExpr {
   ExprPtr property;
   bool computed;
   bool optional;  // Optional chaining (?.)
+  mutable PropertyCache cache;  // Inline cache for property access optimization
   MemberExpr() : computed(false), optional(false) {}
 };
 
@@ -200,6 +203,12 @@ struct ObjectPattern {
   ExprPtr rest;  // Rest properties (...rest)
 };
 
+// import.meta - ES2020
+struct MetaProperty {
+  std::string meta;  // "meta" for import.meta
+  std::string property;  // property name if accessed (e.g., "url")
+};
+
 struct Expression {
   std::variant<
     Identifier,
@@ -228,7 +237,8 @@ struct Expression {
     SuperExpr,
     SpreadElement,
     ArrayPattern,
-    ObjectPattern
+    ObjectPattern,
+    MetaProperty
   > node;
 
   SourceLocation loc;

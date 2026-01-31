@@ -16,10 +16,12 @@
 #include "text_encoding.h"
 #include "url.h"
 #include "fs.h"
+#include "streams.h"
 #include <iostream>
 #include <thread>
 #include <limits>
 #include <cmath>
+#include <random>
 
 namespace lightjs {
 
@@ -98,12 +100,105 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   };
 
+  // console.error - writes to stderr
+  auto consoleErrorFn = std::make_shared<Function>();
+  consoleErrorFn->isNative = true;
+  consoleErrorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    for (const auto& arg : args) {
+      std::cerr << arg.toString() << " ";
+    }
+    std::cerr << std::endl;
+    return Value(Undefined{});
+  };
+
+  // console.warn - writes to stderr
+  auto consoleWarnFn = std::make_shared<Function>();
+  consoleWarnFn->isNative = true;
+  consoleWarnFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    for (const auto& arg : args) {
+      std::cerr << arg.toString() << " ";
+    }
+    std::cerr << std::endl;
+    return Value(Undefined{});
+  };
+
+  // console.info - same as log
+  auto consoleInfoFn = std::make_shared<Function>();
+  consoleInfoFn->isNative = true;
+  consoleInfoFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    for (const auto& arg : args) {
+      std::cout << arg.toString() << " ";
+    }
+    std::cout << std::endl;
+    return Value(Undefined{});
+  };
+
+  // console.debug - same as log
+  auto consoleDebugFn = std::make_shared<Function>();
+  consoleDebugFn->isNative = true;
+  consoleDebugFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    for (const auto& arg : args) {
+      std::cout << arg.toString() << " ";
+    }
+    std::cout << std::endl;
+    return Value(Undefined{});
+  };
+
+  // console.time/timeEnd - simple timing
+  static std::unordered_map<std::string, std::chrono::steady_clock::time_point> consoleTimers;
+
+  auto consoleTimeFn = std::make_shared<Function>();
+  consoleTimeFn->isNative = true;
+  consoleTimeFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    std::string label = args.empty() ? "default" : args[0].toString();
+    consoleTimers[label] = std::chrono::steady_clock::now();
+    return Value(Undefined{});
+  };
+
+  auto consoleTimeEndFn = std::make_shared<Function>();
+  consoleTimeEndFn->isNative = true;
+  consoleTimeEndFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    std::string label = args.empty() ? "default" : args[0].toString();
+    auto it = consoleTimers.find(label);
+    if (it != consoleTimers.end()) {
+      auto elapsed = std::chrono::steady_clock::now() - it->second;
+      auto ms = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() / 1000.0;
+      std::cout << label << ": " << ms << "ms" << std::endl;
+      consoleTimers.erase(it);
+    }
+    return Value(Undefined{});
+  };
+
+  // console.assert
+  auto consoleAssertFn = std::make_shared<Function>();
+  consoleAssertFn->isNative = true;
+  consoleAssertFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    bool condition = args.empty() ? false : args[0].toBool();
+    if (!condition) {
+      std::cerr << "Assertion failed:";
+      for (size_t i = 1; i < args.size(); ++i) {
+        std::cerr << " " << args[i].toString();
+      }
+      std::cerr << std::endl;
+    }
+    return Value(Undefined{});
+  };
+
   auto consoleObj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   consoleObj->properties["log"] = Value(consoleFn);
+  consoleObj->properties["error"] = Value(consoleErrorFn);
+  consoleObj->properties["warn"] = Value(consoleWarnFn);
+  consoleObj->properties["info"] = Value(consoleInfoFn);
+  consoleObj->properties["debug"] = Value(consoleDebugFn);
+  consoleObj->properties["time"] = Value(consoleTimeFn);
+  consoleObj->properties["timeEnd"] = Value(consoleTimeEndFn);
+  consoleObj->properties["assert"] = Value(consoleAssertFn);
 
   env->define("console", Value(consoleObj));
   env->define("undefined", Value(Undefined{}));
+  env->define("Infinity", Value(std::numeric_limits<double>::infinity()));
+  env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()));
 
   // Symbol constructor
   auto symbolFn = std::make_shared<Function>();
@@ -113,6 +208,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Symbol(description));
   };
   symbolFn->properties["iterator"] = WellKnownSymbols::iterator();
+  symbolFn->properties["asyncIterator"] = WellKnownSymbols::asyncIterator();
+  symbolFn->properties["toStringTag"] = WellKnownSymbols::toStringTag();
   env->define("Symbol", Value(symbolFn));
 
   auto createTypedArrayConstructor = [](TypedArrayType type) {
@@ -247,6 +344,58 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(result);
   };
   cryptoObj->properties["toHex"] = Value(toHexFn);
+
+  // crypto.randomUUID - generate RFC 4122 version 4 UUID
+  auto randomUUIDFn = std::make_shared<Function>();
+  randomUUIDFn->isNative = true;
+  randomUUIDFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Generate 16 random bytes
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dis(0, 255);
+
+    uint8_t bytes[16];
+    for (int i = 0; i < 16; ++i) {
+      bytes[i] = static_cast<uint8_t>(dis(gen));
+    }
+
+    // Set version (4) and variant (RFC 4122)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;  // Version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;  // Variant RFC 4122
+
+    // Format as UUID string
+    char uuid[37];
+    snprintf(uuid, sizeof(uuid),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             bytes[0], bytes[1], bytes[2], bytes[3],
+             bytes[4], bytes[5], bytes[6], bytes[7],
+             bytes[8], bytes[9], bytes[10], bytes[11],
+             bytes[12], bytes[13], bytes[14], bytes[15]);
+    return Value(std::string(uuid));
+  };
+  cryptoObj->properties["randomUUID"] = Value(randomUUIDFn);
+
+  // crypto.getRandomValues - fill typed array with random values
+  auto getRandomValuesFn = std::make_shared<Function>();
+  getRandomValuesFn->isNative = true;
+  getRandomValuesFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isTypedArray()) {
+      return Value(std::make_shared<Error>(ErrorType::TypeError, "getRandomValues requires a TypedArray"));
+    }
+
+    auto typedArray = std::get<std::shared_ptr<TypedArray>>(args[0].data);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    // Fill buffer with random bytes
+    std::uniform_int_distribution<uint32_t> dis(0, 255);
+    for (size_t i = 0; i < typedArray->buffer.size(); ++i) {
+      typedArray->buffer[i] = static_cast<uint8_t>(dis(gen));
+    }
+
+    return args[0];  // Return the same array
+  };
+  cryptoObj->properties["getRandomValues"] = Value(getRandomValuesFn);
 
   env->define("crypto", Value(cryptoObj));
 
@@ -507,6 +656,184 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(false);
   };
   reflectObj->properties["deleteProperty"] = Value(reflectDelete);
+
+  // Reflect.apply(target, thisArg, argumentsList)
+  auto reflectApply = std::make_shared<Function>();
+  reflectApply->isNative = true;
+  reflectApply->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 3 || !args[0].isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto func = std::get<std::shared_ptr<Function>>(args[0].data);
+    const Value& thisArg = args[1];
+
+    std::vector<Value> callArgs;
+    if (args[2].isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(args[2].data);
+      callArgs = arr->elements;
+    }
+
+    if (func->isNative) {
+      // For native functions, we can't pass 'this' directly
+      // Native functions typically don't use 'this'
+      return func->nativeFunc(callArgs);
+    }
+    // For non-native functions, we'd need interpreter access
+    return Value(Undefined{});
+  };
+  reflectObj->properties["apply"] = Value(reflectApply);
+
+  // Reflect.construct(target, argumentsList, newTarget?)
+  auto reflectConstruct = std::make_shared<Function>();
+  reflectConstruct->isNative = true;
+  reflectConstruct->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2 || !args[0].isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto func = std::get<std::shared_ptr<Function>>(args[0].data);
+
+    std::vector<Value> callArgs;
+    if (args[1].isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(args[1].data);
+      callArgs = arr->elements;
+    }
+
+    if (func->isNative) {
+      return func->nativeFunc(callArgs);
+    }
+    // For non-native functions, we'd need interpreter access
+    return Value(Undefined{});
+  };
+  reflectObj->properties["construct"] = Value(reflectConstruct);
+
+  // Reflect.getPrototypeOf(target) - returns null (limited prototype support)
+  auto reflectGetPrototypeOf = std::make_shared<Function>();
+  reflectGetPrototypeOf->isNative = true;
+  reflectGetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(Null{});
+    // LightJS has limited prototype support, return null
+    return Value(Null{});
+  };
+  reflectObj->properties["getPrototypeOf"] = Value(reflectGetPrototypeOf);
+
+  // Reflect.setPrototypeOf(target, proto) - returns false (not supported)
+  auto reflectSetPrototypeOf = std::make_shared<Function>();
+  reflectSetPrototypeOf->isNative = true;
+  reflectSetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // LightJS doesn't support dynamic prototype modification
+    return Value(false);
+  };
+  reflectObj->properties["setPrototypeOf"] = Value(reflectSetPrototypeOf);
+
+  // Reflect.isExtensible(target) - check if object can be extended
+  auto reflectIsExtensible = std::make_shared<Function>();
+  reflectIsExtensible->isNative = true;
+  reflectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(false);
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      return Value(!obj->sealed && !obj->frozen);
+    }
+    return Value(false);
+  };
+  reflectObj->properties["isExtensible"] = Value(reflectIsExtensible);
+
+  // Reflect.preventExtensions(target) - prevent adding new properties
+  auto reflectPreventExtensions = std::make_shared<Function>();
+  reflectPreventExtensions->isNative = true;
+  reflectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return Value(false);
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    obj->sealed = true;
+    return Value(true);
+  };
+  reflectObj->properties["preventExtensions"] = Value(reflectPreventExtensions);
+
+  // Reflect.ownKeys(target) - return array of own property keys
+  auto reflectOwnKeys = std::make_shared<Function>();
+  reflectOwnKeys->isNative = true;
+  reflectOwnKeys->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto result = std::make_shared<Array>();
+
+    if (args.empty()) return Value(result);
+
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      for (const auto& [key, _] : obj->properties) {
+        result->elements.push_back(Value(key));
+      }
+    } else if (args[0].isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+      for (size_t i = 0; i < arr->elements.size(); ++i) {
+        result->elements.push_back(Value(std::to_string(i)));
+      }
+      result->elements.push_back(Value("length"));
+    }
+
+    return Value(result);
+  };
+  reflectObj->properties["ownKeys"] = Value(reflectOwnKeys);
+
+  // Reflect.getOwnPropertyDescriptor(target, propertyKey)
+  auto reflectGetOwnPropertyDescriptor = std::make_shared<Function>();
+  reflectGetOwnPropertyDescriptor->isNative = true;
+  reflectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(Undefined{});
+
+    std::string prop = args[1].toString();
+
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto it = obj->properties.find(prop);
+      if (it == obj->properties.end()) {
+        return Value(Undefined{});
+      }
+      // Create a simplified property descriptor
+      auto descriptor = std::make_shared<Object>();
+      descriptor->properties["value"] = it->second;
+      descriptor->properties["writable"] = Value(!obj->frozen);
+      descriptor->properties["enumerable"] = Value(true);
+      descriptor->properties["configurable"] = Value(!obj->sealed);
+      return Value(descriptor);
+    }
+
+    return Value(Undefined{});
+  };
+  reflectObj->properties["getOwnPropertyDescriptor"] = Value(reflectGetOwnPropertyDescriptor);
+
+  // Reflect.defineProperty(target, propertyKey, attributes)
+  auto reflectDefineProperty = std::make_shared<Function>();
+  reflectDefineProperty->isNative = true;
+  reflectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 3) return Value(false);
+    if (!args[0].isObject()) return Value(false);
+
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    std::string prop = args[1].toString();
+
+    // Check if object is sealed/frozen
+    bool isNewProp = obj->properties.find(prop) == obj->properties.end();
+    if ((obj->sealed && isNewProp) || obj->frozen) {
+      return Value(false);
+    }
+
+    // Get value from descriptor
+    if (args[2].isObject()) {
+      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      auto valueIt = descriptor->properties.find("value");
+      if (valueIt != descriptor->properties.end()) {
+        obj->properties[prop] = valueIt->second;
+        return Value(true);
+      }
+    }
+
+    return Value(false);
+  };
+  reflectObj->properties["defineProperty"] = Value(reflectDefineProperty);
 
   env->define("Reflect", Value(reflectObj));
 
@@ -804,6 +1131,138 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   promiseConstructor->properties["all"] = Value(promiseAll);
 
+  // Promise.allSettled - waits for all promises to settle (resolve or reject)
+  auto promiseAllSettled = std::make_shared<Function>();
+  promiseAllSettled->isNative = true;
+  promiseAllSettled->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      auto promise = std::make_shared<Promise>();
+      GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->reject(Value(std::string("Promise.allSettled expects an array")));
+      return Value(promise);
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto resultPromise = std::make_shared<Promise>();
+    auto results = std::make_shared<Array>();
+
+    for (const auto& elem : arr->elements) {
+      auto resultObj = std::make_shared<Object>();
+      if (elem.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        if (p->state == PromiseState::Fulfilled) {
+          resultObj->properties["status"] = Value(std::string("fulfilled"));
+          resultObj->properties["value"] = p->result;
+        } else if (p->state == PromiseState::Rejected) {
+          resultObj->properties["status"] = Value(std::string("rejected"));
+          resultObj->properties["reason"] = p->result;
+        } else {
+          // Pending - treat as fulfilled with the promise itself
+          resultObj->properties["status"] = Value(std::string("fulfilled"));
+          resultObj->properties["value"] = elem;
+        }
+      } else {
+        // Non-promise values are treated as fulfilled
+        resultObj->properties["status"] = Value(std::string("fulfilled"));
+        resultObj->properties["value"] = elem;
+      }
+      results->elements.push_back(Value(resultObj));
+    }
+
+    resultPromise->resolve(Value(results));
+    return Value(resultPromise);
+  };
+  promiseConstructor->properties["allSettled"] = Value(promiseAllSettled);
+
+  // Promise.any - resolves when any promise fulfills, rejects if all reject
+  auto promiseAny = std::make_shared<Function>();
+  promiseAny->isNative = true;
+  promiseAny->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      auto promise = std::make_shared<Promise>();
+      GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->reject(Value(std::string("Promise.any expects an array")));
+      return Value(promise);
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto resultPromise = std::make_shared<Promise>();
+
+    if (arr->elements.empty()) {
+      // Empty array - reject with AggregateError
+      auto err = std::make_shared<Error>(ErrorType::Error, "All promises were rejected");
+      resultPromise->reject(Value(err));
+      return Value(resultPromise);
+    }
+
+    auto errors = std::make_shared<Array>();
+    bool hasResolved = false;
+
+    for (const auto& elem : arr->elements) {
+      if (elem.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        if (p->state == PromiseState::Fulfilled && !hasResolved) {
+          hasResolved = true;
+          resultPromise->resolve(p->result);
+          break;
+        } else if (p->state == PromiseState::Rejected) {
+          errors->elements.push_back(p->result);
+        }
+      } else {
+        // Non-promise values are treated as fulfilled
+        if (!hasResolved) {
+          hasResolved = true;
+          resultPromise->resolve(elem);
+          break;
+        }
+      }
+    }
+
+    if (!hasResolved) {
+      // All rejected - create AggregateError-like object
+      auto err = std::make_shared<Error>(ErrorType::Error, "All promises were rejected");
+      resultPromise->reject(Value(err));
+    }
+
+    return Value(resultPromise);
+  };
+  promiseConstructor->properties["any"] = Value(promiseAny);
+
+  // Promise.race - resolves or rejects with the first settled promise
+  auto promiseRace = std::make_shared<Function>();
+  promiseRace->isNative = true;
+  promiseRace->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      auto promise = std::make_shared<Promise>();
+      GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->reject(Value(std::string("Promise.race expects an array")));
+      return Value(promise);
+    }
+
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto resultPromise = std::make_shared<Promise>();
+
+    for (const auto& elem : arr->elements) {
+      if (elem.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        if (p->state == PromiseState::Fulfilled) {
+          resultPromise->resolve(p->result);
+          break;
+        } else if (p->state == PromiseState::Rejected) {
+          resultPromise->reject(p->result);
+          break;
+        }
+      } else {
+        // Non-promise value settles immediately
+        resultPromise->resolve(elem);
+        break;
+      }
+    }
+
+    return Value(resultPromise);
+  };
+  promiseConstructor->properties["race"] = Value(promiseRace);
+
   // Promise constructor function
   auto promiseFunc = std::make_shared<Function>();
   promiseFunc->isNative = true;
@@ -1049,6 +1508,103 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(false);
   };
   objectConstructor->properties["is"] = Value(objectIs);
+
+  // Object.getOwnPropertyDescriptor - get property descriptor
+  auto objectGetOwnPropertyDescriptor = std::make_shared<Function>();
+  objectGetOwnPropertyDescriptor->isNative = true;
+  objectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2 || !args[0].isObject()) {
+      return Value(Undefined{});
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    std::string key = args[1].toString();
+
+    auto it = obj->properties.find(key);
+    if (it == obj->properties.end()) {
+      return Value(Undefined{});
+    }
+
+    auto descriptor = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    descriptor->properties["value"] = it->second;
+    descriptor->properties["writable"] = Value(!obj->frozen);
+    descriptor->properties["enumerable"] = Value(true);
+    descriptor->properties["configurable"] = Value(!obj->sealed);
+    return Value(descriptor);
+  };
+  objectConstructor->properties["getOwnPropertyDescriptor"] = Value(objectGetOwnPropertyDescriptor);
+
+  // Object.defineProperty - define property with descriptor
+  auto objectDefineProperty = std::make_shared<Function>();
+  objectDefineProperty->isNative = true;
+  objectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 3 || !args[0].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    std::string key = args[1].toString();
+
+    if (obj->frozen) {
+      return args[0];  // Cannot modify frozen object
+    }
+
+    // Check if adding new property to sealed object
+    if (obj->sealed && obj->properties.find(key) == obj->properties.end()) {
+      return args[0];  // Cannot add new property to sealed object
+    }
+
+    if (args[2].isObject()) {
+      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      auto valueIt = descriptor->properties.find("value");
+      if (valueIt != descriptor->properties.end()) {
+        obj->properties[key] = valueIt->second;
+      }
+
+      // Check for getter
+      auto getIt = descriptor->properties.find("get");
+      if (getIt != descriptor->properties.end() && getIt->second.isFunction()) {
+        obj->properties["__get_" + key] = getIt->second;
+      }
+
+      // Check for setter
+      auto setIt = descriptor->properties.find("set");
+      if (setIt != descriptor->properties.end() && setIt->second.isFunction()) {
+        obj->properties["__set_" + key] = setIt->second;
+      }
+    }
+    return args[0];
+  };
+  objectConstructor->properties["defineProperty"] = Value(objectDefineProperty);
+
+  // Object.defineProperties - define multiple properties
+  auto objectDefineProperties = std::make_shared<Function>();
+  objectDefineProperties->isNative = true;
+  objectDefineProperties->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2 || !args[0].isObject() || !args[1].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto props = std::get<std::shared_ptr<Object>>(args[1].data);
+
+    if (obj->frozen) {
+      return args[0];
+    }
+
+    for (const auto& [key, descriptor] : props->properties) {
+      if (obj->sealed && obj->properties.find(key) == obj->properties.end()) {
+        continue;  // Skip new properties on sealed object
+      }
+      if (descriptor.isObject()) {
+        auto descObj = std::get<std::shared_ptr<Object>>(descriptor.data);
+        auto valueIt = descObj->properties.find("value");
+        if (valueIt != descObj->properties.end()) {
+          obj->properties[key] = valueIt->second;
+        }
+      }
+    }
+    return args[0];
+  };
+  objectConstructor->properties["defineProperties"] = Value(objectDefineProperties);
 
   env->define("Object", Value(objectConstructor));
 
@@ -1383,8 +1939,463 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("URL", Value(createURLConstructor()));
   env->define("URLSearchParams", Value(createURLSearchParamsConstructor()));
 
+  // AbortController and AbortSignal
+  auto abortControllerCtor = std::make_shared<Function>();
+  abortControllerCtor->isNative = true;
+  abortControllerCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto controller = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+    // Create AbortSignal
+    auto signal = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    signal->properties["aborted"] = Value(false);
+    signal->properties["reason"] = Value(Undefined{});
+
+    // Event listeners storage
+    auto listeners = std::make_shared<Array>();
+    signal->properties["_listeners"] = Value(listeners);
+
+    // addEventListener method
+    auto addEventListenerFn = std::make_shared<Function>();
+    addEventListenerFn->isNative = true;
+    addEventListenerFn->nativeFunc = [listeners](const std::vector<Value>& args) -> Value {
+      if (args.size() >= 2 && args[0].toString() == "abort" && args[1].isFunction()) {
+        listeners->elements.push_back(args[1]);
+      }
+      return Value(Undefined{});
+    };
+    signal->properties["addEventListener"] = Value(addEventListenerFn);
+
+    // removeEventListener method
+    auto removeEventListenerFn = std::make_shared<Function>();
+    removeEventListenerFn->isNative = true;
+    removeEventListenerFn->nativeFunc = [listeners](const std::vector<Value>& args) -> Value {
+      // Simple implementation - just mark for removal
+      return Value(Undefined{});
+    };
+    signal->properties["removeEventListener"] = Value(removeEventListenerFn);
+
+    controller->properties["signal"] = Value(signal);
+
+    // abort method
+    auto abortFn = std::make_shared<Function>();
+    abortFn->isNative = true;
+    abortFn->nativeFunc = [signal, listeners](const std::vector<Value>& args) -> Value {
+      // Check if already aborted
+      if (signal->properties["aborted"].toBool()) {
+        return Value(Undefined{});
+      }
+
+      signal->properties["aborted"] = Value(true);
+      signal->properties["reason"] = args.empty() ?
+          Value(std::string("AbortError: The operation was aborted")) : args[0];
+
+      // Call all abort listeners
+      for (const auto& listener : listeners->elements) {
+        if (listener.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(listener.data);
+          if (fn->isNative && fn->nativeFunc) {
+            fn->nativeFunc({});
+          }
+        }
+      }
+
+      return Value(Undefined{});
+    };
+    controller->properties["abort"] = Value(abortFn);
+
+    return Value(controller);
+  };
+  env->define("AbortController", Value(abortControllerCtor));
+
+  // AbortSignal.abort() static method
+  auto abortSignalObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  auto abortStaticFn = std::make_shared<Function>();
+  abortStaticFn->isNative = true;
+  abortStaticFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto signal = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    signal->properties["aborted"] = Value(true);
+    signal->properties["reason"] = args.empty() ?
+        Value(std::string("AbortError: The operation was aborted")) : args[0];
+    return Value(signal);
+  };
+  abortSignalObj->properties["abort"] = Value(abortStaticFn);
+
+  // AbortSignal.timeout() static method
+  auto timeoutStaticFn = std::make_shared<Function>();
+  timeoutStaticFn->isNative = true;
+  timeoutStaticFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto signal = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    signal->properties["aborted"] = Value(false);
+    signal->properties["reason"] = Value(Undefined{});
+    // Note: Actual timeout implementation would require event loop integration
+    return Value(signal);
+  };
+  abortSignalObj->properties["timeout"] = Value(timeoutStaticFn);
+
+  env->define("AbortSignal", Value(abortSignalObj));
+
+  // Streams API - ReadableStream
+  auto readableStreamCtor = std::make_shared<Function>();
+  readableStreamCtor->isNative = true;
+  readableStreamCtor->isConstructor = true;
+  readableStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Create underlying source callbacks from argument
+    std::shared_ptr<Function> startFn = nullptr;
+    std::shared_ptr<Function> pullFn = nullptr;
+    std::shared_ptr<Function> cancelFn = nullptr;
+    double highWaterMark = 1.0;
+
+    if (!args.empty() && args[0].isObject()) {
+      auto srcObj = std::get<std::shared_ptr<Object>>(args[0].data);
+
+      // Get start callback
+      auto startIt = srcObj->properties.find("start");
+      if (startIt != srcObj->properties.end() && startIt->second.isFunction()) {
+        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+      }
+
+      // Get pull callback
+      auto pullIt = srcObj->properties.find("pull");
+      if (pullIt != srcObj->properties.end() && pullIt->second.isFunction()) {
+        pullFn = std::get<std::shared_ptr<Function>>(pullIt->second.data);
+      }
+
+      // Get cancel callback
+      auto cancelIt = srcObj->properties.find("cancel");
+      if (cancelIt != srcObj->properties.end() && cancelIt->second.isFunction()) {
+        cancelFn = std::get<std::shared_ptr<Function>>(cancelIt->second.data);
+      }
+    }
+
+    // Create the stream
+    auto stream = createReadableStream(startFn, pullFn, cancelFn, highWaterMark);
+    return Value(stream);
+  };
+  env->define("ReadableStream", Value(readableStreamCtor));
+
+  // Streams API - WritableStream
+  auto writableStreamCtor = std::make_shared<Function>();
+  writableStreamCtor->isNative = true;
+  writableStreamCtor->isConstructor = true;
+  writableStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Create underlying sink callbacks from argument
+    std::shared_ptr<Function> startFn = nullptr;
+    std::shared_ptr<Function> writeFn = nullptr;
+    std::shared_ptr<Function> closeFn = nullptr;
+    std::shared_ptr<Function> abortFn = nullptr;
+    double highWaterMark = 1.0;
+
+    if (!args.empty() && args[0].isObject()) {
+      auto sinkObj = std::get<std::shared_ptr<Object>>(args[0].data);
+
+      // Get start callback
+      auto startIt = sinkObj->properties.find("start");
+      if (startIt != sinkObj->properties.end() && startIt->second.isFunction()) {
+        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+      }
+
+      // Get write callback
+      auto writeIt = sinkObj->properties.find("write");
+      if (writeIt != sinkObj->properties.end() && writeIt->second.isFunction()) {
+        writeFn = std::get<std::shared_ptr<Function>>(writeIt->second.data);
+      }
+
+      // Get close callback
+      auto closeIt = sinkObj->properties.find("close");
+      if (closeIt != sinkObj->properties.end() && closeIt->second.isFunction()) {
+        closeFn = std::get<std::shared_ptr<Function>>(closeIt->second.data);
+      }
+
+      // Get abort callback
+      auto abortIt = sinkObj->properties.find("abort");
+      if (abortIt != sinkObj->properties.end() && abortIt->second.isFunction()) {
+        abortFn = std::get<std::shared_ptr<Function>>(abortIt->second.data);
+      }
+    }
+
+    // Create the stream
+    auto stream = createWritableStream(startFn, writeFn, closeFn, abortFn, highWaterMark);
+    return Value(stream);
+  };
+  env->define("WritableStream", Value(writableStreamCtor));
+
+  // Streams API - TransformStream
+  auto transformStreamCtor = std::make_shared<Function>();
+  transformStreamCtor->isNative = true;
+  transformStreamCtor->isConstructor = true;
+  transformStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Create transformer callbacks from argument
+    std::shared_ptr<Function> startFn = nullptr;
+    std::shared_ptr<Function> transformFn = nullptr;
+    std::shared_ptr<Function> flushFn = nullptr;
+
+    if (!args.empty() && args[0].isObject()) {
+      auto transformerObj = std::get<std::shared_ptr<Object>>(args[0].data);
+
+      // Get start callback
+      auto startIt = transformerObj->properties.find("start");
+      if (startIt != transformerObj->properties.end() && startIt->second.isFunction()) {
+        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+      }
+
+      // Get transform callback
+      auto transformIt = transformerObj->properties.find("transform");
+      if (transformIt != transformerObj->properties.end() && transformIt->second.isFunction()) {
+        transformFn = std::get<std::shared_ptr<Function>>(transformIt->second.data);
+      }
+
+      // Get flush callback
+      auto flushIt = transformerObj->properties.find("flush");
+      if (flushIt != transformerObj->properties.end() && flushIt->second.isFunction()) {
+        flushFn = std::get<std::shared_ptr<Function>>(flushIt->second.data);
+      }
+    }
+
+    // Create the stream
+    auto stream = createTransformStream(startFn, transformFn, flushFn);
+    return Value(stream);
+  };
+  env->define("TransformStream", Value(transformStreamCtor));
+
   // File System module (fs)
   globalThisObj->properties["fs"] = Value(createFSModule());
+
+  // performance.now() - high-resolution timing
+  static auto startTime = std::chrono::steady_clock::now();
+
+  auto performanceNowFn = std::make_shared<Function>();
+  performanceNowFn->isNative = true;
+  performanceNowFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - startTime).count();
+    return Value(static_cast<double>(elapsed) / 1000.0);  // Return milliseconds
+  };
+
+  auto performanceObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  performanceObj->properties["now"] = Value(performanceNowFn);
+  env->define("performance", Value(performanceObj));
+  globalThisObj->properties["performance"] = Value(performanceObj);
+
+  // structuredClone - deep clone objects, arrays, and primitives
+  std::function<Value(const Value&)> deepClone;
+  deepClone = [&deepClone](const Value& val) -> Value {
+    // Primitives are returned as-is (they're already copies)
+    if (val.isUndefined() || val.isNull() || val.isBool() ||
+        val.isNumber() || val.isString() || val.isBigInt() || val.isSymbol()) {
+      return val;
+    }
+
+    // Clone arrays
+    if (val.isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(val.data);
+      auto newArr = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      for (const auto& elem : arr->elements) {
+        newArr->elements.push_back(deepClone(elem));
+      }
+      return Value(newArr);
+    }
+
+    // Clone objects
+    if (val.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(val.data);
+      auto newObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      for (const auto& [key, value] : obj->properties) {
+        newObj->properties[key] = deepClone(value);
+      }
+      return Value(newObj);
+    }
+
+    // Functions, Promises, etc. cannot be cloned - return as-is
+    return val;
+  };
+
+  auto structuredCloneFn = std::make_shared<Function>();
+  structuredCloneFn->isNative = true;
+  structuredCloneFn->nativeFunc = [deepClone](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(Undefined{});
+    return deepClone(args[0]);
+  };
+  env->define("structuredClone", Value(structuredCloneFn));
+  globalThisObj->properties["structuredClone"] = Value(structuredCloneFn);
+
+  // Base64 encoding table
+  static const char base64Chars[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  // btoa - encode string to Base64
+  auto btoaFn = std::make_shared<Function>();
+  btoaFn->isNative = true;
+  btoaFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string(""));
+    std::string input = args[0].toString();
+    std::string result;
+    result.reserve((input.size() + 2) / 3 * 4);
+
+    for (size_t i = 0; i < input.size(); i += 3) {
+      uint32_t n = static_cast<uint8_t>(input[i]) << 16;
+      if (i + 1 < input.size()) n |= static_cast<uint8_t>(input[i + 1]) << 8;
+      if (i + 2 < input.size()) n |= static_cast<uint8_t>(input[i + 2]);
+
+      result += base64Chars[(n >> 18) & 0x3F];
+      result += base64Chars[(n >> 12) & 0x3F];
+      result += (i + 1 < input.size()) ? base64Chars[(n >> 6) & 0x3F] : '=';
+      result += (i + 2 < input.size()) ? base64Chars[n & 0x3F] : '=';
+    }
+    return Value(result);
+  };
+  env->define("btoa", Value(btoaFn));
+  globalThisObj->properties["btoa"] = Value(btoaFn);
+
+  // atob - decode Base64 to string
+  auto atobFn = std::make_shared<Function>();
+  atobFn->isNative = true;
+  atobFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string(""));
+    std::string input = args[0].toString();
+
+    // Build decode lookup table
+    static int decodeTable[256] = {-1};
+    static bool tableInit = false;
+    if (!tableInit) {
+      for (int i = 0; i < 256; ++i) decodeTable[i] = -1;
+      for (int i = 0; i < 64; ++i) decodeTable[static_cast<uint8_t>(base64Chars[i])] = i;
+      tableInit = true;
+    }
+
+    std::string result;
+    result.reserve(input.size() * 3 / 4);
+
+    int bits = 0;
+    int bitCount = 0;
+    for (char c : input) {
+      if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+      int value = decodeTable[static_cast<uint8_t>(c)];
+      if (value == -1) continue;  // Skip invalid characters
+
+      bits = (bits << 6) | value;
+      bitCount += 6;
+
+      if (bitCount >= 8) {
+        bitCount -= 8;
+        result += static_cast<char>((bits >> bitCount) & 0xFF);
+      }
+    }
+    return Value(result);
+  };
+  env->define("atob", Value(atobFn));
+  globalThisObj->properties["atob"] = Value(atobFn);
+
+  // encodeURIComponent - encode URI component
+  auto encodeURIComponentFn = std::make_shared<Function>();
+  encodeURIComponentFn->isNative = true;
+  encodeURIComponentFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string("undefined"));
+    std::string input = args[0].toString();
+    std::string result;
+    result.reserve(input.size() * 3);  // Worst case
+
+    for (unsigned char c : input) {
+      // Unreserved characters (RFC 3986): A-Z a-z 0-9 - _ . ~
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+        result += static_cast<char>(c);
+      } else {
+        char hex[4];
+        snprintf(hex, sizeof(hex), "%%%02X", c);
+        result += hex;
+      }
+    }
+    return Value(result);
+  };
+  env->define("encodeURIComponent", Value(encodeURIComponentFn));
+  globalThisObj->properties["encodeURIComponent"] = Value(encodeURIComponentFn);
+
+  // decodeURIComponent - decode URI component
+  auto decodeURIComponentFn = std::make_shared<Function>();
+  decodeURIComponentFn->isNative = true;
+  decodeURIComponentFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string("undefined"));
+    std::string input = args[0].toString();
+    std::string result;
+    result.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+      if (input[i] == '%' && i + 2 < input.size()) {
+        int value = 0;
+        if (std::sscanf(input.c_str() + i + 1, "%2x", &value) == 1) {
+          result += static_cast<char>(value);
+          i += 2;
+          continue;
+        }
+      }
+      result += input[i];
+    }
+    return Value(result);
+  };
+  env->define("decodeURIComponent", Value(decodeURIComponentFn));
+  globalThisObj->properties["decodeURIComponent"] = Value(decodeURIComponentFn);
+
+  // encodeURI - encode full URI (leaves more characters unencoded)
+  auto encodeURIFn = std::make_shared<Function>();
+  encodeURIFn->isNative = true;
+  encodeURIFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string("undefined"));
+    std::string input = args[0].toString();
+    std::string result;
+    result.reserve(input.size() * 3);
+
+    for (unsigned char c : input) {
+      // Reserved and unreserved characters that should NOT be encoded in full URI
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' ||
+          c == ':' || c == '/' || c == '?' || c == '#' || c == '[' || c == ']' ||
+          c == '@' || c == '!' || c == '$' || c == '&' || c == '\'' ||
+          c == '(' || c == ')' || c == '*' || c == '+' || c == ',' || c == ';' || c == '=') {
+        result += static_cast<char>(c);
+      } else {
+        char hex[4];
+        snprintf(hex, sizeof(hex), "%%%02X", c);
+        result += hex;
+      }
+    }
+    return Value(result);
+  };
+  env->define("encodeURI", Value(encodeURIFn));
+  globalThisObj->properties["encodeURI"] = Value(encodeURIFn);
+
+  // decodeURI - decode full URI
+  auto decodeURIFn = std::make_shared<Function>();
+  decodeURIFn->isNative = true;
+  decodeURIFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string("undefined"));
+    std::string input = args[0].toString();
+    std::string result;
+    result.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+      if (input[i] == '%' && i + 2 < input.size()) {
+        int value = 0;
+        if (std::sscanf(input.c_str() + i + 1, "%2x", &value) == 1) {
+          result += static_cast<char>(value);
+          i += 2;
+          continue;
+        }
+      }
+      result += input[i];
+    }
+    return Value(result);
+  };
+  env->define("decodeURI", Value(decodeURIFn));
+  globalThisObj->properties["decodeURI"] = Value(decodeURIFn);
 
   return env;
 }

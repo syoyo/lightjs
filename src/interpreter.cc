@@ -4,12 +4,15 @@
 #include "unicode.h"
 #include "gc.h"
 #include "symbols.h"
+#include "streams.h"
 #include <iostream>
 #include <cmath>
 #include <climits>
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
+#include <cctype>
 
 namespace lightjs {
 
@@ -191,6 +194,10 @@ Task Interpreter::evaluate(const Expression& expr) {
     throwError(ErrorType::ReferenceError, formatError("'" + node->name + "' is not defined", expr.loc));
     LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<NumberLiteral>(&expr.node)) {
+    // Use cached value for small integers
+    if (SmallIntCache::inRange(node->value)) {
+      LIGHTJS_RETURN(SmallIntCache::get(static_cast<int>(node->value)));
+    }
     LIGHTJS_RETURN(Value(node->value));
   } else if (auto* node = std::get_if<BigIntLiteral>(&expr.node)) {
     LIGHTJS_RETURN(Value(BigInt(node->value)));
@@ -256,6 +263,33 @@ Task Interpreter::evaluate(const Expression& expr) {
     }
     throwError(ErrorType::ReferenceError, formatError("'super' keyword is not valid here", expr.loc));
     LIGHTJS_RETURN(Value(Undefined{}));
+  } else if (auto* node = std::get_if<MetaProperty>(&expr.node)) {
+    // import.meta - ES2020
+    if (node->meta == "meta") {
+      // Create import.meta object with common properties
+      auto metaObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+      // import.meta.url - the URL of the current module
+      if (auto moduleUrl = env_->get("__module_url__")) {
+        metaObj->properties["url"] = *moduleUrl;
+      } else {
+        metaObj->properties["url"] = Value(std::string(""));
+      }
+
+      // import.meta.resolve - function to resolve module specifiers
+      auto resolveFn = std::make_shared<Function>();
+      resolveFn->isNative = true;
+      resolveFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(std::string(""));
+        // Simple implementation - just return the specifier as-is
+        return Value(args[0].toString());
+      };
+      metaObj->properties["resolve"] = Value(resolveFn);
+
+      LIGHTJS_RETURN(Value(metaObj));
+    }
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
   LIGHTJS_RETURN(Value(Undefined{}));
 }
@@ -268,6 +302,31 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   auto rightTask = evaluate(*expr.right);
   Value right;
   LIGHTJS_RUN_TASK(rightTask, right);
+
+  // Fast path: both operands are numbers (most common case in loops)
+  const bool leftIsNum = left.isNumber();
+  const bool rightIsNum = right.isNumber();
+
+  if (leftIsNum && rightIsNum) {
+    double l = std::get<double>(left.data);
+    double r = std::get<double>(right.data);
+    switch (expr.op) {
+      case BinaryExpr::Op::Add: LIGHTJS_RETURN(Value(l + r));
+      case BinaryExpr::Op::Sub: LIGHTJS_RETURN(Value(l - r));
+      case BinaryExpr::Op::Mul: LIGHTJS_RETURN(Value(l * r));
+      case BinaryExpr::Op::Div: LIGHTJS_RETURN(Value(l / r));
+      case BinaryExpr::Op::Mod: LIGHTJS_RETURN(Value(std::fmod(l, r)));
+      case BinaryExpr::Op::Less: LIGHTJS_RETURN(Value(l < r));
+      case BinaryExpr::Op::Greater: LIGHTJS_RETURN(Value(l > r));
+      case BinaryExpr::Op::LessEqual: LIGHTJS_RETURN(Value(l <= r));
+      case BinaryExpr::Op::GreaterEqual: LIGHTJS_RETURN(Value(l >= r));
+      case BinaryExpr::Op::Equal:
+      case BinaryExpr::Op::StrictEqual: LIGHTJS_RETURN(Value(l == r));
+      case BinaryExpr::Op::NotEqual:
+      case BinaryExpr::Op::StrictNotEqual: LIGHTJS_RETURN(Value(l != r));
+      default: break;  // Fall through for other ops
+    }
+  }
 
   switch (expr.op) {
     case BinaryExpr::Op::Add:
@@ -422,12 +481,145 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
     case BinaryExpr::Op::NullishCoalescing:
       // Return right if left is null or undefined, otherwise return left
       LIGHTJS_RETURN((left.isNull() || left.isUndefined()) ? right : left);
+    case BinaryExpr::Op::In: {
+      // 'prop in obj' - check if property exists in object
+      std::string propName = left.toString();
+
+      // Handle Proxy has trap
+      if (right.isProxy()) {
+        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(right.data);
+        if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto trapIt = handlerObj->properties.find("has");
+          if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+            auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+            if (trap->isNative) {
+              std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName)};
+              LIGHTJS_RETURN(trap->nativeFunc(trapArgs));
+            }
+          }
+        }
+        // Fall through to check target
+        if (proxyPtr->target && proxyPtr->target->isObject()) {
+          auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          LIGHTJS_RETURN(Value(targetObj->properties.find(propName) != targetObj->properties.end()));
+        }
+        LIGHTJS_RETURN(Value(false));
+      }
+
+      if (right.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(right.data);
+        LIGHTJS_RETURN(Value(objPtr->properties.find(propName) != objPtr->properties.end()));
+      }
+
+      if (right.isArray()) {
+        auto arrPtr = std::get<std::shared_ptr<Array>>(right.data);
+        // Check if propName is a valid array index
+        try {
+          size_t idx = std::stoul(propName);
+          LIGHTJS_RETURN(Value(idx < arrPtr->elements.size()));
+        } catch (...) {}
+        // Check special array properties
+        if (propName == "length") LIGHTJS_RETURN(Value(true));
+        LIGHTJS_RETURN(Value(false));
+      }
+
+      // 'in' on primitives returns false
+      LIGHTJS_RETURN(Value(false));
+    }
+    case BinaryExpr::Op::Instanceof:
+      // TODO: implement instanceof operator
+      LIGHTJS_RETURN(Value(false));
   }
 
   LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
+  // Handle delete operator specially - it needs direct access to the member expression
+  if (expr.op == UnaryExpr::Op::Delete) {
+    // delete only works on member expressions
+    if (auto* member = std::get_if<MemberExpr>(&expr.argument->node)) {
+      auto objTask = evaluate(*member->object);
+      Value obj;
+      LIGHTJS_RUN_TASK(objTask, obj);
+
+      std::string propName;
+      if (member->computed) {
+        auto propTask = evaluate(*member->property);
+        LIGHTJS_RUN_TASK_VOID(propTask);
+        propName = propTask.result().toString();
+      } else {
+        if (auto* id = std::get_if<Identifier>(&member->property->node)) {
+          propName = id->name;
+        }
+      }
+
+      // Handle Proxy deleteProperty trap
+      if (obj.isProxy()) {
+        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+        if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto trapIt = handlerObj->properties.find("deleteProperty");
+          if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+            auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+            if (trap->isNative) {
+              std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName)};
+              LIGHTJS_RETURN(trap->nativeFunc(trapArgs));
+            }
+          }
+        }
+        // Fall through to delete from target
+        if (proxyPtr->target && proxyPtr->target->isObject()) {
+          auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          bool deleted = targetObj->properties.erase(propName) > 0;
+          if (deleted && targetObj->shape) {
+            targetObj->shape = nullptr; // Invalidate shape on delete
+          }
+          LIGHTJS_RETURN(Value(true));
+        }
+        LIGHTJS_RETURN(Value(false));
+      }
+
+      if (obj.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        if (objPtr->frozen || objPtr->sealed) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        bool deleted = objPtr->properties.erase(propName) > 0;
+        if (deleted && objPtr->shape) {
+          objPtr->shape = nullptr; // Invalidate shape on delete
+        }
+        LIGHTJS_RETURN(Value(true));
+      }
+
+      if (obj.isArray()) {
+        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        try {
+          size_t idx = std::stoul(propName);
+          if (idx < arrPtr->elements.size()) {
+            arrPtr->elements[idx] = Value(Undefined{});
+            LIGHTJS_RETURN(Value(true));
+          }
+        } catch (...) {}
+        LIGHTJS_RETURN(Value(false));
+      }
+
+      // Can't delete from primitives
+      LIGHTJS_RETURN(Value(false));
+    }
+
+    // delete on identifier (not allowed in strict mode, but we return true)
+    if (std::holds_alternative<Identifier>(expr.argument->node)) {
+      // In non-strict mode, delete on variables returns false
+      LIGHTJS_RETURN(Value(false));
+    }
+
+    // delete on other expressions always returns true
+    LIGHTJS_RETURN(Value(true));
+  }
+
+  // For other unary operators, evaluate the argument first
   auto argTask = evaluate(*expr.argument);
   Value arg;
   LIGHTJS_RUN_TASK(argTask, arg);
@@ -453,6 +645,9 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isFunction()) LIGHTJS_RETURN(Value("function"));
       LIGHTJS_RETURN(Value("object"));
     }
+    case UnaryExpr::Op::Delete:
+      // Already handled above
+      break;
   }
 
   LIGHTJS_RETURN(Value(Undefined{}));
@@ -538,6 +733,41 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
     }
 
+    // Handle Proxy set trap
+    if (obj.isProxy()) {
+      auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+      if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+        auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+        auto trapIt = handlerObj->properties.find("set");
+        if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+          auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+          if (trap->isNative) {
+            // Call set trap: handler.set(target, property, value, receiver)
+            std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName), right, obj};
+            Value result = trap->nativeFunc(trapArgs);
+            if (!result.toBool()) {
+              // Set trap returned false - throw in strict mode, but we'll just return
+            }
+            LIGHTJS_RETURN(right);
+          } else {
+            // Non-native set trap - call as JS function
+            std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName), right, obj};
+            Value result = invokeFunction(trap, trapArgs, Value(Undefined{}));
+            if (!result.toBool()) {
+              // Set trap returned false
+            }
+            LIGHTJS_RETURN(right);
+          }
+        }
+      }
+      // No set trap - fall through to set on target
+      if (proxyPtr->target && proxyPtr->target->isObject()) {
+        auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+        targetObj->properties[propName] = right;
+        LIGHTJS_RETURN(right);
+      }
+    }
+
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
 
@@ -551,6 +781,18 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       bool isNewProperty = objPtr->properties.find(propName) == objPtr->properties.end();
       if (objPtr->sealed && isNewProperty) {
         // Can't add new properties to sealed object
+        LIGHTJS_RETURN(right);
+      }
+
+      // Shape tracking disabled - using direct hash map access for simplicity
+
+      // Check for setter
+      std::string setterName = "__set_" + propName;
+      auto setterIt = objPtr->properties.find(setterName);
+      if (setterIt != objPtr->properties.end() && setterIt->second.isFunction()) {
+        auto setter = std::get<std::shared_ptr<Function>>(setterIt->second.data);
+        // Call the setter with 'this' bound to the object and the value as argument
+        invokeFunction(setter, {right}, obj);
         LIGHTJS_RETURN(right);
       }
 
@@ -719,6 +961,32 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     }
   }
 
+  // Handle Proxy apply trap for callable proxies
+  if (callee.isProxy()) {
+    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(callee.data);
+    if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto trapIt = handlerObj->properties.find("apply");
+      if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+        auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+        // Create args array
+        auto argsArray = std::make_shared<Array>();
+        argsArray->elements = args;
+        // Call apply trap: handler.apply(target, thisArg, argumentsList)
+        std::vector<Value> trapArgs = {*proxyPtr->target, thisValue, Value(argsArray)};
+        if (trap->isNative) {
+          LIGHTJS_RETURN(trap->nativeFunc(trapArgs));
+        } else {
+          LIGHTJS_RETURN(invokeFunction(trap, trapArgs, Value(Undefined{})));
+        }
+      }
+    }
+    // No apply trap - call the target directly if it's a function
+    if (proxyPtr->target && proxyPtr->target->isFunction()) {
+      LIGHTJS_RETURN(callFunction(*proxyPtr->target, args, thisValue));
+    }
+  }
+
   if (callee.isFunction()) {
     LIGHTJS_RETURN(callFunction(callee, args, thisValue));
   }
@@ -771,13 +1039,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
         // Call the get trap: handler.get(target, property, receiver)
         auto getTrap = std::get<std::shared_ptr<Function>>(getTrapIt->second.data);
+        std::vector<Value> trapArgs = {
+          *proxyPtr->target,
+          Value(propName),
+          obj  // receiver is the proxy itself
+        };
         if (getTrap->isNative) {
-          std::vector<Value> trapArgs = {
-            *proxyPtr->target,
-            Value(propName),
-            obj  // receiver is the proxy itself
-          };
           LIGHTJS_RETURN(getTrap->nativeFunc(trapArgs));
+        } else {
+          LIGHTJS_RETURN(invokeFunction(getTrap, trapArgs, Value(Undefined{})));
         }
       }
     }
@@ -917,7 +1187,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getInt8 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt8 requires offset"));
         return Value(static_cast<double>(viewPtr->getInt8(static_cast<size_t>(args[0].toNumber()))));
       };
       LIGHTJS_RETURN(Value(fn));
@@ -926,7 +1196,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getUint8 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint8 requires offset"));
         return Value(static_cast<double>(viewPtr->getUint8(static_cast<size_t>(args[0].toNumber()))));
       };
       LIGHTJS_RETURN(Value(fn));
@@ -935,7 +1205,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getInt16 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt16 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -945,7 +1215,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getUint16 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint16 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -955,7 +1225,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getInt32 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -965,7 +1235,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getUint32 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -975,7 +1245,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getFloat32 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getFloat32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getFloat32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -985,7 +1255,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getFloat64 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getFloat64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(viewPtr->getFloat64(static_cast<size_t>(args[0].toNumber()), littleEndian));
       };
@@ -995,7 +1265,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getBigInt64 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getBigInt64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(viewPtr->getBigInt64(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
@@ -1005,7 +1275,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) throw std::runtime_error("getBigUint64 requires offset");
+        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getBigUint64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(static_cast<int64_t>(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
       };
@@ -1017,7 +1287,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setInt8 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt8 requires offset and value"));
         viewPtr->setInt8(static_cast<size_t>(args[0].toNumber()), static_cast<int8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
@@ -1027,7 +1297,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setUint8 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint8 requires offset and value"));
         viewPtr->setUint8(static_cast<size_t>(args[0].toNumber()), static_cast<uint8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
@@ -1037,7 +1307,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setInt16 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt16 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setInt16(static_cast<size_t>(args[0].toNumber()), static_cast<int16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -1048,7 +1318,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setUint16 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint16 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setUint16(static_cast<size_t>(args[0].toNumber()), static_cast<uint16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -1059,7 +1329,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setInt32 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setInt32(static_cast<size_t>(args[0].toNumber()), static_cast<int32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -1070,7 +1340,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setUint32 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setUint32(static_cast<size_t>(args[0].toNumber()), static_cast<uint32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -1081,7 +1351,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setFloat32 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setFloat32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setFloat32(static_cast<size_t>(args[0].toNumber()), static_cast<float>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -1092,7 +1362,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setFloat64 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setFloat64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setFloat64(static_cast<size_t>(args[0].toNumber()), args[1].toNumber(), littleEndian);
         return Value(Undefined{});
@@ -1103,7 +1373,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setBigInt64 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigInt64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), args[1].toBigInt(), littleEndian);
         return Value(Undefined{});
@@ -1114,7 +1384,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) throw std::runtime_error("setBigUint64 requires offset and value");
+        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigUint64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), static_cast<uint64_t>(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
@@ -1123,8 +1393,259 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
   }
 
+  // ReadableStream property and method access
+  if (obj.isReadableStream()) {
+    auto streamPtr = std::get<std::shared_ptr<ReadableStream>>(obj.data);
+
+    if (propName == "locked") {
+      LIGHTJS_RETURN(Value(streamPtr->locked));
+    }
+
+    if (propName == "getReader") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        auto reader = streamPtr->getReader();
+        if (!reader) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
+        }
+        // Return reader wrapped in an Object for now
+        auto readerObj = std::make_shared<Object>();
+        readerObj->properties["__reader__"] = Value(true);
+
+        // Add read method
+        auto readFn = std::make_shared<Function>();
+        readFn->isNative = true;
+        readFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
+          return Value(reader->read());
+        };
+        readerObj->properties["read"] = Value(readFn);
+
+        // Add releaseLock method
+        auto releaseFn = std::make_shared<Function>();
+        releaseFn->isNative = true;
+        releaseFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
+          reader->releaseLock();
+          return Value(Undefined{});
+        };
+        readerObj->properties["releaseLock"] = Value(releaseFn);
+
+        // Add closed property (Promise)
+        readerObj->properties["closed"] = Value(reader->closedPromise);
+
+        return Value(readerObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "cancel") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        Value reason = args.empty() ? Value(Undefined{}) : args[0];
+        return Value(streamPtr->cancel(reason));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "pipeTo") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isWritableStream()) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "pipeTo requires a WritableStream"));
+        }
+        auto dest = std::get<std::shared_ptr<WritableStream>>(args[0].data);
+        return Value(streamPtr->pipeTo(dest));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "pipeThrough") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isTransformStream()) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "pipeThrough requires a TransformStream"));
+        }
+        auto transform = std::get<std::shared_ptr<TransformStream>>(args[0].data);
+        auto result = streamPtr->pipeThrough(transform);
+        return result ? Value(result) : Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "tee") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        auto [branch1, branch2] = streamPtr->tee();
+        auto result = std::make_shared<Array>();
+        result->elements.push_back(Value(branch1));
+        result->elements.push_back(Value(branch2));
+        return Value(result);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    // Symbol.asyncIterator - returns async iterator for for-await-of
+    const std::string& asyncIteratorKey = WellKnownSymbols::asyncIteratorKey();
+    if (propName == asyncIteratorKey) {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        // Return an async iterator object
+        auto iteratorObj = std::make_shared<Object>();
+
+        // Get reader for the stream
+        auto reader = streamPtr->getReader();
+        if (!reader) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
+        }
+
+        // next() method returns Promise<{value, done}>
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
+          return Value(reader->read());
+        };
+        iteratorObj->properties["next"] = Value(nextFn);
+
+        // return() method for early termination
+        auto returnFn = std::make_shared<Function>();
+        returnFn->isNative = true;
+        returnFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
+          reader->releaseLock();
+          auto promise = std::make_shared<Promise>();
+          auto resultObj = std::make_shared<Object>();
+          resultObj->properties["value"] = args.empty() ? Value(Undefined{}) : args[0];
+          resultObj->properties["done"] = true;
+          promise->resolve(Value(resultObj));
+          return Value(promise);
+        };
+        iteratorObj->properties["return"] = Value(returnFn);
+
+        return Value(iteratorObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+  }
+
+  // WritableStream property and method access
+  if (obj.isWritableStream()) {
+    auto streamPtr = std::get<std::shared_ptr<WritableStream>>(obj.data);
+
+    if (propName == "locked") {
+      LIGHTJS_RETURN(Value(streamPtr->locked));
+    }
+
+    if (propName == "getWriter") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        auto writer = streamPtr->getWriter();
+        if (!writer) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "WritableStream is already locked"));
+        }
+        // Return writer wrapped in an Object
+        auto writerObj = std::make_shared<Object>();
+        writerObj->properties["__writer__"] = Value(true);
+
+        // Add write method
+        auto writeFn = std::make_shared<Function>();
+        writeFn->isNative = true;
+        writeFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
+          Value chunk = args.empty() ? Value(Undefined{}) : args[0];
+          return Value(writer->write(chunk));
+        };
+        writerObj->properties["write"] = Value(writeFn);
+
+        // Add close method
+        auto closeFn = std::make_shared<Function>();
+        closeFn->isNative = true;
+        closeFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
+          return Value(writer->close());
+        };
+        writerObj->properties["close"] = Value(closeFn);
+
+        // Add abort method
+        auto abortFn = std::make_shared<Function>();
+        abortFn->isNative = true;
+        abortFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
+          Value reason = args.empty() ? Value(Undefined{}) : args[0];
+          return Value(writer->abort(reason));
+        };
+        writerObj->properties["abort"] = Value(abortFn);
+
+        // Add releaseLock method
+        auto releaseFn = std::make_shared<Function>();
+        releaseFn->isNative = true;
+        releaseFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
+          writer->releaseLock();
+          return Value(Undefined{});
+        };
+        writerObj->properties["releaseLock"] = Value(releaseFn);
+
+        // Add closed property (Promise)
+        writerObj->properties["closed"] = Value(writer->closedPromise);
+
+        // Add ready property (Promise)
+        writerObj->properties["ready"] = Value(writer->readyPromise);
+
+        // Add desiredSize property
+        writerObj->properties["desiredSize"] = Value(writer->desiredSize());
+
+        return Value(writerObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "abort") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        Value reason = args.empty() ? Value(Undefined{}) : args[0];
+        return Value(streamPtr->abort(reason));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    if (propName == "close") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
+        return Value(streamPtr->close());
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+  }
+
+  // TransformStream property access
+  if (obj.isTransformStream()) {
+    auto streamPtr = std::get<std::shared_ptr<TransformStream>>(obj.data);
+
+    if (propName == "readable") {
+      LIGHTJS_RETURN(Value(streamPtr->readable));
+    }
+
+    if (propName == "writable") {
+      LIGHTJS_RETURN(Value(streamPtr->writable));
+    }
+  }
+
   if (obj.isObject()) {
     auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+
+    // Check for getter first
+    std::string getterName = "__get_" + propName;
+    auto getterIt = objPtr->properties.find(getterName);
+    if (getterIt != objPtr->properties.end() && getterIt->second.isFunction()) {
+      auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+      // Call the getter with 'this' bound to the object
+      LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+    }
+
+    // Direct property lookup
     auto it = objPtr->properties.find(propName);
     if (it != objPtr->properties.end()) {
       LIGHTJS_RETURN(it->second);
@@ -1183,7 +1704,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
         genPtr->state = GeneratorState::Completed;
-        throw std::runtime_error(args.empty() ? "Generator error" : args[0].toString());
+        std::string msg = args.empty() ? "Generator error" : args[0].toString();
+        return Value(std::make_shared<Error>(ErrorType::Error, msg));
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -1207,7 +1729,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       mapFn->isNative = true;
       mapFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("map requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "map requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         auto result = std::make_shared<Array>();
@@ -1232,7 +1754,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       filterFn->isNative = true;
       filterFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("filter requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "filter requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         auto result = std::make_shared<Array>();
@@ -1258,7 +1780,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       forEachFn->isNative = true;
       forEachFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("forEach requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
 
@@ -1279,7 +1801,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       reduceFn->isNative = true;
       reduceFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("reduce requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "reduce requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
 
@@ -1305,7 +1827,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("reduceRight requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "reduceRight requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
 
@@ -1331,7 +1853,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("find requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "find requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1352,7 +1874,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("findIndex requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "findIndex requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1373,7 +1895,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("findLast requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "findLast requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1395,7 +1917,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("findLastIndex requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "findLastIndex requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1417,7 +1939,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("some requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "some requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1438,7 +1960,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("every requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "every requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -1836,7 +2358,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         int size = static_cast<int>(arrPtr->elements.size());
         if (index < 0) index = size + index;
         if (index < 0 || index >= size) {
-          throw std::runtime_error("Invalid index");
+          return Value(std::make_shared<Error>(ErrorType::RangeError, "Invalid index"));
         }
         auto result = std::make_shared<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
@@ -1908,7 +2430,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          throw std::runtime_error("flatMap requires a callback function");
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "flatMap requires a callback function"));
         }
         auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -2164,7 +2686,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         int radix = static_cast<int>(args[0].toNumber());
         if (radix < 2 || radix > 36) {
-          throw std::runtime_error("toString() radix must be between 2 and 36");
+          return Value(std::make_shared<Error>(ErrorType::RangeError, "toString() radix must be between 2 and 36"));
         }
         // For simplicity, only implement radix 10, 16, 8, 2
         if (radix == 10) {
@@ -2201,6 +2723,20 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "length") {
       // Return Unicode code point length, not byte length
       LIGHTJS_RETURN(Value(static_cast<double>(unicode::utf8Length(str))));
+    }
+
+    // Support numeric indexing for strings (e.g., str[0])
+    // Check if propName is a valid non-negative integer
+    bool isNumericIndex = !propName.empty() && std::all_of(propName.begin(), propName.end(), ::isdigit);
+    if (isNumericIndex) {
+      size_t index = std::stoul(propName);
+      size_t strLen = unicode::utf8Length(str);
+      if (index < strLen) {
+        // Get character at Unicode code point index
+        std::string charAtIndex = unicode::charAt(str, index);
+        LIGHTJS_RETURN(Value(charAtIndex));
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     if (propName == iteratorKey) {
@@ -2512,6 +3048,71 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(matchFn));
     }
 
+    // String.prototype.matchAll - ES2020
+    if (propName == "matchAll") {
+      auto matchAllFn = std::make_shared<Function>();
+      matchAllFn->isNative = true;
+      matchAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isRegex()) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "matchAll requires a regex argument"));
+        }
+        auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+
+        // Create an array of all matches
+        auto allMatches = std::make_shared<Array>();
+        GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+#if USE_SIMPLE_REGEX
+        std::string remaining = str;
+        size_t offset = 0;
+        std::vector<simple_regex::Regex::Match> matches;
+        while (regexPtr->regex->search(remaining, matches)) {
+          if (matches.empty()) break;
+          auto matchArr = std::make_shared<Array>();
+          GarbageCollector::instance().reportAllocation(sizeof(Array));
+          for (const auto& m : matches) {
+            matchArr->elements.push_back(Value(m.str));
+          }
+          // Add index property
+          auto matchObj = std::make_shared<Object>();
+          matchObj->properties["0"] = Value(matches[0].str);
+          matchObj->properties["index"] = Value(static_cast<double>(offset + matches[0].start));
+          matchObj->properties["input"] = Value(str);
+          allMatches->elements.push_back(Value(matchObj));
+
+          // Move past this match
+          size_t matchEnd = matches[0].start + matches[0].str.length();
+          if (matchEnd == 0) matchEnd = 1;  // Prevent infinite loop
+          offset += matchEnd;
+          remaining = remaining.substr(matchEnd);
+          matches.clear();
+        }
+#else
+        std::string::const_iterator searchStart = str.cbegin();
+        std::smatch match;
+        while (std::regex_search(searchStart, str.cend(), match, regexPtr->regex)) {
+          auto matchObj = std::make_shared<Object>();
+          GarbageCollector::instance().reportAllocation(sizeof(Object));
+          matchObj->properties["0"] = Value(match[0].str());
+          matchObj->properties["index"] = Value(static_cast<double>(match.position() + (searchStart - str.cbegin())));
+          matchObj->properties["input"] = Value(str);
+
+          // Add captured groups
+          for (size_t i = 1; i < match.size(); ++i) {
+            matchObj->properties[std::to_string(i)] = Value(match[i].str());
+          }
+
+          allMatches->elements.push_back(Value(matchObj));
+          searchStart = match.suffix().first;
+          if (match[0].length() == 0) ++searchStart;  // Prevent infinite loop
+        }
+#endif
+        // Return iterator over matches
+        return createIteratorFactory(allMatches);
+      };
+      LIGHTJS_RETURN(Value(matchAllFn));
+    }
+
     if (propName == "replace") {
       auto replaceFn = std::make_shared<Function>();
       replaceFn->isNative = true;
@@ -2578,7 +3179,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(std::string(""));
         int count = static_cast<int>(args[0].toNumber());
-        if (count < 0) throw std::runtime_error("RangeError: Invalid count value");
+        if (count < 0) return Value(std::make_shared<Error>(ErrorType::RangeError, "Invalid count value"));
         if (count == 0) return Value(std::string(""));
         std::string result;
         result.reserve(str.length() * count);
@@ -3240,6 +3841,39 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     auto argTask = evaluate(*arg);
     LIGHTJS_RUN_TASK_VOID(argTask);
     args.push_back(argTask.result());
+  }
+
+  // Handle Proxy construct trap
+  if (callee.isProxy()) {
+    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(callee.data);
+    if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto trapIt = handlerObj->properties.find("construct");
+      if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+        auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+        // Create args array
+        auto argsArray = std::make_shared<Array>();
+        argsArray->elements = args;
+        // Call construct trap: handler.construct(target, argumentsList, newTarget)
+        std::vector<Value> trapArgs = {*proxyPtr->target, Value(argsArray), callee};
+        Value result;
+        if (trap->isNative) {
+          result = trap->nativeFunc(trapArgs);
+        } else {
+          result = invokeFunction(trap, trapArgs, Value(Undefined{}));
+        }
+        // construct trap must return an object
+        if (result.isObject() || result.isArray() || result.isFunction()) {
+          LIGHTJS_RETURN(result);
+        }
+        throwError(ErrorType::TypeError, "'construct' on proxy: trap returned non-object");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+    }
+    // No construct trap - pass through to target
+    if (proxyPtr->target) {
+      callee = *proxyPtr->target;
+    }
   }
 
   // Handle Class constructor

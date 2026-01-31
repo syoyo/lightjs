@@ -32,6 +32,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"new", TokenType::New},
   {"this", TokenType::This},
   {"typeof", TokenType::Typeof},
+  {"delete", TokenType::Delete},
   {"import", TokenType::Import},
   {"export", TokenType::Export},
   {"from", TokenType::From},

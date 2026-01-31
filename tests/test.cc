@@ -1258,6 +1258,419 @@ int main() {
     str.length
   )", "3");
 
+  // Delete operator tests
+  runTest("Delete operator - object property", R"(
+    let obj = {x: 1, y: 2};
+    delete obj.x;
+    obj.x
+  )", "undefined");
+
+  runTest("Delete operator - returns true", R"(
+    let obj = {a: 1};
+    delete obj.a ? "yes" : "no"
+  )", "yes");
+
+  // In operator tests
+  runTest("In operator - existing property", R"(
+    let obj = {x: 10, y: 20};
+    "x" in obj ? "yes" : "no"
+  )", "yes");
+
+  runTest("In operator - missing property", R"(
+    let obj = {x: 10};
+    "z" in obj ? "yes" : "no"
+  )", "no");
+
+  runTest("In operator - array index", R"(
+    let arr = [10, 20, 30];
+    1 in arr ? "yes" : "no"
+  )", "yes");
+
+  // Reflect API tests
+  runTest("Reflect.has", R"(
+    let obj = {name: "test"};
+    Reflect.has(obj, "name") ? "yes" : "no"
+  )", "yes");
+
+  runTest("Reflect.get", R"(
+    let obj = {value: 42};
+    Reflect.get(obj, "value")
+  )", "42");
+
+  runTest("Reflect.set", R"(
+    let obj = {};
+    Reflect.set(obj, "x", 100);
+    obj.x
+  )", "100");
+
+  runTest("Reflect.deleteProperty", R"(
+    let obj = {a: 1, b: 2};
+    Reflect.deleteProperty(obj, "a");
+    obj.a
+  )", "undefined");
+
+  runTest("Reflect.ownKeys", R"(
+    let obj = {x: 1, y: 2};
+    let keys = Reflect.ownKeys(obj);
+    keys.length
+  )", "2");
+
+  // Proxy tests
+  runTest("Proxy - basic passthrough", R"(
+    let target = {x: 100};
+    let proxy = new Proxy(target, {});
+    proxy.x
+  )", "100");
+
+  runTest("Proxy - set through proxy", R"(
+    let target = {};
+    let proxy = new Proxy(target, {});
+    proxy.y = 50;
+    target.y
+  )", "50");
+
+  runTest("Proxy get trap", R"(
+    let target = {message: "hello"};
+    let handler = {
+      get: function(obj, prop) {
+        return "intercepted:" + prop;
+      }
+    };
+    let proxy = new Proxy(target, handler);
+    proxy.message
+  )", "intercepted:message");
+
+  runTest("Proxy set trap", R"(
+    let target = {};
+    let handler = {
+      set: function(obj, prop, value) {
+        obj[prop] = value * 2;
+        return true;
+      }
+    };
+    let proxy = new Proxy(target, handler);
+    proxy.x = 5;
+    target.x
+  )", "10");
+
+  runTest("Proxy has trap", R"(
+    let target = {a: 1};
+    let handler = {
+      has: function(obj, prop) {
+        return prop === "secret" ? false : prop in obj;
+      }
+    };
+    let proxy = new Proxy(target, handler);
+    ("a" in proxy) + "," + ("secret" in proxy)
+  )", "true,false");
+
+  // Symbol tests
+  runTest("Symbol.asyncIterator exists", R"(
+    typeof Symbol.asyncIterator
+  )", "symbol");
+
+  runTest("Symbol.toStringTag exists", R"(
+    typeof Symbol.toStringTag
+  )", "symbol");
+
+  // ReadableStream tests
+  runTest("ReadableStream - creation", R"(
+    let stream = new ReadableStream();
+    stream.locked ? "locked" : "unlocked"
+  )", "unlocked");
+
+  runTest("WritableStream - creation", R"(
+    let stream = new WritableStream();
+    stream.locked ? "locked" : "unlocked"
+  )", "unlocked");
+
+  runTest("TransformStream - creation", R"(
+    let ts = new TransformStream();
+    ts.readable && ts.writable ? "has both" : "missing"
+  )", "has both");
+
+  // Getter/Setter syntax tests
+  runTest("Object getter syntax", R"(
+    let obj = {
+      _value: 42,
+      get value() { return this._value; }
+    };
+    obj.value
+  )", "42");
+
+  runTest("Object setter syntax", R"(
+    let obj = {
+      _value: 0,
+      get value() { return this._value; },
+      set value(v) { this._value = v * 2; }
+    };
+    obj.value = 21;
+    obj.value
+  )", "42");
+
+  runTest("Object getter with computation", R"(
+    let obj = {
+      firstName: "John",
+      lastName: "Doe",
+      get fullName() { return this.firstName + " " + this.lastName; }
+    };
+    obj.fullName
+  )", "John Doe");
+
+  runTest("Object property named get", R"(
+    let obj = { get: 42 };
+    obj.get
+  )", "42");
+
+  runTest("Object property named set", R"(
+    let obj = { set: 100 };
+    obj.set
+  )", "100");
+
+  // Console methods tests
+  runTest("console.error exists", R"(
+    typeof console.error
+  )", "function");
+
+  runTest("console.warn exists", R"(
+    typeof console.warn
+  )", "function");
+
+  runTest("console.info exists", R"(
+    typeof console.info
+  )", "function");
+
+  runTest("console.debug exists", R"(
+    typeof console.debug
+  )", "function");
+
+  runTest("console.time exists", R"(
+    typeof console.time
+  )", "function");
+
+  runTest("console.timeEnd exists", R"(
+    typeof console.timeEnd
+  )", "function");
+
+  runTest("console.assert exists", R"(
+    typeof console.assert
+  )", "function");
+
+  // performance.now tests
+  runTest("performance.now exists", R"(
+    typeof performance.now
+  )", "function");
+
+  runTest("performance.now returns number", R"(
+    typeof performance.now()
+  )", "number");
+
+  runTest("performance.now increases", R"(
+    let t1 = performance.now();
+    let sum = 0;
+    for (let i = 0; i < 1000; i++) sum += i;
+    let t2 = performance.now();
+    t2 >= t1 ? "ok" : "fail"
+  )", "ok");
+
+  // structuredClone tests
+  runTest("structuredClone - primitive", R"(
+    let x = structuredClone(42);
+    x
+  )", "42");
+
+  runTest("structuredClone - array", R"(
+    let arr = [1, 2, 3];
+    let clone = structuredClone(arr);
+    clone.push(4);
+    arr.length + "," + clone.length
+  )", "3,4");
+
+  runTest("structuredClone - object", R"(
+    let obj = { a: 1, b: 2 };
+    let clone = structuredClone(obj);
+    clone.c = 3;
+    Object.keys(obj).length + "," + Object.keys(clone).length
+  )", "2,3");
+
+  runTest("structuredClone - nested", R"(
+    let obj = { arr: [1, 2], nested: { x: 10 } };
+    let clone = structuredClone(obj);
+    clone.nested.x = 20;
+    obj.nested.x + "," + clone.nested.x
+  )", "10,20");
+
+  // Base64 encoding/decoding tests
+  runTest("btoa - simple string", R"(
+    btoa("Hello")
+  )", "SGVsbG8=");
+
+  runTest("btoa - hello world", R"(
+    btoa("Hello, World!")
+  )", "SGVsbG8sIFdvcmxkIQ==");
+
+  runTest("atob - simple decode", R"(
+    atob("SGVsbG8=")
+  )", "Hello");
+
+  runTest("atob - hello world", R"(
+    atob("SGVsbG8sIFdvcmxkIQ==")
+  )", "Hello, World!");
+
+  runTest("btoa/atob roundtrip", R"(
+    let original = "Test123!@#";
+    let encoded = btoa(original);
+    let decoded = atob(encoded);
+    decoded === original ? "ok" : "fail"
+  )", "ok");
+
+  // URI encoding/decoding tests
+  runTest("encodeURIComponent - space", R"(
+    encodeURIComponent("hello world")
+  )", "hello%20world");
+
+  runTest("encodeURIComponent - special chars", R"(
+    encodeURIComponent("a=b&c=d")
+  )", "a%3Db%26c%3Dd");
+
+  runTest("decodeURIComponent - space", R"(
+    decodeURIComponent("hello%20world")
+  )", "hello world");
+
+  runTest("encodeURIComponent/decodeURIComponent roundtrip", R"(
+    let original = "key=value&other=test!@#";
+    let encoded = encodeURIComponent(original);
+    let decoded = decodeURIComponent(encoded);
+    decoded === original ? "ok" : "fail"
+  )", "ok");
+
+  runTest("encodeURI - preserves URL chars", R"(
+    encodeURI("https://example.com/path?q=hello world")
+  )", "https://example.com/path?q=hello%20world");
+
+  runTest("decodeURI - decodes URL", R"(
+    decodeURI("https://example.com/path?q=hello%20world")
+  )", "https://example.com/path?q=hello world");
+
+  // Global Infinity and NaN tests
+  runTest("Global Infinity", R"(
+    Infinity > 1e308 ? "ok" : "fail"
+  )", "ok");
+
+  runTest("Global NaN is NaN", R"(
+    Number.isNaN(NaN) ? "ok" : "fail"
+  )", "ok");
+
+  runTest("Infinity arithmetic", R"(
+    (1 / Infinity === 0) ? "ok" : "fail"
+  )", "ok");
+
+  // crypto.randomUUID tests
+  runTest("crypto.randomUUID format", R"(
+    let uuid = crypto.randomUUID();
+    uuid.length === 36 && uuid.charAt(8) === '-' && uuid.charAt(13) === '-' ? "ok" : "fail"
+  )", "ok");
+
+  runTest("crypto.randomUUID uniqueness", R"(
+    let uuid1 = crypto.randomUUID();
+    let uuid2 = crypto.randomUUID();
+    uuid1 !== uuid2 ? "ok" : "fail"
+  )", "ok");
+
+  runTest("crypto.getRandomValues exists", R"(
+    typeof crypto.getRandomValues
+  )", "function");
+
+  // AbortController tests
+  runTest("AbortController - creation", R"(
+    let controller = new AbortController();
+    controller.signal.aborted ? "aborted" : "not aborted"
+  )", "not aborted");
+
+  runTest("AbortController - abort", R"(
+    let controller = new AbortController();
+    controller.abort();
+    controller.signal.aborted ? "aborted" : "not aborted"
+  )", "aborted");
+
+  runTest("AbortController - abort reason", R"(
+    let controller = new AbortController();
+    controller.abort("custom reason");
+    controller.signal.reason
+  )", "custom reason");
+
+  runTest("AbortSignal.abort static method", R"(
+    let signal = AbortSignal.abort();
+    signal.aborted ? "aborted" : "not aborted"
+  )", "aborted");
+
+  // String bracket indexing tests
+  runTest("String bracket indexing - first char", R"(
+    let s = "hello";
+    s[0]
+  )", "h");
+
+  runTest("String bracket indexing - middle char", R"(
+    let s = "hello";
+    s[2]
+  )", "l");
+
+  runTest("String bracket indexing - out of bounds", R"(
+    let s = "hello";
+    s[10] === undefined ? "undefined" : "defined"
+  )", "undefined");
+
+  runTest("String bracket indexing - unicode", R"(
+    let s = "日本語";
+    s[1]
+  )", "本");
+
+  // Object.getOwnPropertyDescriptor tests
+  runTest("Object.getOwnPropertyDescriptor - basic", R"(
+    let obj = { x: 42 };
+    let desc = Object.getOwnPropertyDescriptor(obj, "x");
+    desc.value
+  )", "42");
+
+  runTest("Object.getOwnPropertyDescriptor - writable", R"(
+    let obj = { x: 42 };
+    let desc = Object.getOwnPropertyDescriptor(obj, "x");
+    desc.writable ? "writable" : "not writable"
+  )", "writable");
+
+  runTest("Object.defineProperty - basic", R"(
+    let obj = {};
+    Object.defineProperty(obj, "x", { value: 100 });
+    obj.x
+  )", "100");
+
+  runTest("Object.defineProperties - multiple", R"(
+    let obj = {};
+    Object.defineProperties(obj, {
+      a: { value: 1 },
+      b: { value: 2 }
+    });
+    obj.a + obj.b
+  )", "3");
+
+  // String.prototype.matchAll - ES2020
+  runTest("String.matchAll exists", R"(
+    typeof "test".matchAll
+  )", "function");
+
+  // import.meta - ES2020
+  runTest("import.meta exists", R"(
+    typeof import.meta
+  )", "object");
+
+  runTest("import.meta.url exists", R"(
+    typeof import.meta.url
+  )", "string");
+
+  runTest("import.meta.resolve exists", R"(
+    typeof import.meta.resolve
+  )", "function");
+
   std::cout << "=== All tests completed ===" << std::endl;
 
   return 0;

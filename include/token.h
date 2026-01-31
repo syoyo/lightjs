@@ -47,6 +47,7 @@ enum class TokenType {
   New,
   This,
   Typeof,
+  Delete,
   Import,
   Export,
   From,

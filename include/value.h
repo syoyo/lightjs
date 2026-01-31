@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include "gc.h"
+#include "object_shape.h"
 
 #if USE_SIMPLE_REGEX
 #include "simple_regex.h"
@@ -38,6 +39,9 @@ struct ArrayBuffer;
 struct DataView;
 struct WasmInstanceJS;
 struct WasmMemoryJS;
+struct ReadableStream;
+struct WritableStream;
+struct TransformStream;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -122,9 +126,18 @@ struct Array : public GCObject {
 };
 
 struct Object : public GCObject {
-  std::unordered_map<std::string, Value> properties;
+  std::unordered_map<std::string, Value> properties;  // Fallback for dynamic properties
+  std::vector<Value> slots;  // Fast slot-based storage for known properties
+  std::shared_ptr<ObjectShape> shape;  // Shape for inline caching optimization
   bool frozen = false;  // Object.freeze() prevents adding/removing/modifying properties
   bool sealed = false;  // Object.seal() prevents adding/removing properties (can still modify)
+  bool useSlots = false;  // Whether to use slot-based storage
+
+  Object() : shape(nullptr) {}  // Shape created lazily when needed
+
+  // Fast property access using slots (defined after Value is complete)
+  bool getSlot(int offset, Value& out) const;
+  void setSlot(int offset, const Value& value);
 
   // GCObject interface
   const char* typeName() const override { return "Object"; }
@@ -560,7 +573,10 @@ struct Value {
     std::shared_ptr<DataView>,
     std::shared_ptr<Class>,
     std::shared_ptr<WasmInstanceJS>,
-    std::shared_ptr<WasmMemoryJS>
+    std::shared_ptr<WasmMemoryJS>,
+    std::shared_ptr<ReadableStream>,
+    std::shared_ptr<WritableStream>,
+    std::shared_ptr<TransformStream>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -590,6 +606,9 @@ struct Value {
   Value(std::shared_ptr<Class> c) : data(c) {}
   Value(std::shared_ptr<WasmInstanceJS> wi) : data(wi) {}
   Value(std::shared_ptr<WasmMemoryJS> wm) : data(wm) {}
+  Value(std::shared_ptr<ReadableStream> rs) : data(rs) {}
+  Value(std::shared_ptr<WritableStream> ws) : data(ws) {}
+  Value(std::shared_ptr<TransformStream> ts) : data(ts) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -616,6 +635,9 @@ struct Value {
   bool isClass() const { return std::holds_alternative<std::shared_ptr<Class>>(data); }
   bool isWasmInstance() const { return std::holds_alternative<std::shared_ptr<WasmInstanceJS>>(data); }
   bool isWasmMemory() const { return std::holds_alternative<std::shared_ptr<WasmMemoryJS>>(data); }
+  bool isReadableStream() const { return std::holds_alternative<std::shared_ptr<ReadableStream>>(data); }
+  bool isWritableStream() const { return std::holds_alternative<std::shared_ptr<WritableStream>>(data); }
+  bool isTransformStream() const { return std::holds_alternative<std::shared_ptr<TransformStream>>(data); }
 
   bool toBool() const;
   double toNumber() const;
@@ -657,6 +679,82 @@ struct Promise : public GCObject {
   // GCObject interface
   const char* typeName() const override { return "Promise"; }
   void getReferences(std::vector<GCObject*>& refs) const override;
+};
+
+// Pre-allocated common values to avoid repeated allocation
+class CommonValues {
+public:
+  static const Value& undefined() {
+    static Value v(Undefined{});
+    return v;
+  }
+
+  static const Value& null() {
+    static Value v(Null{});
+    return v;
+  }
+
+  static const Value& trueValue() {
+    static Value v(true);
+    return v;
+  }
+
+  static const Value& falseValue() {
+    static Value v(false);
+    return v;
+  }
+
+  static const Value& zero() {
+    static Value v(0.0);
+    return v;
+  }
+
+  static const Value& one() {
+    static Value v(1.0);
+    return v;
+  }
+
+  static const Value& negOne() {
+    static Value v(-1.0);
+    return v;
+  }
+
+  static const Value& emptyString() {
+    static Value v(std::string(""));
+    return v;
+  }
+};
+
+// Small integer cache for frequently used values (0-255)
+class SmallIntCache {
+public:
+  static constexpr int MIN_CACHED = 0;
+  static constexpr int MAX_CACHED = 255;
+
+  static const Value& get(int n) {
+    static SmallIntCache instance;
+    if (n >= MIN_CACHED && n <= MAX_CACHED) {
+      return instance.cache_[n - MIN_CACHED];
+    }
+    // Return a reference to a static value for out-of-range
+    static Value outOfRange;
+    outOfRange = Value(static_cast<double>(n));
+    return outOfRange;
+  }
+
+  static bool inRange(double d) {
+    int i = static_cast<int>(d);
+    return d == static_cast<double>(i) && i >= MIN_CACHED && i <= MAX_CACHED;
+  }
+
+private:
+  SmallIntCache() {
+    for (int i = MIN_CACHED; i <= MAX_CACHED; ++i) {
+      cache_[i - MIN_CACHED] = Value(static_cast<double>(i));
+    }
+  }
+
+  Value cache_[MAX_CACHED - MIN_CACHED + 1];
 };
 
 }

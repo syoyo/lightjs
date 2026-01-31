@@ -1,5 +1,6 @@
 #include "value.h"
 #include "gc.h"
+#include "streams.h"
 
 namespace lightjs {
 
@@ -31,6 +32,12 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
         if (*weakmap) refs.push_back(weakmap->get());
     } else if (auto* weakset = std::get_if<std::shared_ptr<WeakSet>>(&value.data)) {
         if (*weakset) refs.push_back(weakset->get());
+    } else if (auto* readable = std::get_if<std::shared_ptr<ReadableStream>>(&value.data)) {
+        if (*readable) refs.push_back(readable->get());
+    } else if (auto* writable = std::get_if<std::shared_ptr<WritableStream>>(&value.data)) {
+        if (*writable) refs.push_back(writable->get());
+    } else if (auto* transform = std::get_if<std::shared_ptr<TransformStream>>(&value.data)) {
+        if (*transform) refs.push_back(transform->get());
     }
 }
 
@@ -48,8 +55,30 @@ void Array::getReferences(std::vector<GCObject*>& refs) const {
     }
 }
 
+bool Object::getSlot(int offset, Value& out) const {
+    if (useSlots && offset >= 0 && static_cast<size_t>(offset) < slots.size()) {
+        out = slots[offset];
+        return true;
+    }
+    return false;
+}
+
+void Object::setSlot(int offset, const Value& value) {
+    if (offset >= 0) {
+        if (static_cast<size_t>(offset) >= slots.size()) {
+            slots.resize(offset + 1);
+        }
+        slots[offset] = value;
+        const_cast<Object*>(this)->useSlots = true;
+    }
+}
+
 void Object::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& [key, value] : properties) {
+        addValueReferences(value, refs);
+    }
+    // Also add references from slots
+    for (const auto& value : slots) {
         addValueReferences(value, refs);
     }
 }

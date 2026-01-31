@@ -1049,7 +1049,8 @@ ExprPtr Parser::parseRelational() {
   auto left = parseAdditive();
 
   while (match(TokenType::Less) || match(TokenType::Greater) ||
-         match(TokenType::LessEqual) || match(TokenType::GreaterEqual)) {
+         match(TokenType::LessEqual) || match(TokenType::GreaterEqual) ||
+         match(TokenType::In)) {
 
     BinaryExpr::Op op;
     switch (current().type) {
@@ -1057,6 +1058,7 @@ ExprPtr Parser::parseRelational() {
       case TokenType::Greater: op = BinaryExpr::Op::Greater; break;
       case TokenType::LessEqual: op = BinaryExpr::Op::LessEqual; break;
       case TokenType::GreaterEqual: op = BinaryExpr::Op::GreaterEqual; break;
+      case TokenType::In: op = BinaryExpr::Op::In; break;
       default: op = BinaryExpr::Op::Less; break;
     }
     advance();
@@ -1141,7 +1143,8 @@ ExprPtr Parser::parseUnary() {
   }
 
   if (match(TokenType::Bang) || match(TokenType::Minus) ||
-      match(TokenType::Plus) || match(TokenType::Typeof)) {
+      match(TokenType::Plus) || match(TokenType::Typeof) ||
+      match(TokenType::Delete)) {
 
     UnaryExpr::Op op;
     switch (current().type) {
@@ -1149,6 +1152,7 @@ ExprPtr Parser::parseUnary() {
       case TokenType::Minus: op = UnaryExpr::Op::Minus; break;
       case TokenType::Plus: op = UnaryExpr::Op::Plus; break;
       case TokenType::Typeof: op = UnaryExpr::Op::Typeof; break;
+      case TokenType::Delete: op = UnaryExpr::Op::Delete; break;
       default: op = UnaryExpr::Op::Not; break;
     }
     advance();
@@ -1374,8 +1378,9 @@ ExprPtr Parser::parsePrimary() {
     return makeExpr(Identifier{name}, tok);
   }
 
-  // Dynamic import: import(specifier)
+  // Dynamic import: import(specifier) or import.meta
   if (match(TokenType::Import)) {
+    Token importTok = current();
     advance();
     if (match(TokenType::LeftParen)) {
       // This is a dynamic import expression
@@ -1397,7 +1402,15 @@ ExprPtr Parser::parsePrimary() {
       expect(TokenType::RightParen);
       return std::make_unique<Expression>(CallExpr{std::move(importId), std::move(args)});
     }
-    // If not followed by '(', it's a static import statement (error here)
+    // import.meta - ES2020
+    if (match(TokenType::Dot)) {
+      advance(); // consume '.'
+      if (match(TokenType::Identifier) && current().value == "meta") {
+        advance(); // consume 'meta'
+        return makeExpr(MetaProperty{"meta", ""}, importTok);
+      }
+    }
+    // If not followed by '(' or '.meta', it's a static import statement (error here)
     return nullptr;
   }
 
@@ -1528,6 +1541,79 @@ ExprPtr Parser::parseObjectExpression() {
           prop.isSpread = false;
           properties.push_back(std::move(prop));
           continue;
+        }
+      } else if (match(TokenType::Get) || match(TokenType::Set)) {
+        // Handle 'get' and 'set' as property keys (contextual keywords)
+        // If followed by ':', it's a regular property: {get: 42}
+        // If followed by identifier and '(', it's a getter/setter: {get foo() {}}
+        bool isGetter = current().type == TokenType::Get;
+        std::string keyName = current().value;
+        advance();
+
+        if (match(TokenType::Colon)) {
+          // Regular property with 'get' or 'set' as key name
+          key = std::make_unique<Expression>(Identifier{keyName});
+        } else if (match(TokenType::Identifier)) {
+          // Getter/setter syntax: get propName() or set propName(value)
+          std::string propName = current().value;
+          key = std::make_unique<Expression>(Identifier{propName});
+          advance();
+
+          // Expect '(' for the parameter list
+          expect(TokenType::LeftParen);
+          std::vector<Parameter> params;
+
+          // Setters have one parameter, getters have none
+          if (!isGetter && match(TokenType::Identifier)) {
+            Parameter param;
+            param.name = Identifier{current().value};
+            advance();
+            params.push_back(std::move(param));
+          }
+          expect(TokenType::RightParen);
+
+          // Parse function body
+          expect(TokenType::LeftBrace);
+          std::vector<StmtPtr> body;
+          while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+            if (auto stmt = parseStatement()) {
+              body.push_back(std::move(stmt));
+            } else {
+              break;
+            }
+          }
+          expect(TokenType::RightBrace);
+
+          // Create FunctionExpr for the getter/setter
+          FunctionExpr funcExpr;
+          funcExpr.params = std::move(params);
+          funcExpr.body = std::move(body);
+          funcExpr.isAsync = false;
+          funcExpr.isGenerator = false;
+          funcExpr.isArrow = false;
+
+          // Mark the property with a special naming convention for getters/setters
+          // The interpreter will need to handle this specially
+          ObjectProperty prop;
+          prop.key = std::move(key);
+          prop.value = std::make_unique<Expression>(std::move(funcExpr));
+          prop.isSpread = false;
+          prop.isComputed = false;
+
+          // Store getter/setter info in a wrapper object for interpreter
+          // We'll use a special internal property name convention
+          auto actualKey = std::make_unique<Expression>(Identifier{(isGetter ? "__get_" : "__set_") + propName});
+          prop.key = std::move(actualKey);
+
+          properties.push_back(std::move(prop));
+          continue;
+        } else if (match(TokenType::LeftParen)) {
+          // Method shorthand with 'get' or 'set' as method name: {get() {...}}
+          key = std::make_unique<Expression>(Identifier{keyName});
+          // Don't advance - let the method parsing handle it below
+        } else {
+          // Just a property named 'get' or 'set' without colon (error or shorthand)
+          key = std::make_unique<Expression>(Identifier{keyName});
         }
       } else if (match(TokenType::String)) {
         key = std::make_unique<Expression>(StringLiteral{current().value});

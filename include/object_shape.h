@@ -90,74 +90,88 @@ private:
   static std::unordered_map<std::vector<std::string>, std::shared_ptr<ObjectShape>, VectorHash> shapeCache_;
 };
 
-/**
- * Shape-based object with optimized property storage
- */
-struct ShapedObject {
-  std::shared_ptr<ObjectShape> shape;
-  std::vector<class Value> slots;  // Dense array indexed by property offset
-
-  // For properties added after shape creation (rare)
-  std::unordered_map<std::string, class Value> dynamicProperties;
-
-  ShapedObject() : shape(ObjectShape::createRootShape()) {}
-  explicit ShapedObject(std::shared_ptr<ObjectShape> s) : shape(s) {
-    if (shape) {
-      slots.resize(shape->getPropertyCount());
-    }
-  }
-
-  // Get property by name
-  const Value* getProperty(const std::string& name) const;
-  Value* getProperty(const std::string& name);
-
-  // Set property by name (may transition shape)
-  void setProperty(const std::string& name, const Value& value);
-
-  // Check if property exists
-  bool hasProperty(const std::string& name) const;
-
-  // Delete property (converts to dynamic)
-  bool deleteProperty(const std::string& name);
-
-  // Get all property names
-  std::vector<std::string> getPropertyNames() const;
-};
+// Note: ShapedObject is defined in value.h after Value is complete
+// This avoids circular dependency issues
 
 /**
- * Inline cache for property access
+ * Polymorphic inline cache for property access
  *
- * Caches the shape and offset for fast property lookup
+ * Caches multiple shape/offset pairs for fast property lookup
+ * at polymorphic call sites (where multiple object types are used)
  */
 struct PropertyCache {
-  ObjectShape::ShapeId shapeId;
-  int offset;
-  size_t hitCount;
-  size_t missCount;
+  static constexpr size_t MAX_ENTRIES = 4;  // Maximum cache entries (polymorphic)
 
-  PropertyCache() : shapeId(0), offset(-1), hitCount(0), missCount(0) {}
+  struct CacheEntry {
+    ObjectShape::ShapeId shapeId = 0;
+    int offset = -1;
+  };
 
-  // Try to use cache
+  CacheEntry entries[MAX_ENTRIES];
+  size_t entryCount = 0;
+  size_t hitCount = 0;
+  size_t missCount = 0;
+
+  PropertyCache() = default;
+
+  // Try to use cache - check all entries
   bool tryGet(ObjectShape::ShapeId currentShapeId, int& outOffset) {
-    if (currentShapeId == shapeId && offset >= 0) {
-      hitCount++;
-      outOffset = offset;
-      return true;
+    // Check all cached entries
+    for (size_t i = 0; i < entryCount; ++i) {
+      if (entries[i].shapeId == currentShapeId && entries[i].offset >= 0) {
+        hitCount++;
+        outOffset = entries[i].offset;
+        // Move to front for better locality (most recently used first)
+        if (i > 0) {
+          CacheEntry temp = entries[i];
+          for (size_t j = i; j > 0; --j) {
+            entries[j] = entries[j - 1];
+          }
+          entries[0] = temp;
+        }
+        return true;
+      }
     }
     missCount++;
     return false;
   }
 
-  // Update cache
+  // Update cache - add new entry or update existing
   void update(ObjectShape::ShapeId newShapeId, int newOffset) {
-    shapeId = newShapeId;
-    offset = newOffset;
+    // Check if already in cache
+    for (size_t i = 0; i < entryCount; ++i) {
+      if (entries[i].shapeId == newShapeId) {
+        entries[i].offset = newOffset;
+        return;
+      }
+    }
+
+    // Add new entry
+    if (entryCount < MAX_ENTRIES) {
+      // Shift entries down to make room at front
+      for (size_t i = entryCount; i > 0; --i) {
+        entries[i] = entries[i - 1];
+      }
+      entries[0] = {newShapeId, newOffset};
+      entryCount++;
+    } else {
+      // Cache full - replace oldest entry (last one)
+      for (size_t i = MAX_ENTRIES - 1; i > 0; --i) {
+        entries[i] = entries[i - 1];
+      }
+      entries[0] = {newShapeId, newOffset};
+    }
   }
 
   // Get hit rate
   double getHitRate() const {
     size_t total = hitCount + missCount;
     return total > 0 ? static_cast<double>(hitCount) / total : 0.0;
+  }
+
+  // Check if cache is megamorphic (too many different shapes)
+  bool isMegamorphic() const {
+    return entryCount >= MAX_ENTRIES && missCount > hitCount * 2;
   }
 };
 
