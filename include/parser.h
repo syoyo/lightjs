@@ -9,13 +9,20 @@ namespace lightjs {
 
 class Parser {
 public:
-  explicit Parser(std::vector<Token> tokens);
+  explicit Parser(std::vector<Token> tokens, bool isModule = false);
 
   std::optional<Program> parse();
 
 private:
   std::vector<Token> tokens_;
   size_t pos_ = 0;
+  bool isModule_ = false;
+  bool strictMode_ = false;
+  int superCallDisallowDepth_ = 0;
+  int functionDepth_ = 0;
+  int asyncFunctionDepth_ = 0;
+  int generatorFunctionDepth_ = 0;
+  size_t arrowDestructureTempCounter_ = 0;
 
   const Token& current() const;
   const Token& peek(size_t offset = 1) const;
@@ -23,6 +30,10 @@ private:
   bool match(TokenType type) const;
   bool expect(TokenType type);
   void consumeSemicolon();
+  bool canUseAwaitAsIdentifier() const;
+  bool canParseAwaitExpression() const;
+  bool canUseYieldAsIdentifier() const;
+  bool isIdentifierLikeToken(TokenType type) const;
 
   StmtPtr parseStatement();
   StmtPtr parseVarDeclaration();
@@ -46,6 +57,9 @@ private:
   ExprPtr parseNullishCoalescing();
   ExprPtr parseLogicalOr();
   ExprPtr parseLogicalAnd();
+  ExprPtr parseBitwiseOr();
+  ExprPtr parseBitwiseXor();
+  ExprPtr parseBitwiseAnd();
   ExprPtr parseEquality();
   ExprPtr parseRelational();
   ExprPtr parseAdditive();
@@ -55,7 +69,7 @@ private:
   ExprPtr parsePostfix();
   ExprPtr parseCall();
   ExprPtr parseMember();
-  ExprPtr parseMemberSuffix(ExprPtr expr);
+  ExprPtr parseMemberSuffix(ExprPtr expr, bool inOptionalChain = false);
   ExprPtr parsePrimary();
   ExprPtr parseArrayExpression();
   ExprPtr parseObjectExpression();

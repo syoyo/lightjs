@@ -42,6 +42,7 @@ struct WasmMemoryJS;
 struct ReadableStream;
 struct WritableStream;
 struct TransformStream;
+class Module;
 
 using ValuePtr = std::shared_ptr<Value>;
 
@@ -63,6 +64,11 @@ struct Symbol {
   bool operator!=(const Symbol& other) const { return id != other.id; }
 };
 
+struct ModuleBinding {
+  std::weak_ptr<Module> module;
+  std::string exportName;
+};
+
 using NativeFunction = std::function<Value(const std::vector<Value>&)>;
 
 struct FunctionParam {
@@ -78,11 +84,12 @@ struct Function : public GCObject {
   bool isNative;
   bool isAsync;
   bool isGenerator;
+  bool isStrict;
   bool isConstructor = false;  // Can be called with 'new'
   NativeFunction nativeFunc;
   std::unordered_map<std::string, Value> properties;
 
-  Function() : isNative(false), isAsync(false), isGenerator(false), isConstructor(false) {}
+  Function() : isNative(false), isAsync(false), isGenerator(false), isStrict(false), isConstructor(false) {}
 
   // GCObject interface
   const char* typeName() const override { return "Function"; }
@@ -119,6 +126,7 @@ struct Class : public GCObject {
 
 struct Array : public GCObject {
   std::vector<Value> elements;
+  std::unordered_map<std::string, Value> properties;
 
   // GCObject interface
   const char* typeName() const override { return "Array"; }
@@ -129,6 +137,8 @@ struct Object : public GCObject {
   std::unordered_map<std::string, Value> properties;  // Fallback for dynamic properties
   std::vector<Value> slots;  // Fast slot-based storage for known properties
   std::shared_ptr<ObjectShape> shape;  // Shape for inline caching optimization
+  bool isModuleNamespace = false;  // Special handling for ES module namespace objects.
+  std::vector<std::string> moduleExportNames;  // Sorted string export keys.
   bool frozen = false;  // Object.freeze() prevents adding/removing/modifying properties
   bool sealed = false;  // Object.seal() prevents adding/removing properties (can still modify)
   bool useSlots = false;  // Whether to use slot-based storage
@@ -214,6 +224,7 @@ struct Regex : public GCObject {
 #endif
   std::string pattern;
   std::string flags;
+  std::unordered_map<std::string, Value> properties;
 
   Regex(const std::string& p, const std::string& f = "")
     : pattern(p), flags(f) {
@@ -272,7 +283,7 @@ struct Regex : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "Regex"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {}
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 // Error types for JavaScript exceptions
@@ -555,6 +566,7 @@ struct Value {
     double,
     BigInt,
     Symbol,
+    ModuleBinding,
     std::string,
     std::shared_ptr<Function>,
     std::shared_ptr<Array>,
@@ -588,6 +600,7 @@ struct Value {
   Value(BigInt bi) : data(bi) {}
   Value(int64_t i) : data(BigInt(i)) {}
   Value(Symbol sym) : data(sym) {}
+  Value(ModuleBinding binding) : data(std::move(binding)) {}
   Value(const std::string& s) : data(s) {}
   Value(const char* s) : data(std::string(s)) {}
   Value(std::shared_ptr<Function> f) : data(f) {}
@@ -596,6 +609,8 @@ struct Value {
   Value(std::shared_ptr<TypedArray> ta) : data(ta) {}
   Value(std::shared_ptr<Promise> p) : data(p) {}
   Value(std::shared_ptr<Regex> r) : data(r) {}
+  Value(std::shared_ptr<Map> m) : data(m) {}
+  Value(std::shared_ptr<Set> s) : data(s) {}
   Value(std::shared_ptr<Error> e) : data(e) {}
   Value(std::shared_ptr<Generator> g) : data(g) {}
   Value(std::shared_ptr<Proxy> p) : data(p) {}
@@ -616,6 +631,7 @@ struct Value {
   bool isNumber() const { return std::holds_alternative<double>(data); }
   bool isBigInt() const { return std::holds_alternative<BigInt>(data); }
   bool isSymbol() const { return std::holds_alternative<Symbol>(data); }
+  bool isModuleBinding() const { return std::holds_alternative<ModuleBinding>(data); }
   bool isString() const { return std::holds_alternative<std::string>(data); }
   bool isFunction() const { return std::holds_alternative<std::shared_ptr<Function>>(data); }
   bool isArray() const { return std::holds_alternative<std::shared_ptr<Array>>(data); }
@@ -643,6 +659,8 @@ struct Value {
   double toNumber() const;
   int64_t toBigInt() const;
   std::string toString() const;
+  // Display string for REPL/debugging - BigInt shows "42n" suffix
+  std::string toDisplayString() const;
 };
 
 enum class PromiseState {
@@ -657,6 +675,7 @@ struct Promise : public GCObject {
   std::vector<std::function<Value(Value)>> fulfilledCallbacks;
   std::vector<std::function<Value(Value)>> rejectedCallbacks;
   std::vector<std::shared_ptr<Promise>> chainedPromises;
+  std::unordered_map<std::string, Value> properties;
 
   Promise() : state(PromiseState::Pending), result(Undefined{}) {}
 

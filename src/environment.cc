@@ -13,17 +13,209 @@
 #include "module.h"
 #include "interpreter.h"
 #include "wasm_js.h"
+#include "unicode.h"
 #include "text_encoding.h"
 #include "url.h"
 #include "fs.h"
 #include "streams.h"
+#include "lexer.h"
+#include "parser.h"
 #include <iostream>
 #include <thread>
 #include <limits>
 #include <cmath>
 #include <random>
+#include <cctype>
+#include <array>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <regex>
+#include <unordered_set>
 
 namespace lightjs {
+
+namespace {
+
+std::string trimAsciiWhitespace(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+    start++;
+  }
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+    end--;
+  }
+  return s.substr(start, end - start);
+}
+
+int digitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'z') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'Z') return 10 + (c - 'A');
+  return -1;
+}
+
+// Parse a JS integer string into int64_t. Supports optional sign and 0x/0o/0b prefixes.
+// Values are reduced modulo 2^64 to keep the runtime stable on very large inputs.
+bool parseBigIntString64(const std::string& raw, int64_t& out) {
+  std::string s = trimAsciiWhitespace(raw);
+  if (s.empty()) {
+    out = 0;
+    return true;
+  }
+
+  bool negative = false;
+  bool hadSign = false;
+  size_t i = 0;
+  if (s[i] == '+' || s[i] == '-') {
+    hadSign = true;
+    negative = (s[i] == '-');
+    i++;
+  }
+  if (i >= s.size()) return false;
+
+  int base = 10;
+  if (i + 1 < s.size() && s[i] == '0') {
+    if (s[i + 1] == 'x' || s[i + 1] == 'X') {
+      if (hadSign) return false;
+      base = 16;
+      i += 2;
+    } else if (s[i + 1] == 'o' || s[i + 1] == 'O') {
+      if (hadSign) return false;
+      base = 8;
+      i += 2;
+    } else if (s[i + 1] == 'b' || s[i + 1] == 'B') {
+      if (hadSign) return false;
+      base = 2;
+      i += 2;
+    }
+  }
+  if (i >= s.size()) return false;
+
+  uint64_t value = 0;
+  bool sawDigit = false;
+  for (; i < s.size(); i++) {
+    int d = digitValue(s[i]);
+    if (d < 0 || d >= base) return false;
+    sawDigit = true;
+    value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
+  }
+  if (!sawDigit) return false;
+
+  uint64_t signedBits = value;
+  if (negative) {
+    signedBits = uint64_t{0} - signedBits;
+  }
+  out = static_cast<int64_t>(signedBits);
+  return true;
+}
+
+bool isModuleNamespaceExportKey(const std::shared_ptr<Object>& obj, const std::string& key) {
+  return std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
+         obj->moduleExportNames.end();
+}
+
+constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_source__";
+constexpr const char* kImportPhaseDeferSentinel = "__lightjs_import_phase_defer__";
+
+bool defineModuleNamespaceProperty(const std::shared_ptr<Object>& obj,
+                                   const std::string& key,
+                                   const std::shared_ptr<Object>& descriptor) {
+  const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
+  const bool isExport = isModuleNamespaceExportKey(obj, key);
+  const bool isToStringTag = (key == toStringTagKey);
+  if (!isExport && !isToStringTag) {
+    return false;
+  }
+
+  auto has = [&](const std::string& name) {
+    return descriptor->properties.find(name) != descriptor->properties.end();
+  };
+  auto boolFieldMatches = [&](const std::string& name, bool expected) {
+    if (!has(name)) return true;
+    return descriptor->properties.at(name).toBool() == expected;
+  };
+
+  if (has("get") || has("set")) {
+    return false;
+  }
+
+  if (isExport) {
+    if (has("value")) {
+      return false;
+    }
+    return boolFieldMatches("writable", true) &&
+           boolFieldMatches("enumerable", true) &&
+           boolFieldMatches("configurable", false);
+  }
+
+  if (has("value") && descriptor->properties.at("value").toString() != "Module") {
+    return false;
+  }
+  return boolFieldMatches("writable", false) &&
+         boolFieldMatches("enumerable", false) &&
+         boolFieldMatches("configurable", false);
+}
+
+std::optional<std::string> readTextFile(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    return std::nullopt;
+  }
+  std::stringstream ss;
+  ss << file.rdbuf();
+  return ss.str();
+}
+
+std::vector<std::string> parseStaticImportSpecifiers(const std::string& source) {
+  std::vector<std::string> specifiers;
+  static const std::regex kImportRegex(
+    R"((?:^|[\n\r])\s*import\s+(?:[^'";\n]*\s+from\s+)?["']([^"']+)["']\s*;)");
+  for (std::sregex_iterator it(source.begin(), source.end(), kImportRegex), end; it != end; ++it) {
+    specifiers.push_back((*it)[1].str());
+  }
+  return specifiers;
+}
+
+bool hasTopLevelAwaitInSource(const std::string& source) {
+  static const std::regex kTopLevelAwaitRegex(R"((?:^|[\n\r])\s*await\b)");
+  return std::regex_search(source, kTopLevelAwaitRegex);
+}
+
+void gatherAsyncTransitiveDependencies(const std::string& modulePath,
+                                       ModuleLoader* loader,
+                                       std::unordered_set<std::string>& visitedModules,
+                                       std::unordered_set<std::string>& queuedAsyncModules,
+                                       std::vector<std::string>& orderedAsyncModules) {
+  if (!loader) {
+    return;
+  }
+  if (!visitedModules.insert(modulePath).second) {
+    return;
+  }
+
+  auto sourceOpt = readTextFile(modulePath);
+  if (!sourceOpt.has_value()) {
+    return;
+  }
+
+  if (hasTopLevelAwaitInSource(*sourceOpt)) {
+    if (queuedAsyncModules.insert(modulePath).second) {
+      orderedAsyncModules.push_back(modulePath);
+    }
+    return;
+  }
+
+  auto specifiers = parseStaticImportSpecifiers(*sourceOpt);
+  for (const auto& specifier : specifiers) {
+    std::string resolvedDependency = loader->resolvePath(specifier, modulePath);
+    gatherAsyncTransitiveDependencies(
+      resolvedDependency, loader, visitedModules, queuedAsyncModules, orderedAsyncModules);
+  }
+}
+
+}  // namespace
 
 // Global module loader and interpreter for dynamic imports
 static std::shared_ptr<ModuleLoader> g_moduleLoader;
@@ -37,6 +229,10 @@ void setGlobalInterpreter(Interpreter* interpreter) {
   g_interpreter = interpreter;
 }
 
+Interpreter* getGlobalInterpreter() {
+  return g_interpreter;
+}
+
 Environment::Environment(std::shared_ptr<Environment> parent)
   : parent_(parent) {}
 
@@ -44,6 +240,13 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
   bindings_[name] = value;
   if (isConst) {
     constants_[name] = true;
+  }
+  if (!parent_) {
+    auto it = bindings_.find("globalThis");
+    if (it != bindings_.end() && it->second.isObject()) {
+      auto globalObj = std::get<std::shared_ptr<Object>>(it->second.data);
+      globalObj->properties[name] = value;
+    }
   }
 }
 
@@ -200,6 +403,63 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Infinity", Value(std::numeric_limits<double>::infinity()));
   env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()));
 
+  auto evalFn = std::make_shared<Function>();
+  evalFn->isNative = true;
+  evalFn->nativeFunc = [env](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(Undefined{});
+    }
+    if (!args[0].isString()) {
+      return args[0];
+    }
+
+    Interpreter* prevInterpreter = getGlobalInterpreter();
+    if (!prevInterpreter) {
+      return Value(Undefined{});
+    }
+
+    std::string source = args[0].toString();
+    Lexer lexer(source);
+    auto tokens = lexer.tokenize();
+
+    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
+      if (tokens[i].type == TokenType::Import &&
+          !tokens[i].escaped &&
+          tokens[i + 1].type == TokenType::Dot &&
+          tokens[i + 2].type == TokenType::Identifier &&
+          !tokens[i + 2].escaped &&
+          tokens[i + 2].value == "meta") {
+        throw std::runtime_error("SyntaxError: import.meta is not allowed in eval");
+      }
+    }
+
+    Parser parser(tokens);
+    auto program = parser.parse();
+    if (!program) {
+      throw std::runtime_error("SyntaxError: Parse error");
+    }
+
+    Interpreter evalInterpreter(env);
+    Value result = Value(Undefined{});
+    try {
+      auto task = evalInterpreter.evaluate(*program);
+      LIGHTJS_RUN_TASK(task, result);
+      if (evalInterpreter.hasError()) {
+        Value err = evalInterpreter.getError();
+        evalInterpreter.clearError();
+        setGlobalInterpreter(prevInterpreter);
+        throw std::runtime_error(err.toString());
+      }
+    } catch (...) {
+      setGlobalInterpreter(prevInterpreter);
+      throw;
+    }
+
+    setGlobalInterpreter(prevInterpreter);
+    return result;
+  };
+  env->define("eval", Value(evalFn));
+
   // Symbol constructor
   auto symbolFn = std::make_shared<Function>();
   symbolFn->isNative = true;
@@ -210,7 +470,374 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   symbolFn->properties["iterator"] = WellKnownSymbols::iterator();
   symbolFn->properties["asyncIterator"] = WellKnownSymbols::asyncIterator();
   symbolFn->properties["toStringTag"] = WellKnownSymbols::toStringTag();
+  symbolFn->properties["toPrimitive"] = WellKnownSymbols::toPrimitive();
+  symbolFn->properties["matchAll"] = WellKnownSymbols::matchAll();
   env->define("Symbol", Value(symbolFn));
+
+  // BigInt constructor/function
+  auto bigIntFn = std::make_shared<Function>();
+  bigIntFn->isNative = true;
+  bigIntFn->isConstructor = true;
+
+  auto arrayToString = [](const std::shared_ptr<Array>& arr) -> std::string {
+    std::string out;
+    for (size_t i = 0; i < arr->elements.size(); i++) {
+      if (i > 0) out += ",";
+      out += arr->elements[i].toString();
+    }
+    return out;
+  };
+
+  auto isObjectLike = [](const Value& value) -> bool {
+    return value.isObject() || value.isArray() || value.isFunction() || value.isRegex();
+  };
+
+  auto callChecked = [](const Value& callee,
+                        const std::vector<Value>& callArgs,
+                        const Value& thisArg) -> Value {
+    if (!callee.isFunction()) {
+      return Value(Undefined{});
+    }
+
+    auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+    if (fn->isNative) {
+      auto itUsesThis = fn->properties.find("__uses_this_arg__");
+      if (itUsesThis != fn->properties.end() &&
+          itUsesThis->second.isBool() &&
+          itUsesThis->second.toBool()) {
+        std::vector<Value> nativeArgs;
+        nativeArgs.reserve(callArgs.size() + 1);
+        nativeArgs.push_back(thisArg);
+        nativeArgs.insert(nativeArgs.end(), callArgs.begin(), callArgs.end());
+        return fn->nativeFunc(nativeArgs);
+      }
+      return fn->nativeFunc(callArgs);
+    }
+
+    Interpreter* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: Interpreter unavailable for callable conversion");
+    }
+    interpreter->clearError();
+    Value result = interpreter->callForHarness(callee, callArgs, thisArg);
+    if (interpreter->hasError()) {
+      Value err = interpreter->getError();
+      interpreter->clearError();
+      throw std::runtime_error(err.toString());
+    }
+    return result;
+  };
+
+  auto getObjectProperty = [callChecked](const std::shared_ptr<Object>& obj,
+                                         const Value& receiver,
+                                         const std::string& key) -> std::pair<bool, Value> {
+    auto current = obj;
+    int depth = 0;
+    while (current && depth <= 16) {
+      depth++;
+
+      std::string getterKey = "__get_" + key;
+      auto getterIt = current->properties.find(getterKey);
+      if (getterIt != current->properties.end()) {
+        if (getterIt->second.isFunction()) {
+          return {true, callChecked(getterIt->second, {}, receiver)};
+        }
+        return {true, Value(Undefined{})};
+      }
+
+      auto it = current->properties.find(key);
+      if (it != current->properties.end()) {
+        return {true, it->second};
+      }
+
+      auto protoIt = current->properties.find("__proto__");
+      if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
+        break;
+      }
+      current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    }
+
+    return {false, Value(Undefined{})};
+  };
+
+  auto getProperty = [getObjectProperty, callChecked](const Value& receiver,
+                                                       const std::string& key) -> std::pair<bool, Value> {
+    if (receiver.isObject()) {
+      return getObjectProperty(std::get<std::shared_ptr<Object>>(receiver.data), receiver, key);
+    }
+    if (receiver.isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+      auto it = fn->properties.find(key);
+      if (it != fn->properties.end()) {
+        return {true, it->second};
+      }
+      return {false, Value(Undefined{})};
+    }
+    if (receiver.isRegex()) {
+      auto regex = std::get<std::shared_ptr<Regex>>(receiver.data);
+      std::string getterKey = "__get_" + key;
+      auto getterIt = regex->properties.find(getterKey);
+      if (getterIt != regex->properties.end()) {
+        if (getterIt->second.isFunction()) {
+          return {true, callChecked(getterIt->second, {}, receiver)};
+        }
+        return {true, Value(Undefined{})};
+      }
+      auto it = regex->properties.find(key);
+      if (it != regex->properties.end()) {
+        return {true, it->second};
+      }
+      return {false, Value(Undefined{})};
+    }
+    return {false, Value(Undefined{})};
+  };
+
+  auto toPrimitive = [isObjectLike, arrayToString, getProperty, callChecked](const Value& input,
+                                                                              bool preferString) -> Value {
+    if (!isObjectLike(input)) {
+      return input;
+    }
+
+    const std::string& toPrimitiveKey = WellKnownSymbols::toPrimitiveKey();
+    auto [hasExotic, exotic] = getProperty(input, toPrimitiveKey);
+    if (hasExotic && !exotic.isUndefined() && !exotic.isNull()) {
+      if (!exotic.isFunction()) {
+        throw std::runtime_error("TypeError: @@toPrimitive is not callable");
+      }
+      std::string hint = preferString ? "string" : "number";
+      Value result = callChecked(exotic, {Value(hint)}, input);
+      if (isObjectLike(result)) {
+        throw std::runtime_error("TypeError: @@toPrimitive must return a primitive value");
+      }
+      return result;
+    }
+
+    std::array<std::string, 2> methodOrder = preferString
+      ? std::array<std::string, 2>{"toString", "valueOf"}
+      : std::array<std::string, 2>{"valueOf", "toString"};
+
+    for (const auto& methodName : methodOrder) {
+      auto [found, method] = getProperty(input, methodName);
+      if (found) {
+        if (method.isFunction()) {
+          Value result = callChecked(method, {}, input);
+          if (!isObjectLike(result)) {
+            return result;
+          }
+        }
+        continue;
+      }
+
+      if (methodName == "toString") {
+        if (input.isArray()) {
+          return Value(arrayToString(std::get<std::shared_ptr<Array>>(input.data)));
+        }
+        if (input.isObject()) {
+          return Value(std::string("[object Object]"));
+        }
+        if (input.isFunction()) {
+          return Value(std::string("[Function]"));
+        }
+        if (input.isRegex()) {
+          return Value(input.toString());
+        }
+      }
+    }
+
+    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+  };
+
+  auto toBigIntFromPrimitive = [](const Value& v) -> int64_t {
+    if (v.isBigInt()) {
+      return v.toBigInt();
+    }
+    if (v.isBool()) {
+      return v.toBool() ? 1 : 0;
+    }
+    if (v.isString()) {
+      int64_t parsed = 0;
+      if (!parseBigIntString64(std::get<std::string>(v.data), parsed)) {
+        throw std::runtime_error("SyntaxError: Cannot convert string to BigInt");
+      }
+      return parsed;
+    }
+    throw std::runtime_error("TypeError: Cannot convert value to BigInt");
+  };
+
+  auto toBigIntFromValue = [toPrimitive, toBigIntFromPrimitive](const Value& v) -> int64_t {
+    Value primitive = toPrimitive(v, false);
+    return toBigIntFromPrimitive(primitive);
+  };
+
+  auto toIndex = [toPrimitive](const Value& v) -> uint64_t {
+    Value primitive = toPrimitive(v, false);
+    if (primitive.isBigInt() || primitive.isSymbol()) {
+      throw std::runtime_error("TypeError: Cannot convert to index");
+    }
+    double n = primitive.toNumber();
+    if (std::isnan(n)) return 0;
+    if (!std::isfinite(n)) {
+      throw std::runtime_error("RangeError: Invalid index");
+    }
+    n = std::trunc(n);
+    if (n < 0.0 || n > 9007199254740991.0) {
+      throw std::runtime_error("RangeError: Invalid index");
+    }
+    return static_cast<uint64_t>(n);
+  };
+
+  auto thisBigIntValue = [](const Value& thisValue) -> int64_t {
+    if (thisValue.isBigInt()) {
+      return thisValue.toBigInt();
+    }
+    if (thisValue.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(thisValue.data);
+      auto primitiveIt = obj->properties.find("__primitive_value__");
+      if (primitiveIt != obj->properties.end() && primitiveIt->second.isBigInt()) {
+        return primitiveIt->second.toBigInt();
+      }
+    }
+    throw std::runtime_error("TypeError: BigInt method called on incompatible receiver");
+  };
+
+  auto formatBigInt = [](int64_t value, int radix) -> std::string {
+    if (radix == 10) {
+      return std::to_string(value);
+    }
+
+    bool negative = value < 0;
+    uint64_t magnitude = negative
+      ? static_cast<uint64_t>(-(value + 1)) + 1
+      : static_cast<uint64_t>(value);
+
+    if (magnitude == 0) {
+      return "0";
+    }
+
+    static const std::string digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::string out;
+    while (magnitude > 0) {
+      uint64_t digit = magnitude % static_cast<uint64_t>(radix);
+      out.push_back(digits[static_cast<size_t>(digit)]);
+      magnitude /= static_cast<uint64_t>(radix);
+    }
+    std::reverse(out.begin(), out.end());
+    if (negative) out.insert(out.begin(), '-');
+    return out;
+  };
+
+  bigIntFn->nativeFunc = [toPrimitive, toBigIntFromPrimitive](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined to BigInt");
+    }
+
+    Value primitive = toPrimitive(args[0], false);
+    if (primitive.isNumber()) {
+      double n = primitive.toNumber();
+      if (!std::isfinite(n) || std::floor(n) != n) {
+        throw std::runtime_error("RangeError: Cannot convert Number to BigInt");
+      }
+      return Value(BigInt(static_cast<int64_t>(n)));
+    }
+
+    return Value(BigInt(toBigIntFromPrimitive(primitive)));
+  };
+  bigIntFn->properties["name"] = Value(std::string("BigInt"));
+  bigIntFn->properties["length"] = Value(1.0);
+  bigIntFn->properties["__throw_on_new__"] = Value(true);
+
+  auto asUintN = std::make_shared<Function>();
+  asUintN->isNative = true;
+  asUintN->properties["__throw_on_new__"] = Value(true);
+  asUintN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
+    uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
+    int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
+
+    if (bits == 0) {
+      return Value(BigInt(0));
+    }
+
+    uint64_t u = static_cast<uint64_t>(n);
+    if (bits < 64) {
+      uint64_t mask = (uint64_t{1} << bits) - 1;
+      u &= mask;
+    }
+    return Value(BigInt(static_cast<int64_t>(u)));
+  };
+  bigIntFn->properties["asUintN"] = Value(asUintN);
+
+  auto asIntN = std::make_shared<Function>();
+  asIntN->isNative = true;
+  asIntN->properties["__throw_on_new__"] = Value(true);
+  asIntN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
+    uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
+    int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
+
+    if (bits == 0) {
+      return Value(BigInt(0));
+    }
+
+    uint64_t u = static_cast<uint64_t>(n);
+    if (bits < 64) {
+      uint64_t mask = (uint64_t{1} << bits) - 1;
+      u &= mask;
+      uint64_t signBit = uint64_t{1} << (bits - 1);
+      if (u & signBit) {
+        u |= ~mask;
+      }
+    }
+    return Value(BigInt(static_cast<int64_t>(u)));
+  };
+  bigIntFn->properties["asIntN"] = Value(asIntN);
+
+  auto bigIntProto = std::make_shared<Object>();
+  auto bigIntProtoToString = std::make_shared<Function>();
+  bigIntProtoToString->isNative = true;
+  bigIntProtoToString->properties["__throw_on_new__"] = Value(true);
+  bigIntProtoToString->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoToString->nativeFunc = [thisBigIntValue, formatBigInt](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      throw std::runtime_error("TypeError: BigInt.prototype.toString requires BigInt");
+    }
+
+    int64_t n = thisBigIntValue(args[0]);
+    int radix = 10;
+    if (args.size() > 1 && !args[1].isUndefined()) {
+      radix = static_cast<int>(std::trunc(args[1].toNumber()));
+      if (radix < 2 || radix > 36) {
+        throw std::runtime_error("RangeError: radix must be between 2 and 36");
+      }
+    }
+    return Value(formatBigInt(n, radix));
+  };
+  bigIntProto->properties["toString"] = Value(bigIntProtoToString);
+
+  auto bigIntProtoValueOf = std::make_shared<Function>();
+  bigIntProtoValueOf->isNative = true;
+  bigIntProtoValueOf->properties["__throw_on_new__"] = Value(true);
+  bigIntProtoValueOf->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoValueOf->nativeFunc = [thisBigIntValue](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      throw std::runtime_error("TypeError: BigInt.prototype.valueOf requires BigInt");
+    }
+    return Value(BigInt(thisBigIntValue(args[0])));
+  };
+  bigIntProto->properties["valueOf"] = Value(bigIntProtoValueOf);
+
+  auto bigIntProtoToLocaleString = std::make_shared<Function>();
+  bigIntProtoToLocaleString->isNative = true;
+  bigIntProtoToLocaleString->properties["__throw_on_new__"] = Value(true);
+  bigIntProtoToLocaleString->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoToLocaleString->nativeFunc = [thisBigIntValue](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      throw std::runtime_error("TypeError: BigInt.prototype.toLocaleString requires BigInt");
+    }
+    return Value(std::to_string(thisBigIntValue(args[0])));
+  };
+  bigIntProto->properties["toLocaleString"] = Value(bigIntProtoToLocaleString);
+  bigIntFn->properties["prototype"] = Value(bigIntProto);
+
+  env->define("BigInt", Value(bigIntFn));
 
   auto createTypedArrayConstructor = [](TypedArrayType type) {
     auto func = std::make_shared<Function>();
@@ -447,7 +1074,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Dynamic import() function - returns a Promise
   auto importFn = std::make_shared<Function>();
   importFn->isNative = true;
-  importFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  importFn->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       auto promise = std::make_shared<Promise>();
       auto err = std::make_shared<Error>(ErrorType::TypeError, "import() requires a module specifier");
@@ -455,10 +1082,99 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(promise);
     }
 
-    std::string specifier = args[0].toString();
     auto promise = std::make_shared<Promise>();
+    std::string specifier;
+    enum class ImportPhase {
+      Normal,
+      Source,
+      Defer,
+    };
+    ImportPhase importPhase = ImportPhase::Normal;
+    bool hasImportOptions = false;
+    Value importOptions = Value(Undefined{});
+    if (args.size() > 1 && args[1].isString()) {
+      const std::string& maybePhase = std::get<std::string>(args[1].data);
+      if (maybePhase == kImportPhaseSourceSentinel) {
+        importPhase = ImportPhase::Source;
+      } else if (maybePhase == kImportPhaseDeferSentinel) {
+        importPhase = ImportPhase::Defer;
+      } else {
+        hasImportOptions = true;
+        importOptions = args[1];
+      }
+    } else if (args.size() > 1) {
+      hasImportOptions = true;
+      importOptions = args[1];
+    }
+
+    auto rejectWith = [&](ErrorType fallbackType, const std::string& fallbackMessage, const std::optional<Value>& candidate = std::nullopt) {
+      if (candidate.has_value()) {
+        promise->reject(*candidate);
+      } else {
+        auto err = std::make_shared<Error>(fallbackType, fallbackMessage);
+        promise->reject(Value(err));
+      }
+    };
 
     try {
+      if (args[0].isObject()) {
+        auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+        auto importMetaIt = obj->properties.find("__import_meta__");
+        if (importMetaIt != obj->properties.end() &&
+            importMetaIt->second.isBool() &&
+            importMetaIt->second.toBool()) {
+          auto err = std::make_shared<Error>(ErrorType::TypeError, "Cannot convert object to primitive value");
+          promise->reject(Value(err));
+          return Value(promise);
+        }
+      }
+      Value primitiveSpecifier = toPrimitive(args[0], true);
+      if (primitiveSpecifier.isSymbol()) {
+        auto err = std::make_shared<Error>(ErrorType::TypeError, "Cannot convert a Symbol value to a string");
+        promise->reject(Value(err));
+        return Value(promise);
+      }
+      specifier = primitiveSpecifier.toString();
+
+      if (importPhase == ImportPhase::Source) {
+        auto err = std::make_shared<Error>(ErrorType::SyntaxError, "Source phase import is not available");
+        promise->reject(Value(err));
+        return Value(promise);
+      }
+
+      if (hasImportOptions && !importOptions.isUndefined()) {
+        if (!importOptions.isObject()) {
+          auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options must be an object");
+          promise->reject(Value(err));
+          return Value(promise);
+        }
+
+        auto optionsObj = std::get<std::shared_ptr<Object>>(importOptions.data);
+        auto withIt = optionsObj->properties.find("with");
+        if (withIt != optionsObj->properties.end() && !withIt->second.isUndefined()) {
+          const Value& withValue = withIt->second;
+          if (!withValue.isObject() && !withValue.isProxy()) {
+            auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options.with must be an object");
+            promise->reject(Value(err));
+            return Value(promise);
+          }
+
+          if (withValue.isObject()) {
+            auto withObj = std::get<std::shared_ptr<Object>>(withValue.data);
+            for (const auto& [key, attrValue] : withObj->properties) {
+              if (key.rfind("__", 0) == 0) {
+                continue;
+              }
+              if (!attrValue.isString()) {
+                auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options.with values must be strings");
+                promise->reject(Value(err));
+                return Value(promise);
+              }
+            }
+          }
+        }
+      }
+
       // Use global module loader if available
       if (g_moduleLoader && g_interpreter) {
         // Resolve the module path
@@ -467,33 +1183,100 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         // Load the module
         auto module = g_moduleLoader->loadModule(resolvedPath);
         if (!module) {
-          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
-          promise->reject(Value(err));
+          rejectWith(ErrorType::Error, "Failed to load module: " + specifier, g_moduleLoader->getLastError());
           return Value(promise);
         }
 
         // Instantiate the module
         if (!module->instantiate(g_moduleLoader.get())) {
-          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to instantiate module: " + specifier);
-          promise->reject(Value(err));
+          rejectWith(ErrorType::SyntaxError, "Failed to instantiate module: " + specifier, module->getLastError());
           return Value(promise);
         }
 
-        // Evaluate the module
-        if (!module->evaluate(g_interpreter)) {
-          auto err = std::make_shared<Error>(ErrorType::Error, "Failed to evaluate module: " + specifier);
-          promise->reject(Value(err));
-          return Value(promise);
+        bool deferEvaluationUntilNamespaceAccess = false;
+        if (importPhase == ImportPhase::Defer) {
+          // Defer phase: eagerly evaluate only asynchronous transitive dependencies.
+          std::unordered_set<std::string> visitedModules;
+          std::unordered_set<std::string> queuedAsyncModules;
+          std::vector<std::string> orderedAsyncModules;
+          gatherAsyncTransitiveDependencies(
+            resolvedPath, g_moduleLoader.get(), visitedModules, queuedAsyncModules, orderedAsyncModules);
+
+          for (const auto& asyncModulePath : orderedAsyncModules) {
+            auto asyncModule = g_moduleLoader->loadModule(asyncModulePath);
+            if (!asyncModule) {
+              rejectWith(
+                ErrorType::Error,
+                "Failed to load deferred async dependency: " + asyncModulePath,
+                g_moduleLoader->getLastError());
+              return Value(promise);
+            }
+            if (!asyncModule->instantiate(g_moduleLoader.get())) {
+              rejectWith(
+                ErrorType::SyntaxError,
+                "Failed to instantiate deferred async dependency: " + asyncModulePath,
+                asyncModule->getLastError());
+              return Value(promise);
+            }
+            if (!asyncModule->evaluate(g_interpreter)) {
+              rejectWith(
+                ErrorType::Error,
+                "Failed to evaluate deferred async dependency: " + asyncModulePath,
+                asyncModule->getLastError());
+              return Value(promise);
+            }
+          }
+
+          deferEvaluationUntilNamespaceAccess = (module->getState() != Module::State::Evaluated);
+        } else {
+          // Normal dynamic import evaluates immediately.
+          if (!module->evaluate(g_interpreter)) {
+            rejectWith(ErrorType::Error, "Failed to evaluate module: " + specifier, module->getLastError());
+            return Value(promise);
+          }
         }
 
-        // Create namespace object from exports
-        auto moduleNamespace = std::make_shared<Object>();
-        GarbageCollector::instance().reportAllocation(sizeof(Object));
-        moduleNamespace->properties["__esModule"] = Value(true);
+        if (module->getState() == Module::State::EvaluatingAsync) {
+          auto evalPromise = module->getEvaluationPromise();
+          if (evalPromise) {
+            evalPromise->then(
+              [promise, module](Value) -> Value {
+                promise->resolve(Value(module->getNamespaceObject()));
+                return Value(Undefined{});
+              },
+              [promise](Value reason) -> Value {
+                promise->reject(reason);
+                return Value(Undefined{});
+              }
+            );
+            return Value(promise);
+          }
+        }
 
-        auto exports = module->getAllExports();
-        for (const auto& [name, value] : exports) {
-          moduleNamespace->properties[name] = value;
+        auto moduleNamespace = module->getNamespaceObject();
+        if (deferEvaluationUntilNamespaceAccess) {
+          auto deferredEvalFn = std::make_shared<Function>();
+          deferredEvalFn->isNative = true;
+          deferredEvalFn->properties["__throw_on_new__"] = Value(true);
+          auto deferredModule = module;
+          deferredEvalFn->nativeFunc = [deferredModule](const std::vector<Value>&) -> Value {
+            if (deferredModule->getState() == Module::State::Evaluated) {
+              return Value(Undefined{});
+            }
+            Interpreter* interpreter = getGlobalInterpreter();
+            if (!interpreter) {
+              throw std::runtime_error("Error: Interpreter unavailable for deferred module evaluation");
+            }
+            if (!deferredModule->evaluate(interpreter)) {
+              if (auto error = deferredModule->getLastError()) {
+                throw std::runtime_error(error->toString());
+              }
+              throw std::runtime_error("Error: Failed to evaluate deferred module");
+            }
+            return Value(Undefined{});
+          };
+          moduleNamespace->properties["__deferred_pending__"] = Value(true);
+          moduleNamespace->properties["__deferred_eval__"] = Value(deferredEvalFn);
         }
 
         promise->resolve(Value(moduleNamespace));
@@ -506,7 +1289,28 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         promise->resolve(Value(moduleNamespace));
       }
     } catch (const std::exception& e) {
-      auto err = std::make_shared<Error>(ErrorType::Error, std::string("Failed to load module: ") + e.what());
+      std::string message = e.what();
+      ErrorType errorType = ErrorType::Error;
+      auto consumePrefix = [&](const std::string& prefix, ErrorType type) {
+        if (message.rfind(prefix, 0) == 0) {
+          errorType = type;
+          message = message.substr(prefix.size());
+          return true;
+        }
+        return false;
+      };
+      if (!consumePrefix("TypeError: ", ErrorType::TypeError) &&
+          !consumePrefix("ReferenceError: ", ErrorType::ReferenceError) &&
+          !consumePrefix("RangeError: ", ErrorType::RangeError) &&
+          !consumePrefix("SyntaxError: ", ErrorType::SyntaxError) &&
+          !consumePrefix("URIError: ", ErrorType::URIError) &&
+          !consumePrefix("EvalError: ", ErrorType::EvalError) &&
+          !consumePrefix("Error: ", ErrorType::Error)) {
+        // Keep non-Error abrupt completions (e.g. thrown strings) as-is.
+        promise->reject(Value(message));
+        return Value(promise);
+      }
+      auto err = std::make_shared<Error>(errorType, message);
       promise->reject(Value(err));
     } catch (...) {
       auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
@@ -517,6 +1321,96 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("import", Value(importFn));
 
+  auto regExpPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  auto regExpMatchAll = std::make_shared<Function>();
+  regExpMatchAll->isNative = true;
+  regExpMatchAll->isConstructor = false;
+  regExpMatchAll->properties["__uses_this_arg__"] = Value(true);
+  regExpMatchAll->properties["__throw_on_new__"] = Value(true);
+  regExpMatchAll->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isRegex()) {
+      throw std::runtime_error("TypeError: RegExp.prototype[@@matchAll] called on non-RegExp");
+    }
+
+    auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+    std::string input = args.size() > 1 ? args[1].toString() : "";
+    bool global = regexPtr->flags.find('g') != std::string::npos;
+    bool unicodeMode = regexPtr->flags.find('u') != std::string::npos ||
+                       regexPtr->flags.find('v') != std::string::npos;
+
+    auto allMatches = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+#if USE_SIMPLE_REGEX
+    std::string remaining = input;
+    size_t offsetBytes = 0;
+    std::vector<simple_regex::Regex::Match> matches;
+    while (regexPtr->regex->search(remaining, matches)) {
+      if (matches.empty()) break;
+      auto matchObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      for (size_t i = 0; i < matches.size(); ++i) {
+        matchObj->properties[std::to_string(i)] = Value(matches[i].str);
+      }
+      size_t matchStartBytes = offsetBytes + matches[0].start;
+      double matchIndex = static_cast<double>(unicode::utf8Length(input.substr(0, matchStartBytes)));
+      matchObj->properties["index"] = Value(matchIndex);
+      matchObj->properties["input"] = Value(input);
+      allMatches->elements.push_back(Value(matchObj));
+
+      if (!global) break;
+
+      size_t matchAdvance = matches[0].start + matches[0].str.length();
+      if (matchAdvance == 0) {
+        if (!remaining.empty()) {
+          if (unicodeMode) {
+            matchAdvance = unicode::utf8SequenceLength(static_cast<uint8_t>(remaining[0]));
+          } else {
+            matchAdvance = 1;
+          }
+        } else {
+          break;
+        }
+      }
+      offsetBytes += matchAdvance;
+      remaining = remaining.substr(matchAdvance);
+      matches.clear();
+    }
+#else
+    std::string::const_iterator searchStart = input.cbegin();
+    std::smatch match;
+    while (std::regex_search(searchStart, input.cend(), match, regexPtr->regex)) {
+      auto matchObj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      for (size_t i = 0; i < match.size(); ++i) {
+        matchObj->properties[std::to_string(i)] = Value(match[i].str());
+      }
+      size_t matchStartBytes = static_cast<size_t>(match.position() + (searchStart - input.cbegin()));
+      double matchIndex = static_cast<double>(unicode::utf8Length(input.substr(0, matchStartBytes)));
+      matchObj->properties["index"] = Value(matchIndex);
+      matchObj->properties["input"] = Value(input);
+      allMatches->elements.push_back(Value(matchObj));
+
+      if (!global) break;
+      searchStart = match.suffix().first;
+      if (match[0].length() == 0 && searchStart != input.cend()) {
+        if (unicodeMode) {
+          size_t byteOffset = static_cast<size_t>(searchStart - input.cbegin());
+          size_t advance = unicode::utf8SequenceLength(static_cast<uint8_t>(input[byteOffset]));
+          std::advance(searchStart, static_cast<std::ptrdiff_t>(advance));
+        } else {
+          ++searchStart;
+        }
+      }
+    }
+#endif
+
+    return Value(allMatches);
+  };
+  regExpPrototype->properties[WellKnownSymbols::matchAllKey()] = Value(regExpMatchAll);
+
   auto regExpConstructor = std::make_shared<Function>();
   regExpConstructor->isNative = true;
   regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -525,26 +1419,99 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string flags = args.size() > 1 ? args[1].toString() : "";
     return Value(std::make_shared<Regex>(pattern, flags));
   };
+  regExpConstructor->properties["prototype"] = Value(regExpPrototype);
   env->define("RegExp", Value(regExpConstructor));
 
   // Error constructors
-  auto createErrorConstructor = [](ErrorType type) {
+  auto createErrorConstructor = [](ErrorType type, const std::string& name) {
+    auto prototype = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
     auto func = std::make_shared<Function>();
     func->isNative = true;
+    func->isConstructor = true;
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       std::string message = args.empty() ? "" : args[0].toString();
       return Value(std::make_shared<Error>(type, message));
     };
-    return Value(func);
+    func->properties["__error_type__"] = Value(static_cast<double>(static_cast<int>(type)));
+    func->properties["prototype"] = Value(prototype);
+    prototype->properties["constructor"] = Value(func);
+    prototype->properties["name"] = Value(name);
+    return func;
   };
 
-  env->define("Error", createErrorConstructor(ErrorType::Error));
-  env->define("TypeError", createErrorConstructor(ErrorType::TypeError));
-  env->define("ReferenceError", createErrorConstructor(ErrorType::ReferenceError));
-  env->define("RangeError", createErrorConstructor(ErrorType::RangeError));
-  env->define("SyntaxError", createErrorConstructor(ErrorType::SyntaxError));
-  env->define("URIError", createErrorConstructor(ErrorType::URIError));
-  env->define("EvalError", createErrorConstructor(ErrorType::EvalError));
+  auto errorCtor = createErrorConstructor(ErrorType::Error, "Error");
+  auto typeErrorCtor = createErrorConstructor(ErrorType::TypeError, "TypeError");
+  auto referenceErrorCtor = createErrorConstructor(ErrorType::ReferenceError, "ReferenceError");
+  auto rangeErrorCtor = createErrorConstructor(ErrorType::RangeError, "RangeError");
+  auto syntaxErrorCtor = createErrorConstructor(ErrorType::SyntaxError, "SyntaxError");
+  auto uriErrorCtor = createErrorConstructor(ErrorType::URIError, "URIError");
+  auto evalErrorCtor = createErrorConstructor(ErrorType::EvalError, "EvalError");
+
+  env->define("Error", Value(errorCtor));
+  env->define("TypeError", Value(typeErrorCtor));
+  env->define("ReferenceError", Value(referenceErrorCtor));
+  env->define("RangeError", Value(rangeErrorCtor));
+  env->define("SyntaxError", Value(syntaxErrorCtor));
+  env->define("URIError", Value(uriErrorCtor));
+  env->define("EvalError", Value(evalErrorCtor));
+
+  // Map constructor
+  auto mapConstructor = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  mapConstructor->isNative = true;
+  mapConstructor->isConstructor = true;
+  mapConstructor->properties["name"] = Value(std::string("Map"));
+  mapConstructor->properties["length"] = Value(0.0);
+  mapConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto mapObj = std::make_shared<Map>();
+    GarbageCollector::instance().reportAllocation(sizeof(Map));
+
+    if (!args.empty() && args[0].isArray()) {
+      auto entriesArr = std::get<std::shared_ptr<Array>>(args[0].data);
+      for (const auto& entryVal : entriesArr->elements) {
+        if (entryVal.isArray()) {
+          auto entryArr = std::get<std::shared_ptr<Array>>(entryVal.data);
+          if (entryArr->elements.size() >= 2) {
+            mapObj->set(entryArr->elements[0], entryArr->elements[1]);
+          }
+        }
+      }
+    }
+
+    return Value(mapObj);
+  };
+  auto mapPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  mapConstructor->properties["prototype"] = Value(mapPrototype);
+  mapPrototype->properties["constructor"] = Value(mapConstructor);
+  env->define("Map", Value(mapConstructor));
+
+  // Set constructor
+  auto setConstructor = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  setConstructor->isNative = true;
+  setConstructor->isConstructor = true;
+  setConstructor->properties["name"] = Value(std::string("Set"));
+  setConstructor->properties["length"] = Value(0.0);
+  setConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto setObj = std::make_shared<Set>();
+    GarbageCollector::instance().reportAllocation(sizeof(Set));
+
+    if (!args.empty() && args[0].isArray()) {
+      auto entriesArr = std::get<std::shared_ptr<Array>>(args[0].data);
+      for (const auto& entryVal : entriesArr->elements) {
+        setObj->add(entryVal);
+      }
+    }
+
+    return Value(setObj);
+  };
+  auto setPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  setConstructor->properties["prototype"] = Value(setPrototype);
+  setPrototype->properties["constructor"] = Value(setConstructor);
+  env->define("Set", Value(setConstructor));
 
   // WeakMap constructor
   auto weakMapConstructor = std::make_shared<Function>();
@@ -569,6 +1536,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Proxy constructor
   auto proxyConstructor = std::make_shared<Function>();
   proxyConstructor->isNative = true;
+  proxyConstructor->isConstructor = true;
   proxyConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
       // Need target and handler
@@ -595,6 +1563,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (target.isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      if (obj->isModuleNamespace) {
+        auto getterIt = obj->properties.find("__get_" + prop);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          Interpreter* interpreter = getGlobalInterpreter();
+          if (interpreter) {
+            Value out = interpreter->callForHarness(getterIt->second, {}, target);
+            if (interpreter->hasError()) {
+              Value err = interpreter->getError();
+              interpreter->clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return out;
+          }
+        }
+      }
       auto it = obj->properties.find(prop);
       if (it != obj->properties.end()) {
         return it->second;
@@ -616,6 +1599,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (target.isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      if (obj->isModuleNamespace) {
+        return Value(false);
+      }
       obj->properties[prop] = value;
       return Value(true);
     }
@@ -634,6 +1620,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (target.isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      if (obj->isModuleNamespace) {
+        if (prop == WellKnownSymbols::toStringTagKey()) {
+          return Value(true);
+        }
+        return Value(isModuleNamespaceExportKey(obj, prop));
+      }
       return Value(obj->properties.find(prop) != obj->properties.end());
     }
     return Value(false);
@@ -651,6 +1643,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (target.isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      if (obj->isModuleNamespace) {
+        if (prop == WellKnownSymbols::toStringTagKey()) {
+          return Value(false);
+        }
+        return Value(!isModuleNamespaceExportKey(obj, prop));
+      }
       return Value(obj->properties.erase(prop) > 0);
     }
     return Value(false);
@@ -689,10 +1687,23 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectConstruct->isNative = true;
   reflectConstruct->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 || !args[0].isFunction()) {
-      return Value(Undefined{});
+      throw std::runtime_error("TypeError: Reflect.construct target is not a function");
     }
 
     auto func = std::get<std::shared_ptr<Function>>(args[0].data);
+    if (!func->isConstructor) {
+      throw std::runtime_error("TypeError: target is not a constructor");
+    }
+
+    if (args.size() >= 3) {
+      if (!args[2].isFunction()) {
+        throw std::runtime_error("TypeError: newTarget is not a constructor");
+      }
+      auto newTarget = std::get<std::shared_ptr<Function>>(args[2].data);
+      if (!newTarget->isConstructor) {
+        throw std::runtime_error("TypeError: newTarget is not a constructor");
+      }
+    }
 
     std::vector<Value> callArgs;
     if (args[1].isArray()) {
@@ -734,6 +1745,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty()) return Value(false);
     if (args[0].isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      if (obj->isModuleNamespace) {
+        return Value(false);
+      }
       return Value(!obj->sealed && !obj->frozen);
     }
     return Value(false);
@@ -748,6 +1762,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(false);
     }
     auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (obj->isModuleNamespace) {
+      return Value(true);
+    }
     obj->sealed = true;
     return Value(true);
   };
@@ -763,6 +1780,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (args[0].isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      if (obj->isModuleNamespace) {
+        for (const auto& key : obj->moduleExportNames) {
+          result->elements.push_back(Value(key));
+        }
+        result->elements.push_back(WellKnownSymbols::toStringTag());
+        return Value(result);
+      }
       for (const auto& [key, _] : obj->properties) {
         result->elements.push_back(Value(key));
       }
@@ -788,6 +1812,42 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (args[0].isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      if (obj->isModuleNamespace) {
+        auto descriptor = std::make_shared<Object>();
+        if (prop == WellKnownSymbols::toStringTagKey()) {
+          descriptor->properties["value"] = Value(std::string("Module"));
+          descriptor->properties["writable"] = Value(false);
+          descriptor->properties["enumerable"] = Value(false);
+          descriptor->properties["configurable"] = Value(false);
+          return Value(descriptor);
+        }
+        if (!isModuleNamespaceExportKey(obj, prop)) {
+          return Value(Undefined{});
+        }
+        auto getterIt = obj->properties.find("__get_" + prop);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          Interpreter* interpreter = getGlobalInterpreter();
+          if (interpreter) {
+            Value out = interpreter->callForHarness(getterIt->second, {}, args[0]);
+            if (interpreter->hasError()) {
+              Value err = interpreter->getError();
+              interpreter->clearError();
+              throw std::runtime_error(err.toString());
+            }
+            descriptor->properties["value"] = out;
+          } else {
+            descriptor->properties["value"] = Value(Undefined{});
+          }
+        } else if (auto it = obj->properties.find(prop); it != obj->properties.end()) {
+          descriptor->properties["value"] = it->second;
+        } else {
+          descriptor->properties["value"] = Value(Undefined{});
+        }
+        descriptor->properties["writable"] = Value(true);
+        descriptor->properties["enumerable"] = Value(true);
+        descriptor->properties["configurable"] = Value(false);
+        return Value(descriptor);
+      }
       auto it = obj->properties.find(prop);
       if (it == obj->properties.end()) {
         return Value(Undefined{});
@@ -814,6 +1874,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
     std::string prop = args[1].toString();
+    if (obj->isModuleNamespace) {
+      if (!args[2].isObject()) {
+        return Value(false);
+      }
+      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      return Value(defineModuleNamespaceProperty(obj, prop, descriptor));
+    }
 
     // Check if object is sealed/frozen
     bool isNewProp = obj->properties.find(prop) == obj->properties.end();
@@ -838,8 +1905,23 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Reflect", Value(reflectObj));
 
   // Number object with static methods
-  auto numberObj = std::make_shared<Object>();
-  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  auto numberObj = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  numberObj->isNative = true;
+  numberObj->isConstructor = true;
+  numberObj->properties["__wrap_primitive__"] = Value(true);
+  numberObj->properties["name"] = Value(std::string("Number"));
+  numberObj->properties["length"] = Value(1.0);
+  numberObj->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(0.0);
+    }
+    Value primitive = toPrimitive(args[0], false);
+    if (primitive.isSymbol()) {
+      throw std::runtime_error("TypeError: Cannot convert Symbol to number");
+    }
+    return Value(primitive.toNumber());
+  };
 
   // Number.parseInt
   auto parseIntFn = std::make_shared<Function>();
@@ -976,6 +2058,23 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   env->define("Number", Value(numberObj));
 
+  // Boolean constructor
+  auto booleanObj = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  booleanObj->isNative = true;
+  booleanObj->isConstructor = true;
+  booleanObj->properties["__wrap_primitive__"] = Value(true);
+  booleanObj->properties["name"] = Value(std::string("Boolean"));
+  booleanObj->properties["length"] = Value(1.0);
+  booleanObj->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(false);
+    }
+    Value primitive = toPrimitive(args[0], false);
+    return Value(primitive.toBool());
+  };
+  env->define("Boolean", Value(booleanObj));
+
   // Global parseInt and parseFloat (aliases)
   env->define("parseInt", Value(parseIntFn));
   env->define("parseFloat", Value(parseFloatFn));
@@ -1000,9 +2099,44 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("isFinite", Value(globalIsFiniteFn));
 
-  // Array object with static methods
-  auto arrayObj = std::make_shared<Object>();
-  // GarbageCollector::instance().reportAllocation(sizeof(Object));
+  // Array constructor with static methods
+  auto arrayConstructorFn = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  arrayConstructorFn->isNative = true;
+  arrayConstructorFn->isConstructor = true;
+  arrayConstructorFn->properties["name"] = Value(std::string("Array"));
+  arrayConstructorFn->properties["length"] = Value(1.0);
+  arrayConstructorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto result = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+    if (args.empty()) {
+      return Value(result);
+    }
+
+    if (args.size() == 1 && args[0].isNumber()) {
+      double lengthNum = args[0].toNumber();
+      if (!std::isfinite(lengthNum) || lengthNum < 0 || std::floor(lengthNum) != lengthNum) {
+        throw std::runtime_error("RangeError: Invalid array length");
+      }
+      result->elements.resize(static_cast<size_t>(lengthNum), Value(Undefined{}));
+      return Value(result);
+    }
+
+    result->elements = args;
+    return Value(result);
+  };
+
+  auto arrayConstructorObj = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  arrayConstructorObj->properties["__callable_object__"] = Value(true);
+  arrayConstructorObj->properties["constructor"] = Value(arrayConstructorFn);
+
+  auto arrayPrototype = std::make_shared<Object>();
+  arrayConstructorObj->properties["prototype"] = Value(arrayPrototype);
+  arrayConstructorFn->properties["prototype"] = Value(arrayPrototype);
+  arrayPrototype->properties["constructor"] = Value(arrayConstructorObj);
+  env->define("__array_prototype__", Value(arrayPrototype));
 
   // Array.isArray
   auto isArrayFn = std::make_shared<Function>();
@@ -1011,7 +2145,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty()) return Value(false);
     return Value(args[0].isArray());
   };
-  arrayObj->properties["isArray"] = Value(isArrayFn);
+  arrayConstructorObj->properties["isArray"] = Value(isArrayFn);
 
   // Array.from - creates array from array-like or iterable object
   auto fromFn = std::make_shared<Function>();
@@ -1024,12 +2158,53 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
 
     const Value& arrayLike = args[0];
+    Value mapFn = args.size() > 1 ? args[1] : Value(Undefined{});
+    Value thisArg = args.size() > 2 ? args[2] : Value(Undefined{});
+    bool hasMapFn = !mapFn.isUndefined();
+
+    if (hasMapFn && !mapFn.isFunction()) {
+      throw std::runtime_error("TypeError: Array.from mapper must be a function");
+    }
+
+    auto applyMap = [&](const Value& value, size_t index) -> Value {
+      if (!hasMapFn) {
+        return value;
+      }
+
+      std::vector<Value> mapperArgs = {value, Value(static_cast<double>(index))};
+      Interpreter* interpreter = getGlobalInterpreter();
+      if (interpreter) {
+        Value mapped = interpreter->callForHarness(mapFn, mapperArgs, thisArg);
+        if (interpreter->hasError()) {
+          Value err = interpreter->getError();
+          interpreter->clearError();
+          throw std::runtime_error(err.toString());
+        }
+        return mapped;
+      }
+
+      auto mapper = std::get<std::shared_ptr<Function>>(mapFn.data);
+      if (mapper->isNative) {
+        auto itUsesThis = mapper->properties.find("__uses_this_arg__");
+        if (itUsesThis != mapper->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+          std::vector<Value> nativeArgs;
+          nativeArgs.reserve(mapperArgs.size() + 1);
+          nativeArgs.push_back(thisArg);
+          nativeArgs.insert(nativeArgs.end(), mapperArgs.begin(), mapperArgs.end());
+          return mapper->nativeFunc(nativeArgs);
+        }
+        return mapper->nativeFunc(mapperArgs);
+      }
+
+      return value;
+    };
 
     // If it's already an array, copy it
     if (arrayLike.isArray()) {
       auto srcArray = std::get<std::shared_ptr<Array>>(arrayLike.data);
+      size_t index = 0;
       for (const auto& elem : srcArray->elements) {
-        result->elements.push_back(elem);
+        result->elements.push_back(applyMap(elem, index++));
       }
       return Value(result);
     }
@@ -1037,16 +2212,78 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     // If it's a string, convert each character to array element
     if (arrayLike.isString()) {
       std::string str = std::get<std::string>(arrayLike.data);
+      size_t index = 0;
       for (char c : str) {
-        result->elements.push_back(Value(std::string(1, c)));
+        result->elements.push_back(applyMap(Value(std::string(1, c)), index++));
       }
       return Value(result);
+    }
+
+    // If it's an iterator object, consume it
+    if (arrayLike.isObject()) {
+      Value iteratorValue = arrayLike;
+      auto srcObj = std::get<std::shared_ptr<Object>>(arrayLike.data);
+      const auto& iteratorKey = WellKnownSymbols::iteratorKey();
+
+      auto iteratorMethodIt = srcObj->properties.find(iteratorKey);
+      if (iteratorMethodIt != srcObj->properties.end() && iteratorMethodIt->second.isFunction()) {
+        Interpreter* interpreter = getGlobalInterpreter();
+        if (interpreter) {
+          iteratorValue = interpreter->callForHarness(iteratorMethodIt->second, {}, arrayLike);
+          if (interpreter->hasError()) {
+            Value err = interpreter->getError();
+            interpreter->clearError();
+            throw std::runtime_error(err.toString());
+          }
+        } else {
+          auto iterMethod = std::get<std::shared_ptr<Function>>(iteratorMethodIt->second.data);
+          iteratorValue = iterMethod->isNative ? iterMethod->nativeFunc({}) : Value(Undefined{});
+        }
+      }
+
+      if (iteratorValue.isObject()) {
+        auto iterObj = std::get<std::shared_ptr<Object>>(iteratorValue.data);
+        auto nextIt = iterObj->properties.find("next");
+        if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
+          size_t index = 0;
+          while (true) {
+            Value stepResult;
+            Interpreter* interpreter = getGlobalInterpreter();
+            if (interpreter) {
+              stepResult = interpreter->callForHarness(nextIt->second, {}, iteratorValue);
+              if (interpreter->hasError()) {
+                Value err = interpreter->getError();
+                interpreter->clearError();
+                throw std::runtime_error(err.toString());
+              }
+            } else {
+              auto nextFn = std::get<std::shared_ptr<Function>>(nextIt->second.data);
+              stepResult = nextFn->isNative ? nextFn->nativeFunc({}) : Value(Undefined{});
+            }
+
+            if (!stepResult.isObject()) break;
+            auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+            bool done = false;
+            if (auto doneIt = stepObj->properties.find("done"); doneIt != stepObj->properties.end()) {
+              done = doneIt->second.toBool();
+            }
+            if (done) break;
+
+            Value element = Value(Undefined{});
+            if (auto valueIt = stepObj->properties.find("value"); valueIt != stepObj->properties.end()) {
+              element = valueIt->second;
+            }
+            result->elements.push_back(applyMap(element, index++));
+          }
+          return Value(result);
+        }
+      }
     }
 
     // Otherwise return empty array
     return Value(result);
   };
-  arrayObj->properties["from"] = Value(fromFn);
+  arrayConstructorObj->properties["from"] = Value(fromFn);
 
   // Array.of - creates array from arguments
   auto ofFn = std::make_shared<Function>();
@@ -1056,24 +2293,151 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     result->elements = args;
     return Value(result);
   };
-  arrayObj->properties["of"] = Value(ofFn);
+  arrayConstructorObj->properties["of"] = Value(ofFn);
 
-  env->define("Array", Value(arrayObj));
+  env->define("Array", Value(arrayConstructorObj));
 
   // Promise constructor
+  auto promiseFunc = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  promiseFunc->isNative = true;
+  promiseFunc->isConstructor = true;
+  promiseFunc->properties["name"] = Value(std::string("Promise"));
+  promiseFunc->properties["length"] = Value(1.0);
+
   auto promiseConstructor = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+  auto promisePrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  promiseConstructor->properties["prototype"] = Value(promisePrototype);
+  promisePrototype->properties["constructor"] = Value(promiseFunc);
 
   // Promise.resolve
   auto promiseResolve = std::make_shared<Function>();
   promiseResolve->isNative = true;
-  promiseResolve->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto promise = std::make_shared<Promise>();
-    if (!args.empty()) {
-      promise->resolve(args[0]);
-    } else {
-      promise->resolve(Value(Undefined{}));
+  promiseResolve->properties["__uses_this_arg__"] = Value(true);
+  promiseResolve->nativeFunc = [callChecked, getProperty, env, promiseFunc](const std::vector<Value>& args) -> Value {
+    Value resolution = args.size() > 1 ? args[1] : Value(Undefined{});
+    if (resolution.isPromise()) {
+      return resolution;
     }
+
+    auto promise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    promise->properties["__constructor__"] = Value(promiseFunc);
+
+    auto getThenProperty = [&](const Value& candidate) -> std::pair<bool, Value> {
+      if (candidate.isArray()) {
+        auto arr = std::get<std::shared_ptr<Array>>(candidate.data);
+        auto getterIt = arr->properties.find("__get_then");
+        if (getterIt != arr->properties.end()) {
+          if (getterIt->second.isFunction()) {
+            return {true, callChecked(getterIt->second, {}, candidate)};
+          }
+          return {true, Value(Undefined{})};
+        }
+        auto ownIt = arr->properties.find("then");
+        if (ownIt != arr->properties.end()) {
+          return {true, ownIt->second};
+        }
+        if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
+          auto arrayObjPtr = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+          auto protoIt = arrayObjPtr->properties.find("prototype");
+          if (protoIt != arrayObjPtr->properties.end() && protoIt->second.isObject()) {
+            auto protoObj = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+            auto protoGetterIt = protoObj->properties.find("__get_then");
+            if (protoGetterIt != protoObj->properties.end()) {
+              if (protoGetterIt->second.isFunction()) {
+                return {true, callChecked(protoGetterIt->second, {}, candidate)};
+              }
+              return {true, Value(Undefined{})};
+            }
+            auto protoThenIt = protoObj->properties.find("then");
+            if (protoThenIt != protoObj->properties.end()) {
+              return {true, protoThenIt->second};
+            }
+          }
+        }
+        return {false, Value(Undefined{})};
+      }
+
+      return getProperty(candidate, "then");
+    };
+
+    auto resolveSelf = std::make_shared<std::function<void(const Value&)>>();
+    *resolveSelf = [promise, resolveSelf, getThenProperty, callChecked](const Value& value) {
+      if (promise->state != PromiseState::Pending) {
+        return;
+      }
+
+      if (value.isPromise()) {
+        auto nested = std::get<std::shared_ptr<Promise>>(value.data);
+        if (nested.get() == promise.get()) {
+          promise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself")));
+          return;
+        }
+        if (nested->state == PromiseState::Fulfilled) {
+          (*resolveSelf)(nested->result);
+          return;
+        }
+        if (nested->state == PromiseState::Rejected) {
+          promise->reject(nested->result);
+          return;
+        }
+        nested->then(
+          [resolveSelf](Value fulfilled) -> Value {
+            (*resolveSelf)(fulfilled);
+            return fulfilled;
+          },
+          [promise](Value reason) -> Value {
+            promise->reject(reason);
+            return reason;
+          });
+        return;
+      }
+
+      if (value.isObject() || value.isArray() || value.isFunction() || value.isRegex() || value.isProxy()) {
+        try {
+          auto [foundThen, thenValue] = getThenProperty(value);
+          if (foundThen && thenValue.isFunction()) {
+            auto alreadyCalled = std::make_shared<bool>(false);
+            auto resolveFn = std::make_shared<Function>();
+            resolveFn->isNative = true;
+            resolveFn->nativeFunc = [resolveSelf, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
+              if (*alreadyCalled) {
+                return Value(Undefined{});
+              }
+              *alreadyCalled = true;
+              Value next = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+              (*resolveSelf)(next);
+              return Value(Undefined{});
+            };
+
+            auto rejectFn = std::make_shared<Function>();
+            rejectFn->isNative = true;
+            rejectFn->nativeFunc = [promise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
+              if (*alreadyCalled) {
+                return Value(Undefined{});
+              }
+              *alreadyCalled = true;
+              Value reason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+              promise->reject(reason);
+              return Value(Undefined{});
+            };
+
+            callChecked(thenValue, {Value(resolveFn), Value(rejectFn)}, value);
+            return;
+          }
+        } catch (const std::exception& e) {
+          promise->reject(Value(std::string(e.what())));
+          return;
+        }
+      }
+
+      promise->resolve(value);
+    };
+
+    (*resolveSelf)(resolution);
     return Value(promise);
   };
   promiseConstructor->properties["resolve"] = Value(promiseResolve);
@@ -1081,8 +2445,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.reject
   auto promiseReject = std::make_shared<Function>();
   promiseReject->isNative = true;
-  promiseReject->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  promiseReject->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     auto promise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    promise->properties["__constructor__"] = Value(promiseFunc);
     if (!args.empty()) {
       promise->reject(args[0]);
     } else {
@@ -1092,19 +2458,62 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   promiseConstructor->properties["reject"] = Value(promiseReject);
 
+  // Promise.withResolvers
+  auto promiseWithResolvers = std::make_shared<Function>();
+  promiseWithResolvers->isNative = true;
+  promiseWithResolvers->nativeFunc = [promiseFunc](const std::vector<Value>&) -> Value {
+    auto promise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    promise->properties["__constructor__"] = Value(promiseFunc);
+
+    auto resolveFunc = std::make_shared<Function>();
+    resolveFunc->isNative = true;
+    auto promisePtr = promise;
+    resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+      if (!args.empty()) {
+        promisePtr->resolve(args[0]);
+      } else {
+        promisePtr->resolve(Value(Undefined{}));
+      }
+      return Value(Undefined{});
+    };
+
+    auto rejectFunc = std::make_shared<Function>();
+    rejectFunc->isNative = true;
+    rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+      if (!args.empty()) {
+        promisePtr->reject(args[0]);
+      } else {
+        promisePtr->reject(Value(Undefined{}));
+      }
+      return Value(Undefined{});
+    };
+
+    auto result = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    result->properties["promise"] = Value(promise);
+    result->properties["resolve"] = Value(resolveFunc);
+    result->properties["reject"] = Value(rejectFunc);
+    return Value(result);
+  };
+  promiseConstructor->properties["withResolvers"] = Value(promiseWithResolvers);
+
   // Promise.all
   auto promiseAll = std::make_shared<Function>();
   promiseAll->isNative = true;
-  promiseAll->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  promiseAll->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.all expects an array")));
       return Value(promise);
     }
 
     auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
     auto resultPromise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    resultPromise->properties["__constructor__"] = Value(promiseFunc);
     auto results = std::make_shared<Array>();
 
     bool hasRejection = false;
@@ -1134,42 +2543,506 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.allSettled - waits for all promises to settle (resolve or reject)
   auto promiseAllSettled = std::make_shared<Function>();
   promiseAllSettled->isNative = true;
-  promiseAllSettled->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      auto promise = std::make_shared<Promise>();
-      GarbageCollector::instance().reportAllocation(sizeof(Promise));
-      promise->reject(Value(std::string("Promise.allSettled expects an array")));
-      return Value(promise);
-    }
-
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+  promiseAllSettled->properties["__uses_this_arg__"] = Value(true);
+  promiseAllSettled->nativeFunc = [callChecked, getProperty, env, promiseFunc](const std::vector<Value>& args) -> Value {
+    Value constructor = args.empty() ? Value(Undefined{}) : args[0];
+    Value iterable = args.size() > 1 ? args[1] : Value(Undefined{});
     auto resultPromise = std::make_shared<Promise>();
-    auto results = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
-    for (const auto& elem : arr->elements) {
-      auto resultObj = std::make_shared<Object>();
-      if (elem.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
-        if (p->state == PromiseState::Fulfilled) {
-          resultObj->properties["status"] = Value(std::string("fulfilled"));
-          resultObj->properties["value"] = p->result;
-        } else if (p->state == PromiseState::Rejected) {
-          resultObj->properties["status"] = Value(std::string("rejected"));
-          resultObj->properties["reason"] = p->result;
-        } else {
-          // Pending - treat as fulfilled with the promise itself
-          resultObj->properties["status"] = Value(std::string("fulfilled"));
-          resultObj->properties["value"] = elem;
-        }
-      } else {
-        // Non-promise values are treated as fulfilled
-        resultObj->properties["status"] = Value(std::string("fulfilled"));
-        resultObj->properties["value"] = elem;
+    auto typeErrorValue = [](const std::string& msg) -> Value {
+      return Value(std::make_shared<Error>(ErrorType::TypeError, msg));
+    };
+
+    auto rejectAndReturn = [&](const Value& reason) -> Value {
+      resultPromise->reject(reason);
+      return Value(resultPromise);
+    };
+
+    auto callWithThis = [](const Value& callee,
+                           const std::vector<Value>& callArgs,
+                           const Value& thisArg,
+                           Value& out,
+                           Value& thrown) -> bool {
+      if (!callee.isFunction()) {
+        thrown = Value(std::make_shared<Error>(ErrorType::TypeError, "Value is not callable"));
+        return false;
       }
-      results->elements.push_back(Value(resultObj));
+
+      auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+      if (fn->isNative) {
+        try {
+          auto itUsesThis = fn->properties.find("__uses_this_arg__");
+          if (itUsesThis != fn->properties.end() &&
+              itUsesThis->second.isBool() &&
+              itUsesThis->second.toBool()) {
+            std::vector<Value> nativeArgs;
+            nativeArgs.reserve(callArgs.size() + 1);
+            nativeArgs.push_back(thisArg);
+            nativeArgs.insert(nativeArgs.end(), callArgs.begin(), callArgs.end());
+            out = fn->nativeFunc(nativeArgs);
+          } else {
+            out = fn->nativeFunc(callArgs);
+          }
+          return true;
+        } catch (const std::exception& e) {
+          thrown = Value(std::string(e.what()));
+          return false;
+        }
+      }
+
+      Interpreter* interpreter = getGlobalInterpreter();
+      if (!interpreter) {
+        thrown = Value(std::string("TypeError: Interpreter unavailable"));
+        return false;
+      }
+      interpreter->clearError();
+      out = interpreter->callForHarness(callee, callArgs, thisArg);
+      if (interpreter->hasError()) {
+        thrown = interpreter->getError();
+        interpreter->clearError();
+        return false;
+      }
+      return true;
+    };
+
+    auto getPropertyWithThrow = [&](const Value& receiver,
+                                    const std::string& key,
+                                    Value& out,
+                                    bool& found,
+                                    Value& thrown) -> bool {
+      auto resolveFromObject = [&](const std::shared_ptr<Object>& obj,
+                                   const Value& originalReceiver) -> bool {
+        auto current = obj;
+        int depth = 0;
+        while (current && depth <= 32) {
+          depth++;
+
+          auto getterIt = current->properties.find("__get_" + key);
+          if (getterIt != current->properties.end()) {
+            found = true;
+            if (!getterIt->second.isFunction()) {
+              out = Value(Undefined{});
+              return true;
+            }
+            Value getterOut;
+            if (!callWithThis(getterIt->second, {}, originalReceiver, getterOut, thrown)) {
+              return false;
+            }
+            out = getterOut;
+            return true;
+          }
+
+          auto it = current->properties.find(key);
+          if (it != current->properties.end()) {
+            found = true;
+            out = it->second;
+            return true;
+          }
+
+          auto protoIt = current->properties.find("__proto__");
+          if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
+            break;
+          }
+          current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        }
+        return true;
+      };
+
+      found = false;
+      out = Value(Undefined{});
+
+      if (receiver.isObject()) {
+        return resolveFromObject(std::get<std::shared_ptr<Object>>(receiver.data), receiver);
+      }
+      if (receiver.isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+        auto getterIt = fn->properties.find("__get_" + key);
+        if (getterIt != fn->properties.end()) {
+          found = true;
+          if (!getterIt->second.isFunction()) {
+            out = Value(Undefined{});
+            return true;
+          }
+          return callWithThis(getterIt->second, {}, receiver, out, thrown);
+        }
+        auto it = fn->properties.find(key);
+        if (it != fn->properties.end()) {
+          found = true;
+          out = it->second;
+        }
+        return true;
+      }
+      if (receiver.isArray()) {
+        auto arr = std::get<std::shared_ptr<Array>>(receiver.data);
+        auto getterIt = arr->properties.find("__get_" + key);
+        if (getterIt != arr->properties.end()) {
+          found = true;
+          if (!getterIt->second.isFunction()) {
+            out = Value(Undefined{});
+            return true;
+          }
+          return callWithThis(getterIt->second, {}, receiver, out, thrown);
+        }
+        auto it = arr->properties.find(key);
+        if (it != arr->properties.end()) {
+          found = true;
+          out = it->second;
+          return true;
+        }
+        if (key == "length") {
+          found = true;
+          out = Value(static_cast<double>(arr->elements.size()));
+          return true;
+        }
+        if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
+          auto arrayObjPtr = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+          auto protoIt = arrayObjPtr->properties.find("prototype");
+          if (protoIt != arrayObjPtr->properties.end() && protoIt->second.isObject()) {
+            return resolveFromObject(std::get<std::shared_ptr<Object>>(protoIt->second.data), receiver);
+          }
+        }
+        return true;
+      }
+
+      return true;
+    };
+
+    Value promiseResolveMethod = Value(Undefined{});
+    bool hasResolve = false;
+    Value resolveThrown;
+    if (!getPropertyWithThrow(constructor, "resolve", promiseResolveMethod, hasResolve, resolveThrown)) {
+      return rejectAndReturn(resolveThrown);
+    }
+    if (!hasResolve || !promiseResolveMethod.isFunction()) {
+      return rejectAndReturn(typeErrorValue("Promise.resolve is not callable"));
     }
 
-    resultPromise->resolve(Value(results));
+    auto results = std::make_shared<Array>();
+    auto remaining = std::make_shared<size_t>(1);
+
+    auto resolveResultPromise = std::make_shared<std::function<void(const Value&)>>();
+    *resolveResultPromise = [resultPromise, resolveResultPromise, getPropertyWithThrow, callWithThis](const Value& finalValue) {
+      if (resultPromise->state != PromiseState::Pending) {
+        return;
+      }
+
+      if (finalValue.isPromise()) {
+        auto nested = std::get<std::shared_ptr<Promise>>(finalValue.data);
+        if (nested.get() == resultPromise.get()) {
+          resultPromise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself")));
+          return;
+        }
+        if (nested->state == PromiseState::Fulfilled) {
+          (*resolveResultPromise)(nested->result);
+          return;
+        }
+        if (nested->state == PromiseState::Rejected) {
+          resultPromise->reject(nested->result);
+          return;
+        }
+        nested->then(
+          [resolveResultPromise](Value fulfilled) -> Value {
+            (*resolveResultPromise)(fulfilled);
+            return fulfilled;
+          },
+          [resultPromise](Value reason) -> Value {
+            resultPromise->reject(reason);
+            return reason;
+          });
+        return;
+      }
+
+      if (finalValue.isObject() || finalValue.isArray() || finalValue.isFunction() ||
+          finalValue.isRegex() || finalValue.isProxy()) {
+        Value thenValue = Value(Undefined{});
+        bool hasThen = false;
+        Value thenThrown;
+        if (!getPropertyWithThrow(finalValue, "then", thenValue, hasThen, thenThrown)) {
+          resultPromise->reject(thenThrown);
+          return;
+        }
+        if (hasThen && thenValue.isFunction()) {
+          auto alreadyCalled = std::make_shared<bool>(false);
+          auto resolveFn = std::make_shared<Function>();
+          resolveFn->isNative = true;
+          resolveFn->nativeFunc = [resolveResultPromise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
+            if (*alreadyCalled) {
+              return Value(Undefined{});
+            }
+            *alreadyCalled = true;
+            Value next = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+            (*resolveResultPromise)(next);
+            return Value(Undefined{});
+          };
+          auto rejectFn = std::make_shared<Function>();
+          rejectFn->isNative = true;
+          rejectFn->nativeFunc = [resultPromise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
+            if (*alreadyCalled) {
+              return Value(Undefined{});
+            }
+            *alreadyCalled = true;
+            Value reason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+            resultPromise->reject(reason);
+            return Value(Undefined{});
+          };
+
+          Value ignored;
+          Value thenCallThrown;
+          if (!callWithThis(thenValue, {Value(resolveFn), Value(rejectFn)}, finalValue, ignored, thenCallThrown) &&
+              !*alreadyCalled) {
+            resultPromise->reject(thenCallThrown);
+          }
+          return;
+        }
+      }
+
+      resultPromise->resolve(finalValue);
+    };
+
+    auto finalizeIfDone = [remaining, results, resolveResultPromise]() {
+      if (*remaining == 0) {
+        auto valuesArray = std::make_shared<Array>();
+        valuesArray->elements = results->elements;
+        (*resolveResultPromise)(Value(valuesArray));
+      }
+    };
+
+    auto processElement = [&](size_t index, const Value& nextValue, Value& failureReason) -> bool {
+      if (results->elements.size() <= index) {
+        results->elements.resize(index + 1, Value(Undefined{}));
+      }
+
+      (*remaining)++;
+      Value nextPromise = Value(Undefined{});
+      Value resolveCallThrown;
+      if (!callWithThis(promiseResolveMethod, {nextValue}, constructor, nextPromise, resolveCallThrown)) {
+        failureReason = resolveCallThrown;
+        return false;
+      }
+
+      auto alreadyCalled = std::make_shared<bool>(false);
+      auto resolveElement = std::make_shared<Function>();
+      resolveElement->isNative = true;
+      resolveElement->nativeFunc = [results, remaining, index, alreadyCalled, finalizeIfDone](const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadyCalled) {
+          return Value(Undefined{});
+        }
+        *alreadyCalled = true;
+        Value settledValue = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+        auto entry = std::make_shared<Object>();
+        entry->properties["status"] = Value(std::string("fulfilled"));
+        entry->properties["value"] = settledValue;
+        results->elements[index] = Value(entry);
+        (*remaining)--;
+        finalizeIfDone();
+        return Value(Undefined{});
+      };
+
+      auto rejectElement = std::make_shared<Function>();
+      rejectElement->isNative = true;
+      rejectElement->nativeFunc = [results, remaining, index, alreadyCalled, finalizeIfDone](const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadyCalled) {
+          return Value(Undefined{});
+        }
+        *alreadyCalled = true;
+        Value settledReason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+        auto entry = std::make_shared<Object>();
+        entry->properties["status"] = Value(std::string("rejected"));
+        entry->properties["reason"] = settledReason;
+        results->elements[index] = Value(entry);
+        (*remaining)--;
+        finalizeIfDone();
+        return Value(Undefined{});
+      };
+
+      if (nextPromise.isPromise()) {
+        auto promisePtr = std::get<std::shared_ptr<Promise>>(nextPromise.data);
+        Value overriddenThen = Value(Undefined{});
+        bool hasOverriddenThen = false;
+
+        auto getterIt = promisePtr->properties.find("__get_then");
+        if (getterIt != promisePtr->properties.end()) {
+          hasOverriddenThen = true;
+          if (getterIt->second.isFunction()) {
+            Value getterOut = Value(Undefined{});
+            Value getterThrown;
+            if (!callWithThis(getterIt->second, {}, nextPromise, getterOut, getterThrown)) {
+              failureReason = getterThrown;
+              return false;
+            }
+            overriddenThen = getterOut;
+          }
+        } else if (auto thenIt = promisePtr->properties.find("then");
+                   thenIt != promisePtr->properties.end()) {
+          hasOverriddenThen = true;
+          overriddenThen = thenIt->second;
+        }
+
+        if (hasOverriddenThen) {
+          if (!overriddenThen.isFunction()) {
+            failureReason = typeErrorValue("Promise resolve result is not thenable");
+            return false;
+          }
+          Value ignored;
+          Value thenInvokeThrown;
+          if (!callWithThis(overriddenThen, {Value(resolveElement), Value(rejectElement)},
+                            nextPromise, ignored, thenInvokeThrown) &&
+              !*alreadyCalled) {
+            failureReason = thenInvokeThrown;
+            return false;
+          }
+          return true;
+        }
+
+        promisePtr->then(
+          [resolveElement](Value v) -> Value {
+            return resolveElement->nativeFunc({v});
+          },
+          [rejectElement](Value reason) -> Value {
+            return rejectElement->nativeFunc({reason});
+          });
+        return true;
+      }
+
+      Value thenMethod = Value(Undefined{});
+      bool hasThenMethod = false;
+      Value thenLookupThrown;
+      if (!getPropertyWithThrow(nextPromise, "then", thenMethod, hasThenMethod, thenLookupThrown)) {
+        failureReason = thenLookupThrown;
+        return false;
+      }
+      if (!hasThenMethod || !thenMethod.isFunction()) {
+        failureReason = typeErrorValue("Promise resolve result is not thenable");
+        return false;
+      }
+
+      Value ignored;
+      Value thenInvokeThrown;
+      if (!callWithThis(thenMethod, {Value(resolveElement), Value(rejectElement)}, nextPromise, ignored, thenInvokeThrown) &&
+          !*alreadyCalled) {
+        failureReason = thenInvokeThrown;
+        return false;
+      }
+      return true;
+    };
+
+    auto closeIterator = [&](const Value& iteratorValue, Value& closeFailure) -> bool {
+      Value returnMethod = Value(Undefined{});
+      bool hasReturn = false;
+      Value returnLookupThrown;
+      if (!getPropertyWithThrow(iteratorValue, "return", returnMethod, hasReturn, returnLookupThrown)) {
+        closeFailure = returnLookupThrown;
+        return false;
+      }
+      if (!hasReturn || returnMethod.isUndefined() || returnMethod.isNull()) {
+        return true;
+      }
+      if (!returnMethod.isFunction()) {
+        closeFailure = typeErrorValue("Iterator return is not callable");
+        return false;
+      }
+      Value ignored;
+      Value returnThrown;
+      if (!callWithThis(returnMethod, {}, iteratorValue, ignored, returnThrown)) {
+        closeFailure = returnThrown;
+        return false;
+      }
+      return true;
+    };
+
+    const auto& iteratorKey = WellKnownSymbols::iteratorKey();
+    size_t nextIndex = 0;
+    if (iterable.isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(iterable.data);
+      for (const auto& value : arr->elements) {
+        Value failureReason;
+        if (!processElement(nextIndex++, value, failureReason)) {
+          return rejectAndReturn(failureReason);
+        }
+      }
+    } else if (iterable.isString()) {
+      const auto& str = std::get<std::string>(iterable.data);
+      for (char c : str) {
+        Value failureReason;
+        if (!processElement(nextIndex++, Value(std::string(1, c)), failureReason)) {
+          return rejectAndReturn(failureReason);
+        }
+      }
+    } else {
+      Value iteratorMethod = Value(Undefined{});
+      bool hasIteratorMethod = false;
+      Value iteratorLookupThrown;
+      if (!getPropertyWithThrow(iterable, iteratorKey, iteratorMethod, hasIteratorMethod, iteratorLookupThrown)) {
+        return rejectAndReturn(iteratorLookupThrown);
+      }
+      if (!hasIteratorMethod || iteratorMethod.isUndefined() || iteratorMethod.isNull()) {
+        return rejectAndReturn(typeErrorValue("Value is not iterable"));
+      }
+      if (!iteratorMethod.isFunction()) {
+        return rejectAndReturn(typeErrorValue("Symbol.iterator is not callable"));
+      }
+
+      Value iteratorValue = Value(Undefined{});
+      Value iteratorThrown;
+      if (!callWithThis(iteratorMethod, {}, iterable, iteratorValue, iteratorThrown)) {
+        return rejectAndReturn(iteratorThrown);
+      }
+      if (!iteratorValue.isObject()) {
+        return rejectAndReturn(typeErrorValue("Iterator must be an object"));
+      }
+
+      while (true) {
+        Value nextMethod = Value(Undefined{});
+        bool hasNext = false;
+        Value nextLookupThrown;
+        if (!getPropertyWithThrow(iteratorValue, "next", nextMethod, hasNext, nextLookupThrown)) {
+          return rejectAndReturn(nextLookupThrown);
+        }
+        if (!hasNext || !nextMethod.isFunction()) {
+          return rejectAndReturn(typeErrorValue("Iterator next is not callable"));
+        }
+
+        Value stepResult = Value(Undefined{});
+        Value nextThrown;
+        if (!callWithThis(nextMethod, {}, iteratorValue, stepResult, nextThrown)) {
+          return rejectAndReturn(nextThrown);
+        }
+        if (!stepResult.isObject()) {
+          return rejectAndReturn(typeErrorValue("Iterator result is not an object"));
+        }
+
+        Value doneValue = Value(false);
+        bool hasDone = false;
+        Value doneThrown;
+        if (!getPropertyWithThrow(stepResult, "done", doneValue, hasDone, doneThrown)) {
+          return rejectAndReturn(doneThrown);
+        }
+        if (hasDone && doneValue.toBool()) {
+          break;
+        }
+
+        Value itemValue = Value(Undefined{});
+        bool hasItem = false;
+        Value itemThrown;
+        if (!getPropertyWithThrow(stepResult, "value", itemValue, hasItem, itemThrown)) {
+          return rejectAndReturn(itemThrown);
+        }
+
+        Value failureReason;
+        if (!processElement(nextIndex++, hasItem ? itemValue : Value(Undefined{}), failureReason)) {
+          Value closeFailure;
+          if (!closeIterator(iteratorValue, closeFailure)) {
+            return rejectAndReturn(closeFailure);
+          }
+          return rejectAndReturn(failureReason);
+        }
+      }
+    }
+
+    (*remaining)--;
+    finalizeIfDone();
     return Value(resultPromise);
   };
   promiseConstructor->properties["allSettled"] = Value(promiseAllSettled);
@@ -1177,16 +3050,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.any - resolves when any promise fulfills, rejects if all reject
   auto promiseAny = std::make_shared<Function>();
   promiseAny->isNative = true;
-  promiseAny->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  promiseAny->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.any expects an array")));
       return Value(promise);
     }
 
     auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
     auto resultPromise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
     if (arr->elements.empty()) {
       // Empty array - reject with AggregateError
@@ -1231,16 +3107,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.race - resolves or rejects with the first settled promise
   auto promiseRace = std::make_shared<Function>();
   promiseRace->isNative = true;
-  promiseRace->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  promiseRace->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
+      promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.race expects an array")));
       return Value(promise);
     }
 
     auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
     auto resultPromise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
     for (const auto& elem : arr->elements) {
       if (elem.isPromise()) {
@@ -1264,10 +3143,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["race"] = Value(promiseRace);
 
   // Promise constructor function
-  auto promiseFunc = std::make_shared<Function>();
-  promiseFunc->isNative = true;
-  promiseFunc->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  promiseFunc->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     auto promise = std::make_shared<Promise>();
+    GarbageCollector::instance().reportAllocation(sizeof(Promise));
+    promise->properties["__constructor__"] = Value(promiseFunc);
 
     if (!args.empty() && args[0].isFunction()) {
       auto executor = std::get<std::shared_ptr<Function>>(args[0].data);
@@ -1303,15 +3182,28 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         } catch (const std::exception& e) {
           promise->reject(Value(std::string(e.what())));
         }
+      } else {
+        Interpreter* interpreter = getGlobalInterpreter();
+        if (interpreter) {
+          interpreter->clearError();
+          interpreter->callForHarness(Value(executor), {Value(resolveFunc), Value(rejectFunc)}, Value(Undefined{}));
+          if (interpreter->hasError()) {
+            Value err = interpreter->getError();
+            interpreter->clearError();
+            promise->reject(err);
+          }
+        } else {
+          promise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Interpreter unavailable")));
+        }
       }
     }
 
     return Value(promise);
   };
 
-  // For now, define Promise as an object with static methods
-  // In a full implementation, we'd need to make Function objects support properties
-  env->define("Promise", Value(promiseConstructor));
+  // Expose Promise as a callable constructor with static methods.
+  promiseFunc->properties = promiseConstructor->properties;
+  env->define("Promise", Value(promiseFunc));
 
   // JSON object
   auto jsonObj = std::make_shared<Object>();
@@ -1332,8 +3224,112 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("JSON", Value(jsonObj));
 
   // Object static methods
-  auto objectConstructor = std::make_shared<Object>();
+  auto objectConstructor = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  objectConstructor->isNative = true;
+  objectConstructor->isConstructor = true;
+  objectConstructor->properties["name"] = Value(std::string("Object"));
+  objectConstructor->properties["length"] = Value(1.0);
+  objectConstructor->nativeFunc = [env](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      auto obj = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      return Value(obj);
+    }
+
+    const Value& value = args[0];
+    if (!value.isBool() && !value.isNumber() && !value.isString() &&
+        !value.isBigInt() && !value.isSymbol()) {
+      return value;
+    }
+
+    auto wrapped = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    wrapped->properties["__primitive_value__"] = value;
+
+    if (!value.isBigInt()) {
+      auto valueOf = std::make_shared<Function>();
+      valueOf->isNative = true;
+      valueOf->properties["__uses_this_arg__"] = Value(true);
+      valueOf->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
+        if (!callArgs.empty() && callArgs[0].isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(callArgs[0].data);
+          auto it = obj->properties.find("__primitive_value__");
+          if (it != obj->properties.end()) {
+            return it->second;
+          }
+        }
+        return callArgs.empty() ? Value(Undefined{}) : callArgs[0];
+      };
+      wrapped->properties["valueOf"] = Value(valueOf);
+
+      auto toString = std::make_shared<Function>();
+      toString->isNative = true;
+      toString->properties["__uses_this_arg__"] = Value(true);
+      toString->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
+        if (!callArgs.empty() && callArgs[0].isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(callArgs[0].data);
+          auto it = obj->properties.find("__primitive_value__");
+          if (it != obj->properties.end()) {
+            return Value(it->second.toString());
+          }
+        }
+        return Value(callArgs.empty() ? std::string("undefined") : callArgs[0].toString());
+      };
+      wrapped->properties["toString"] = Value(toString);
+    }
+
+    if (value.isBigInt()) {
+      if (auto bigIntCtor = env->get("BigInt")) {
+        if (bigIntCtor->isFunction()) {
+          auto ctor = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
+          auto protoIt = ctor->properties.find("prototype");
+          if (protoIt != ctor->properties.end() && protoIt->second.isObject()) {
+            wrapped->properties["__proto__"] = protoIt->second;
+          }
+        }
+      }
+    }
+
+    return Value(wrapped);
+  };
+
+  auto objectPrototype = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+  objectConstructor->properties["prototype"] = Value(objectPrototype);
+
+  auto objectProtoHasOwnProperty = std::make_shared<Function>();
+  objectProtoHasOwnProperty->isNative = true;
+  objectProtoHasOwnProperty->properties["__uses_this_arg__"] = Value(true);
+  objectProtoHasOwnProperty->nativeFunc = Object_hasOwnProperty;
+  objectPrototype->properties["hasOwnProperty"] = Value(objectProtoHasOwnProperty);
+
+  auto objectProtoToString = std::make_shared<Function>();
+  objectProtoToString->isNative = true;
+  objectProtoToString->properties["__uses_this_arg__"] = Value(true);
+  objectProtoToString->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined()) {
+      return Value(std::string("[object Undefined]"));
+    }
+    if (args[0].isNull()) {
+      return Value(std::string("[object Null]"));
+    }
+
+    std::string tag = "Object";
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto toStringTagIt = obj->properties.find(WellKnownSymbols::toStringTagKey());
+      if (toStringTagIt != obj->properties.end()) {
+        tag = toStringTagIt->second.toString();
+      }
+    } else if (args[0].isArray()) {
+      tag = "Array";
+    } else if (args[0].isFunction()) {
+      tag = "Function";
+    }
+    return Value(std::string("[object ") + tag + "]");
+  };
+  objectPrototype->properties["toString"] = Value(objectProtoToString);
 
   // Object.keys
   auto objectKeys = std::make_shared<Function>();
@@ -1391,6 +3387,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string key = args[1].toString();
     if (args[0].isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      if (obj->isModuleNamespace) {
+        if (key == WellKnownSymbols::toStringTagKey()) {
+          return Value(true);
+        }
+        return Value(isModuleNamespaceExportKey(obj, key));
+      }
       return Value(obj->properties.find(key) != obj->properties.end());
     }
     if (args[0].isArray()) {
@@ -1406,6 +3408,125 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(false);
   };
   objectConstructor->properties["hasOwn"] = Value(objectHasOwn);
+
+  auto objectGetPrototypeOf = std::make_shared<Function>();
+  objectGetPrototypeOf->isNative = true;
+  objectGetPrototypeOf->nativeFunc = [promisePrototype, env](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      return Value(Null{});
+    }
+    if (args[0].isPromise()) {
+      return Value(promisePrototype);
+    }
+    if (args[0].isArray()) {
+      if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
+        auto arrayObj = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+        auto protoIt = arrayObj->properties.find("prototype");
+        if (protoIt != arrayObj->properties.end()) {
+          return protoIt->second;
+        }
+      }
+      if (auto hiddenProto = env->get("__array_prototype__"); hiddenProto.has_value()) {
+        return *hiddenProto;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isError()) {
+      auto err = std::get<std::shared_ptr<Error>>(args[0].data);
+      std::string ctorName = "Error";
+      switch (err->type) {
+        case ErrorType::TypeError:
+          ctorName = "TypeError";
+          break;
+        case ErrorType::ReferenceError:
+          ctorName = "ReferenceError";
+          break;
+        case ErrorType::RangeError:
+          ctorName = "RangeError";
+          break;
+        case ErrorType::SyntaxError:
+          ctorName = "SyntaxError";
+          break;
+        case ErrorType::URIError:
+          ctorName = "URIError";
+          break;
+        case ErrorType::EvalError:
+          ctorName = "EvalError";
+          break;
+        case ErrorType::Error:
+        default:
+          ctorName = "Error";
+          break;
+      }
+      if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(ctor->data);
+        auto protoIt = fn->properties.find("prototype");
+        if (protoIt != fn->properties.end()) {
+          return protoIt->second;
+        }
+      }
+      return Value(Null{});
+    }
+    if (!args[0].isObject()) {
+      return Value(Null{});
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (obj->isModuleNamespace) {
+      return Value(Null{});
+    }
+    auto it = obj->properties.find("__proto__");
+    if (it != obj->properties.end()) {
+      return it->second;
+    }
+    return Value(Null{});
+  };
+  objectConstructor->properties["getPrototypeOf"] = Value(objectGetPrototypeOf);
+
+  auto objectSetPrototypeOf = std::make_shared<Function>();
+  objectSetPrototypeOf->isNative = true;
+  objectSetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2 || !args[0].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (obj->isModuleNamespace) {
+      if (args[1].isNull()) {
+        return args[0];
+      }
+      throw std::runtime_error("TypeError: Cannot set prototype of module namespace object");
+    }
+    obj->properties["__proto__"] = args[1];
+    return args[0];
+  };
+  objectConstructor->properties["setPrototypeOf"] = Value(objectSetPrototypeOf);
+
+  auto objectIsExtensible = std::make_shared<Function>();
+  objectIsExtensible->isNative = true;
+  objectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return Value(false);
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (obj->isModuleNamespace) {
+      return Value(false);
+    }
+    return Value(!obj->sealed && !obj->frozen);
+  };
+  objectConstructor->properties["isExtensible"] = Value(objectIsExtensible);
+
+  auto objectPreventExtensions = std::make_shared<Function>();
+  objectPreventExtensions->isNative = true;
+  objectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isObject()) {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (!obj->isModuleNamespace) {
+      obj->sealed = true;
+    }
+    return args[0];
+  };
+  objectConstructor->properties["preventExtensions"] = Value(objectPreventExtensions);
 
   // Object.freeze - makes an object immutable
   auto objectFreeze = std::make_shared<Function>();
@@ -1513,23 +3634,123 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto objectGetOwnPropertyDescriptor = std::make_shared<Function>();
   objectGetOwnPropertyDescriptor->isNative = true;
   objectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2 || !args[0].isObject()) {
+    if (args.size() < 2 ||
+        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex())) {
       return Value(Undefined{});
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
     std::string key = args[1].toString();
-
-    auto it = obj->properties.find(key);
-    if (it == obj->properties.end()) {
-      return Value(Undefined{});
-    }
 
     auto descriptor = std::make_shared<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
-    descriptor->properties["value"] = it->second;
-    descriptor->properties["writable"] = Value(!obj->frozen);
+
+    if (args[0].isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto getterIt = fn->properties.find("__get_" + key);
+      if (getterIt != fn->properties.end() && getterIt->second.isFunction()) {
+        descriptor->properties["get"] = getterIt->second;
+      }
+
+      auto it = fn->properties.find(key);
+      if (it == fn->properties.end() && getterIt == fn->properties.end()) {
+        return Value(Undefined{});
+      }
+      if (it != fn->properties.end()) {
+        descriptor->properties["value"] = it->second;
+      }
+      descriptor->properties["writable"] = Value(true);
+      descriptor->properties["enumerable"] = Value(true);
+      descriptor->properties["configurable"] = Value(true);
+      return Value(descriptor);
+    }
+
+    if (args[0].isPromise()) {
+      auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+      auto getterIt = promise->properties.find("__get_" + key);
+      if (getterIt != promise->properties.end() && getterIt->second.isFunction()) {
+        descriptor->properties["get"] = getterIt->second;
+      }
+
+      auto it = promise->properties.find(key);
+      if (it == promise->properties.end() && getterIt == promise->properties.end()) {
+        return Value(Undefined{});
+      }
+      if (it != promise->properties.end()) {
+        descriptor->properties["value"] = it->second;
+      }
+      descriptor->properties["writable"] = Value(true);
+      descriptor->properties["enumerable"] = Value(true);
+      descriptor->properties["configurable"] = Value(true);
+      return Value(descriptor);
+    }
+
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      if (obj->isModuleNamespace) {
+        if (key == WellKnownSymbols::toStringTagKey()) {
+          descriptor->properties["value"] = Value(std::string("Module"));
+          descriptor->properties["writable"] = Value(false);
+          descriptor->properties["enumerable"] = Value(false);
+          descriptor->properties["configurable"] = Value(false);
+          return Value(descriptor);
+        }
+        if (!isModuleNamespaceExportKey(obj, key)) {
+          return Value(Undefined{});
+        }
+        auto getterIt = obj->properties.find("__get_" + key);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          Interpreter* interpreter = getGlobalInterpreter();
+          if (interpreter) {
+            Value out = interpreter->callForHarness(getterIt->second, {}, args[0]);
+            if (interpreter->hasError()) {
+              Value err = interpreter->getError();
+              interpreter->clearError();
+              throw std::runtime_error(err.toString());
+            }
+            descriptor->properties["value"] = out;
+          } else {
+            descriptor->properties["value"] = Value(Undefined{});
+          }
+        } else if (auto it = obj->properties.find(key); it != obj->properties.end()) {
+          descriptor->properties["value"] = it->second;
+        } else {
+          descriptor->properties["value"] = Value(Undefined{});
+        }
+        descriptor->properties["writable"] = Value(true);
+        descriptor->properties["enumerable"] = Value(true);
+        descriptor->properties["configurable"] = Value(false);
+        return Value(descriptor);
+      }
+      auto it = obj->properties.find(key);
+      if (it == obj->properties.end()) {
+        return Value(Undefined{});
+      }
+      descriptor->properties["value"] = it->second;
+      descriptor->properties["writable"] = Value(!obj->frozen);
+      descriptor->properties["enumerable"] = Value(true);
+      descriptor->properties["configurable"] = Value(!obj->sealed);
+      return Value(descriptor);
+    }
+
+    auto regex = std::get<std::shared_ptr<Regex>>(args[0].data);
+    auto getterIt = regex->properties.find("__get_" + key);
+    if (getterIt != regex->properties.end() && getterIt->second.isFunction()) {
+      descriptor->properties["get"] = getterIt->second;
+    }
+
+    auto it = regex->properties.find(key);
+    if (it != regex->properties.end()) {
+      descriptor->properties["value"] = it->second;
+    } else if (key == "source") {
+      descriptor->properties["value"] = Value(regex->pattern);
+    } else if (key == "flags") {
+      descriptor->properties["value"] = Value(regex->flags);
+    } else if (getterIt == regex->properties.end()) {
+      return Value(Undefined{});
+    }
+
+    descriptor->properties["writable"] = Value(true);
     descriptor->properties["enumerable"] = Value(true);
-    descriptor->properties["configurable"] = Value(!obj->sealed);
+    descriptor->properties["configurable"] = Value(true);
     return Value(descriptor);
   };
   objectConstructor->properties["getOwnPropertyDescriptor"] = Value(objectGetOwnPropertyDescriptor);
@@ -1538,38 +3759,104 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto objectDefineProperty = std::make_shared<Function>();
   objectDefineProperty->isNative = true;
   objectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 3 || !args[0].isObject()) {
+    if (args.size() < 3 ||
+        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex())) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
     std::string key = args[1].toString();
-
-    if (obj->frozen) {
-      return args[0];  // Cannot modify frozen object
-    }
-
-    // Check if adding new property to sealed object
-    if (obj->sealed && obj->properties.find(key) == obj->properties.end()) {
-      return args[0];  // Cannot add new property to sealed object
-    }
 
     if (args[2].isObject()) {
       auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
-      auto valueIt = descriptor->properties.find("value");
-      if (valueIt != descriptor->properties.end()) {
-        obj->properties[key] = valueIt->second;
-      }
+      auto readDescriptorField = [&](const std::string& name) -> std::optional<Value> {
+        auto it = descriptor->properties.find(name);
+        if (it != descriptor->properties.end()) {
+          return it->second;
+        }
+        if (descriptor->shape) {
+          int offset = descriptor->shape->getPropertyOffset(name);
+          if (offset >= 0) {
+            Value slotValue;
+            if (descriptor->getSlot(offset, slotValue)) {
+              return slotValue;
+            }
+          }
+        }
+        return std::nullopt;
+      };
+      if (args[0].isObject()) {
+        auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+        if (obj->isModuleNamespace) {
+          if (!defineModuleNamespaceProperty(obj, key, descriptor)) {
+            throw std::runtime_error("TypeError: Cannot redefine module namespace property");
+          }
+          return args[0];
+        }
 
-      // Check for getter
-      auto getIt = descriptor->properties.find("get");
-      if (getIt != descriptor->properties.end() && getIt->second.isFunction()) {
-        obj->properties["__get_" + key] = getIt->second;
-      }
+        if (obj->frozen) {
+          return args[0];
+        }
+        if (obj->sealed && obj->properties.find(key) == obj->properties.end()) {
+          return args[0];
+        }
 
-      // Check for setter
-      auto setIt = descriptor->properties.find("set");
-      if (setIt != descriptor->properties.end() && setIt->second.isFunction()) {
-        obj->properties["__set_" + key] = setIt->second;
+        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+          obj->properties[key] = *valueField;
+        }
+
+        if (auto getField = readDescriptorField("get");
+            getField.has_value() && getField->isFunction()) {
+          obj->properties["__get_" + key] = *getField;
+        }
+
+        if (auto setField = readDescriptorField("set");
+            setField.has_value() && setField->isFunction()) {
+          obj->properties["__set_" + key] = *setField;
+        }
+      } else if (args[0].isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+          fn->properties[key] = *valueField;
+        }
+
+        if (auto getField = readDescriptorField("get");
+            getField.has_value() && getField->isFunction()) {
+          fn->properties["__get_" + key] = *getField;
+        }
+
+        if (auto setField = readDescriptorField("set");
+            setField.has_value() && setField->isFunction()) {
+          fn->properties["__set_" + key] = *setField;
+        }
+      } else if (args[0].isPromise()) {
+        auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+          promise->properties[key] = *valueField;
+        }
+
+        if (auto getField = readDescriptorField("get");
+            getField.has_value() && getField->isFunction()) {
+          promise->properties["__get_" + key] = *getField;
+        }
+
+        if (auto setField = readDescriptorField("set");
+            setField.has_value() && setField->isFunction()) {
+          promise->properties["__set_" + key] = *setField;
+        }
+      } else {
+        auto regex = std::get<std::shared_ptr<Regex>>(args[0].data);
+        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+          regex->properties[key] = *valueField;
+        }
+
+        if (auto getField = readDescriptorField("get");
+            getField.has_value() && getField->isFunction()) {
+          regex->properties["__get_" + key] = *getField;
+        }
+
+        if (auto setField = readDescriptorField("set");
+            setField.has_value() && setField->isFunction()) {
+          regex->properties["__set_" + key] = *setField;
+        }
       }
     }
     return args[0];
@@ -1751,14 +4038,25 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Math", Value(mathObj));
 
   // Date constructor
-  auto dateConstructor = std::make_shared<Object>();
-  GarbageCollector::instance().reportAllocation(sizeof(Object));
-
-  // Date as function
-  auto dateFunc = std::make_shared<Function>();
-  dateFunc->isNative = true;
-  dateFunc->nativeFunc = Date_constructor;
-  dateConstructor->properties["constructor"] = Value(dateFunc);
+  auto dateConstructor = std::make_shared<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  dateConstructor->isNative = true;
+  dateConstructor->isConstructor = true;
+  dateConstructor->properties["name"] = Value(std::string("Date"));
+  dateConstructor->properties["length"] = Value(1.0);
+  dateConstructor->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+    if (args.size() == 1) {
+      Value primitive = toPrimitive(args[0], false);
+      if (primitive.isSymbol() || primitive.isBigInt()) {
+        throw std::runtime_error("TypeError: Cannot convert to number");
+      }
+      if (primitive.isString()) {
+        return Date_constructor({primitive});
+      }
+      return Date_constructor({Value(primitive.toNumber())});
+    }
+    return Date_constructor(args);
+  };
 
   // Date static methods
   auto dateNow = std::make_shared<Function>();
@@ -1776,11 +4074,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // String constructor with static methods
   auto stringConstructorFn = std::make_shared<Function>();
   stringConstructorFn->isNative = true;
-  stringConstructorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  stringConstructorFn->isConstructor = true;
+  stringConstructorFn->properties["__wrap_primitive__"] = Value(true);
+  stringConstructorFn->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       return Value(std::string(""));
     }
-    return Value(args[0].toString());
+    Value primitive = toPrimitive(args[0], true);
+    return Value(primitive.toString());
   };
 
   // Wrap in an Object to hold static methods
@@ -1788,6 +4089,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // The constructor itself
+  stringConstructorObj->properties["__callable_object__"] = Value(true);
   stringConstructorObj->properties["constructor"] = Value(stringConstructorFn);
 
   // String.fromCharCode
@@ -1801,6 +4103,184 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   fromCodePoint->isNative = true;
   fromCodePoint->nativeFunc = String_fromCodePoint;
   stringConstructorObj->properties["fromCodePoint"] = Value(fromCodePoint);
+
+  auto stringPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  auto stringMatchAll = std::make_shared<Function>();
+  stringMatchAll->isNative = true;
+  stringMatchAll->isConstructor = false;
+  stringMatchAll->properties["__uses_this_arg__"] = Value(true);
+  stringMatchAll->properties["__throw_on_new__"] = Value(true);
+  stringMatchAll->nativeFunc = [regExpPrototype](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: String.prototype.matchAll called on null or undefined");
+    }
+
+    Value thisValue = args[0];
+    Value regexp = args.size() > 1 ? args[1] : Value(Undefined{});
+    Interpreter* interpreter = getGlobalInterpreter();
+    const std::string& matchAllKey = WellKnownSymbols::matchAllKey();
+
+    auto callChecked = [&](const Value& callee,
+                           const std::vector<Value>& callArgs,
+                           const Value& thisArg) -> Value {
+      if (!callee.isFunction()) {
+        return Value(Undefined{});
+      }
+
+      if (interpreter) {
+        Value out = interpreter->callForHarness(callee, callArgs, thisArg);
+        if (interpreter->hasError()) {
+          Value err = interpreter->getError();
+          interpreter->clearError();
+          throw std::runtime_error(err.toString());
+        }
+        return out;
+      }
+
+      auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+      if (fn->isNative) {
+        auto itUsesThis = fn->properties.find("__uses_this_arg__");
+        if (itUsesThis != fn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+          std::vector<Value> nativeArgs;
+          nativeArgs.reserve(callArgs.size() + 1);
+          nativeArgs.push_back(thisArg);
+          nativeArgs.insert(nativeArgs.end(), callArgs.begin(), callArgs.end());
+          return fn->nativeFunc(nativeArgs);
+        }
+        return fn->nativeFunc(callArgs);
+      }
+
+      return Value(Undefined{});
+    };
+
+    auto getObjectValue = [&](const std::shared_ptr<Object>& obj,
+                              const Value& thisArg,
+                              const std::string& key) -> Value {
+      std::string getterName = "__get_" + key;
+      auto getterIt = obj->properties.find(getterName);
+      if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+        return callChecked(getterIt->second, {}, thisArg);
+      }
+
+      auto it = obj->properties.find(key);
+      if (it != obj->properties.end()) {
+        return it->second;
+      }
+      return Value(Undefined{});
+    };
+
+    auto getRegexValue = [&](const std::shared_ptr<Regex>& regex,
+                             const std::string& key) -> Value {
+      Value regexValue(regex);
+
+      std::string getterName = "__get_" + key;
+      auto getterIt = regex->properties.find(getterName);
+      if (getterIt != regex->properties.end() && getterIt->second.isFunction()) {
+        return callChecked(getterIt->second, {}, regexValue);
+      }
+
+      auto it = regex->properties.find(key);
+      if (it != regex->properties.end()) {
+        return it->second;
+      }
+
+      if (regExpPrototype) {
+        std::string protoGetterName = "__get_" + key;
+        auto protoGetterIt = regExpPrototype->properties.find(protoGetterName);
+        if (protoGetterIt != regExpPrototype->properties.end() && protoGetterIt->second.isFunction()) {
+          return callChecked(protoGetterIt->second, {}, regexValue);
+        }
+
+        auto protoIt = regExpPrototype->properties.find(key);
+        if (protoIt != regExpPrototype->properties.end()) {
+          return protoIt->second;
+        }
+      }
+
+      if (key == "source") {
+        return Value(regex->pattern);
+      }
+      if (key == "flags") {
+        return Value(regex->flags);
+      }
+
+      return Value(Undefined{});
+    };
+
+    std::string input;
+    if (thisValue.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(thisValue.data);
+      Value toPrimitive = Value(Undefined{});
+      auto toPrimitiveIt = obj->properties.find("Symbol(Symbol.toPrimitive)");
+      if (toPrimitiveIt != obj->properties.end()) {
+        toPrimitive = toPrimitiveIt->second;
+      } else {
+        auto fallbackIt = obj->properties.find("undefined");
+        if (fallbackIt != obj->properties.end()) {
+          toPrimitive = fallbackIt->second;
+        }
+      }
+      if (toPrimitive.isFunction()) {
+        input = callChecked(toPrimitive, {}, thisValue).toString();
+      } else {
+        input = thisValue.toString();
+      }
+    } else {
+      input = thisValue.toString();
+    }
+
+    if (!regexp.isUndefined() && !regexp.isNull()) {
+      if (regexp.isRegex()) {
+        auto regex = std::get<std::shared_ptr<Regex>>(regexp.data);
+        Value flagsValue = getRegexValue(regex, "flags");
+        if (flagsValue.isUndefined() || flagsValue.isNull()) {
+          throw std::runtime_error("TypeError: RegExp flags is undefined or null");
+        }
+        if (flagsValue.toString().find('g') == std::string::npos) {
+          throw std::runtime_error("TypeError: String.prototype.matchAll requires a global RegExp");
+        }
+      }
+
+      Value matcher(Undefined{});
+      if (regexp.isRegex()) {
+        matcher = getRegexValue(std::get<std::shared_ptr<Regex>>(regexp.data), matchAllKey);
+      } else if (regexp.isObject()) {
+        matcher = getObjectValue(std::get<std::shared_ptr<Object>>(regexp.data), regexp, matchAllKey);
+      } else if (regexp.isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(regexp.data);
+        auto it = fn->properties.find(matchAllKey);
+        if (it != fn->properties.end()) {
+          matcher = it->second;
+        }
+      }
+
+      if (!matcher.isUndefined() && !matcher.isNull()) {
+        if (!matcher.isFunction()) {
+          throw std::runtime_error("TypeError: @@matchAll is not callable");
+        }
+        return callChecked(matcher, {Value(input)}, regexp);
+      }
+    }
+
+    std::string pattern;
+    if (regexp.isRegex()) {
+      pattern = std::get<std::shared_ptr<Regex>>(regexp.data)->pattern;
+    } else {
+      pattern = regexp.toString();
+    }
+
+    auto rx = std::make_shared<Regex>(pattern, "g");
+    Value rxValue(rx);
+    Value matcher = getRegexValue(rx, matchAllKey);
+    if (!matcher.isFunction()) {
+      throw std::runtime_error("TypeError: RegExp @@matchAll is not callable");
+    }
+    return callChecked(matcher, {Value(input)}, rxValue);
+  };
+  stringPrototype->properties["matchAll"] = Value(stringMatchAll);
+  stringConstructorObj->properties["prototype"] = Value(stringPrototype);
 
   // For simplicity, we can make the Object callable by storing the function
   env->define("String", Value(stringConstructorObj));

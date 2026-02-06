@@ -1,8 +1,10 @@
 #include "interpreter.h"
+#include "module.h"
 #include "array_methods.h"
 #include "string_methods.h"
 #include "unicode.h"
 #include "gc.h"
+#include "event_loop.h"
 #include "symbols.h"
 #include "streams.h"
 #include <iostream>
@@ -13,10 +15,101 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace lightjs {
 
-Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {}
+namespace {
+int32_t toInt32(double value) {
+  if (!std::isfinite(value) || value == 0.0) {
+    return 0;
+  }
+
+  double intPart = std::trunc(value);
+  constexpr double kTwo32 = 4294967296.0;
+  double wrapped = std::fmod(intPart, kTwo32);
+  if (wrapped < 0) {
+    wrapped += kTwo32;
+  }
+  if (wrapped >= 2147483648.0) {
+    wrapped -= kTwo32;
+  }
+  return static_cast<int32_t>(wrapped);
+}
+
+std::string numberToPropertyKey(double value) {
+  if (std::isnan(value)) return "NaN";
+  if (std::isinf(value)) return value < 0 ? "-Infinity" : "Infinity";
+  if (value == 0.0) return "0";
+
+  double integral = std::trunc(value);
+  if (integral == value) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(0) << value;
+    return oss.str();
+  }
+
+  std::ostringstream oss;
+  oss << std::setprecision(15) << value;
+  std::string out = oss.str();
+  auto dot = out.find('.');
+  if (dot != std::string::npos) {
+    while (!out.empty() && out.back() == '0') out.pop_back();
+    if (!out.empty() && out.back() == '.') out.pop_back();
+  }
+  return out;
+}
+
+std::string toPropertyKeyString(const Value& value) {
+  if (value.isNumber()) {
+    return numberToPropertyKey(value.toNumber());
+  }
+  return value.toString();
+}
+
+bool parseArrayIndex(const std::string& key, size_t& index) {
+  if (key.empty()) return false;
+  if (key.size() > 1 && key[0] == '0') return false;
+  for (char c : key) {
+    if (c < '0' || c > '9') return false;
+  }
+
+  try {
+    size_t parsed = std::stoull(key);
+    if (parsed == static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      return false;
+    }
+    index = parsed;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
+  for (const auto& stmt : body) {
+    if (!stmt) {
+      break;
+    }
+    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+    if (!exprStmt || !exprStmt->expression) {
+      break;
+    }
+    auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node);
+    if (!str) {
+      break;
+    }
+    if (str->value == "use strict") {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {
+  setGlobalInterpreter(this);
+}
 
 bool Interpreter::hasError() const {
   return flow_.type == ControlFlow::Type::Throw;
@@ -29,6 +122,151 @@ Value Interpreter::getError() const {
 void Interpreter::clearError() {
   flow_.type = ControlFlow::Type::None;
   flow_.value = Value(Undefined{});
+}
+
+Value Interpreter::callForHarness(const Value& callee,
+                                  const std::vector<Value>& args,
+                                  const Value& thisValue) {
+  return callFunction(callee, args, thisValue);
+}
+
+bool Interpreter::isObjectLike(const Value& value) const {
+  return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() || value.isProxy();
+}
+
+std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receiver, const std::string& key) {
+  if (receiver.isObject()) {
+    auto current = std::get<std::shared_ptr<Object>>(receiver.data);
+    int depth = 0;
+    while (current && depth <= 16) {
+      depth++;
+
+      std::string getterKey = "__get_" + key;
+      auto getterIt = current->properties.find(getterKey);
+      if (getterIt != current->properties.end()) {
+        if (getterIt->second.isFunction()) {
+          return {true, callFunction(getterIt->second, {}, receiver)};
+        }
+        return {true, Value(Undefined{})};
+      }
+
+      auto it = current->properties.find(key);
+      if (it != current->properties.end()) {
+        return {true, it->second};
+      }
+
+      auto protoIt = current->properties.find("__proto__");
+      if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
+        break;
+      }
+      current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    }
+    return {false, Value(Undefined{})};
+  }
+
+  if (receiver.isFunction()) {
+    auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+    auto it = fn->properties.find(key);
+    if (it != fn->properties.end()) {
+      return {true, it->second};
+    }
+    return {false, Value(Undefined{})};
+  }
+
+  if (receiver.isRegex()) {
+    auto regex = std::get<std::shared_ptr<Regex>>(receiver.data);
+    std::string getterKey = "__get_" + key;
+    auto getterIt = regex->properties.find(getterKey);
+    if (getterIt != regex->properties.end()) {
+      if (getterIt->second.isFunction()) {
+        return {true, callFunction(getterIt->second, {}, receiver)};
+      }
+      return {true, Value(Undefined{})};
+    }
+    auto it = regex->properties.find(key);
+    if (it != regex->properties.end()) {
+      return {true, it->second};
+    }
+    return {false, Value(Undefined{})};
+  }
+
+  if (receiver.isProxy()) {
+    auto proxy = std::get<std::shared_ptr<Proxy>>(receiver.data);
+    if (proxy->target) {
+      return getPropertyForPrimitive(*proxy->target, key);
+    }
+  }
+
+  return {false, Value(Undefined{})};
+}
+
+Value Interpreter::toPrimitiveValue(const Value& input, bool preferString) {
+  if (!isObjectLike(input)) {
+    return input;
+  }
+
+  const std::string& toPrimitiveKey = WellKnownSymbols::toPrimitiveKey();
+  auto [hasExotic, exotic] = getPropertyForPrimitive(input, toPrimitiveKey);
+  if (hasError()) {
+    return Value(Undefined{});
+  }
+  if (hasExotic && !exotic.isUndefined() && !exotic.isNull()) {
+    if (!exotic.isFunction()) {
+      throwError(ErrorType::TypeError, "@@toPrimitive is not callable");
+      return Value(Undefined{});
+    }
+    Value hint = Value(std::string(preferString ? "string" : "number"));
+    Value result = callFunction(exotic, {hint}, input);
+    if (hasError()) {
+      return Value(Undefined{});
+    }
+    if (isObjectLike(result)) {
+      throwError(ErrorType::TypeError, "@@toPrimitive must return a primitive");
+      return Value(Undefined{});
+    }
+    return result;
+  }
+
+  const char* firstMethod = preferString ? "toString" : "valueOf";
+  const char* secondMethod = preferString ? "valueOf" : "toString";
+  const char* methods[2] = {firstMethod, secondMethod};
+
+  for (const char* methodName : methods) {
+    auto [found, method] = getPropertyForPrimitive(input, methodName);
+    if (hasError()) {
+      return Value(Undefined{});
+    }
+    if (found) {
+      if (method.isFunction()) {
+        Value result = callFunction(method, {}, input);
+        if (hasError()) {
+          return Value(Undefined{});
+        }
+        if (!isObjectLike(result)) {
+          return result;
+        }
+      }
+      continue;
+    }
+
+    if (std::string(methodName) == "toString") {
+      if (input.isArray()) {
+        auto arr = std::get<std::shared_ptr<Array>>(input.data);
+        std::string out;
+        for (size_t i = 0; i < arr->elements.size(); i++) {
+          if (i > 0) out += ",";
+          out += arr->elements[i].toString();
+        }
+        return Value(out);
+      }
+      if (input.isObject()) return Value(std::string("[object Object]"));
+      if (input.isFunction()) return Value(std::string("[Function]"));
+      if (input.isRegex()) return Value(input.toString());
+    }
+  }
+
+  throwError(ErrorType::TypeError, "Cannot convert object to primitive value");
+  return Value(Undefined{});
 }
 
 bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
@@ -57,8 +295,26 @@ bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
 }
 
 Task Interpreter::evaluate(const Program& program) {
+  bool previousStrictMode = strictMode_;
+  strictMode_ = hasUseStrictDirective(program.body) || program.isModule;
+
+  if (program.isModule) {
+    for (const auto& stmt : program.body) {
+      if (std::holds_alternative<ImportDeclaration>(stmt->node)) {
+        auto task = evaluate(*stmt);
+        LIGHTJS_RUN_TASK_VOID(task);
+        if (flow_.type != ControlFlow::Type::None) {
+          break;
+        }
+      }
+    }
+  }
+
   Value result = Value(Undefined{});
   for (const auto& stmt : program.body) {
+    if (program.isModule && std::holds_alternative<ImportDeclaration>(stmt->node)) {
+      continue;
+    }
     auto task = evaluate(*stmt);
   LIGHTJS_RUN_TASK(task, result);
 
@@ -66,6 +322,7 @@ Task Interpreter::evaluate(const Program& program) {
       break;
     }
   }
+  strictMode_ = previousStrictMode;
   LIGHTJS_RETURN(result);
 }
 
@@ -102,6 +359,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
       auto func = std::make_shared<Function>();
       func->isNative = false;
       func->isAsync = method.isAsync;
+      func->isStrict = true;  // Class bodies are always strict.
       func->closure = env_;
 
       for (const auto& param : method.params) {
@@ -115,6 +373,14 @@ Task Interpreter::evaluate(const Statement& stmt) {
         const_cast<std::vector<StmtPtr>*>(&method.body),
         [](void*){} // No-op deleter
       );
+      if (method.kind == MethodDefinition::Kind::Constructor) {
+        func->properties["name"] = Value(std::string("constructor"));
+      } else {
+        func->properties["name"] = Value(method.key.name);
+      }
+      if (cls->superClass) {
+        func->properties["__super_class__"] = Value(cls->superClass);
+      }
 
       if (method.kind == MethodDefinition::Kind::Constructor) {
         cls->constructor = func;
@@ -161,6 +427,9 @@ Task Interpreter::evaluate(const Statement& stmt) {
   } else if (auto* node = std::get_if<ThrowStmt>(&stmt.node)) {
     auto task = evaluate(*node->argument);
     LIGHTJS_RUN_TASK_VOID(task);
+    if (flow_.type == ControlFlow::Type::Throw) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     flow_.type = ControlFlow::Type::Throw;
     flow_.value = task.result();
     LIGHTJS_RETURN(Value(Undefined{}));
@@ -188,6 +457,22 @@ Task Interpreter::evaluate(const Expression& expr) {
 
   if (auto* node = std::get_if<Identifier>(&expr.node)) {
     if (auto val = env_->get(node->name)) {
+      if (val->isModuleBinding()) {
+        const auto& binding = std::get<ModuleBinding>(val->data);
+        auto module = binding.module.lock();
+        if (!module) {
+          throwError(ErrorType::ReferenceError,
+                     formatError("Cannot access '" + node->name + "' before initialization", expr.loc));
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        auto exportValue = module->getExport(binding.exportName);
+        if (!exportValue) {
+          throwError(ErrorType::ReferenceError,
+                     formatError("Cannot access '" + node->name + "' before initialization", expr.loc));
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(*exportValue);
+      }
       LIGHTJS_RETURN(*val);
     }
     // Throw ReferenceError for undefined variables with line info
@@ -211,7 +496,14 @@ Task Interpreter::evaluate(const Expression& expr) {
       if (i < node->expressions.size()) {
         auto exprTask = evaluate(*node->expressions[i]);
         LIGHTJS_RUN_TASK_VOID(exprTask);
-        result += exprTask.result().toString();
+        Value interpolated = exprTask.result();
+        if (isObjectLike(interpolated)) {
+          interpolated = toPrimitiveValue(interpolated, true);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        }
+        result += interpolated.toString();
       }
     }
     LIGHTJS_RETURN(Value(result));
@@ -236,6 +528,15 @@ Task Interpreter::evaluate(const Expression& expr) {
     LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateMember(*node)));
   } else if (auto* node = std::get_if<ConditionalExpr>(&expr.node)) {
     LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateConditional(*node)));
+  } else if (auto* node = std::get_if<SequenceExpr>(&expr.node)) {
+    Value last = Value(Undefined{});
+    for (const auto& sequenceExpr : node->expressions) {
+      if (!sequenceExpr) {
+        continue;
+      }
+      last = LIGHTJS_AWAIT(evaluate(*sequenceExpr));
+    }
+    LIGHTJS_RETURN(last);
   } else if (auto* node = std::get_if<ArrayExpr>(&expr.node)) {
     LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateArray(*node)));
   } else if (auto* node = std::get_if<ObjectExpr>(&expr.node)) {
@@ -264,6 +565,13 @@ Task Interpreter::evaluate(const Expression& expr) {
     throwError(ErrorType::ReferenceError, formatError("'super' keyword is not valid here", expr.loc));
     LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<MetaProperty>(&expr.node)) {
+    if (node->meta == "new" && node->property == "target") {
+      if (auto newTarget = env_->get("__new_target__")) {
+        LIGHTJS_RETURN(*newTarget);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
     // import.meta - ES2020
     if (node->meta == "meta") {
       // Create import.meta object with common properties
@@ -286,6 +594,7 @@ Task Interpreter::evaluate(const Expression& expr) {
         return Value(args[0].toString());
       };
       metaObj->properties["resolve"] = Value(resolveFn);
+      metaObj->properties["__import_meta__"] = Value(true);
 
       LIGHTJS_RETURN(Value(metaObj));
     }
@@ -298,6 +607,35 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   auto leftTask = evaluate(*expr.left);
   Value left;
   LIGHTJS_RUN_TASK(leftTask, left);
+
+  // Short-circuit evaluation for logical operators
+  if (expr.op == BinaryExpr::Op::LogicalAnd) {
+    if (!left.toBool()) {
+      LIGHTJS_RETURN(left);
+    }
+    auto rTask = evaluate(*expr.right);
+    Value rVal;
+    LIGHTJS_RUN_TASK(rTask, rVal);
+    LIGHTJS_RETURN(rVal);
+  }
+  if (expr.op == BinaryExpr::Op::LogicalOr) {
+    if (left.toBool()) {
+      LIGHTJS_RETURN(left);
+    }
+    auto rTask = evaluate(*expr.right);
+    Value rVal;
+    LIGHTJS_RUN_TASK(rTask, rVal);
+    LIGHTJS_RETURN(rVal);
+  }
+  if (expr.op == BinaryExpr::Op::NullishCoalescing) {
+    if (!left.isNull() && !left.isUndefined()) {
+      LIGHTJS_RETURN(left);
+    }
+    auto rTask = evaluate(*expr.right);
+    Value rVal;
+    LIGHTJS_RUN_TASK(rTask, rVal);
+    LIGHTJS_RETURN(rVal);
+  }
 
   auto rightTask = evaluate(*expr.right);
   Value right;
@@ -316,6 +654,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       case BinaryExpr::Op::Mul: LIGHTJS_RETURN(Value(l * r));
       case BinaryExpr::Op::Div: LIGHTJS_RETURN(Value(l / r));
       case BinaryExpr::Op::Mod: LIGHTJS_RETURN(Value(std::fmod(l, r)));
+      case BinaryExpr::Op::BitwiseAnd: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) & toInt32(r))));
+      case BinaryExpr::Op::BitwiseOr: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) | toInt32(r))));
+      case BinaryExpr::Op::BitwiseXor: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) ^ toInt32(r))));
       case BinaryExpr::Op::Less: LIGHTJS_RETURN(Value(l < r));
       case BinaryExpr::Op::Greater: LIGHTJS_RETURN(Value(l > r));
       case BinaryExpr::Op::LessEqual: LIGHTJS_RETURN(Value(l <= r));
@@ -329,39 +670,121 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   }
 
   switch (expr.op) {
-    case BinaryExpr::Op::Add:
-      if (left.isString() || right.isString()) {
-        LIGHTJS_RETURN(Value(left.toString() + right.toString()));
+    case BinaryExpr::Op::Add: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isString() || rhs.isString()) {
+        LIGHTJS_RETURN(Value(lhs.toString() + rhs.toString()));
       }
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() + right.toBigInt())));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() + rhs.toBigInt())));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() + right.toNumber()));
-    case BinaryExpr::Op::Sub:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() - right.toBigInt())));
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() - right.toNumber()));
-    case BinaryExpr::Op::Mul:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() * right.toBigInt())));
+      LIGHTJS_RETURN(Value(lhs.toNumber() + rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Sub: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() - rhs.toBigInt())));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() * right.toNumber()));
-    case BinaryExpr::Op::Div:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() / right.toBigInt())));
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() / right.toNumber()));
-    case BinaryExpr::Op::Mod:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() % right.toBigInt())));
+      LIGHTJS_RETURN(Value(lhs.toNumber() - rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Mul: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() * rhs.toBigInt())));
       }
-      LIGHTJS_RETURN(Value(std::fmod(left.toNumber(), right.toNumber())));
-    case BinaryExpr::Op::Exp:
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(lhs.toNumber() * rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Div: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() / rhs.toBigInt())));
+      }
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(lhs.toNumber() / rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Mod: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() % rhs.toBigInt())));
+      }
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(std::fmod(lhs.toNumber(), rhs.toNumber())));
+    }
+    case BinaryExpr::Op::BitwiseAnd:
       if (left.isBigInt() && right.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() & right.toBigInt())));
+      }
+      if (left.isBigInt() != right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) & toInt32(right.toNumber()))));
+    case BinaryExpr::Op::BitwiseOr:
+      if (left.isBigInt() && right.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() | right.toBigInt())));
+      }
+      if (left.isBigInt() != right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) | toInt32(right.toNumber()))));
+    case BinaryExpr::Op::BitwiseXor:
+      if (left.isBigInt() && right.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() ^ right.toBigInt())));
+      }
+      if (left.isBigInt() != right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) ^ toInt32(right.toNumber()))));
+    case BinaryExpr::Op::Exp: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
         // BigInt exponentiation
-        int64_t base = left.toBigInt();
-        int64_t exp = right.toBigInt();
+        int64_t base = lhs.toBigInt();
+        int64_t exp = rhs.toBigInt();
         if (exp < 0) {
           LIGHTJS_RETURN(Value(0.0));  // Negative exponents for BigInt return 0
         }
@@ -371,37 +794,72 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         }
         LIGHTJS_RETURN(Value(BigInt(result)));
       }
-      LIGHTJS_RETURN(Value(std::pow(left.toNumber(), right.toNumber())));
-    case BinaryExpr::Op::Less:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() < right.toBigInt()));
+      if (lhs.isBigInt() != rhs.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() < right.toNumber()));
-    case BinaryExpr::Op::Greater:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() > right.toBigInt()));
+      LIGHTJS_RETURN(Value(std::pow(lhs.toNumber(), rhs.toNumber())));
+    }
+    case BinaryExpr::Op::Less: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() < rhs.toBigInt()));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() > right.toNumber()));
-    case BinaryExpr::Op::LessEqual:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() <= right.toBigInt()));
+      LIGHTJS_RETURN(Value(lhs.toNumber() < rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Greater: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() > rhs.toBigInt()));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() <= right.toNumber()));
-    case BinaryExpr::Op::GreaterEqual:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() >= right.toBigInt()));
+      LIGHTJS_RETURN(Value(lhs.toNumber() > rhs.toNumber()));
+    }
+    case BinaryExpr::Op::LessEqual: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() <= rhs.toBigInt()));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() >= right.toNumber()));
-    case BinaryExpr::Op::Equal:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() == right.toBigInt()));
+      LIGHTJS_RETURN(Value(lhs.toNumber() <= rhs.toNumber()));
+    }
+    case BinaryExpr::Op::GreaterEqual: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() >= rhs.toBigInt()));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() == right.toNumber()));
-    case BinaryExpr::Op::NotEqual:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(left.toBigInt() != right.toBigInt()));
+      LIGHTJS_RETURN(Value(lhs.toNumber() >= rhs.toNumber()));
+    }
+    case BinaryExpr::Op::Equal: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() == rhs.toBigInt()));
       }
-      LIGHTJS_RETURN(Value(left.toNumber() != right.toNumber()));
+      LIGHTJS_RETURN(Value(lhs.toNumber() == rhs.toNumber()));
+    }
+    case BinaryExpr::Op::NotEqual: {
+      Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(lhs.toBigInt() != rhs.toBigInt()));
+      }
+      LIGHTJS_RETURN(Value(lhs.toNumber() != rhs.toNumber()));
+    }
     case BinaryExpr::Op::StrictEqual: {
       // Strict equality requires same type
       if (left.data.index() != right.data.index()) {
@@ -434,8 +892,91 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         LIGHTJS_RETURN(Value(true));
       }
 
-      // For objects, arrays, functions - compare by reference
-      // We already checked the types are the same
+      if (left.isObject() && right.isObject()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Object>>(left.data).get() ==
+                             std::get<std::shared_ptr<Object>>(right.data).get()));
+      }
+      if (left.isArray() && right.isArray()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Array>>(left.data).get() ==
+                             std::get<std::shared_ptr<Array>>(right.data).get()));
+      }
+      if (left.isFunction() && right.isFunction()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Function>>(left.data).get() ==
+                             std::get<std::shared_ptr<Function>>(right.data).get()));
+      }
+      if (left.isTypedArray() && right.isTypedArray()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<TypedArray>>(left.data).get() ==
+                             std::get<std::shared_ptr<TypedArray>>(right.data).get()));
+      }
+      if (left.isPromise() && right.isPromise()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Promise>>(left.data).get() ==
+                             std::get<std::shared_ptr<Promise>>(right.data).get()));
+      }
+      if (left.isRegex() && right.isRegex()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Regex>>(left.data).get() ==
+                             std::get<std::shared_ptr<Regex>>(right.data).get()));
+      }
+      if (left.isMap() && right.isMap()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Map>>(left.data).get() ==
+                             std::get<std::shared_ptr<Map>>(right.data).get()));
+      }
+      if (left.isSet() && right.isSet()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Set>>(left.data).get() ==
+                             std::get<std::shared_ptr<Set>>(right.data).get()));
+      }
+      if (left.isError() && right.isError()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Error>>(left.data).get() ==
+                             std::get<std::shared_ptr<Error>>(right.data).get()));
+      }
+      if (left.isGenerator() && right.isGenerator()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Generator>>(left.data).get() ==
+                             std::get<std::shared_ptr<Generator>>(right.data).get()));
+      }
+      if (left.isProxy() && right.isProxy()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Proxy>>(left.data).get() ==
+                             std::get<std::shared_ptr<Proxy>>(right.data).get()));
+      }
+      if (left.isWeakMap() && right.isWeakMap()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WeakMap>>(left.data).get() ==
+                             std::get<std::shared_ptr<WeakMap>>(right.data).get()));
+      }
+      if (left.isWeakSet() && right.isWeakSet()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WeakSet>>(left.data).get() ==
+                             std::get<std::shared_ptr<WeakSet>>(right.data).get()));
+      }
+      if (left.isArrayBuffer() && right.isArrayBuffer()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<ArrayBuffer>>(left.data).get() ==
+                             std::get<std::shared_ptr<ArrayBuffer>>(right.data).get()));
+      }
+      if (left.isDataView() && right.isDataView()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<DataView>>(left.data).get() ==
+                             std::get<std::shared_ptr<DataView>>(right.data).get()));
+      }
+      if (left.isClass() && right.isClass()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Class>>(left.data).get() ==
+                             std::get<std::shared_ptr<Class>>(right.data).get()));
+      }
+      if (left.isWasmInstance() && right.isWasmInstance()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WasmInstanceJS>>(left.data).get() ==
+                             std::get<std::shared_ptr<WasmInstanceJS>>(right.data).get()));
+      }
+      if (left.isWasmMemory() && right.isWasmMemory()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WasmMemoryJS>>(left.data).get() ==
+                             std::get<std::shared_ptr<WasmMemoryJS>>(right.data).get()));
+      }
+      if (left.isReadableStream() && right.isReadableStream()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<ReadableStream>>(left.data).get() ==
+                             std::get<std::shared_ptr<ReadableStream>>(right.data).get()));
+      }
+      if (left.isWritableStream() && right.isWritableStream()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WritableStream>>(left.data).get() ==
+                             std::get<std::shared_ptr<WritableStream>>(right.data).get()));
+      }
+      if (left.isTransformStream() && right.isTransformStream()) {
+        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<TransformStream>>(left.data).get() ==
+                             std::get<std::shared_ptr<TransformStream>>(right.data).get()));
+      }
+
       LIGHTJS_RETURN(Value(false));
     }
     case BinaryExpr::Op::StrictNotEqual: {
@@ -470,20 +1011,101 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         LIGHTJS_RETURN(Value(false));
       }
 
-      // For objects, arrays, functions - compare by reference
-      // We already checked the types are the same
-      LIGHTJS_RETURN(Value(true));
+      // For all reference types, strict inequality is pointer inequality.
+      auto equalByPointer = [&](const Value& a, const Value& b) -> bool {
+        if (a.isObject() && b.isObject()) {
+          return std::get<std::shared_ptr<Object>>(a.data).get() ==
+                 std::get<std::shared_ptr<Object>>(b.data).get();
+        }
+        if (a.isArray() && b.isArray()) {
+          return std::get<std::shared_ptr<Array>>(a.data).get() ==
+                 std::get<std::shared_ptr<Array>>(b.data).get();
+        }
+        if (a.isFunction() && b.isFunction()) {
+          return std::get<std::shared_ptr<Function>>(a.data).get() ==
+                 std::get<std::shared_ptr<Function>>(b.data).get();
+        }
+        if (a.isTypedArray() && b.isTypedArray()) {
+          return std::get<std::shared_ptr<TypedArray>>(a.data).get() ==
+                 std::get<std::shared_ptr<TypedArray>>(b.data).get();
+        }
+        if (a.isPromise() && b.isPromise()) {
+          return std::get<std::shared_ptr<Promise>>(a.data).get() ==
+                 std::get<std::shared_ptr<Promise>>(b.data).get();
+        }
+        if (a.isRegex() && b.isRegex()) {
+          return std::get<std::shared_ptr<Regex>>(a.data).get() ==
+                 std::get<std::shared_ptr<Regex>>(b.data).get();
+        }
+        if (a.isMap() && b.isMap()) {
+          return std::get<std::shared_ptr<Map>>(a.data).get() ==
+                 std::get<std::shared_ptr<Map>>(b.data).get();
+        }
+        if (a.isSet() && b.isSet()) {
+          return std::get<std::shared_ptr<Set>>(a.data).get() ==
+                 std::get<std::shared_ptr<Set>>(b.data).get();
+        }
+        if (a.isError() && b.isError()) {
+          return std::get<std::shared_ptr<Error>>(a.data).get() ==
+                 std::get<std::shared_ptr<Error>>(b.data).get();
+        }
+        if (a.isGenerator() && b.isGenerator()) {
+          return std::get<std::shared_ptr<Generator>>(a.data).get() ==
+                 std::get<std::shared_ptr<Generator>>(b.data).get();
+        }
+        if (a.isProxy() && b.isProxy()) {
+          return std::get<std::shared_ptr<Proxy>>(a.data).get() ==
+                 std::get<std::shared_ptr<Proxy>>(b.data).get();
+        }
+        if (a.isWeakMap() && b.isWeakMap()) {
+          return std::get<std::shared_ptr<WeakMap>>(a.data).get() ==
+                 std::get<std::shared_ptr<WeakMap>>(b.data).get();
+        }
+        if (a.isWeakSet() && b.isWeakSet()) {
+          return std::get<std::shared_ptr<WeakSet>>(a.data).get() ==
+                 std::get<std::shared_ptr<WeakSet>>(b.data).get();
+        }
+        if (a.isArrayBuffer() && b.isArrayBuffer()) {
+          return std::get<std::shared_ptr<ArrayBuffer>>(a.data).get() ==
+                 std::get<std::shared_ptr<ArrayBuffer>>(b.data).get();
+        }
+        if (a.isDataView() && b.isDataView()) {
+          return std::get<std::shared_ptr<DataView>>(a.data).get() ==
+                 std::get<std::shared_ptr<DataView>>(b.data).get();
+        }
+        if (a.isClass() && b.isClass()) {
+          return std::get<std::shared_ptr<Class>>(a.data).get() ==
+                 std::get<std::shared_ptr<Class>>(b.data).get();
+        }
+        if (a.isWasmInstance() && b.isWasmInstance()) {
+          return std::get<std::shared_ptr<WasmInstanceJS>>(a.data).get() ==
+                 std::get<std::shared_ptr<WasmInstanceJS>>(b.data).get();
+        }
+        if (a.isWasmMemory() && b.isWasmMemory()) {
+          return std::get<std::shared_ptr<WasmMemoryJS>>(a.data).get() ==
+                 std::get<std::shared_ptr<WasmMemoryJS>>(b.data).get();
+        }
+        if (a.isReadableStream() && b.isReadableStream()) {
+          return std::get<std::shared_ptr<ReadableStream>>(a.data).get() ==
+                 std::get<std::shared_ptr<ReadableStream>>(b.data).get();
+        }
+        if (a.isWritableStream() && b.isWritableStream()) {
+          return std::get<std::shared_ptr<WritableStream>>(a.data).get() ==
+                 std::get<std::shared_ptr<WritableStream>>(b.data).get();
+        }
+        if (a.isTransformStream() && b.isTransformStream()) {
+          return std::get<std::shared_ptr<TransformStream>>(a.data).get() ==
+                 std::get<std::shared_ptr<TransformStream>>(b.data).get();
+        }
+        return false;
+      };
+      LIGHTJS_RETURN(Value(!equalByPointer(left, right)));
     }
-    case BinaryExpr::Op::LogicalAnd:
-      LIGHTJS_RETURN(left.toBool() ? right : left);
-    case BinaryExpr::Op::LogicalOr:
-      LIGHTJS_RETURN(left.toBool() ? left : right);
-    case BinaryExpr::Op::NullishCoalescing:
-      // Return right if left is null or undefined, otherwise return left
-      LIGHTJS_RETURN((left.isNull() || left.isUndefined()) ? right : left);
+    // LogicalAnd, LogicalOr, and NullishCoalescing are handled above
+    // with short-circuit evaluation (right side not evaluated if not needed)
     case BinaryExpr::Op::In: {
       // 'prop in obj' - check if property exists in object
-      std::string propName = left.toString();
+      std::string propName = toPropertyKeyString(left);
 
       // Handle Proxy has trap
       if (right.isProxy()) {
@@ -514,22 +1136,94 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       if (right.isArray()) {
         auto arrPtr = std::get<std::shared_ptr<Array>>(right.data);
-        // Check if propName is a valid array index
-        try {
-          size_t idx = std::stoul(propName);
+        size_t idx = 0;
+        if (parseArrayIndex(propName, idx)) {
           LIGHTJS_RETURN(Value(idx < arrPtr->elements.size()));
-        } catch (...) {}
-        // Check special array properties
+        }
         if (propName == "length") LIGHTJS_RETURN(Value(true));
-        LIGHTJS_RETURN(Value(false));
+        LIGHTJS_RETURN(Value(arrPtr->properties.find(propName) != arrPtr->properties.end()));
       }
 
       // 'in' on primitives returns false
       LIGHTJS_RETURN(Value(false));
     }
-    case BinaryExpr::Op::Instanceof:
-      // TODO: implement instanceof operator
+    case BinaryExpr::Op::Instanceof: {
+      auto unwrapConstructor = [&](const Value& ctor) -> Value {
+        if (ctor.isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(ctor.data);
+          auto callableIt = obj->properties.find("__callable_object__");
+          if (callableIt != obj->properties.end() &&
+              callableIt->second.isBool() && callableIt->second.toBool()) {
+            auto ctorIt = obj->properties.find("constructor");
+            if (ctorIt != obj->properties.end() &&
+                (ctorIt->second.isFunction() || ctorIt->second.isClass())) {
+              return ctorIt->second;
+            }
+          }
+        }
+        return ctor;
+      };
+
+      auto sameCtor = [&](const Value& candidate, const Value& ctor) -> bool {
+        if (candidate.data.index() != ctor.data.index()) {
+          return false;
+        }
+        if (candidate.isFunction()) {
+          return std::get<std::shared_ptr<Function>>(candidate.data) ==
+                 std::get<std::shared_ptr<Function>>(ctor.data);
+        }
+        if (candidate.isClass()) {
+          return std::get<std::shared_ptr<Class>>(candidate.data) ==
+                 std::get<std::shared_ptr<Class>>(ctor.data);
+        }
+        return false;
+      };
+
+      auto matchesConstructor = [&](const Value& instance, const Value& ctor) -> bool {
+        if (instance.isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(instance.data);
+          auto it = obj->properties.find("__constructor__");
+          return it != obj->properties.end() && sameCtor(it->second, ctor);
+        }
+        if (instance.isArray()) {
+          auto arr = std::get<std::shared_ptr<Array>>(instance.data);
+          auto it = arr->properties.find("__constructor__");
+          return it != arr->properties.end() && sameCtor(it->second, ctor);
+        }
+        if (instance.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(instance.data);
+          auto it = fn->properties.find("__constructor__");
+          return it != fn->properties.end() && sameCtor(it->second, ctor);
+        }
+        if (instance.isRegex()) {
+          auto regex = std::get<std::shared_ptr<Regex>>(instance.data);
+          auto it = regex->properties.find("__constructor__");
+          return it != regex->properties.end() && sameCtor(it->second, ctor);
+        }
+        if (instance.isPromise()) {
+          auto promise = std::get<std::shared_ptr<Promise>>(instance.data);
+          auto it = promise->properties.find("__constructor__");
+          return it != promise->properties.end() && sameCtor(it->second, ctor);
+        }
+        return false;
+      };
+
+      Value ctorValue = unwrapConstructor(right);
+      if ((ctorValue.isFunction() || ctorValue.isClass()) && matchesConstructor(left, ctorValue)) {
+        LIGHTJS_RETURN(Value(true));
+      }
+
+      if (left.isError() && ctorValue.isFunction()) {
+        auto ctor = std::get<std::shared_ptr<Function>>(ctorValue.data);
+        auto tagIt = ctor->properties.find("__error_type__");
+        if (tagIt != ctor->properties.end() && tagIt->second.isNumber()) {
+          auto err = std::get<std::shared_ptr<Error>>(left.data);
+          int expected = static_cast<int>(std::get<double>(tagIt->second.data));
+          LIGHTJS_RETURN(Value(static_cast<int>(err->type) == expected));
+        }
+      }
       LIGHTJS_RETURN(Value(false));
+    }
   }
 
   LIGHTJS_RETURN(Value(Undefined{}));
@@ -548,7 +1242,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (member->computed) {
         auto propTask = evaluate(*member->property);
         LIGHTJS_RUN_TASK_VOID(propTask);
-        propName = propTask.result().toString();
+        propName = toPropertyKeyString(propTask.result());
       } else {
         if (auto* id = std::get_if<Identifier>(&member->property->node)) {
           propName = id->name;
@@ -572,7 +1266,10 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
         // Fall through to delete from target
         if (proxyPtr->target && proxyPtr->target->isObject()) {
           auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
-          bool deleted = targetObj->properties.erase(propName) > 0;
+          bool deleted = false;
+          deleted = targetObj->properties.erase(propName) > 0 || deleted;
+          deleted = targetObj->properties.erase("__get_" + propName) > 0 || deleted;
+          deleted = targetObj->properties.erase("__set_" + propName) > 0 || deleted;
           if (deleted && targetObj->shape) {
             targetObj->shape = nullptr; // Invalidate shape on delete
           }
@@ -583,10 +1280,29 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       if (obj.isObject()) {
         auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        if (objPtr->isModuleNamespace) {
+          const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
+          bool isExport = std::find(
+            objPtr->moduleExportNames.begin(),
+            objPtr->moduleExportNames.end(),
+            propName
+          ) != objPtr->moduleExportNames.end();
+          if (propName == toStringTagKey) {
+            isExport = true;
+          }
+          if (isExport && strictMode_) {
+            throwError(ErrorType::TypeError, "Cannot delete property '" + propName + "' of module namespace object");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(Value(!isExport));
+        }
         if (objPtr->frozen || objPtr->sealed) {
           LIGHTJS_RETURN(Value(false));
         }
-        bool deleted = objPtr->properties.erase(propName) > 0;
+        bool deleted = false;
+        deleted = objPtr->properties.erase(propName) > 0 || deleted;
+        deleted = objPtr->properties.erase("__get_" + propName) > 0 || deleted;
+        deleted = objPtr->properties.erase("__set_" + propName) > 0 || deleted;
         if (deleted && objPtr->shape) {
           objPtr->shape = nullptr; // Invalidate shape on delete
         }
@@ -595,14 +1311,23 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       if (obj.isArray()) {
         auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
-        try {
-          size_t idx = std::stoul(propName);
-          if (idx < arrPtr->elements.size()) {
-            arrPtr->elements[idx] = Value(Undefined{});
-            LIGHTJS_RETURN(Value(true));
-          }
-        } catch (...) {}
-        LIGHTJS_RETURN(Value(false));
+        size_t idx = 0;
+        if (parseArrayIndex(propName, idx) && idx < arrPtr->elements.size()) {
+          arrPtr->elements[idx] = Value(Undefined{});
+          LIGHTJS_RETURN(Value(true));
+        }
+        arrPtr->properties.erase(propName);
+        arrPtr->properties.erase("__get_" + propName);
+        arrPtr->properties.erase("__set_" + propName);
+        LIGHTJS_RETURN(Value(true));
+      }
+
+      if (obj.isPromise()) {
+        auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+        promisePtr->properties.erase(propName);
+        promisePtr->properties.erase("__get_" + propName);
+        promisePtr->properties.erase("__set_" + propName);
+        LIGHTJS_RETURN(Value(true));
       }
 
       // Can't delete from primitives
@@ -619,6 +1344,17 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
     LIGHTJS_RETURN(Value(true));
   }
 
+  // For typeof, handle undeclared identifiers specially (return "undefined" instead of throwing)
+  if (expr.op == UnaryExpr::Op::Typeof) {
+    if (auto* id = std::get_if<Identifier>(&expr.argument->node)) {
+      auto val = env_->get(id->name);
+      if (!val) {
+        // Unresolvable reference: typeof returns "undefined"
+        LIGHTJS_RETURN(Value("undefined"));
+      }
+    }
+  }
+
   // For other unary operators, evaluate the argument first
   auto argTask = evaluate(*expr.argument);
   Value arg;
@@ -627,13 +1363,35 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
   switch (expr.op) {
     case UnaryExpr::Op::Not:
       LIGHTJS_RETURN(Value(!arg.toBool()));
-    case UnaryExpr::Op::Minus:
-      if (arg.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(-arg.toBigInt())));
+    case UnaryExpr::Op::Minus: {
+      Value prim = isObjectLike(arg) ? toPrimitiveValue(arg, false) : arg;
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(-arg.toNumber()));
-    case UnaryExpr::Op::Plus:
-      LIGHTJS_RETURN(Value(arg.toNumber()));
+      if (prim.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(-prim.toBigInt())));
+      }
+      if (prim.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(-prim.toNumber()));
+    }
+    case UnaryExpr::Op::Plus: {
+      Value prim = isObjectLike(arg) ? toPrimitiveValue(arg, false) : arg;
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (prim.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot convert BigInt value to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (prim.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(prim.toNumber()));
+    }
     case UnaryExpr::Op::Typeof: {
       if (arg.isUndefined()) LIGHTJS_RETURN(Value("undefined"));
       if (arg.isNull()) LIGHTJS_RETURN(Value("object"));
@@ -644,6 +1402,23 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isString()) LIGHTJS_RETURN(Value("string"));
       if (arg.isFunction()) LIGHTJS_RETURN(Value("function"));
       LIGHTJS_RETURN(Value("object"));
+    }
+    case UnaryExpr::Op::Void:
+      LIGHTJS_RETURN(Value(Undefined{}));
+    case UnaryExpr::Op::BitNot: {
+      Value prim = isObjectLike(arg) ? toPrimitiveValue(arg, false) : arg;
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (prim.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(~prim.toBigInt())));
+      }
+      if (prim.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      int32_t number = static_cast<int32_t>(prim.toNumber());
+      LIGHTJS_RETURN(Value(static_cast<double>(~number)));
     }
     case UnaryExpr::Op::Delete:
       // Already handled above
@@ -697,9 +1472,23 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     if (auto current = env_->get(id->name)) {
       Value result;
       switch (expr.op) {
-        case AssignmentExpr::Op::AddAssign:
-          result = Value(current->toNumber() + right.toNumber());
+        case AssignmentExpr::Op::AddAssign: {
+          Value lhs = isObjectLike(*current) ? toPrimitiveValue(*current, false) : *current;
+          if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+          Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+          if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+          if (lhs.isString() || rhs.isString()) {
+            result = Value(lhs.toString() + rhs.toString());
+          } else if (lhs.isBigInt() && rhs.isBigInt()) {
+            result = Value(BigInt(lhs.toBigInt() + rhs.toBigInt()));
+          } else if (lhs.isBigInt() != rhs.isBigInt()) {
+            throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          } else {
+            result = Value(lhs.toNumber() + rhs.toNumber());
+          }
           break;
+        }
         case AssignmentExpr::Op::SubAssign:
           result = Value(current->toNumber() - right.toNumber());
           break;
@@ -726,7 +1515,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     if (member->computed) {
       auto propTask = evaluate(*member->property);
       LIGHTJS_RUN_TASK_VOID(propTask);
-      propName = propTask.result().toString();
+      propName = toPropertyKeyString(propTask.result());
     } else {
       if (auto* id = std::get_if<Identifier>(&member->property->node)) {
         propName = id->name;
@@ -770,6 +1559,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      if (objPtr->isModuleNamespace) {
+        // Module namespace exotic objects reject writes.
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to property '" + propName + "' of module namespace object");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(right);
+      }
 
       // Check if object is frozen (can't modify any properties)
       if (objPtr->frozen) {
@@ -801,9 +1598,23 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       } else {
         Value current = objPtr->properties[propName];
         switch (expr.op) {
-          case AssignmentExpr::Op::AddAssign:
-            objPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+          case AssignmentExpr::Op::AddAssign: {
+            Value lhs = isObjectLike(current) ? toPrimitiveValue(current, false) : current;
+            if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+            Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
+            if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+            if (lhs.isString() || rhs.isString()) {
+              objPtr->properties[propName] = Value(lhs.toString() + rhs.toString());
+            } else if (lhs.isBigInt() && rhs.isBigInt()) {
+              objPtr->properties[propName] = Value(BigInt(lhs.toBigInt() + rhs.toBigInt()));
+            } else if (lhs.isBigInt() != rhs.isBigInt()) {
+              throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
+              LIGHTJS_RETURN(Value(Undefined{}));
+            } else {
+              objPtr->properties[propName] = Value(lhs.toNumber() + rhs.toNumber());
+            }
             break;
+          }
           case AssignmentExpr::Op::SubAssign:
             objPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
             break;
@@ -846,29 +1657,84 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       LIGHTJS_RETURN(right);
     }
 
+    if (obj.isPromise()) {
+      auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+      if (expr.op == AssignmentExpr::Op::Assign) {
+        promisePtr->properties[propName] = right;
+      } else {
+        Value current = promisePtr->properties[propName];
+        switch (expr.op) {
+          case AssignmentExpr::Op::AddAssign:
+            promisePtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+            break;
+          case AssignmentExpr::Op::SubAssign:
+            promisePtr->properties[propName] = Value(current.toNumber() - right.toNumber());
+            break;
+          case AssignmentExpr::Op::MulAssign:
+            promisePtr->properties[propName] = Value(current.toNumber() * right.toNumber());
+            break;
+          case AssignmentExpr::Op::DivAssign:
+            promisePtr->properties[propName] = Value(current.toNumber() / right.toNumber());
+            break;
+          default:
+            promisePtr->properties[propName] = right;
+            break;
+        }
+      }
+      LIGHTJS_RETURN(right);
+    }
+
     if (obj.isArray()) {
       auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
-      try {
-        size_t idx = std::stoul(propName);
+      size_t idx = 0;
+      if (parseArrayIndex(propName, idx)) {
         if (idx >= arrPtr->elements.size()) {
           arrPtr->elements.resize(idx + 1, Value(Undefined{}));
         }
         arrPtr->elements[idx] = right;
         LIGHTJS_RETURN(right);
-      } catch (...) {}
+      }
+      arrPtr->properties[propName] = right;
+      LIGHTJS_RETURN(right);
     }
 
     if (obj.isTypedArray()) {
       auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
-      try {
-        size_t idx = std::stoul(propName);
+      size_t idx = 0;
+      if (parseArrayIndex(propName, idx)) {
         if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
           taPtr->setBigIntElement(idx, right.toBigInt());
         } else {
           taPtr->setElement(idx, right.toNumber());
         }
         LIGHTJS_RETURN(right);
-      } catch (...) {}
+      }
+    }
+
+    if (obj.isRegex()) {
+      auto regexPtr = std::get<std::shared_ptr<Regex>>(obj.data);
+      if (expr.op == AssignmentExpr::Op::Assign) {
+        regexPtr->properties[propName] = right;
+      } else {
+        Value current = regexPtr->properties[propName];
+        switch (expr.op) {
+          case AssignmentExpr::Op::AddAssign:
+            regexPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+            break;
+          case AssignmentExpr::Op::SubAssign:
+            regexPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
+            break;
+          case AssignmentExpr::Op::MulAssign:
+            regexPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
+            break;
+          case AssignmentExpr::Op::DivAssign:
+            regexPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
+            break;
+          default:
+            regexPtr->properties[propName] = right;
+        }
+      }
+      LIGHTJS_RETURN(right);
     }
   }
 
@@ -878,6 +1744,13 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
   if (auto* id = std::get_if<Identifier>(&expr.argument->node)) {
     if (auto current = env_->get(id->name)) {
+      if (current->isBigInt()) {
+        int64_t oldVal = current->toBigInt();
+        int64_t newVal = (expr.op == UpdateExpr::Op::Increment) ? oldVal + 1 : oldVal - 1;
+        env_->set(id->name, Value(BigInt(newVal)));
+        LIGHTJS_RETURN(expr.prefix ? Value(BigInt(newVal)) : Value(BigInt(oldVal)));
+      }
+
       double num = current->toNumber();
       double newVal = (expr.op == UpdateExpr::Op::Increment) ? num + 1 : num - 1;
       env_->set(id->name, Value(newVal));
@@ -929,14 +1802,21 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   Value callee;
 
   // Check if this is a method call (obj.method())
-  if (auto* memberExpr = std::get_if<MemberExpr>(&expr.callee->node)) {
-    // Evaluate the object (receiver)
-    thisValue = LIGHTJS_AWAIT(evaluate(*memberExpr->object));
-
-    // Now evaluate the full member expression to get the method
+  if (std::holds_alternative<MemberExpr>(expr.callee->node)) {
+    // Evaluate the member expression once and capture the base object from evaluateMember.
+    hasLastMemberBase_ = false;
     callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
+    if (hasLastMemberBase_) {
+      thisValue = lastMemberBase_;
+    }
   } else {
     callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
+  }
+
+  // Optional call short-circuits without evaluating arguments.
+  // inOptionalChain propagates through the entire chain (e.g., a?.b.c(x))
+  if ((expr.optional || expr.inOptionalChain) && (callee.isNull() || callee.isUndefined())) {
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   std::vector<Value> args;
@@ -991,6 +1871,21 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     LIGHTJS_RETURN(callFunction(callee, args, thisValue));
   }
 
+  // Some built-ins are represented as wrapper objects with a callable constructor.
+  if (callee.isObject()) {
+    auto objPtr = std::get<std::shared_ptr<Object>>(callee.data);
+    auto callableIt = objPtr->properties.find("__callable_object__");
+    bool isCallableWrapper = callableIt != objPtr->properties.end() &&
+                             callableIt->second.isBool() &&
+                             callableIt->second.toBool();
+    if (isCallableWrapper) {
+      auto ctorIt = objPtr->properties.find("constructor");
+      if (ctorIt != objPtr->properties.end() && ctorIt->second.isFunction()) {
+        LIGHTJS_RETURN(callFunction(ctorIt->second, args, thisValue));
+      }
+    }
+  }
+
   // Throw TypeError if trying to call a non-function
   throwError(ErrorType::TypeError, callee.toString() + " is not a function");
   LIGHTJS_RETURN(Value(Undefined{}));
@@ -1000,20 +1895,143 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   auto objTask = evaluate(*expr.object);
   Value obj;
   LIGHTJS_RUN_TASK(objTask, obj);
+
+  // Optional chaining: if object is null or undefined, return undefined.
+  // This check must happen before evaluating computed keys to preserve short-circuiting.
+  // inOptionalChain propagates short-circuiting through the entire chain (e.g., a?.b.c.d)
+  if ((expr.optional || expr.inOptionalChain) && (obj.isNull() || obj.isUndefined())) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
   std::string propName;
   if (expr.computed) {
     auto propTask = evaluate(*expr.property);
     LIGHTJS_RUN_TASK_VOID(propTask);
-    propName = propTask.result().toString();
+    Value key = propTask.result();
+    if (isObjectLike(key)) {
+      key = toPrimitiveValue(key, true);
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+    }
+    propName = toPropertyKeyString(key);
   } else {
     if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
       propName = id->name;
     }
   }
 
-  // Optional chaining: if object is null or undefined, return undefined
-  if (expr.optional && (obj.isNull() || obj.isUndefined())) {
-    LIGHTJS_RETURN(Value(Undefined{}));
+  // Remember the current base object so method calls can bind `this` without
+  // re-evaluating side-effectful member objects.
+  lastMemberBase_ = obj;
+  hasLastMemberBase_ = true;
+
+  // BigInt primitive member access
+  if (obj.isBigInt()) {
+    int64_t bigintValue = obj.toBigInt();
+
+    if (propName == "constructor") {
+      if (auto ctor = env_->get("BigInt")) {
+        LIGHTJS_RETURN(*ctor);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
+    if (propName == "valueOf") {
+      auto valueOfFn = std::make_shared<Function>();
+      valueOfFn->isNative = true;
+      valueOfFn->properties["__throw_on_new__"] = Value(true);
+      valueOfFn->nativeFunc = [bigintValue](const std::vector<Value>&) -> Value {
+        return Value(BigInt(bigintValue));
+      };
+      LIGHTJS_RETURN(Value(valueOfFn));
+    }
+
+    if (propName == "toLocaleString") {
+      auto toLocaleStringFn = std::make_shared<Function>();
+      toLocaleStringFn->isNative = true;
+      toLocaleStringFn->properties["__throw_on_new__"] = Value(true);
+      toLocaleStringFn->nativeFunc = [bigintValue](const std::vector<Value>&) -> Value {
+        return Value(std::to_string(bigintValue));
+      };
+      LIGHTJS_RETURN(Value(toLocaleStringFn));
+    }
+
+    if (propName == "toString") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->properties["__throw_on_new__"] = Value(true);
+      toStringFn->nativeFunc = [bigintValue](const std::vector<Value>& args) -> Value {
+        int radix = 10;
+        if (!args.empty() && !args[0].isUndefined()) {
+          int r = static_cast<int>(std::trunc(args[0].toNumber()));
+          if (r < 2 || r > 36) {
+            throw std::runtime_error("RangeError: radix must be between 2 and 36");
+          }
+          radix = r;
+        }
+
+        bool negative = bigintValue < 0;
+        uint64_t magnitude = negative
+          ? static_cast<uint64_t>(-(bigintValue + 1)) + 1
+          : static_cast<uint64_t>(bigintValue);
+
+        if (magnitude == 0) {
+          return Value(std::string("0"));
+        }
+
+        std::string digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+        std::string out;
+        while (magnitude > 0) {
+          uint64_t digit = magnitude % static_cast<uint64_t>(radix);
+          out.push_back(digits[static_cast<size_t>(digit)]);
+          magnitude /= static_cast<uint64_t>(radix);
+        }
+        std::reverse(out.begin(), out.end());
+        if (negative) out.insert(out.begin(), '-');
+        return Value(out);
+      };
+      LIGHTJS_RETURN(Value(toStringFn));
+    }
+  }
+
+  // Symbol primitive member access
+  if (obj.isSymbol()) {
+    Symbol symbolValue = std::get<Symbol>(obj.data);
+
+    if (propName == "constructor") {
+      if (auto ctor = env_->get("Symbol")) {
+        LIGHTJS_RETURN(*ctor);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
+    if (propName == "toString") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->properties["__throw_on_new__"] = Value(true);
+      toStringFn->nativeFunc = [symbolValue](const std::vector<Value>&) -> Value {
+        return Value(std::string("Symbol(") + symbolValue.description + ")");
+      };
+      LIGHTJS_RETURN(Value(toStringFn));
+    }
+
+    if (propName == "valueOf") {
+      auto valueOfFn = std::make_shared<Function>();
+      valueOfFn->isNative = true;
+      valueOfFn->properties["__throw_on_new__"] = Value(true);
+      valueOfFn->nativeFunc = [symbolValue](const std::vector<Value>&) -> Value {
+        return Value(symbolValue);
+      };
+      LIGHTJS_RETURN(Value(valueOfFn));
+    }
+
+    if (propName == "description") {
+      if (symbolValue.description.empty()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(symbolValue.description));
+    }
   }
 
   // Proxy trap handling - intercept get operations
@@ -1024,7 +2042,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::string propName;
     if (expr.computed) {
       Value propVal = LIGHTJS_AWAIT(evaluate(*expr.property));
-      propName = propVal.toString();
+      propName = toPropertyKeyString(propVal);
     } else {
       if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
         propName = id->name;
@@ -1068,6 +2086,24 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   if (obj.isPromise()) {
     auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
 
+    // Promise own accessor/data properties can override built-in behavior.
+    std::string promiseGetterName = "__get_" + propName;
+    auto promiseGetterIt = promisePtr->properties.find(promiseGetterName);
+    if (promiseGetterIt != promisePtr->properties.end() && promiseGetterIt->second.isFunction()) {
+      LIGHTJS_RETURN(callFunction(promiseGetterIt->second, {}, obj));
+    }
+    auto promiseOwnIt = promisePtr->properties.find(propName);
+    if (promiseOwnIt != promisePtr->properties.end()) {
+      LIGHTJS_RETURN(promiseOwnIt->second);
+    }
+
+    if (propName == "constructor") {
+      if (auto ctor = env_->get("Promise")) {
+        LIGHTJS_RETURN(*ctor);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
     // Add toString method for Promise
     if (propName == "toString") {
       auto toStringFn = std::make_shared<Function>();
@@ -1090,7 +2126,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (!args.empty() && args[0].isFunction()) {
           auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
           onFulfilled = [this, callback](Value val) -> Value {
-            return invokeFunction(callback, {val}, Value(Undefined{}));
+            Value out = invokeFunction(callback, {val}, Value(Undefined{}));
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return out;
           };
         }
 
@@ -1098,7 +2140,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (args.size() > 1 && args[1].isFunction()) {
           auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
           onRejected = [this, callback](Value val) -> Value {
-            return invokeFunction(callback, {val}, Value(Undefined{}));
+            Value out = invokeFunction(callback, {val}, Value(Undefined{}));
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return out;
           };
         }
 
@@ -1118,7 +2166,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (!args.empty() && args[0].isFunction()) {
           auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
           onRejected = [this, callback](Value val) -> Value {
-            return invokeFunction(callback, {val}, Value(Undefined{}));
+            Value out = invokeFunction(callback, {val}, Value(Undefined{}));
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return out;
           };
         }
 
@@ -1138,7 +2192,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (!args.empty() && args[0].isFunction()) {
           auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
           onFinally = [this, callback]() -> Value {
-            return invokeFunction(callback, {}, Value(Undefined{}));
+            Value out = invokeFunction(callback, {}, Value(Undefined{}));
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return out;
           };
         }
 
@@ -1633,8 +2693,41 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
   }
 
+  if (obj.isClass()) {
+    auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+    auto methodIt = clsPtr->methods.find(propName);
+    if (methodIt != clsPtr->methods.end()) {
+      LIGHTJS_RETURN(Value(methodIt->second));
+    }
+    auto staticIt = clsPtr->staticMethods.find(propName);
+    if (staticIt != clsPtr->staticMethods.end()) {
+      LIGHTJS_RETURN(Value(staticIt->second));
+    }
+    if (propName == "name") {
+      LIGHTJS_RETURN(Value(clsPtr->name));
+    }
+  }
+
   if (obj.isObject()) {
     auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+
+    // Deferred dynamic import namespace: trigger evaluation on first external property access.
+    if (propName.rfind("__", 0) != 0) {
+      auto pendingIt = objPtr->properties.find("__deferred_pending__");
+      auto evalIt = objPtr->properties.find("__deferred_eval__");
+      if (pendingIt != objPtr->properties.end() &&
+          pendingIt->second.isBool() &&
+          pendingIt->second.toBool() &&
+          evalIt != objPtr->properties.end() &&
+          evalIt->second.isFunction()) {
+        auto deferredEvalFn = std::get<std::shared_ptr<Function>>(evalIt->second.data);
+        invokeFunction(deferredEvalFn, {}, obj);
+        if (hasError()) {
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        objPtr->properties["__deferred_pending__"] = Value(false);
+      }
+    }
 
     // Check for getter first
     std::string getterName = "__get_" + propName;
@@ -1650,10 +2743,38 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (it != objPtr->properties.end()) {
       LIGHTJS_RETURN(it->second);
     }
+
+    // Some constructor singletons (notably Array) store prototype metadata
+    // separately for runtime compatibility.
+    if (propName == "prototype") {
+      if (auto arrayValue = env_->get("Array");
+          arrayValue && arrayValue->isObject() &&
+          std::get<std::shared_ptr<Object>>(arrayValue->data).get() == objPtr.get()) {
+        if (auto hiddenArrayProto = env_->get("__array_prototype__")) {
+          LIGHTJS_RETURN(*hiddenArrayProto);
+        }
+      }
+    }
   }
 
   if (obj.isFunction()) {
     auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+
+    if (propName == "call") {
+      auto callFn = std::make_shared<Function>();
+      callFn->isNative = true;
+      callFn->properties["__throw_on_new__"] = Value(true);
+      callFn->nativeFunc = [this, funcPtr](const std::vector<Value>& args) -> Value {
+        Value thisArg = args.empty() ? Value(Undefined{}) : args[0];
+        std::vector<Value> callArgs;
+        if (args.size() > 1) {
+          callArgs.insert(callArgs.end(), args.begin() + 1, args.end());
+        }
+        return callFunction(Value(funcPtr), callArgs, thisArg);
+      };
+      LIGHTJS_RETURN(Value(callFn));
+    }
+
     auto it = funcPtr->properties.find(propName);
     if (it != funcPtr->properties.end()) {
       LIGHTJS_RETURN(it->second);
@@ -2520,12 +3641,126 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
 
-    try {
-      size_t idx = std::stoul(propName);
-      if (idx < arrPtr->elements.size()) {
-        LIGHTJS_RETURN(arrPtr->elements[idx]);
+    size_t idx = 0;
+    if (parseArrayIndex(propName, idx) && idx < arrPtr->elements.size()) {
+      LIGHTJS_RETURN(arrPtr->elements[idx]);
+    }
+    auto propIt = arrPtr->properties.find(propName);
+    if (propIt != arrPtr->properties.end()) {
+      LIGHTJS_RETURN(propIt->second);
+    }
+  }
+
+  if (obj.isMap()) {
+    auto mapPtr = std::get<std::shared_ptr<Map>>(obj.data);
+    if (propName == "size") {
+      LIGHTJS_RETURN(Value(static_cast<double>(mapPtr->size())));
+    }
+    if (propName == "set") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
+        if (args.size() < 2) {
+          return Value(mapPtr);
+        }
+        mapPtr->set(args[0], args[1]);
+        return Value(mapPtr);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "get") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(Undefined{});
+        return mapPtr->get(args[0]);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "has") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        return Value(mapPtr->has(args[0]));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "delete") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        return Value(mapPtr->deleteKey(args[0]));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "clear") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
+        mapPtr->clear();
+        return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "constructor") {
+      if (auto ctor = env_->get("Map")) {
+        LIGHTJS_RETURN(*ctor);
       }
-    } catch (...) {}
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+  }
+
+  if (obj.isSet()) {
+    auto setPtr = std::get<std::shared_ptr<Set>>(obj.data);
+    if (propName == "size") {
+      LIGHTJS_RETURN(Value(static_cast<double>(setPtr->size())));
+    }
+    if (propName == "add") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          setPtr->add(args[0]);
+        }
+        return Value(setPtr);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "has") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        return Value(setPtr->has(args[0]));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "delete") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        return Value(setPtr->deleteValue(args[0]));
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "clear") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
+        setPtr->clear();
+        return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "constructor") {
+      if (auto ctor = env_->get("Set")) {
+        LIGHTJS_RETURN(*ctor);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
   }
 
   if (obj.isTypedArray()) {
@@ -2536,16 +3771,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "byteLength") {
       LIGHTJS_RETURN(Value(static_cast<double>(taPtr->buffer.size())));
     }
-    try {
-      size_t idx = std::stoul(propName);
-      if (idx < taPtr->length) {
-        if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
-          LIGHTJS_RETURN(Value(BigInt(taPtr->getBigIntElement(idx))));
-        } else {
-          LIGHTJS_RETURN(Value(taPtr->getElement(idx)));
-        }
+    size_t idx = 0;
+    if (parseArrayIndex(propName, idx) && idx < taPtr->length) {
+      if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
+        LIGHTJS_RETURN(Value(BigInt(taPtr->getBigIntElement(idx))));
+      } else {
+        LIGHTJS_RETURN(Value(taPtr->getElement(idx)));
       }
-    } catch (...) {}
+    }
   }
 
   if (obj.isRegex()) {
@@ -2619,6 +3852,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     if (propName == "name") {
       LIGHTJS_RETURN(Value(errorPtr->getName()));
+    }
+
+    if (propName == "constructor") {
+      if (auto ctor = env_->get(errorPtr->getName())) {
+        LIGHTJS_RETURN(*ctor);
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     if (propName == "message") {
@@ -2719,6 +3959,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   if (obj.isString()) {
     std::string str = std::get<std::string>(obj.data);
+
+    if (propName == "toString" || propName == "valueOf") {
+      auto toStringFn = std::make_shared<Function>();
+      toStringFn->isNative = true;
+      toStringFn->nativeFunc = [str](const std::vector<Value>&) -> Value {
+        return Value(str);
+      };
+      LIGHTJS_RETURN(Value(toStringFn));
+    }
 
     if (propName == "length") {
       // Return Unicode code point length, not byte length
@@ -3050,67 +4299,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // String.prototype.matchAll - ES2020
     if (propName == "matchAll") {
-      auto matchAllFn = std::make_shared<Function>();
-      matchAllFn->isNative = true;
-      matchAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty() || !args[0].isRegex()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "matchAll requires a regex argument"));
-        }
-        auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
-
-        // Create an array of all matches
-        auto allMatches = std::make_shared<Array>();
-        GarbageCollector::instance().reportAllocation(sizeof(Array));
-
-#if USE_SIMPLE_REGEX
-        std::string remaining = str;
-        size_t offset = 0;
-        std::vector<simple_regex::Regex::Match> matches;
-        while (regexPtr->regex->search(remaining, matches)) {
-          if (matches.empty()) break;
-          auto matchArr = std::make_shared<Array>();
-          GarbageCollector::instance().reportAllocation(sizeof(Array));
-          for (const auto& m : matches) {
-            matchArr->elements.push_back(Value(m.str));
+      if (auto strCtor = env_->get("String"); strCtor && strCtor->isObject()) {
+        auto strObj = std::get<std::shared_ptr<Object>>(strCtor->data);
+        auto protoIt = strObj->properties.find("prototype");
+        if (protoIt != strObj->properties.end() && protoIt->second.isObject()) {
+          auto protoObj = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          auto methodIt = protoObj->properties.find("matchAll");
+          if (methodIt != protoObj->properties.end() && methodIt->second.isFunction()) {
+            LIGHTJS_RETURN(methodIt->second);
           }
-          // Add index property
-          auto matchObj = std::make_shared<Object>();
-          matchObj->properties["0"] = Value(matches[0].str);
-          matchObj->properties["index"] = Value(static_cast<double>(offset + matches[0].start));
-          matchObj->properties["input"] = Value(str);
-          allMatches->elements.push_back(Value(matchObj));
-
-          // Move past this match
-          size_t matchEnd = matches[0].start + matches[0].str.length();
-          if (matchEnd == 0) matchEnd = 1;  // Prevent infinite loop
-          offset += matchEnd;
-          remaining = remaining.substr(matchEnd);
-          matches.clear();
         }
-#else
-        std::string::const_iterator searchStart = str.cbegin();
-        std::smatch match;
-        while (std::regex_search(searchStart, str.cend(), match, regexPtr->regex)) {
-          auto matchObj = std::make_shared<Object>();
-          GarbageCollector::instance().reportAllocation(sizeof(Object));
-          matchObj->properties["0"] = Value(match[0].str());
-          matchObj->properties["index"] = Value(static_cast<double>(match.position() + (searchStart - str.cbegin())));
-          matchObj->properties["input"] = Value(str);
-
-          // Add captured groups
-          for (size_t i = 1; i < match.size(); ++i) {
-            matchObj->properties[std::to_string(i)] = Value(match[i].str());
-          }
-
-          allMatches->elements.push_back(Value(matchObj));
-          searchStart = match.suffix().first;
-          if (match[0].length() == 0) ++searchStart;  // Prevent infinite loop
-        }
-#endif
-        // Return iterator over matches
-        return createIteratorFactory(allMatches);
-      };
-      LIGHTJS_RETURN(Value(matchAllFn));
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     if (propName == "replace") {
@@ -3514,7 +4714,7 @@ Value Interpreter::iteratorNext(IteratorRecord& record) {
       if (nextIt == record.iteratorObject->properties.end() || !nextIt->second.isFunction()) {
         return makeIteratorResult(Value(Undefined{}), true);
       }
-      return callFunction(nextIt->second, {});
+      return callFunction(nextIt->second, {}, Value(record.iteratorObject));
     }
   }
 
@@ -3533,6 +4733,15 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     if (!thisValue.isUndefined()) {
       targetEnv->define("this", thisValue);
     }
+    auto superIt = func->properties.find("__super_class__");
+    if (superIt != func->properties.end() && superIt->second.isClass()) {
+      targetEnv->define("__super__", superIt->second);
+    }
+
+    auto argumentsArray = std::make_shared<Array>();
+    GarbageCollector::instance().reportAllocation(sizeof(Array));
+    argumentsArray->elements = args;
+    targetEnv->define("arguments", Value(argumentsArray));
 
     for (size_t i = 0; i < func->params.size(); ++i) {
       if (i < args.size()) {
@@ -3558,7 +4767,39 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   };
 
   if (func->isNative) {
-    return func->nativeFunc(args);
+    try {
+      auto itUsesThis = func->properties.find("__uses_this_arg__");
+      if (itUsesThis != func->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+        std::vector<Value> nativeArgs;
+        nativeArgs.reserve(args.size() + 1);
+        nativeArgs.push_back(thisValue);
+        nativeArgs.insert(nativeArgs.end(), args.begin(), args.end());
+        return func->nativeFunc(nativeArgs);
+      }
+      return func->nativeFunc(args);
+    } catch (const std::exception& e) {
+      std::string message = e.what();
+      ErrorType errorType = ErrorType::Error;
+      auto consumePrefix = [&](const std::string& prefix, ErrorType type) {
+        if (message.rfind(prefix, 0) == 0) {
+          errorType = type;
+          message = message.substr(prefix.size());
+          return true;
+        }
+        return false;
+      };
+      if (!consumePrefix("TypeError: ", ErrorType::TypeError) &&
+          !consumePrefix("ReferenceError: ", ErrorType::ReferenceError) &&
+          !consumePrefix("RangeError: ", ErrorType::RangeError) &&
+          !consumePrefix("SyntaxError: ", ErrorType::SyntaxError) &&
+          !consumePrefix("URIError: ", ErrorType::URIError) &&
+          !consumePrefix("EvalError: ", ErrorType::EvalError) &&
+          !consumePrefix("Error: ", ErrorType::Error)) {
+        errorType = ErrorType::Error;
+      }
+      throwError(errorType, message);
+      return Value(Undefined{});
+    }
   }
 
   if (func->isGenerator) {
@@ -3582,7 +4823,10 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     bindParameters(env_);
 
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+    bool previousStrictMode = strictMode_;
+    strictMode_ = func->isStrict;
     Value result = Value(Undefined{});
+    bool returned = false;
 
     auto prevFlow = flow_;
     flow_ = ControlFlow{};
@@ -3590,10 +4834,12 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     try {
       for (const auto& stmt : *bodyPtr) {
         auto stmtTask = evaluate(*stmt);
-  LIGHTJS_RUN_TASK(stmtTask, result);
+        Value stmtResult = Value(Undefined{});
+        LIGHTJS_RUN_TASK(stmtTask, stmtResult);
 
         if (flow_.type == ControlFlow::Type::Return) {
           result = flow_.value;
+          returned = true;
           break;
         }
 
@@ -3604,16 +4850,18 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         }
       }
       if (flow_.type != ControlFlow::Type::Throw) {
+        if (!returned) {
+          result = Value(Undefined{});
+        }
         promise->resolve(result);
       }
     } catch (const std::exception& e) {
       promise->reject(Value(std::string(e.what())));
     }
 
-    // Don't restore flow if an error was thrown - preserve the error
-    if (flow_.type != ControlFlow::Type::Throw) {
-      flow_ = prevFlow;
-    }
+    // Async functions convert abrupt completion into Promise rejection.
+    flow_ = prevFlow;
+    strictMode_ = previousStrictMode;
     env_ = prevEnv;
     return Value(promise);
   }
@@ -3627,17 +4875,22 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   bindParameters(env_);
 
   auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+  bool previousStrictMode = strictMode_;
+  strictMode_ = func->isStrict;
   Value result = Value(Undefined{});
+  bool returned = false;
 
   auto prevFlow = flow_;
   flow_ = ControlFlow{};
 
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
-  LIGHTJS_RUN_TASK(stmtTask, result);
+    Value stmtResult = Value(Undefined{});
+    LIGHTJS_RUN_TASK(stmtTask, stmtResult);
 
     if (flow_.type == ControlFlow::Type::Return) {
       result = flow_.value;
+      returned = true;
       break;
     }
 
@@ -3647,10 +4900,15 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     }
   }
 
+  if (!returned && flow_.type != ControlFlow::Type::Throw) {
+    result = Value(Undefined{});
+  }
+
   // Don't restore flow if an error was thrown - preserve the error
   if (flow_.type != ControlFlow::Type::Throw) {
     flow_ = prevFlow;
   }
+  strictMode_ = previousStrictMode;
   env_ = prevEnv;
   return result;
 }
@@ -3772,6 +5030,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->isNative = false;
   func->isAsync = expr.isAsync;
   func->isGenerator = expr.isGenerator;
+  func->isStrict = strictMode_ || hasUseStrictDirective(expr.body);
 
   for (const auto& param : expr.params) {
     FunctionParam funcParam;
@@ -3788,6 +5047,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
   func->closure = env_;
+  func->properties["name"] = Value(expr.name);
 
   LIGHTJS_RETURN(Value(func));
 }
@@ -3797,14 +5057,78 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
   Value val;
   LIGHTJS_RUN_TASK(task, val);
 
+  if (!val.isPromise() && isObjectLike(val)) {
+    auto [foundThen, thenValue] = getPropertyForPrimitive(val, "then");
+    if (hasError()) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    if (foundThen && thenValue.isFunction()) {
+      auto promise = std::make_shared<Promise>();
+
+      auto resolveFunc = std::make_shared<Function>();
+      resolveFunc->isNative = true;
+      resolveFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promise->resolve(args[0]);
+        } else {
+          promise->resolve(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      auto rejectFunc = std::make_shared<Function>();
+      rejectFunc->isNative = true;
+      rejectFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promise->reject(args[0]);
+        } else {
+          promise->reject(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      callFunction(thenValue, {Value(resolveFunc), Value(rejectFunc)}, val);
+      if (hasError()) {
+        Value err = getError();
+        clearError();
+        promise->reject(err);
+      }
+
+      val = Value(promise);
+    }
+  }
+
   if (val.isPromise()) {
     auto promise = std::get<std::shared_ptr<Promise>>(val.data);
+    if (promise->state == PromiseState::Pending) {
+      // TinyJS models await synchronously; drive pending microtasks until settled.
+      auto& loop = EventLoopContext::instance().getLoop();
+      constexpr size_t kMaxAwaitTicks = 10000;
+      size_t ticks = 0;
+      while (promise->state == PromiseState::Pending &&
+             loop.hasPendingWork() &&
+             ticks < kMaxAwaitTicks) {
+        loop.runOnce();
+        ticks++;
+      }
+    }
+
     if (promise->state == PromiseState::Fulfilled) {
       LIGHTJS_RETURN(promise->result);
     } else if (promise->state == PromiseState::Rejected) {
-      LIGHTJS_RETURN(promise->result);
+      flow_.type = ControlFlow::Type::Throw;
+      flow_.value = promise->result;
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
     LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  // Await on non-Promise values still yields to queued microtasks.
+  if (!suppressMicrotasks_) {
+    auto& loop = EventLoopContext::instance().getLoop();
+    if (loop.pendingMicrotaskCount() > 0) {
+      loop.runOnce();
+    }
   }
 
   LIGHTJS_RETURN(val);
@@ -3876,6 +5200,67 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     }
   }
 
+  auto setConstructorTag = [&](Value& instanceVal) {
+    if (instanceVal.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(instanceVal.data);
+      obj->properties["__constructor__"] = callee;
+    } else if (instanceVal.isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(instanceVal.data);
+      arr->properties["__constructor__"] = callee;
+    } else if (instanceVal.isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(instanceVal.data);
+      fn->properties["__constructor__"] = callee;
+    } else if (instanceVal.isRegex()) {
+      auto regex = std::get<std::shared_ptr<Regex>>(instanceVal.data);
+      regex->properties["__constructor__"] = callee;
+    } else if (instanceVal.isPromise()) {
+      auto promise = std::get<std::shared_ptr<Promise>>(instanceVal.data);
+      promise->properties["__constructor__"] = callee;
+    }
+  };
+
+  auto wrapPrimitiveValue = [&](const Value& primitive) -> Value {
+    auto wrapper = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    wrapper->properties["__primitive_value__"] = primitive;
+
+    auto valueOfFn = std::make_shared<Function>();
+    valueOfFn->isNative = true;
+    valueOfFn->properties["__uses_this_arg__"] = Value(true);
+    valueOfFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (!args.empty()) {
+        if (args[0].isNumber() || args[0].isString() || args[0].isBool()) {
+          return args[0];
+        }
+        if (args[0].isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+          auto it = obj->properties.find("__primitive_value__");
+          if (it != obj->properties.end()) {
+            return it->second;
+          }
+        }
+      }
+      return Value(Undefined{});
+    };
+    wrapper->properties["valueOf"] = Value(valueOfFn);
+
+    return Value(wrapper);
+  };
+
+  if (callee.isObject()) {
+    auto objPtr = std::get<std::shared_ptr<Object>>(callee.data);
+    auto callableIt = objPtr->properties.find("__callable_object__");
+    bool isCallableWrapper = callableIt != objPtr->properties.end() &&
+                             callableIt->second.isBool() &&
+                             callableIt->second.toBool();
+    if (isCallableWrapper) {
+      auto ctorIt = objPtr->properties.find("constructor");
+      if (ctorIt != objPtr->properties.end()) {
+        callee = ctorIt->second;
+      }
+    }
+  }
+
   // Handle Class constructor
   if (callee.isClass()) {
     auto cls = std::get<std::shared_ptr<Class>>(callee.data);
@@ -3906,6 +5291,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 
       // Bind 'this' to the new instance
       env_->define("this", Value(instance));
+      env_->define("__new_target__", callee);
 
       // Bind super class if exists
       if (cls->superClass) {
@@ -3955,6 +5341,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
       env_ = prevEnv;
     }
 
+    instance->properties["__constructor__"] = callee;
     LIGHTJS_RETURN(Value(instance));
   }
 
@@ -3963,8 +5350,22 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     auto func = std::get<std::shared_ptr<Function>>(callee.data);
 
     if (func->isNative) {
+      if (!func->isConstructor) {
+        throwError(ErrorType::TypeError, "Function is not a constructor");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      auto noNewIt = func->properties.find("__throw_on_new__");
+      if (noNewIt != func->properties.end() && noNewIt->second.isBool() && noNewIt->second.toBool()) {
+        throwError(ErrorType::TypeError, "Function is not a constructor");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       // Native constructors (e.g., Array, Object, Map, etc.)
-      LIGHTJS_RETURN(func->nativeFunc(args));
+      Value constructed = func->nativeFunc(args);
+      if (constructed.isNumber() || constructed.isString() || constructed.isBool()) {
+        constructed = wrapPrimitiveValue(constructed);
+      }
+      setConstructorTag(constructed);
+      LIGHTJS_RETURN(constructed);
     }
 
     // Create the new instance object
@@ -3978,6 +5379,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 
     // Bind 'this' to the new instance
     env_->define("this", Value(instance));
+    env_->define("__new_target__", callee);
 
     // Bind parameters
     for (size_t i = 0; i < func->params.size(); ++i) {
@@ -4025,6 +5427,8 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     flow_ = prevFlow;
     env_ = prevEnv;
 
+    Value instanceVal(instance);
+    setConstructorTag(instanceVal);
     LIGHTJS_RETURN(Value(instance));
   }
 
@@ -4058,6 +5462,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     auto func = std::make_shared<Function>();
     func->isNative = false;
     func->isAsync = method.isAsync;
+    func->isStrict = true;  // Class bodies are always strict.
     func->closure = env_;
 
     for (const auto& param : method.params) {
@@ -4071,6 +5476,14 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       const_cast<std::vector<StmtPtr>*>(&method.body),
       [](void*){} // No-op deleter since we don't own the memory
     );
+    if (method.kind == MethodDefinition::Kind::Constructor) {
+      func->properties["name"] = Value(std::string("constructor"));
+    } else {
+      func->properties["name"] = Value(method.key.name);
+    }
+    if (cls->superClass) {
+      func->properties["__super_class__"] = Value(cls->superClass);
+    }
 
     if (method.kind == MethodDefinition::Kind::Constructor) {
       cls->constructor = func;
@@ -4090,6 +5503,18 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
 
 // Helper for recursively binding destructuring patterns
 void Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst) {
+  if (auto* assign = std::get_if<AssignmentPattern>(&pattern.node)) {
+    Value boundValue = value;
+    if (boundValue.isUndefined()) {
+      auto initTask = evaluate(*assign->right);
+      Value initValue = Value(Undefined{});
+      LIGHTJS_RUN_TASK(initTask, initValue);
+      boundValue = initValue;
+    }
+    bindDestructuringPattern(*assign->left, boundValue, isConst);
+    return;
+  }
+
   if (auto* id = std::get_if<Identifier>(&pattern.node)) {
     // Simple identifier
     env_->define(id->name, value, isConst);
@@ -4166,6 +5591,14 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
 // Helper to invoke a JavaScript function synchronously (used by native array methods for callbacks)
 Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue) {
   if (func->isNative) {
+    auto itUsesThis = func->properties.find("__uses_this_arg__");
+    if (itUsesThis != func->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+      std::vector<Value> nativeArgs;
+      nativeArgs.reserve(args.size() + 1);
+      nativeArgs.push_back(thisValue);
+      nativeArgs.insert(nativeArgs.end(), args.begin(), args.end());
+      return func->nativeFunc(nativeArgs);
+    }
     return func->nativeFunc(args);
   }
 
@@ -4178,6 +5611,15 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
   if (!thisValue.isUndefined()) {
     env_->define("this", thisValue);
   }
+  auto superIt = func->properties.find("__super_class__");
+  if (superIt != func->properties.end() && superIt->second.isClass()) {
+    env_->define("__super__", superIt->second);
+  }
+
+  auto argumentsArray = std::make_shared<Array>();
+  GarbageCollector::instance().reportAllocation(sizeof(Array));
+  argumentsArray->elements = args;
+  env_->define("arguments", Value(argumentsArray));
 
   // Bind parameters
   for (size_t i = 0; i < func->params.size(); ++i) {
@@ -4205,22 +5647,36 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
 
   // Execute function body
   auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+  bool previousStrictMode = strictMode_;
+  strictMode_ = func->isStrict;
   Value result = Value(Undefined{});
+  bool returned = false;
 
   auto prevFlow = flow_;
   flow_ = ControlFlow{};
 
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
-  LIGHTJS_RUN_TASK(stmtTask, result);
+    Value stmtResult = Value(Undefined{});
+    LIGHTJS_RUN_TASK(stmtTask, stmtResult);
 
     if (flow_.type == ControlFlow::Type::Return) {
       result = flow_.value;
+      returned = true;
+      break;
+    }
+    if (flow_.type == ControlFlow::Type::Throw) {
       break;
     }
   }
 
-  flow_ = prevFlow;
+  if (!returned && flow_.type != ControlFlow::Type::Throw) {
+    result = Value(Undefined{});
+  }
+  if (flow_.type != ControlFlow::Type::Throw) {
+    flow_ = prevFlow;
+  }
+  strictMode_ = previousStrictMode;
   env_ = prevEnv;
   return result;
 }
@@ -4246,6 +5702,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->isNative = false;
   func->isAsync = decl.isAsync;
   func->isGenerator = decl.isGenerator;
+  func->isStrict = strictMode_ || hasUseStrictDirective(decl.body);
 
   for (const auto& param : decl.params) {
     FunctionParam funcParam;
@@ -4262,6 +5719,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
   func->closure = env_;
+  func->properties["name"] = Value(decl.id.name);
 
   env_->define(decl.id.name, Value(func));
   LIGHTJS_RETURN(Value(Undefined{}));
@@ -4451,7 +5909,14 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
 
   // Iterate over object properties
   if (auto* objPtr = std::get_if<std::shared_ptr<Object>>(&obj.data)) {
-    for (const auto& [key, value] : (*objPtr)->properties) {
+    std::vector<std::string> keys;
+    keys.reserve((*objPtr)->properties.size());
+    for (const auto& [key, _] : (*objPtr)->properties) {
+      keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    for (const auto& key : keys) {
       // Assign the key to the loop variable
       env_->set(varName, Value(key));
 
@@ -4502,43 +5967,93 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     }
   }
 
-  auto iteratorOpt = getIterator(iterable);
-  if (iteratorOpt.has_value()) {
-    auto iterator = std::move(*iteratorOpt);
-    while (true) {
-      Value stepResult = iteratorNext(iterator);
-      if (!stepResult.isObject()) {
+  std::optional<IteratorRecord> iteratorOpt;
+  if (stmt.isAwait && iterable.isObject()) {
+    const auto& asyncIteratorKey = WellKnownSymbols::asyncIteratorKey();
+    auto obj = std::get<std::shared_ptr<Object>>(iterable.data);
+    auto asyncIt = obj->properties.find(asyncIteratorKey);
+    if (asyncIt != obj->properties.end() && asyncIt->second.isFunction()) {
+      Value asyncIterValue = callFunction(asyncIt->second, {}, iterable);
+      if (asyncIterValue.isObject()) {
+        IteratorRecord record;
+        record.kind = IteratorRecord::Kind::IteratorObject;
+        record.iteratorObject = std::get<std::shared_ptr<Object>>(asyncIterValue.data);
+        iteratorOpt = std::move(record);
+      }
+    }
+  }
+
+  if (!iteratorOpt.has_value()) {
+    iteratorOpt = getIterator(iterable);
+  }
+  if (!iteratorOpt.has_value()) {
+    env_ = prevEnv;
+    throwError(ErrorType::TypeError, "Value is not iterable");
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  auto iterator = std::move(*iteratorOpt);
+  while (true) {
+    Value stepResult = iteratorNext(iterator);
+    if (stmt.isAwait && stepResult.isPromise()) {
+      auto promise = std::get<std::shared_ptr<Promise>>(stepResult.data);
+      if (promise->state == PromiseState::Rejected) {
+        env_ = prevEnv;
+        flow_.type = ControlFlow::Type::Throw;
+        flow_.value = promise->result;
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (promise->state == PromiseState::Fulfilled) {
+        stepResult = promise->result;
+      } else {
         break;
       }
+    }
+    if (!stepResult.isObject()) {
+      break;
+    }
 
-      auto resultObj = std::get<std::shared_ptr<Object>>(stepResult.data);
-      bool isDone = false;
-      if (auto doneIt = resultObj->properties.find("done"); doneIt != resultObj->properties.end()) {
-        isDone = doneIt->second.toBool();
+    auto resultObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+    bool isDone = false;
+    if (auto doneIt = resultObj->properties.find("done"); doneIt != resultObj->properties.end()) {
+      isDone = doneIt->second.toBool();
+    }
+    if (isDone) {
+      break;
+    }
+
+    Value currentValue = Value(Undefined{});
+    if (auto valueIt = resultObj->properties.find("value"); valueIt != resultObj->properties.end()) {
+      currentValue = valueIt->second;
+    }
+    if (stmt.isAwait && currentValue.isPromise()) {
+      auto valuePromise = std::get<std::shared_ptr<Promise>>(currentValue.data);
+      if (valuePromise->state == PromiseState::Rejected) {
+        env_ = prevEnv;
+        flow_.type = ControlFlow::Type::Throw;
+        flow_.value = valuePromise->result;
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
-      if (isDone) {
+      if (valuePromise->state == PromiseState::Fulfilled) {
+        currentValue = valuePromise->result;
+      } else {
         break;
       }
+    }
 
-      Value currentValue = Value(Undefined{});
-      if (auto valueIt = resultObj->properties.find("value"); valueIt != resultObj->properties.end()) {
-        currentValue = valueIt->second;
-      }
+    env_->set(varName, currentValue);
 
-      env_->set(varName, currentValue);
+    auto bodyTask = evaluate(*stmt.body);
+    LIGHTJS_RUN_TASK(bodyTask, result);
 
-      auto bodyTask = evaluate(*stmt.body);
-  LIGHTJS_RUN_TASK(bodyTask, result);
-
-      if (flow_.type == ControlFlow::Type::Break) {
-        flow_.type = ControlFlow::Type::None;
-        break;
-      } else if (flow_.type == ControlFlow::Type::Continue) {
-        flow_.type = ControlFlow::Type::None;
-        continue;
-      } else if (flow_.type != ControlFlow::Type::None) {
-        break;
-      }
+    if (flow_.type == ControlFlow::Type::Break) {
+      flow_.type = ControlFlow::Type::None;
+      break;
+    } else if (flow_.type == ControlFlow::Type::Continue) {
+      flow_.type = ControlFlow::Type::None;
+      continue;
+    } else if (flow_.type != ControlFlow::Type::None) {
+      break;
     }
   }
 
@@ -4644,7 +6159,9 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       auto prevEnv = env_;
       env_ = catchEnv;
 
-      if (!stmt.handler.param.name.empty()) {
+      if (stmt.handler.paramPattern) {
+        bindDestructuringPattern(*stmt.handler.paramPattern, flow_.value, false);
+      } else if (!stmt.handler.param.name.empty()) {
         env_->define(stmt.handler.param.name, flow_.value);
       }
 
@@ -4675,8 +6192,83 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
 }
 
 Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
-  // Import evaluation is handled at the module level during instantiation
-  // This is just a placeholder as imports are resolved before execution
+  auto importFnValue = env_->get("import");
+  if (!importFnValue || !importFnValue->isFunction()) {
+    throwError(ErrorType::ReferenceError, "import is not defined");
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  Value importResult = callFunction(*importFnValue, {Value(stmt.source)}, Value(Undefined{}));
+  if (hasError()) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+  if (!importResult.isPromise()) {
+    throwError(ErrorType::TypeError, "import() did not return a Promise");
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  auto promise = std::get<std::shared_ptr<Promise>>(importResult.data);
+  if (promise->state == PromiseState::Rejected) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = promise->result;
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+  if (promise->state != PromiseState::Fulfilled || !promise->result.isObject()) {
+    throwError(ErrorType::Error, "Failed to resolve import '" + stmt.source + "'");
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  Value namespaceValue = promise->result;
+  auto namespaceObj = std::get<std::shared_ptr<Object>>(namespaceValue.data);
+
+  auto hasExport = [&](const std::string& name) -> bool {
+    if (namespaceObj->isModuleNamespace) {
+      return std::find(namespaceObj->moduleExportNames.begin(),
+                       namespaceObj->moduleExportNames.end(),
+                       name) != namespaceObj->moduleExportNames.end();
+    }
+    return namespaceObj->properties.find(name) != namespaceObj->properties.end();
+  };
+
+  auto readExport = [&](const std::string& name) -> Value {
+    if (namespaceObj->isModuleNamespace) {
+      auto getterIt = namespaceObj->properties.find("__get_" + name);
+      if (getterIt != namespaceObj->properties.end() && getterIt->second.isFunction()) {
+        Value v = callFunction(getterIt->second, {}, namespaceValue);
+        if (hasError()) {
+          return Value(Undefined{});
+        }
+        return v;
+      }
+    }
+    auto it = namespaceObj->properties.find(name);
+    if (it != namespaceObj->properties.end()) {
+      return it->second;
+    }
+    return Value(Undefined{});
+  };
+
+  if (stmt.defaultImport) {
+    if (!hasExport("default")) {
+      throwError(ErrorType::SyntaxError, "Module '" + stmt.source + "' does not export 'default'");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    env_->define(stmt.defaultImport->name, readExport("default"));
+  }
+
+  if (stmt.namespaceImport) {
+    env_->define(stmt.namespaceImport->name, namespaceValue);
+  }
+
+  for (const auto& spec : stmt.specifiers) {
+    const std::string& importedName = spec.imported.name;
+    if (!hasExport(importedName)) {
+      throwError(ErrorType::SyntaxError, "Module '" + stmt.source + "' does not export '" + importedName + "'");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    env_->define(spec.local.name, readExport(importedName));
+  }
+
   LIGHTJS_RETURN(Value(Undefined{}));
 }
 

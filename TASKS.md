@@ -2,7 +2,38 @@
 
 This document tracks planned enhancements and future work for LightJS.
 
-**Current Status:** ~24,000 LOC, 204+ tests passing, ES2020 support, WebAssembly 1.0, C++17/C++20 dual support
+**Current Status:** ~24,000 LOC, 238 tests passing (0 failures), ES2020 support, WebAssembly 1.0, C++17/C++20 dual support
+
+---
+
+## Test262 ES2020 Repro Procedure and Status
+
+### Reproduce
+
+1. Download the Test262 suite:
+   - `git clone --depth 1 https://github.com/tc39/test262.git test262-suite`
+2. Configure and build:
+   - `cmake -S . -B build -DLIGHTJS_BUILD_TESTS=ON`
+   - `cmake --build build -j$(nproc)`
+3. Run ES2020 shards:
+   - `build/test262_runner ./test262-suite --test language/module-code/top-level-await`
+   - `build/test262_runner ./test262-suite --test language/expressions/optional-chaining`
+   - `build/test262_runner ./test262-suite --test language/expressions/coalesce`
+   - `build/test262_runner ./test262-suite --test built-ins/BigInt`
+   - `build/test262_runner ./test262-suite --test language/expressions/dynamic-import`
+
+### Current Status (2026-02-06)
+
+| Feature | Pass | Total | Rate |
+|---|---|---|---|
+| Top-Level Await | 251 | 251 | 100.0% |
+| Optional Chaining | 34 | 38 | 89.5% |
+| Nullish Coalescing | 22 | 24 | 91.7% |
+| Dynamic Import | 855 | 939 | 91.1% |
+| BigInt | 51 | 75 | 68.0% |
+| Promise.allSettled | 68 | 104 | 65.4% |
+
+- Note: runner may print `Failed to read module: .../syntax/foo.js` because that file is intentionally absent in the suite.
 
 ---
 

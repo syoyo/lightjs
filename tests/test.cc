@@ -7,14 +7,14 @@
 
 using namespace lightjs;
 
-void runTest(const std::string& name, const std::string& code, const std::string& expected = "") {
+void runTest(const std::string& name, const std::string& code, const std::string& expected = "", bool isModule = false) {
   std::cout << "Test: " << name << std::endl;
 
   try {
     Lexer lexer(code);
     auto tokens = lexer.tokenize();
 
-    Parser parser(tokens);
+    Parser parser(tokens, isModule);
     auto program = parser.parse();
 
     if (!program) {
@@ -29,9 +29,9 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
         Value result;
     LIGHTJS_RUN_TASK(task, result);
-    std::cout << "  Result: " << result.toString() << std::endl;
+    std::cout << "  Result: " << result.toDisplayString() << std::endl;
 
-    if (!expected.empty() && result.toString() != expected) {
+    if (!expected.empty() && result.toDisplayString() != expected) {
       std::cout << "  FAILED! Expected: " << expected << std::endl;
     } else {
       std::cout << "  PASSED" << std::endl;
@@ -1188,27 +1188,27 @@ int main() {
     typeof globalThis.ArrayBuffer
   )", "function");
 
-  // Top-level await tests
+  // Top-level await tests (require module mode for spec-compliant parsing)
   runTest("Top-level await - with Promise.resolve", R"(
     const result = await Promise.resolve(42);
     result
-  )", "42");
+  )", "42", true);
 
   runTest("Top-level await - with async expression", R"(
     const value = await Promise.resolve("hello");
     value
-  )", "hello");
+  )", "hello", true);
 
   runTest("Top-level await - multiple awaits", R"(
     const a = await Promise.resolve(10);
     const b = await Promise.resolve(20);
     a + b
-  )", "30");
+  )", "30", true);
 
   runTest("Top-level await - with computation", R"(
     const num = await Promise.resolve(5);
     num * num
-  )", "25");
+  )", "25", true);
 
   // Unicode tests
   runTest("Unicode - emoji length", R"(

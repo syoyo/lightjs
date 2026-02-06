@@ -1,10 +1,19 @@
 #include "value.h"
+#include "event_loop.h"
 #include "simd.h"
+#include "symbols.h"
 #include "streams.h"
 #include <sstream>
 #include <cmath>
+#include <algorithm>
 
 namespace lightjs {
+
+namespace {
+void queuePromiseCallback(std::function<void()> callback) {
+  EventLoopContext::instance().getLoop().queueMicrotask(std::move(callback));
+}
+}  // namespace
 
 // Initialize static member for Symbol IDs
 size_t Symbol::nextId = 0;
@@ -96,9 +105,11 @@ std::string Value::toString() const {
       oss << arg;
       return oss.str();
     } else if constexpr (std::is_same_v<T, BigInt>) {
-      return std::to_string(arg.value) + "n";
+      return std::to_string(arg.value);
     } else if constexpr (std::is_same_v<T, Symbol>) {
       return "Symbol(" + arg.description + ")";
+    } else if constexpr (std::is_same_v<T, ModuleBinding>) {
+      return "[ModuleBinding]";
     } else if constexpr (std::is_same_v<T, std::string>) {
       return arg;
     } else if constexpr (std::is_same_v<T, std::shared_ptr<Function>>) {
@@ -137,6 +148,13 @@ std::string Value::toString() const {
       return "";
     }
   }, data);
+}
+
+std::string Value::toDisplayString() const {
+  if (isBigInt()) {
+    return std::to_string(std::get<BigInt>(data).value) + "n";
+  }
+  return toString();
 }
 
 double TypedArray::getElement(size_t index) const {
@@ -580,18 +598,29 @@ void Promise::resolve(Value val) {
   state = PromiseState::Fulfilled;
   result = val;
 
-  // Execute all fulfilled callbacks
-  for (size_t i = 0; i < fulfilledCallbacks.size(); ++i) {
-    try {
-      Value callbackResult = fulfilledCallbacks[i](val);
-      if (i < chainedPromises.size()) {
-        chainedPromises[i]->resolve(callbackResult);
+  auto callbacks = fulfilledCallbacks;
+  auto chained = chainedPromises;
+  fulfilledCallbacks.clear();
+  rejectedCallbacks.clear();
+  chainedPromises.clear();
+
+  // Promise reactions must run as microtasks.
+  for (size_t i = 0; i < callbacks.size(); ++i) {
+    auto callback = callbacks[i];
+    std::shared_ptr<Promise> chainedPromise = i < chained.size() ? chained[i] : nullptr;
+    queuePromiseCallback([callback, chainedPromise, val]() {
+      if (!chainedPromise) {
+        return;
       }
-    } catch (...) {
-      if (i < chainedPromises.size()) {
-        chainedPromises[i]->reject(Value("Callback error"));
+      try {
+        Value callbackResult = callback ? callback(val) : val;
+        chainedPromise->resolve(callbackResult);
+      } catch (const std::exception& e) {
+        chainedPromise->reject(Value(std::string(e.what())));
+      } catch (...) {
+        chainedPromise->reject(Value("Callback error"));
       }
-    }
+    });
   }
 }
 
@@ -601,25 +630,33 @@ void Promise::reject(Value val) {
   state = PromiseState::Rejected;
   result = val;
 
-  // Execute all rejected callbacks
-  for (size_t i = 0; i < rejectedCallbacks.size(); ++i) {
-    if (rejectedCallbacks[i]) {
-      try {
-        Value callbackResult = rejectedCallbacks[i](val);
-        if (i < chainedPromises.size()) {
-          chainedPromises[i]->resolve(callbackResult);
-        }
-      } catch (...) {
-        if (i < chainedPromises.size()) {
-          chainedPromises[i]->reject(Value("Callback error"));
-        }
+  auto callbacks = rejectedCallbacks;
+  auto chained = chainedPromises;
+  fulfilledCallbacks.clear();
+  rejectedCallbacks.clear();
+  chainedPromises.clear();
+
+  // Promise reactions must run as microtasks.
+  for (size_t i = 0; i < callbacks.size(); ++i) {
+    auto callback = callbacks[i];
+    std::shared_ptr<Promise> chainedPromise = i < chained.size() ? chained[i] : nullptr;
+    queuePromiseCallback([callback, chainedPromise, val]() {
+      if (!chainedPromise) {
+        return;
       }
-    } else {
-      // No rejection handler, propagate the rejection
-      if (i < chainedPromises.size()) {
-        chainedPromises[i]->reject(val);
+      if (callback) {
+        try {
+          Value callbackResult = callback(val);
+          chainedPromise->resolve(callbackResult);
+        } catch (const std::exception& e) {
+          chainedPromise->reject(Value(std::string(e.what())));
+        } catch (...) {
+          chainedPromise->reject(Value("Callback error"));
+        }
+      } else {
+        chainedPromise->reject(val);
       }
-    }
+    });
   }
 }
 
@@ -633,27 +670,37 @@ std::shared_ptr<Promise> Promise::then(
     rejectedCallbacks.push_back(onRejected);
     chainedPromises.push_back(chainedPromise);
   } else if (state == PromiseState::Fulfilled) {
-    if (onFulfilled) {
-      try {
-        Value callbackResult = onFulfilled(result);
-        chainedPromise->resolve(callbackResult);
-      } catch (...) {
-        chainedPromise->reject(Value("Callback error"));
+    Value settled = result;
+    queuePromiseCallback([onFulfilled, chainedPromise, settled]() {
+      if (onFulfilled) {
+        try {
+          Value callbackResult = onFulfilled(settled);
+          chainedPromise->resolve(callbackResult);
+        } catch (const std::exception& e) {
+          chainedPromise->reject(Value(std::string(e.what())));
+        } catch (...) {
+          chainedPromise->reject(Value("Callback error"));
+        }
+      } else {
+        chainedPromise->resolve(settled);
       }
-    } else {
-      chainedPromise->resolve(result);
-    }
+    });
   } else if (state == PromiseState::Rejected) {
-    if (onRejected) {
-      try {
-        Value callbackResult = onRejected(result);
-        chainedPromise->resolve(callbackResult);
-      } catch (...) {
-        chainedPromise->reject(Value("Callback error"));
+    Value settled = result;
+    queuePromiseCallback([onRejected, chainedPromise, settled]() {
+      if (onRejected) {
+        try {
+          Value callbackResult = onRejected(settled);
+          chainedPromise->resolve(callbackResult);
+        } catch (const std::exception& e) {
+          chainedPromise->reject(Value(std::string(e.what())));
+        } catch (...) {
+          chainedPromise->reject(Value("Callback error"));
+        }
+      } else {
+        chainedPromise->reject(settled);
       }
-    } else {
-      chainedPromise->reject(result);
-    }
+    });
   }
 
   return chainedPromise;
@@ -664,11 +711,73 @@ std::shared_ptr<Promise> Promise::catch_(std::function<Value(Value)> onRejected)
 }
 
 std::shared_ptr<Promise> Promise::finally(std::function<Value()> onFinally) {
-  auto finallyHandler = [onFinally](Value v) -> Value {
-    onFinally();
-    return v;
+  if (!onFinally) {
+    return then(nullptr, nullptr);
+  }
+
+  auto chainedPromise = std::make_shared<Promise>();
+
+  auto settleWithOriginal = [chainedPromise](const Value& original,
+                                             bool rejectOriginal,
+                                             const Value& finallyResult) {
+    auto settleOriginal = [chainedPromise, original, rejectOriginal]() {
+      if (rejectOriginal) {
+        chainedPromise->reject(original);
+      } else {
+        chainedPromise->resolve(original);
+      }
+    };
+
+    if (finallyResult.isPromise()) {
+      auto finPromise = std::get<std::shared_ptr<Promise>>(finallyResult.data);
+      if (finPromise->state == PromiseState::Fulfilled) {
+        settleOriginal();
+        return;
+      }
+      if (finPromise->state == PromiseState::Rejected) {
+        chainedPromise->reject(finPromise->result);
+        return;
+      }
+      finPromise->then(
+        [settleOriginal](Value v) -> Value {
+          settleOriginal();
+          return v;
+        },
+        [chainedPromise](Value reason) -> Value {
+          chainedPromise->reject(reason);
+          return reason;
+        });
+      return;
+    }
+
+    settleOriginal();
   };
-  return then(finallyHandler, finallyHandler);
+
+  then(
+    [onFinally, settleWithOriginal, chainedPromise](Value fulfilled) -> Value {
+      try {
+        Value finallyResult = onFinally();
+        settleWithOriginal(fulfilled, false, finallyResult);
+      } catch (const std::exception& e) {
+        chainedPromise->reject(Value(std::string(e.what())));
+      } catch (...) {
+        chainedPromise->reject(Value("Callback error"));
+      }
+      return Value(Undefined{});
+    },
+    [onFinally, settleWithOriginal, chainedPromise](Value rejected) -> Value {
+      try {
+        Value finallyResult = onFinally();
+        settleWithOriginal(rejected, true, finallyResult);
+      } catch (const std::exception& e) {
+        chainedPromise->reject(Value(std::string(e.what())));
+      } catch (...) {
+        chainedPromise->reject(Value("Callback error"));
+      }
+      return Value(Undefined{});
+    });
+
+  return chainedPromise;
 }
 
 std::shared_ptr<Promise> Promise::all(const std::vector<std::shared_ptr<Promise>>& promises) {
@@ -833,12 +942,16 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     return Value(false);
   }
 
-  if (!args[1].isString()) {
-    return Value(false);
-  }
-
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  std::string key = std::get<std::string>(args[1].data);
+  std::string key = args[1].toString();
+
+  if (obj->isModuleNamespace) {
+    if (key == WellKnownSymbols::toStringTagKey()) {
+      return Value(true);
+    }
+    return Value(std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
+                 obj->moduleExportNames.end());
+  }
 
   return Value(obj->properties.find(key) != obj->properties.end());
 }
@@ -851,6 +964,13 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
 
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
   auto result = std::make_shared<Array>();
+
+  if (obj->isModuleNamespace) {
+    for (const auto& key : obj->moduleExportNames) {
+      result->elements.push_back(Value(key));
+    }
+    return Value(result);
+  }
 
   for (const auto& [key, value] : obj->properties) {
     result->elements.push_back(Value(key));

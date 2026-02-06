@@ -62,6 +62,7 @@ struct BinaryExpr {
     Add, Sub, Mul, Div, Mod, Exp,  // Exp for exponentiation
     Equal, NotEqual, StrictEqual, StrictNotEqual,
     Less, Greater, LessEqual, GreaterEqual,
+    BitwiseAnd, BitwiseXor, BitwiseOr,
     LogicalAnd, LogicalOr, NullishCoalescing,
     In, Instanceof  // Property/type checking operators
   };
@@ -71,7 +72,7 @@ struct BinaryExpr {
 };
 
 struct UnaryExpr {
-  enum class Op { Not, Minus, Plus, Typeof, Delete };
+  enum class Op { Not, Minus, Plus, Typeof, Void, BitNot, Delete };
   Op op;
   ExprPtr argument;
 };
@@ -93,6 +94,8 @@ struct UpdateExpr {
 struct CallExpr {
   ExprPtr callee;
   std::vector<ExprPtr> arguments;
+  bool optional = false;  // Optional call (?.())
+  bool inOptionalChain = false;  // Part of an optional chain (propagate short-circuit)
 };
 
 struct MemberExpr {
@@ -100,14 +103,19 @@ struct MemberExpr {
   ExprPtr property;
   bool computed;
   bool optional;  // Optional chaining (?.)
+  bool inOptionalChain = false;  // Part of an optional chain (propagate short-circuit)
   mutable PropertyCache cache;  // Inline cache for property access optimization
-  MemberExpr() : computed(false), optional(false) {}
+  MemberExpr() : computed(false), optional(false), inOptionalChain(false) {}
 };
 
 struct ConditionalExpr {
   ExprPtr test;
   ExprPtr consequent;
   ExprPtr alternate;
+};
+
+struct SequenceExpr {
+  std::vector<ExprPtr> expressions;
 };
 
 struct ArrayExpr {
@@ -203,6 +211,11 @@ struct ObjectPattern {
   ExprPtr rest;  // Rest properties (...rest)
 };
 
+struct AssignmentPattern {
+  ExprPtr left;   // Binding pattern
+  ExprPtr right;  // Default initializer
+};
+
 // import.meta - ES2020
 struct MetaProperty {
   std::string meta;  // "meta" for import.meta
@@ -226,6 +239,7 @@ struct Expression {
     CallExpr,
     MemberExpr,
     ConditionalExpr,
+    SequenceExpr,
     ArrayExpr,
     ObjectExpr,
     FunctionExpr,
@@ -238,10 +252,12 @@ struct Expression {
     SpreadElement,
     ArrayPattern,
     ObjectPattern,
+    AssignmentPattern,
     MetaProperty
   > node;
 
   SourceLocation loc;
+  bool parenthesized = false;
 
   template<typename T>
   Expression(T&& n) : node(std::forward<T>(n)) {}
@@ -314,6 +330,7 @@ struct ForOfStmt {
   StmtPtr left;  // VarDeclaration or Identifier
   ExprPtr right;
   StmtPtr body;
+  bool isAwait = false;
 };
 
 struct DoWhileStmt {
@@ -340,6 +357,7 @@ struct ThrowStmt {
 
 struct CatchClause {
   Identifier param;
+  ExprPtr paramPattern;
   std::vector<StmtPtr> body;
 };
 

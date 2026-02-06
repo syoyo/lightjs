@@ -1,10 +1,238 @@
 #include "parser.h"
 #include "lexer.h"
 #include <stdexcept>
+#include <cctype>
 
 namespace lightjs {
 
-Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+namespace {
+
+int digitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'z') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'Z') return 10 + (c - 'A');
+  return -1;
+}
+
+bool parseBigIntLiteral64(const std::string& raw, int64_t& out) {
+  if (raw.empty()) return false;
+
+  size_t i = 0;
+  int base = 10;
+  if (raw.size() >= 2 && raw[0] == '0') {
+    if (raw[1] == 'x' || raw[1] == 'X') {
+      base = 16;
+      i = 2;
+    } else if (raw[1] == 'o' || raw[1] == 'O') {
+      base = 8;
+      i = 2;
+    } else if (raw[1] == 'b' || raw[1] == 'B') {
+      base = 2;
+      i = 2;
+    }
+  }
+
+  bool sawDigit = false;
+  uint64_t value = 0;
+  for (; i < raw.size(); ++i) {
+    char c = raw[i];
+    if (c == '_') {
+      continue;
+    }
+    int d = digitValue(c);
+    if (d < 0 || d >= base) {
+      return false;
+    }
+    sawDigit = true;
+    value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
+  }
+
+  if (!sawDigit) return false;
+  out = static_cast<int64_t>(value);
+  return true;
+}
+
+bool parseNumberLiteral(const std::string& raw, double& out) {
+  if (raw.empty()) return false;
+
+  std::string normalized;
+  normalized.reserve(raw.size());
+  for (char c : raw) {
+    if (c != '_') normalized.push_back(c);
+  }
+  if (normalized.empty()) return false;
+
+  if (normalized.size() >= 2 && normalized[0] == '0' &&
+      (normalized[1] == 'x' || normalized[1] == 'X' ||
+       normalized[1] == 'o' || normalized[1] == 'O' ||
+       normalized[1] == 'b' || normalized[1] == 'B')) {
+    int base = 10;
+    if (normalized[1] == 'x' || normalized[1] == 'X') base = 16;
+    if (normalized[1] == 'o' || normalized[1] == 'O') base = 8;
+    if (normalized[1] == 'b' || normalized[1] == 'B') base = 2;
+
+    uint64_t value = 0;
+    bool sawDigit = false;
+    for (size_t i = 2; i < normalized.size(); ++i) {
+      int d = digitValue(normalized[i]);
+      if (d < 0 || d >= base) return false;
+      sawDigit = true;
+      value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
+    }
+    if (!sawDigit) return false;
+    out = static_cast<double>(value);
+    return true;
+  }
+
+  try {
+    out = std::stod(normalized);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool isIdentifierNameToken(TokenType type) {
+  switch (type) {
+    case TokenType::Identifier:
+    case TokenType::True:
+    case TokenType::False:
+    case TokenType::Null:
+    case TokenType::Undefined:
+    case TokenType::Let:
+    case TokenType::Const:
+    case TokenType::Var:
+    case TokenType::Function:
+    case TokenType::Async:
+    case TokenType::Await:
+    case TokenType::Yield:
+    case TokenType::Return:
+    case TokenType::If:
+    case TokenType::Else:
+    case TokenType::While:
+    case TokenType::For:
+    case TokenType::In:
+    case TokenType::Instanceof:
+    case TokenType::Of:
+    case TokenType::Do:
+    case TokenType::Switch:
+    case TokenType::Case:
+    case TokenType::Break:
+    case TokenType::Continue:
+    case TokenType::Try:
+    case TokenType::Catch:
+    case TokenType::Finally:
+    case TokenType::Throw:
+    case TokenType::New:
+    case TokenType::This:
+    case TokenType::Typeof:
+    case TokenType::Void:
+    case TokenType::Delete:
+    case TokenType::Import:
+    case TokenType::Export:
+    case TokenType::From:
+    case TokenType::As:
+    case TokenType::Default:
+    case TokenType::Class:
+    case TokenType::Extends:
+    case TokenType::Static:
+    case TokenType::Super:
+    case TokenType::Get:
+    case TokenType::Set:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isUpdateTarget(const Expression& expr) {
+  if (std::holds_alternative<Identifier>(expr.node)) {
+    return true;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return !member->optional;
+  }
+  return false;
+}
+
+bool isOptionalChain(const Expression& expr) {
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return member->optional;
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    return call->optional;
+  }
+  return false;
+}
+
+bool hasUnparenthesizedLogicalOp(const ExprPtr& expr) {
+  if (!expr || expr->parenthesized) {
+    return false;
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr->node)) {
+    return binary->op == BinaryExpr::Op::LogicalOr ||
+           binary->op == BinaryExpr::Op::LogicalAnd;
+  }
+  return false;
+}
+
+bool isAssignmentTarget(const Expression& expr) {
+  if (std::holds_alternative<MetaProperty>(expr.node)) {
+    return false;
+  }
+
+  if (std::holds_alternative<Identifier>(expr.node)) {
+    return true;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return !member->optional;
+  }
+
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& elem : arr->elements) {
+      if (!elem) continue;
+      if (auto* spread = std::get_if<SpreadElement>(&elem->node)) {
+        if (!spread->argument || !isAssignmentTarget(*spread->argument)) {
+          return false;
+        }
+      } else if (!isAssignmentTarget(*elem)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (!prop.value || !isAssignmentTarget(*prop.value)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+bool isDirectDynamicImportCall(const ExprPtr& expr) {
+  if (!expr || expr->parenthesized) {
+    return false;
+  }
+  auto* call = std::get_if<CallExpr>(&expr->node);
+  if (!call || !call->callee) {
+    return false;
+  }
+  auto* id = std::get_if<Identifier>(&call->callee->node);
+  return id && id->name == "import";
+}
+
+constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_source__";
+constexpr const char* kImportPhaseDeferSentinel = "__lightjs_import_phase_defer__";
+
+}  // namespace
+
+Parser::Parser(std::vector<Token> tokens, bool isModule)
+  : tokens_(std::move(tokens)), isModule_(isModule), strictMode_(isModule) {}
 
 const Token& Parser::current() const {
   if (pos_ >= tokens_.size()) {
@@ -45,10 +273,56 @@ void Parser::consumeSemicolon() {
   }
 }
 
+bool Parser::canUseAwaitAsIdentifier() const {
+  return asyncFunctionDepth_ == 0 && !isModule_;
+}
+
+bool Parser::canParseAwaitExpression() const {
+  if (asyncFunctionDepth_ > 0) {
+    return true;
+  }
+  return isModule_ && functionDepth_ == 0;
+}
+
+bool Parser::canUseYieldAsIdentifier() const {
+  return generatorFunctionDepth_ == 0 && !strictMode_;
+}
+
+bool Parser::isIdentifierLikeToken(TokenType type) const {
+  if (type == TokenType::Identifier) {
+    return true;
+  }
+  if (type == TokenType::Await) {
+    return canUseAwaitAsIdentifier();
+  }
+  if (type == TokenType::Yield) {
+    return canUseYieldAsIdentifier();
+  }
+  return false;
+}
+
 std::optional<Program> Parser::parse() {
   Program program;
+  program.isModule = isModule_;
+  bool inDirectivePrologue = true;
   while (!match(TokenType::EndOfFile)) {
     if (auto stmt = parseStatement()) {
+      if (inDirectivePrologue) {
+        bool isDirectiveString = false;
+        if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node)) {
+          if (exprStmt->expression) {
+            if (auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node)) {
+              isDirectiveString = true;
+              if (str->value == "use strict") {
+                strictMode_ = true;
+              }
+            }
+          }
+        }
+        if (!isDirectiveString) {
+          inDirectivePrologue = false;
+        }
+      }
       program.body.push_back(std::move(stmt));
     } else {
       return std::nullopt;
@@ -58,7 +332,19 @@ std::optional<Program> Parser::parse() {
 }
 
 StmtPtr Parser::parseStatement() {
+  // Parse labeled statements and ignore label metadata for now.
+  if (match(TokenType::Identifier) && peek().type == TokenType::Colon) {
+    advance();  // label identifier
+    advance();  // :
+    return parseStatement();
+  }
+
   switch (current().type) {
+    case TokenType::Semicolon: {
+      const Token& tok = current();
+      advance();
+      return makeStmt(ExpressionStmt{makeExpr(NullLiteral{}, tok)}, tok);
+    }
     case TokenType::Let:
     case TokenType::Const:
     case TokenType::Var:
@@ -99,11 +385,24 @@ StmtPtr Parser::parseStatement() {
     case TokenType::Throw: {
       const Token& tok = current();
       advance();
-      return makeStmt(ThrowStmt{parseExpression()}, tok);
+      auto argument = parseExpression();
+      if (!argument) {
+        return nullptr;
+      }
+      return makeStmt(ThrowStmt{std::move(argument)}, tok);
     }
     case TokenType::Try:
       return parseTryStatement();
     case TokenType::Import:
+      if (current().escaped) {
+        return nullptr;
+      }
+      if (peek().type == TokenType::Dot || peek().type == TokenType::LeftParen) {
+        return parseExpressionStatement();
+      }
+      if (!isModule_) {
+        return nullptr;
+      }
       return parseImportDeclaration();
     case TokenType::Export:
       return parseExportDeclaration();
@@ -130,7 +429,9 @@ StmtPtr Parser::parseVarDeclaration() {
 
   do {
     if (!decl.declarations.empty()) {
-      expect(TokenType::Comma);
+      if (!expect(TokenType::Comma)) {
+        return nullptr;
+      }
     }
 
     // Parse pattern (identifier, array pattern, or object pattern)
@@ -143,6 +444,9 @@ StmtPtr Parser::parseVarDeclaration() {
     if (match(TokenType::Equal)) {
       advance();
       init = parseExpression();
+      if (!init) {
+        return nullptr;
+      }
     }
 
     decl.declarations.push_back({std::move(pattern), std::move(init)});
@@ -169,11 +473,16 @@ StmtPtr Parser::parseFunctionDeclaration() {
     advance();
   }
 
-  if (!match(TokenType::Identifier)) {
+  if (!isIdentifierLikeToken(current().type)) {
     return nullptr;
   }
   std::string name = current().value;
   advance();
+
+  ++functionDepth_;
+  if (isAsync) {
+    ++asyncFunctionDepth_;
+  }
 
   expect(TokenType::LeftParen);
 
@@ -188,13 +497,13 @@ StmtPtr Parser::parseFunctionDeclaration() {
     // Check for rest parameter
     if (match(TokenType::DotDotDot)) {
       advance();
-      if (match(TokenType::Identifier)) {
+      if (isIdentifierLikeToken(current().type)) {
         restParam = Identifier{current().value};
         advance();
       }
       // Rest parameter must be last
       break;
-    } else if (match(TokenType::Identifier)) {
+    } else if (isIdentifierLikeToken(current().type)) {
       Parameter param;
       param.name = Identifier{current().value};
       advance();
@@ -213,7 +522,17 @@ StmtPtr Parser::parseFunctionDeclaration() {
   }
   expect(TokenType::RightParen);
 
+  if (isGenerator) {
+    ++generatorFunctionDepth_;
+  }
   auto block = parseBlockStatement();
+  if (isGenerator) {
+    --generatorFunctionDepth_;
+  }
+  if (isAsync) {
+    --asyncFunctionDepth_;
+  }
+  --functionDepth_;
   if (!block) {
     return nullptr;
   }
@@ -237,7 +556,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
 StmtPtr Parser::parseClassDeclaration() {
   expect(TokenType::Class);
 
-  if (!match(TokenType::Identifier)) {
+  if (!isIdentifierLikeToken(current().type)) {
     return nullptr;
   }
   std::string className = current().value;
@@ -246,7 +565,7 @@ StmtPtr Parser::parseClassDeclaration() {
   ExprPtr superClass;
   if (match(TokenType::Extends)) {
     advance();
-    superClass = parsePrimary();
+    superClass = parseCall();
   }
 
   expect(TokenType::LeftBrace);
@@ -277,7 +596,7 @@ StmtPtr Parser::parseClassDeclaration() {
     }
 
     // Method name
-    if (match(TokenType::Identifier)) {
+    if (isIdentifierNameToken(current().type)) {
       std::string methodName = current().value;
       if (methodName == "constructor") {
         method.kind = MethodDefinition::Kind::Constructor;
@@ -289,9 +608,13 @@ StmtPtr Parser::parseClassDeclaration() {
     }
 
     // Parameters
+    ++functionDepth_;
+    if (method.isAsync) {
+      ++asyncFunctionDepth_;
+    }
     expect(TokenType::LeftParen);
     while (!match(TokenType::RightParen)) {
-      if (match(TokenType::Identifier)) {
+      if (isIdentifierLikeToken(current().type)) {
         method.params.push_back({current().value});
         advance();
         if (match(TokenType::Comma)) {
@@ -304,11 +627,34 @@ StmtPtr Parser::parseClassDeclaration() {
     expect(TokenType::RightParen);
 
     // Method body
+    bool disallowSuperCall = !superClass && !method.isStatic &&
+                             method.kind == MethodDefinition::Kind::Constructor;
+    if (disallowSuperCall) {
+      ++superCallDisallowDepth_;
+    }
     expect(TokenType::LeftBrace);
     while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-      method.body.push_back(parseStatement());
+      auto stmt = parseStatement();
+      if (!stmt) {
+        if (method.isAsync) {
+          --asyncFunctionDepth_;
+        }
+        --functionDepth_;
+        if (disallowSuperCall) {
+          --superCallDisallowDepth_;
+        }
+        return nullptr;
+      }
+      method.body.push_back(std::move(stmt));
     }
     expect(TokenType::RightBrace);
+    if (method.isAsync) {
+      --asyncFunctionDepth_;
+    }
+    --functionDepth_;
+    if (disallowSuperCall) {
+      --superCallDisallowDepth_;
+    }
 
     methods.push_back(std::move(method));
   }
@@ -330,6 +676,9 @@ StmtPtr Parser::parseReturnStatement() {
   ExprPtr argument = nullptr;
   if (!match(TokenType::Semicolon) && !match(TokenType::EndOfFile)) {
     argument = parseExpression();
+    if (!argument) {
+      return nullptr;
+    }
   }
 
   consumeSemicolon();
@@ -339,16 +688,26 @@ StmtPtr Parser::parseReturnStatement() {
 StmtPtr Parser::parseIfStatement() {
   const Token& startTok = current();
   expect(TokenType::If);
-  expect(TokenType::LeftParen);
+  if (!expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
   auto test = parseExpression();
-  expect(TokenType::RightParen);
+  if (!test || !expect(TokenType::RightParen)) {
+    return nullptr;
+  }
 
   auto consequent = parseStatement();
+  if (!consequent) {
+    return nullptr;
+  }
   StmtPtr alternate = nullptr;
 
   if (match(TokenType::Else)) {
     advance();
     alternate = parseStatement();
+    if (!alternate) {
+      return nullptr;
+    }
   }
 
   return makeStmt(IfStmt{
@@ -361,17 +720,31 @@ StmtPtr Parser::parseIfStatement() {
 StmtPtr Parser::parseWhileStatement() {
   const Token& startTok = current();
   expect(TokenType::While);
-  expect(TokenType::LeftParen);
+  if (!expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
   auto test = parseExpression();
-  expect(TokenType::RightParen);
+  if (!test || !expect(TokenType::RightParen)) {
+    return nullptr;
+  }
   auto body = parseStatement();
+  if (!body) {
+    return nullptr;
+  }
 
   return makeStmt(WhileStmt{std::move(test), std::move(body)}, startTok);
 }
 
 StmtPtr Parser::parseForStatement() {
   expect(TokenType::For);
-  expect(TokenType::LeftParen);
+  bool isAwait = false;
+  if (match(TokenType::Await)) {
+    isAwait = true;
+    advance();
+  }
+  if (!expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
 
   // Check if it's a for...in or for...of loop
   size_t savedPos = pos_;
@@ -391,6 +764,20 @@ StmtPtr Parser::parseForStatement() {
         isForOf = true;
       }
     }
+  } else if (match(TokenType::Import) &&
+             peek().type == TokenType::Dot &&
+             peek(2).type == TokenType::Identifier &&
+             peek(2).value == "meta" &&
+             peek(3).type == TokenType::In) {
+    isForInOrOf = true;
+    isForOf = false;
+  } else if (match(TokenType::Import) &&
+             peek().type == TokenType::Dot &&
+             peek(2).type == TokenType::Identifier &&
+             peek(2).value == "meta" &&
+             peek(3).type == TokenType::Of) {
+    isForInOrOf = true;
+    isForOf = true;
   } else if (match(TokenType::Identifier)) {
     advance();
     if (match(TokenType::In)) {
@@ -404,6 +791,11 @@ StmtPtr Parser::parseForStatement() {
 
   // Reset position
   pos_ = savedPos;
+
+  // `for await` is only valid with `of` iteration.
+  if (isAwait && (!isForInOrOf || !isForOf)) {
+    return nullptr;
+  }
 
   if (isForInOrOf) {
     // Parse for...in or for...of
@@ -429,7 +821,13 @@ StmtPtr Parser::parseForStatement() {
       decl.declarations.push_back({std::make_unique<Expression>(Identifier{name}), nullptr});
       left = std::make_unique<Statement>(std::move(decl));
     } else {
-      auto expr = parseExpression();
+      auto expr = parseMember();
+      if (!expr) {
+        return nullptr;
+      }
+      if (!isAssignmentTarget(*expr)) {
+        return nullptr;
+      }
       left = std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
     }
 
@@ -437,19 +835,27 @@ StmtPtr Parser::parseForStatement() {
     if (isOf) {
       advance();
     } else {
-      expect(TokenType::In);
+      if (!expect(TokenType::In)) {
+        return nullptr;
+      }
     }
 
     auto right = parseExpression();
-    expect(TokenType::RightParen);
+    if (!right || !expect(TokenType::RightParen)) {
+      return nullptr;
+    }
     auto body = parseStatement();
+    if (!body) {
+      return nullptr;
+    }
 
     if (isOf) {
-      return std::make_unique<Statement>(ForOfStmt{
-        std::move(left),
-        std::move(right),
-        std::move(body)
-      });
+      ForOfStmt forOf;
+      forOf.left = std::move(left);
+      forOf.right = std::move(right);
+      forOf.body = std::move(body);
+      forOf.isAwait = isAwait;
+      return std::make_unique<Statement>(std::move(forOf));
     } else {
       return std::make_unique<Statement>(ForInStmt{
         std::move(left),
@@ -464,9 +870,17 @@ StmtPtr Parser::parseForStatement() {
   if (!match(TokenType::Semicolon)) {
     if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
       init = parseVarDeclaration();
+      if (!init) {
+        return nullptr;
+      }
     } else {
       auto expr = parseExpression();
-      expect(TokenType::Semicolon);
+      if (!expr) {
+        return nullptr;
+      }
+      if (!expect(TokenType::Semicolon)) {
+        return nullptr;
+      }
       init = std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
     }
   } else {
@@ -476,16 +890,29 @@ StmtPtr Parser::parseForStatement() {
   ExprPtr test = nullptr;
   if (!match(TokenType::Semicolon)) {
     test = parseExpression();
+    if (!test) {
+      return nullptr;
+    }
   }
-  expect(TokenType::Semicolon);
+  if (!expect(TokenType::Semicolon)) {
+    return nullptr;
+  }
 
   ExprPtr update = nullptr;
   if (!match(TokenType::RightParen)) {
     update = parseExpression();
+    if (!update) {
+      return nullptr;
+    }
   }
-  expect(TokenType::RightParen);
+  if (!expect(TokenType::RightParen)) {
+    return nullptr;
+  }
 
   auto body = parseStatement();
+  if (!body) {
+    return nullptr;
+  }
 
   return std::make_unique<Statement>(ForStmt{
     std::move(init),
@@ -498,10 +925,13 @@ StmtPtr Parser::parseForStatement() {
 StmtPtr Parser::parseDoWhileStatement() {
   expect(TokenType::Do);
   auto body = parseStatement();
-  expect(TokenType::While);
-  expect(TokenType::LeftParen);
+  if (!body || !expect(TokenType::While) || !expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
   auto test = parseExpression();
-  expect(TokenType::RightParen);
+  if (!test || !expect(TokenType::RightParen)) {
+    return nullptr;
+  }
   consumeSemicolon();
 
   return std::make_unique<Statement>(DoWhileStmt{std::move(body), std::move(test)});
@@ -559,9 +989,11 @@ StmtPtr Parser::parseBlockStatement() {
 
   std::vector<StmtPtr> body;
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-    if (auto stmt = parseStatement()) {
-      body.push_back(std::move(stmt));
+    auto stmt = parseStatement();
+    if (!stmt) {
+      return nullptr;
     }
+    body.push_back(std::move(stmt));
   }
 
   expect(TokenType::RightBrace);
@@ -569,7 +1001,54 @@ StmtPtr Parser::parseBlockStatement() {
 }
 
 StmtPtr Parser::parseExpressionStatement() {
-  auto expr = parseExpression();
+  auto expr = parseAssignment();
+  if (!expr) {
+    return nullptr;
+  }
+  if (auto* id = std::get_if<Identifier>(&expr->node)) {
+    if (id->name == "await" && pos_ > 0) {
+      const Token& lastTok = tokens_[pos_ - 1];
+      if (current().line == lastTok.line) {
+        switch (current().type) {
+          case TokenType::Number:
+          case TokenType::BigInt:
+          case TokenType::String:
+          case TokenType::TemplateLiteral:
+          case TokenType::Regex:
+          case TokenType::True:
+          case TokenType::False:
+          case TokenType::Null:
+          case TokenType::Undefined:
+          case TokenType::Identifier:
+          case TokenType::Await:
+          case TokenType::Yield:
+          case TokenType::This:
+          case TokenType::Function:
+          case TokenType::Async:
+          case TokenType::Class:
+          case TokenType::New:
+          case TokenType::LeftBrace:
+          case TokenType::LeftBracket:
+            return nullptr;
+          default:
+            break;
+        }
+      }
+    }
+  }
+  if (match(TokenType::Comma)) {
+    std::vector<ExprPtr> sequence;
+    sequence.push_back(std::move(expr));
+    while (match(TokenType::Comma)) {
+      advance();
+      auto nextExpr = parseAssignment();
+      if (!nextExpr) {
+        return nullptr;
+      }
+      sequence.push_back(std::move(nextExpr));
+    }
+    expr = std::make_unique<Expression>(SequenceExpr{std::move(sequence)});
+  }
   consumeSemicolon();
   return std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
 }
@@ -577,6 +1056,9 @@ StmtPtr Parser::parseExpressionStatement() {
 StmtPtr Parser::parseTryStatement() {
   expect(TokenType::Try);
   auto tryBlock = parseBlockStatement();
+  if (!tryBlock) {
+    return nullptr;
+  }
 
   auto tryBlockStmt = std::get_if<BlockStmt>(&tryBlock->node);
   if (!tryBlockStmt) {
@@ -594,28 +1076,47 @@ StmtPtr Parser::parseTryStatement() {
 
     if (match(TokenType::LeftParen)) {
       advance();
-      if (match(TokenType::Identifier)) {
-        handler.param = {current().value};
-        advance();
+      if (!match(TokenType::RightParen)) {
+        auto pattern = parsePattern();
+        if (!pattern) {
+          return nullptr;
+        }
+        if (auto* id = std::get_if<Identifier>(&pattern->node)) {
+          handler.param = {id->name};
+        } else {
+          handler.paramPattern = std::move(pattern);
+        }
       }
       expect(TokenType::RightParen);
     }
 
     auto catchBlock = parseBlockStatement();
-    auto catchBlockStmt = std::get_if<BlockStmt>(&catchBlock->node);
-    if (catchBlockStmt) {
-      handler.body = std::move(catchBlockStmt->body);
+    if (!catchBlock) {
+      return nullptr;
     }
+    auto catchBlockStmt = std::get_if<BlockStmt>(&catchBlock->node);
+    if (!catchBlockStmt) {
+      return nullptr;
+    }
+    handler.body = std::move(catchBlockStmt->body);
   }
 
   if (match(TokenType::Finally)) {
     advance();
     hasFinalizer = true;
     auto finallyBlock = parseBlockStatement();
-    auto finallyBlockStmt = std::get_if<BlockStmt>(&finallyBlock->node);
-    if (finallyBlockStmt) {
-      finalizer = std::move(finallyBlockStmt->body);
+    if (!finallyBlock) {
+      return nullptr;
     }
+    auto finallyBlockStmt = std::get_if<BlockStmt>(&finallyBlock->node);
+    if (!finallyBlockStmt) {
+      return nullptr;
+    }
+    finalizer = std::move(finallyBlockStmt->body);
+  }
+
+  if (!hasHandler && !hasFinalizer) {
+    return nullptr;
   }
 
   return std::make_unique<Statement>(TryStmt{
@@ -646,11 +1147,14 @@ StmtPtr Parser::parseImportDeclaration() {
   // Check for namespace import: import * as name from "module"
   if (match(TokenType::Star)) {
     advance();
-    expect(TokenType::As);
-    if (match(TokenType::Identifier)) {
-      import.namespaceImport = Identifier{current().value};
-      advance();
+    if (!expect(TokenType::As)) {
+      return nullptr;
     }
+    if (!isIdentifierLikeToken(current().type)) {
+      return nullptr;
+    }
+    import.namespaceImport = Identifier{current().value};
+    advance();
   }
   // Check for named imports: import { foo, bar as baz } from "module"
   else if (match(TokenType::LeftBrace)) {
@@ -658,26 +1162,31 @@ StmtPtr Parser::parseImportDeclaration() {
 
     while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
       if (!import.specifiers.empty()) {
-        expect(TokenType::Comma);
-      }
-
-      if (match(TokenType::Identifier)) {
-        ImportSpecifier spec;
-        spec.imported = Identifier{current().value};
-        spec.local = spec.imported;
-        advance();
-
-        // Check for renaming: foo as bar
-        if (match(TokenType::As)) {
-          advance();
-          if (match(TokenType::Identifier)) {
-            spec.local = Identifier{current().value};
-            advance();
-          }
+        if (!expect(TokenType::Comma)) {
+          return nullptr;
         }
-
-        import.specifiers.push_back(spec);
       }
+
+      if (!isIdentifierNameToken(current().type)) {
+        return nullptr;
+      }
+
+      ImportSpecifier spec;
+      spec.imported = Identifier{current().value};
+      spec.local = spec.imported;
+      advance();
+
+      // Check for renaming: foo as bar
+      if (match(TokenType::As)) {
+        advance();
+        if (!isIdentifierLikeToken(current().type)) {
+          return nullptr;
+        }
+        spec.local = Identifier{current().value};
+        advance();
+      }
+
+      import.specifiers.push_back(spec);
     }
 
     expect(TokenType::RightBrace);
@@ -725,10 +1234,11 @@ StmtPtr Parser::parseExportDeclaration() {
 
     if (match(TokenType::As)) {
       advance();
-      if (match(TokenType::Identifier)) {
-        exportAll.exported = Identifier{current().value};
-        advance();
+      if (!isIdentifierNameToken(current().type)) {
+        return nullptr;
       }
+      exportAll.exported = Identifier{current().value};
+      advance();
     }
 
     expect(TokenType::From);
@@ -748,7 +1258,7 @@ StmtPtr Parser::parseExportDeclaration() {
   // Export variable/function declaration
   if (match(TokenType::Const) || match(TokenType::Let) ||
       match(TokenType::Var) || match(TokenType::Function) ||
-      match(TokenType::Async)) {
+      match(TokenType::Async) || match(TokenType::Class)) {
     exportNamed.declaration = parseStatement();
     return std::make_unique<Statement>(std::move(exportNamed));
   }
@@ -759,26 +1269,31 @@ StmtPtr Parser::parseExportDeclaration() {
 
     while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
       if (!exportNamed.specifiers.empty()) {
-        expect(TokenType::Comma);
-      }
-
-      if (match(TokenType::Identifier)) {
-        ExportSpecifier spec;
-        spec.local = Identifier{current().value};
-        spec.exported = spec.local;
-        advance();
-
-        // Check for renaming: foo as bar
-        if (match(TokenType::As)) {
-          advance();
-          if (match(TokenType::Identifier)) {
-            spec.exported = Identifier{current().value};
-            advance();
-          }
+        if (!expect(TokenType::Comma)) {
+          return nullptr;
         }
-
-        exportNamed.specifiers.push_back(spec);
       }
+
+      if (!isIdentifierNameToken(current().type)) {
+        return nullptr;
+      }
+
+      ExportSpecifier spec;
+      spec.local = Identifier{current().value};
+      spec.exported = spec.local;
+      advance();
+
+      // Check for renaming: foo as bar
+      if (match(TokenType::As)) {
+        advance();
+        if (!isIdentifierNameToken(current().type)) {
+          return nullptr;
+        }
+        spec.exported = Identifier{current().value};
+        advance();
+      }
+
+      exportNamed.specifiers.push_back(spec);
     }
 
     expect(TokenType::RightBrace);
@@ -803,6 +1318,176 @@ ExprPtr Parser::parseExpression() {
 }
 
 ExprPtr Parser::parseAssignment() {
+  auto parseArrowBodyInto = [&](FunctionExpr& func) -> bool {
+    if (match(TokenType::LeftBrace)) {
+      auto blockStmt = parseBlockStatement();
+      if (!blockStmt) {
+        return false;
+      }
+      if (auto* block = std::get_if<BlockStmt>(&blockStmt->node)) {
+        func.body = std::move(block->body);
+        return true;
+      }
+      return false;
+    }
+
+    auto expr = parseAssignment();
+    if (!expr) {
+      return false;
+    }
+    auto returnStmt = std::make_unique<Statement>(ReturnStmt{std::move(expr)});
+    func.body.push_back(std::move(returnStmt));
+    return true;
+  };
+
+  auto prependDestructurePrologue = [&](FunctionExpr& func, std::vector<StmtPtr>& prologue) {
+    if (prologue.empty()) {
+      return;
+    }
+    std::vector<StmtPtr> newBody;
+    newBody.reserve(prologue.size() + func.body.size());
+    for (auto& stmt : prologue) {
+      newBody.push_back(std::move(stmt));
+    }
+    for (auto& stmt : func.body) {
+      newBody.push_back(std::move(stmt));
+    }
+    func.body = std::move(newBody);
+  };
+
+  // Case 0: async arrow functions
+  if (match(TokenType::Async)) {
+    size_t savedPos = pos_;
+    advance();  // async
+
+    // async x => ...
+    if (match(TokenType::Identifier)) {
+      auto paramName = current().value;
+      advance();
+      if (match(TokenType::Arrow)) {
+        advance();
+        FunctionExpr func;
+        func.isAsync = true;
+        func.isArrow = true;
+        Parameter param;
+        param.name = Identifier{paramName};
+        func.params.push_back(std::move(param));
+        ++functionDepth_;
+        ++asyncFunctionDepth_;
+        if (!parseArrowBodyInto(func)) {
+          --asyncFunctionDepth_;
+          --functionDepth_;
+          return nullptr;
+        }
+        --asyncFunctionDepth_;
+        --functionDepth_;
+        return std::make_unique<Expression>(std::move(func));
+      }
+      pos_ = savedPos;
+    } else if (match(TokenType::LeftParen)) {
+      // async (...) => ...
+      int prevFunctionDepth = functionDepth_;
+      int prevAsyncDepth = asyncFunctionDepth_;
+      ++functionDepth_;
+      ++asyncFunctionDepth_;
+      advance();
+      std::vector<Parameter> params;
+      std::optional<Identifier> restParam;
+      std::vector<StmtPtr> destructurePrologue;
+      bool validParams = true;
+
+      if (!match(TokenType::RightParen)) {
+        do {
+          if (match(TokenType::DotDotDot)) {
+            advance();
+            if (!isIdentifierLikeToken(current().type)) {
+              validParams = false;
+              break;
+            }
+            restParam = Identifier{current().value};
+            advance();
+            break;
+          }
+
+          Parameter param;
+          bool hasDestructurePattern = false;
+          if (isIdentifierLikeToken(current().type)) {
+            param.name = Identifier{current().value};
+            advance();
+          } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+            auto pattern = parsePattern();
+            if (!pattern) {
+              validParams = false;
+              break;
+            }
+            std::string tempName = "__arrow_param_" + std::to_string(arrowDestructureTempCounter_++);
+            param.name = Identifier{tempName};
+            hasDestructurePattern = true;
+
+            VarDeclaration destructDecl;
+            destructDecl.kind = VarDeclaration::Kind::Let;
+            VarDeclarator destructBinding;
+            destructBinding.pattern = std::move(pattern);
+            destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+            destructDecl.declarations.push_back(std::move(destructBinding));
+            destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+          } else {
+            validParams = false;
+            break;
+          }
+
+          if (match(TokenType::Equal)) {
+            if (hasDestructurePattern) {
+              validParams = false;
+              break;
+            }
+            advance();
+            param.defaultValue = parseAssignment();
+            if (!param.defaultValue) {
+              --asyncFunctionDepth_;
+              --functionDepth_;
+              return nullptr;
+            }
+          }
+
+          params.push_back(std::move(param));
+
+          if (match(TokenType::Comma)) {
+            advance();
+          } else {
+            break;
+          }
+        } while (true);
+      }
+
+      if (validParams && match(TokenType::RightParen)) {
+        advance();
+        if (match(TokenType::Arrow)) {
+          advance();
+          FunctionExpr func;
+          func.isAsync = true;
+          func.isArrow = true;
+          func.params = std::move(params);
+          func.restParam = restParam;
+          if (!parseArrowBodyInto(func)) {
+            --asyncFunctionDepth_;
+            --functionDepth_;
+            return nullptr;
+          }
+          prependDestructurePrologue(func, destructurePrologue);
+          --asyncFunctionDepth_;
+          --functionDepth_;
+          return std::make_unique<Expression>(std::move(func));
+        }
+      }
+      functionDepth_ = prevFunctionDepth;
+      asyncFunctionDepth_ = prevAsyncDepth;
+      pos_ = savedPos;
+    } else {
+      pos_ = savedPos;
+    }
+  }
+
   // Check for arrow functions
   // Case 1: Single parameter without parentheses (e.g., x => x * 2)
   if (match(TokenType::Identifier)) {
@@ -819,19 +1504,12 @@ ExprPtr Parser::parseAssignment() {
       param.name = Identifier{paramName};
       func.params.push_back(std::move(param));
 
-      // Parse body: either expression or block statement
-      if (match(TokenType::LeftBrace)) {
-        // Block body { ... }
-        auto blockStmt = parseBlockStatement();
-        if (auto* block = std::get_if<BlockStmt>(&blockStmt->node)) {
-          func.body = std::move(block->body);
-        }
-      } else {
-        // Expression body (implicit return)
-        auto expr = parseAssignment();
-        auto returnStmt = std::make_unique<Statement>(ReturnStmt{std::move(expr)});
-        func.body.push_back(std::move(returnStmt));
+      ++functionDepth_;
+      if (!parseArrowBodyInto(func)) {
+        --functionDepth_;
+        return nullptr;
       }
+      --functionDepth_;
 
       return std::make_unique<Expression>(std::move(func));
     }
@@ -848,6 +1526,7 @@ ExprPtr Parser::parseAssignment() {
     // Try to parse as arrow function parameters
     std::vector<Parameter> params;
     std::optional<Identifier> restParam;
+    std::vector<StmtPtr> destructurePrologue;
     bool isArrowFunc = false;
 
     if (!match(TokenType::RightParen)) {
@@ -866,19 +1545,45 @@ ExprPtr Parser::parseAssignment() {
           break;
         }
 
-        if (!match(TokenType::Identifier)) {
+        Parameter param;
+        bool hasDestructurePattern = false;
+        if (match(TokenType::Identifier)) {
+          param.name = Identifier{current().value};
+          advance();
+        } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+          auto pattern = parsePattern();
+          if (!pattern) {
+            pos_ = savedPos;
+            goto normal_parse;
+          }
+          std::string tempName = "__arrow_param_" + std::to_string(arrowDestructureTempCounter_++);
+          param.name = Identifier{tempName};
+          hasDestructurePattern = true;
+
+          VarDeclaration destructDecl;
+          destructDecl.kind = VarDeclaration::Kind::Let;
+          VarDeclarator destructBinding;
+          destructBinding.pattern = std::move(pattern);
+          destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+          destructDecl.declarations.push_back(std::move(destructBinding));
+          destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+        } else {
           // Not a valid arrow function, restore
           pos_ = savedPos;
           goto normal_parse;
         }
-        Parameter param;
-        param.name = Identifier{current().value};
-        advance();
 
         // Check for default value (arrow functions support defaults)
         if (match(TokenType::Equal)) {
+          if (hasDestructurePattern) {
+            pos_ = savedPos;
+            goto normal_parse;
+          }
           advance();
           param.defaultValue = parseAssignment();
+          if (!param.defaultValue) {
+            return nullptr;
+          }
         }
 
         params.push_back(std::move(param));
@@ -906,19 +1611,13 @@ ExprPtr Parser::parseAssignment() {
       func.params = std::move(params);
       func.restParam = restParam;
 
-      // Parse body: either expression or block statement
-      if (match(TokenType::LeftBrace)) {
-        // Block body { ... }
-        auto blockStmt = parseBlockStatement();
-        if (auto* block = std::get_if<BlockStmt>(&blockStmt->node)) {
-          func.body = std::move(block->body);
-        }
-      } else {
-        // Expression body (implicit return)
-        auto expr = parseAssignment();
-        auto returnStmt = std::make_unique<Statement>(ReturnStmt{std::move(expr)});
-        func.body.push_back(std::move(returnStmt));
+      ++functionDepth_;
+      if (!parseArrowBodyInto(func)) {
+        --functionDepth_;
+        return nullptr;
       }
+      prependDestructurePrologue(func, destructurePrologue);
+      --functionDepth_;
 
       return std::make_unique<Expression>(std::move(func));
     }
@@ -929,11 +1628,17 @@ ExprPtr Parser::parseAssignment() {
 
 normal_parse:
   auto left = parseConditional();
+  if (!left) {
+    return nullptr;
+  }
 
   if (match(TokenType::Equal) || match(TokenType::PlusEqual) ||
       match(TokenType::MinusEqual) || match(TokenType::StarEqual) ||
       match(TokenType::SlashEqual) || match(TokenType::AmpAmpEqual) ||
       match(TokenType::PipePipeEqual) || match(TokenType::QuestionQuestionEqual)) {
+    if (!left || !isAssignmentTarget(*left)) {
+      return nullptr;
+    }
 
     AssignmentExpr::Op op;
     switch (current().type) {
@@ -950,6 +1655,9 @@ normal_parse:
     advance();
 
     auto right = parseAssignment();
+    if (!right) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(AssignmentExpr{op, std::move(left), std::move(right)});
   }
 
@@ -958,12 +1666,20 @@ normal_parse:
 
 ExprPtr Parser::parseConditional() {
   auto expr = parseNullishCoalescing();
+  if (!expr) {
+    return nullptr;
+  }
 
   if (match(TokenType::Question)) {
     advance();
     auto consequent = parseExpression();
-    expect(TokenType::Colon);
+    if (!consequent || !expect(TokenType::Colon)) {
+      return nullptr;
+    }
     auto alternate = parseExpression();
+    if (!alternate) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(ConditionalExpr{
       std::move(expr),
       std::move(consequent),
@@ -976,10 +1692,22 @@ ExprPtr Parser::parseConditional() {
 
 ExprPtr Parser::parseNullishCoalescing() {
   auto left = parseLogicalOr();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::QuestionQuestion)) {
+    if (hasUnparenthesizedLogicalOp(left)) {
+      return nullptr;
+    }
     advance();
     auto right = parseLogicalOr();
+    if (!right) {
+      return nullptr;
+    }
+    if (hasUnparenthesizedLogicalOp(right)) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{
       BinaryExpr::Op::NullishCoalescing,
       std::move(left),
@@ -992,10 +1720,16 @@ ExprPtr Parser::parseNullishCoalescing() {
 
 ExprPtr Parser::parseLogicalOr() {
   auto left = parseLogicalAnd();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::PipePipe)) {
     advance();
     auto right = parseLogicalAnd();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{
       BinaryExpr::Op::LogicalOr,
       std::move(left),
@@ -1007,11 +1741,17 @@ ExprPtr Parser::parseLogicalOr() {
 }
 
 ExprPtr Parser::parseLogicalAnd() {
-  auto left = parseEquality();
+  auto left = parseBitwiseOr();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::AmpAmp)) {
     advance();
-    auto right = parseEquality();
+    auto right = parseBitwiseOr();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{
       BinaryExpr::Op::LogicalAnd,
       std::move(left),
@@ -1022,8 +1762,77 @@ ExprPtr Parser::parseLogicalAnd() {
   return left;
 }
 
+ExprPtr Parser::parseBitwiseOr() {
+  auto left = parseBitwiseXor();
+  if (!left) {
+    return nullptr;
+  }
+
+  while (match(TokenType::Pipe)) {
+    advance();
+    auto right = parseBitwiseXor();
+    if (!right) {
+      return nullptr;
+    }
+    left = std::make_unique<Expression>(BinaryExpr{
+      BinaryExpr::Op::BitwiseOr,
+      std::move(left),
+      std::move(right)
+    });
+  }
+
+  return left;
+}
+
+ExprPtr Parser::parseBitwiseXor() {
+  auto left = parseBitwiseAnd();
+  if (!left) {
+    return nullptr;
+  }
+
+  while (match(TokenType::Caret)) {
+    advance();
+    auto right = parseBitwiseAnd();
+    if (!right) {
+      return nullptr;
+    }
+    left = std::make_unique<Expression>(BinaryExpr{
+      BinaryExpr::Op::BitwiseXor,
+      std::move(left),
+      std::move(right)
+    });
+  }
+
+  return left;
+}
+
+ExprPtr Parser::parseBitwiseAnd() {
+  auto left = parseEquality();
+  if (!left) {
+    return nullptr;
+  }
+
+  while (match(TokenType::Amp)) {
+    advance();
+    auto right = parseEquality();
+    if (!right) {
+      return nullptr;
+    }
+    left = std::make_unique<Expression>(BinaryExpr{
+      BinaryExpr::Op::BitwiseAnd,
+      std::move(left),
+      std::move(right)
+    });
+  }
+
+  return left;
+}
+
 ExprPtr Parser::parseEquality() {
   auto left = parseRelational();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::EqualEqual) || match(TokenType::EqualEqualEqual) ||
          match(TokenType::BangEqual) || match(TokenType::BangEqualEqual)) {
@@ -1039,6 +1848,9 @@ ExprPtr Parser::parseEquality() {
     advance();
 
     auto right = parseRelational();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
   }
 
@@ -1047,10 +1859,13 @@ ExprPtr Parser::parseEquality() {
 
 ExprPtr Parser::parseRelational() {
   auto left = parseAdditive();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::Less) || match(TokenType::Greater) ||
          match(TokenType::LessEqual) || match(TokenType::GreaterEqual) ||
-         match(TokenType::In)) {
+         match(TokenType::In) || match(TokenType::Instanceof)) {
 
     BinaryExpr::Op op;
     switch (current().type) {
@@ -1059,11 +1874,15 @@ ExprPtr Parser::parseRelational() {
       case TokenType::LessEqual: op = BinaryExpr::Op::LessEqual; break;
       case TokenType::GreaterEqual: op = BinaryExpr::Op::GreaterEqual; break;
       case TokenType::In: op = BinaryExpr::Op::In; break;
+      case TokenType::Instanceof: op = BinaryExpr::Op::Instanceof; break;
       default: op = BinaryExpr::Op::Less; break;
     }
     advance();
 
     auto right = parseAdditive();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
   }
 
@@ -1072,11 +1891,17 @@ ExprPtr Parser::parseRelational() {
 
 ExprPtr Parser::parseAdditive() {
   auto left = parseMultiplicative();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::Plus) || match(TokenType::Minus)) {
     BinaryExpr::Op op = match(TokenType::Plus) ? BinaryExpr::Op::Add : BinaryExpr::Op::Sub;
     advance();
     auto right = parseMultiplicative();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
   }
 
@@ -1085,6 +1910,9 @@ ExprPtr Parser::parseAdditive() {
 
 ExprPtr Parser::parseMultiplicative() {
   auto left = parseExponentiation();
+  if (!left) {
+    return nullptr;
+  }
 
   while (match(TokenType::Star) || match(TokenType::Slash) || match(TokenType::Percent)) {
     BinaryExpr::Op op;
@@ -1096,6 +1924,9 @@ ExprPtr Parser::parseMultiplicative() {
     }
     advance();
     auto right = parseExponentiation();
+    if (!right) {
+      return nullptr;
+    }
     left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
   }
 
@@ -1104,11 +1935,17 @@ ExprPtr Parser::parseMultiplicative() {
 
 ExprPtr Parser::parseExponentiation() {
   auto left = parseUnary();
+  if (!left) {
+    return nullptr;
+  }
 
   // Right-to-left associativity for **
   if (match(TokenType::StarStar)) {
     advance();
     auto right = parseExponentiation();  // Right associative
+    if (!right) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(BinaryExpr{BinaryExpr::Op::Exp, std::move(left), std::move(right)});
   }
 
@@ -1116,13 +1953,23 @@ ExprPtr Parser::parseExponentiation() {
 }
 
 ExprPtr Parser::parseUnary() {
-  if (match(TokenType::Await)) {
+  if (match(TokenType::Await) && canParseAwaitExpression()) {
+    if (current().escaped) {
+      return nullptr;
+    }
     advance();
     auto argument = parseUnary();
+    if (!argument) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(AwaitExpr{std::move(argument)});
   }
 
-  if (match(TokenType::Yield)) {
+  if (match(TokenType::Yield) && !canUseYieldAsIdentifier()) {
+    // `yield` is only an expression keyword inside generator function bodies.
+    if (generatorFunctionDepth_ == 0) {
+      return nullptr;
+    }
     advance();
     bool delegate = false;
 
@@ -1144,6 +1991,7 @@ ExprPtr Parser::parseUnary() {
 
   if (match(TokenType::Bang) || match(TokenType::Minus) ||
       match(TokenType::Plus) || match(TokenType::Typeof) ||
+      match(TokenType::Void) || match(TokenType::Tilde) ||
       match(TokenType::Delete)) {
 
     UnaryExpr::Op op;
@@ -1152,12 +2000,17 @@ ExprPtr Parser::parseUnary() {
       case TokenType::Minus: op = UnaryExpr::Op::Minus; break;
       case TokenType::Plus: op = UnaryExpr::Op::Plus; break;
       case TokenType::Typeof: op = UnaryExpr::Op::Typeof; break;
+      case TokenType::Void: op = UnaryExpr::Op::Void; break;
+      case TokenType::Tilde: op = UnaryExpr::Op::BitNot; break;
       case TokenType::Delete: op = UnaryExpr::Op::Delete; break;
       default: op = UnaryExpr::Op::Not; break;
     }
     advance();
 
     auto argument = parseUnary();
+    if (!argument) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(UnaryExpr{op, std::move(argument)});
   }
 
@@ -1166,6 +2019,9 @@ ExprPtr Parser::parseUnary() {
       UpdateExpr::Op::Increment : UpdateExpr::Op::Decrement;
     advance();
     auto argument = parseUnary();
+    if (!argument || !isUpdateTarget(*argument)) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(UpdateExpr{op, std::move(argument), true});
   }
 
@@ -1179,6 +2035,9 @@ ExprPtr Parser::parsePostfix() {
     UpdateExpr::Op op = match(TokenType::PlusPlus) ?
       UpdateExpr::Op::Increment : UpdateExpr::Op::Decrement;
     advance();
+    if (!expr || !isUpdateTarget(*expr)) {
+      return nullptr;
+    }
     return std::make_unique<Expression>(UpdateExpr{op, std::move(expr), false});
   }
 
@@ -1187,34 +2046,151 @@ ExprPtr Parser::parsePostfix() {
 
 ExprPtr Parser::parseCall() {
   auto expr = parsePrimary();
+  if (!expr) {
+    return nullptr;
+  }
   expr = parseMemberSuffix(std::move(expr));
+  if (!expr) {
+    return nullptr;
+  }
+
+  // Track whether we're inside an optional chain for short-circuit propagation
+  auto isExprInOptionalChain = [](const Expression& e) -> bool {
+    if (auto* m = std::get_if<MemberExpr>(&e.node)) {
+      return m->optional || m->inOptionalChain;
+    }
+    if (auto* c = std::get_if<CallExpr>(&e.node)) {
+      return c->optional || c->inOptionalChain;
+    }
+    return false;
+  };
 
   // Loop to handle both calls and member access after calls
   // This enables chaining like: arr.slice(1).length or obj.method().prop.method2()
   while (true) {
-    if (match(TokenType::LeftParen)) {
-      advance();
+    bool optChain = expr && isExprInOptionalChain(*expr);
+
+    if (match(TokenType::QuestionDot) && peek().type == TokenType::LeftParen) {
+      optChain = true;
+      advance();  // consume ?.
+      advance();  // consume (
       std::vector<ExprPtr> args;
 
       while (!match(TokenType::RightParen)) {
         if (!args.empty()) {
-          expect(TokenType::Comma);
+          if (!expect(TokenType::Comma)) {
+            return nullptr;
+          }
+          if (match(TokenType::RightParen)) {
+            break;
+          }
         }
 
         // Check for spread element in arguments
         if (match(TokenType::DotDotDot)) {
           advance();
           auto arg = parseExpression();
+          if (!arg) {
+            return nullptr;
+          }
           args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
         } else {
-          args.push_back(parseExpression());
+          auto arg = parseExpression();
+          if (!arg) {
+            return nullptr;
+          }
+          args.push_back(std::move(arg));
         }
       }
 
-      expect(TokenType::RightParen);
-      expr = std::make_unique<Expression>(CallExpr{std::move(expr), std::move(args)});
+      if (!expect(TokenType::RightParen)) {
+        return nullptr;
+      }
+      CallExpr call;
+      call.callee = std::move(expr);
+      call.arguments = std::move(args);
+      call.optional = true;
+      call.inOptionalChain = true;
+      expr = std::make_unique<Expression>(std::move(call));
+      expr = parseMemberSuffix(std::move(expr), true);
+      if (!expr) {
+        return nullptr;
+      }
+    } else if (match(TokenType::LeftParen)) {
+      if (superCallDisallowDepth_ > 0 &&
+          expr && std::holds_alternative<SuperExpr>(expr->node)) {
+        return nullptr;
+      }
+      advance();
+      std::vector<ExprPtr> args;
+
+      while (!match(TokenType::RightParen)) {
+        if (!args.empty()) {
+          if (!expect(TokenType::Comma)) {
+            return nullptr;
+          }
+          if (match(TokenType::RightParen)) {
+            break;
+          }
+        }
+
+        // Check for spread element in arguments
+        if (match(TokenType::DotDotDot)) {
+          advance();
+          auto arg = parseExpression();
+          if (!arg) {
+            return nullptr;
+          }
+          args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
+        } else {
+          auto arg = parseExpression();
+          if (!arg) {
+            return nullptr;
+          }
+          args.push_back(std::move(arg));
+        }
+      }
+
+      if (!expect(TokenType::RightParen)) {
+        return nullptr;
+      }
+      CallExpr call;
+      call.callee = std::move(expr);
+      call.arguments = std::move(args);
+      if (auto* member = std::get_if<MemberExpr>(&call.callee->node)) {
+        call.optional = member->optional;
+      }
+      call.inOptionalChain = optChain;
+      expr = std::make_unique<Expression>(std::move(call));
       // Handle member access after a call (e.g., arr.slice(1).length)
-      expr = parseMemberSuffix(std::move(expr));
+      expr = parseMemberSuffix(std::move(expr), optChain);
+      if (!expr) {
+        return nullptr;
+      }
+    } else if (match(TokenType::TemplateLiteral)) {
+      if (isOptionalChain(*expr)) {
+        return nullptr;
+      }
+      // Tagged template call: tag`...`
+      std::vector<ExprPtr> args;
+      auto arg = parsePrimary();
+      if (!arg) {
+        return nullptr;
+      }
+      args.push_back(std::move(arg));
+
+      CallExpr call;
+      call.callee = std::move(expr);
+      call.arguments = std::move(args);
+      if (auto* member = std::get_if<MemberExpr>(&call.callee->node)) {
+        call.optional = member->optional;
+      }
+      call.inOptionalChain = optChain;
+      expr = std::make_unique<Expression>(std::move(call));
+      expr = parseMemberSuffix(std::move(expr), optChain);
+      if (!expr) {
+        return nullptr;
+      }
     } else {
       break;
     }
@@ -1228,36 +2204,98 @@ ExprPtr Parser::parseMember() {
   return parseMemberSuffix(std::move(expr));
 }
 
-ExprPtr Parser::parseMemberSuffix(ExprPtr expr) {
+ExprPtr Parser::parseMemberSuffix(ExprPtr expr, bool inOptionalChain) {
+  if (!expr) {
+    return nullptr;
+  }
   while (true) {
-    if (match(TokenType::Dot) || match(TokenType::QuestionDot)) {
-      bool isOptional = match(TokenType::QuestionDot);
+    if (match(TokenType::QuestionDot) && peek().type == TokenType::LeftParen) {
+      break;
+    }
+
+    if (match(TokenType::QuestionDot)) {
+      inOptionalChain = true;
       advance();
+      if (match(TokenType::LeftBracket)) {
+        advance();
+        auto prop = parseAssignment();
+        if (!prop) {
+          return nullptr;
+        }
+        while (match(TokenType::Comma)) {
+          advance();
+          prop = parseAssignment();
+          if (!prop) {
+            return nullptr;
+          }
+        }
+        if (!expect(TokenType::RightBracket)) {
+          return nullptr;
+        }
+        MemberExpr member;
+        member.object = std::move(expr);
+        member.property = std::move(prop);
+        member.computed = true;
+        member.optional = true;
+        member.inOptionalChain = true;
+        expr = std::make_unique<Expression>(std::move(member));
+        continue;
+      }
+
       // Accept identifiers OR keywords as property names
       // Keywords like catch, finally, class, etc. can be property names in JS
-      if (match(TokenType::Identifier) || match(TokenType::From) || match(TokenType::Of) ||
-          match(TokenType::Catch) || match(TokenType::Finally) || match(TokenType::Class) ||
-          match(TokenType::In) || match(TokenType::Typeof) || match(TokenType::New) ||
-          match(TokenType::Default) || match(TokenType::Static) || match(TokenType::Get) ||
-          match(TokenType::Set) || match(TokenType::Throw) || match(TokenType::This)) {
+      if (isIdentifierNameToken(current().type)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
         MemberExpr member;
         member.object = std::move(expr);
         member.property = std::move(prop);
         member.computed = false;
-        member.optional = isOptional;
+        member.optional = true;
+        member.inOptionalChain = true;
         expr = std::make_unique<Expression>(std::move(member));
+        continue;
       }
+      return nullptr;
+    } else if (match(TokenType::Dot)) {
+      advance();
+      // Accept identifiers OR keywords as property names
+      // Keywords like catch, finally, class, etc. can be property names in JS
+      if (isIdentifierNameToken(current().type)) {
+        auto prop = std::make_unique<Expression>(Identifier{current().value});
+        advance();
+        MemberExpr member;
+        member.object = std::move(expr);
+        member.property = std::move(prop);
+        member.computed = false;
+        member.optional = false;
+        member.inOptionalChain = inOptionalChain;
+        expr = std::make_unique<Expression>(std::move(member));
+        continue;
+      }
+      break;
     } else if (match(TokenType::LeftBracket)) {
       advance();
-      auto prop = parseExpression();
-      expect(TokenType::RightBracket);
+      auto prop = parseAssignment();
+      if (!prop) {
+        return nullptr;
+      }
+      while (match(TokenType::Comma)) {
+        advance();
+        prop = parseAssignment();
+        if (!prop) {
+          return nullptr;
+        }
+      }
+      if (!expect(TokenType::RightBracket)) {
+        return nullptr;
+      }
       MemberExpr member;
       member.object = std::move(expr);
       member.property = std::move(prop);
       member.computed = true;
       member.optional = false;
+      member.inOptionalChain = inOptionalChain;
       expr = std::make_unique<Expression>(std::move(member));
     } else {
       break;
@@ -1269,14 +2307,20 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr) {
 ExprPtr Parser::parsePrimary() {
   if (match(TokenType::Number)) {
     const Token& tok = current();
-    double value = std::stod(tok.value);
+    double value = 0.0;
+    if (!parseNumberLiteral(tok.value, value)) {
+      return nullptr;
+    }
     advance();
     return makeExpr(NumberLiteral{value}, tok);
   }
 
   if (match(TokenType::BigInt)) {
     const Token& tok = current();
-    int64_t value = std::stoll(tok.value);
+    int64_t value = 0;
+    if (!parseBigIntLiteral64(tok.value, value)) {
+      return nullptr;
+    }
     advance();
     return makeExpr(BigIntLiteral{value}, tok);
   }
@@ -1322,7 +2366,7 @@ ExprPtr Parser::parsePrimary() {
         // Parse the expression
         Lexer exprLexer(exprStr);
         auto exprTokens = exprLexer.tokenize();
-        Parser exprParser(exprTokens);
+        Parser exprParser(exprTokens, isModule_);
         if (auto expr = exprParser.parseExpression()) {
           expressions.push_back(std::move(expr));
         }
@@ -1378,36 +2422,104 @@ ExprPtr Parser::parsePrimary() {
     return makeExpr(Identifier{name}, tok);
   }
 
-  // Dynamic import: import(specifier) or import.meta
+  if (match(TokenType::Await) && canUseAwaitAsIdentifier()) {
+    const Token& tok = current();
+    std::string name = tok.value;
+    advance();
+    return makeExpr(Identifier{name}, tok);
+  }
+
+  if (match(TokenType::Yield) && canUseYieldAsIdentifier()) {
+    const Token& tok = current();
+    std::string name = tok.value;
+    advance();
+    return makeExpr(Identifier{name}, tok);
+  }
+
+  // Dynamic import: import(specifier), import.meta, import.source(specifier), import.defer(specifier)
   if (match(TokenType::Import)) {
     Token importTok = current();
+    bool importEscaped = importTok.escaped;
     advance();
+    if (importEscaped) {
+      return nullptr;
+    }
     if (match(TokenType::LeftParen)) {
-      // This is a dynamic import expression
-      // Create a CallExpr with "import" as the callee identifier
       auto importId = std::make_unique<Expression>(Identifier{"import"});
 
-      advance(); // consume '('
-      std::vector<ExprPtr> args;
-
-      if (!match(TokenType::RightParen)) {
-        args.push_back(parseExpression());
-        while (match(TokenType::Comma)) {
-          advance();
-          if (match(TokenType::RightParen)) break;
-          args.push_back(parseExpression());
-        }
+      advance();
+      if (match(TokenType::RightParen)) {
+        return nullptr;
       }
 
-      expect(TokenType::RightParen);
+      std::vector<ExprPtr> args;
+      auto specifier = parseAssignment();
+      if (!specifier) {
+        return nullptr;
+      }
+      args.push_back(std::move(specifier));
+
+      if (match(TokenType::Comma)) {
+        advance();
+        if (!match(TokenType::RightParen)) {
+          auto options = parseAssignment();
+          if (!options) {
+            return nullptr;
+          }
+          args.push_back(std::move(options));
+          if (match(TokenType::Comma)) {
+            advance();
+          }
+        }
+      }
+      if (!expect(TokenType::RightParen)) {
+        return nullptr;
+      }
       return std::make_unique<Expression>(CallExpr{std::move(importId), std::move(args)});
     }
     // import.meta - ES2020
     if (match(TokenType::Dot)) {
       advance(); // consume '.'
-      if (match(TokenType::Identifier) && current().value == "meta") {
-        advance(); // consume 'meta'
-        return makeExpr(MetaProperty{"meta", ""}, importTok);
+      if (match(TokenType::Identifier) && !current().escaped) {
+        if (current().value == "meta") {
+          if (!isModule_) {
+            return nullptr;
+          }
+          advance(); // consume 'meta'
+          return makeExpr(MetaProperty{"meta", ""}, importTok);
+        }
+        if (current().value == "source" || current().value == "defer") {
+          const bool isSourcePhase = (current().value == "source");
+          advance();  // consume 'source' or 'defer'
+
+          if (!match(TokenType::LeftParen)) {
+            return nullptr;
+          }
+          advance();  // consume '('
+          if (match(TokenType::RightParen)) {
+            return nullptr;
+          }
+
+          auto importId = std::make_unique<Expression>(Identifier{"import"});
+          std::vector<ExprPtr> args;
+          auto specifier = parseAssignment();
+          if (!specifier) {
+            return nullptr;
+          }
+          args.push_back(std::move(specifier));
+          args.push_back(std::make_unique<Expression>(StringLiteral{
+            isSourcePhase ? kImportPhaseSourceSentinel : kImportPhaseDeferSentinel
+          }));
+
+          // Keep grammar strict: import.source/defer currently accepts exactly one argument.
+          if (match(TokenType::Comma)) {
+            return nullptr;
+          }
+          if (!expect(TokenType::RightParen)) {
+            return nullptr;
+          }
+          return std::make_unique<Expression>(CallExpr{std::move(importId), std::move(args)});
+        }
       }
     }
     // If not followed by '(' or '.meta', it's a static import statement (error here)
@@ -1444,8 +2556,23 @@ ExprPtr Parser::parsePrimary() {
 
   if (match(TokenType::LeftParen)) {
     advance();
-    auto expr = parseExpression();
-    expect(TokenType::RightParen);
+    auto expr = parseAssignment();
+    if (!expr) {
+      return nullptr;
+    }
+    while (match(TokenType::Comma)) {
+      advance();
+      expr = parseAssignment();
+      if (!expr) {
+        return nullptr;
+      }
+    }
+    if (!expect(TokenType::RightParen)) {
+      return nullptr;
+    }
+    if (expr) {
+      expr->parenthesized = true;
+    }
     return expr;
   }
 
@@ -1488,9 +2615,11 @@ ExprPtr Parser::parseObjectExpression() {
   expect(TokenType::LeftBrace);
 
   std::vector<ObjectProperty> properties;
-  while (!match(TokenType::RightBrace)) {
+  while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
     if (!properties.empty()) {
-      expect(TokenType::Comma);
+      if (!expect(TokenType::Comma)) {
+        return nullptr;
+      }
       if (match(TokenType::RightBrace)) break;
     }
 
@@ -1498,6 +2627,9 @@ ExprPtr Parser::parseObjectExpression() {
     if (match(TokenType::DotDotDot)) {
       advance();
       auto spreadExpr = parseExpression();
+      if (!spreadExpr) {
+        return nullptr;
+      }
       ObjectProperty prop;
       prop.isSpread = true;
       prop.value = std::move(spreadExpr);
@@ -1527,13 +2659,17 @@ ExprPtr Parser::parseObjectExpression() {
         key = parseExpression();
         expect(TokenType::RightBracket);
         isComputed = true;
-      } else if (match(TokenType::Identifier)) {
+      } else if (isIdentifierNameToken(current().type) &&
+                 !match(TokenType::Get) &&
+                 !match(TokenType::Set)) {
         std::string identName = current().value;
+        TokenType identType = current().type;
         key = std::make_unique<Expression>(Identifier{identName});
         advance();
 
         // Check for shorthand property notation (only if not generator/async)
-        if (!isGenerator && !isAsync && (match(TokenType::Comma) || match(TokenType::RightBrace))) {
+        if (!isGenerator && !isAsync && identType == TokenType::Identifier &&
+            (match(TokenType::Comma) || match(TokenType::RightBrace))) {
           // Shorthand: {x} means {x: x}
           ObjectProperty prop;
           prop.key = std::move(key);
@@ -1553,7 +2689,64 @@ ExprPtr Parser::parseObjectExpression() {
         if (match(TokenType::Colon)) {
           // Regular property with 'get' or 'set' as key name
           key = std::make_unique<Expression>(Identifier{keyName});
-        } else if (match(TokenType::Identifier)) {
+        } else if (match(TokenType::LeftBracket)) {
+          // Computed accessor key: get [expr]() {} / set [expr](v) {}
+          advance();
+          key = parseExpression();
+          if (!key) {
+            return nullptr;
+          }
+          if (!expect(TokenType::RightBracket)) {
+            return nullptr;
+          }
+          isComputed = true;
+
+          if (!expect(TokenType::LeftParen)) {
+            return nullptr;
+          }
+          std::vector<Parameter> params;
+          if (!isGetter && match(TokenType::Identifier)) {
+            Parameter param;
+            param.name = Identifier{current().value};
+            advance();
+            params.push_back(std::move(param));
+          }
+          if (!expect(TokenType::RightParen)) {
+            return nullptr;
+          }
+
+          if (!expect(TokenType::LeftBrace)) {
+            return nullptr;
+          }
+          std::vector<StmtPtr> body;
+          while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+            auto stmt = parseStatement();
+            if (!stmt) {
+              return nullptr;
+            }
+            body.push_back(std::move(stmt));
+          }
+          if (!expect(TokenType::RightBrace)) {
+            return nullptr;
+          }
+
+          FunctionExpr funcExpr;
+          funcExpr.params = std::move(params);
+          funcExpr.body = std::move(body);
+          funcExpr.isAsync = false;
+          funcExpr.isGenerator = false;
+          funcExpr.isArrow = false;
+
+          ObjectProperty prop;
+          prop.key = std::move(key);
+          prop.value = std::make_unique<Expression>(std::move(funcExpr));
+          prop.isSpread = false;
+          prop.isComputed = true;
+          properties.push_back(std::move(prop));
+          continue;
+        } else if (isIdentifierNameToken(current().type) ||
+                   match(TokenType::String) ||
+                   match(TokenType::Number)) {
           // Getter/setter syntax: get propName() or set propName(value)
           std::string propName = current().value;
           key = std::make_unique<Expression>(Identifier{propName});
@@ -1570,19 +2763,25 @@ ExprPtr Parser::parseObjectExpression() {
             advance();
             params.push_back(std::move(param));
           }
-          expect(TokenType::RightParen);
+          if (!expect(TokenType::RightParen)) {
+            return nullptr;
+          }
 
           // Parse function body
-          expect(TokenType::LeftBrace);
+          if (!expect(TokenType::LeftBrace)) {
+            return nullptr;
+          }
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-            if (auto stmt = parseStatement()) {
-              body.push_back(std::move(stmt));
-            } else {
-              break;
+            auto stmt = parseStatement();
+            if (!stmt) {
+              return nullptr;
             }
+            body.push_back(std::move(stmt));
           }
-          expect(TokenType::RightBrace);
+          if (!expect(TokenType::RightBrace)) {
+            return nullptr;
+          }
 
           // Create FunctionExpr for the getter/setter
           FunctionExpr funcExpr;
@@ -1623,6 +2822,10 @@ ExprPtr Parser::parseObjectExpression() {
         advance();
       }
 
+      if (!key) {
+        return nullptr;
+      }
+
       // Check for shorthand method syntax: key() { ... } or key(params) { ... }
       if (match(TokenType::LeftParen)) {
         // This is a method shorthand
@@ -1648,20 +2851,55 @@ ExprPtr Parser::parseObjectExpression() {
             advance();
           }
         }
-        expect(TokenType::RightParen);
+        if (!expect(TokenType::RightParen)) {
+          return nullptr;
+        }
 
         // Parse function body
-        expect(TokenType::LeftBrace);
+        if (isAsync) {
+          ++asyncFunctionDepth_;
+        }
+        if (isGenerator) {
+          ++generatorFunctionDepth_;
+        }
+        if (!expect(TokenType::LeftBrace)) {
+          if (isGenerator) {
+            --generatorFunctionDepth_;
+          }
+          if (isAsync) {
+            --asyncFunctionDepth_;
+          }
+          return nullptr;
+        }
         std::vector<StmtPtr> body;
         while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-          if (auto stmt = parseStatement()) {
-            body.push_back(std::move(stmt));
-          } else {
-            // Prevent infinite loop if parseStatement returns null
-            break;
+          auto stmt = parseStatement();
+          if (!stmt) {
+            if (isGenerator) {
+              --generatorFunctionDepth_;
+            }
+            if (isAsync) {
+              --asyncFunctionDepth_;
+            }
+            return nullptr;
           }
+          body.push_back(std::move(stmt));
         }
-        expect(TokenType::RightBrace);
+        if (!expect(TokenType::RightBrace)) {
+          if (isGenerator) {
+            --generatorFunctionDepth_;
+          }
+          if (isAsync) {
+            --asyncFunctionDepth_;
+          }
+          return nullptr;
+        }
+        if (isGenerator) {
+          --generatorFunctionDepth_;
+        }
+        if (isAsync) {
+          --asyncFunctionDepth_;
+        }
 
         // Create FunctionExpr for the method
         FunctionExpr funcExpr;
@@ -1678,8 +2916,13 @@ ExprPtr Parser::parseObjectExpression() {
         properties.push_back(std::move(prop));
       } else {
         // Regular property with colon
-        expect(TokenType::Colon);
+        if (!expect(TokenType::Colon)) {
+          return nullptr;
+        }
         auto value = parseExpression();
+        if (!value) {
+          return nullptr;
+        }
 
         ObjectProperty prop;
         prop.key = std::move(key);
@@ -1712,9 +2955,14 @@ ExprPtr Parser::parseFunctionExpression() {
   }
 
   std::string name;
-  if (match(TokenType::Identifier)) {
+  if (isIdentifierLikeToken(current().type)) {
     name = current().value;
     advance();
+  }
+
+  ++functionDepth_;
+  if (isAsync) {
+    ++asyncFunctionDepth_;
   }
 
   expect(TokenType::LeftParen);
@@ -1730,13 +2978,13 @@ ExprPtr Parser::parseFunctionExpression() {
     // Check for rest parameter
     if (match(TokenType::DotDotDot)) {
       advance();
-      if (match(TokenType::Identifier)) {
+      if (isIdentifierLikeToken(current().type)) {
         restParam = Identifier{current().value};
         advance();
       }
       // Rest parameter must be last
       break;
-    } else if (match(TokenType::Identifier)) {
+    } else if (isIdentifierLikeToken(current().type)) {
       Parameter param;
       param.name = Identifier{current().value};
       advance();
@@ -1756,8 +3004,24 @@ ExprPtr Parser::parseFunctionExpression() {
 
   expect(TokenType::RightParen);
 
+  if (isGenerator) {
+    ++generatorFunctionDepth_;
+  }
   auto block = parseBlockStatement();
+  if (isGenerator) {
+    --generatorFunctionDepth_;
+  }
+  if (isAsync) {
+    --asyncFunctionDepth_;
+  }
+  --functionDepth_;
+  if (!block) {
+    return nullptr;
+  }
   auto blockStmt = std::get_if<BlockStmt>(&block->node);
+  if (!blockStmt) {
+    return nullptr;
+  }
 
   FunctionExpr funcExpr;
   funcExpr.params = std::move(params);
@@ -1765,9 +3029,7 @@ ExprPtr Parser::parseFunctionExpression() {
   funcExpr.name = name;
   funcExpr.isAsync = isAsync;
   funcExpr.isGenerator = isGenerator;
-  if (blockStmt) {
-    funcExpr.body = std::move(blockStmt->body);
-  }
+  funcExpr.body = std::move(blockStmt->body);
 
   return std::make_unique<Expression>(std::move(funcExpr));
 }
@@ -1776,7 +3038,7 @@ ExprPtr Parser::parseClassExpression() {
   expect(TokenType::Class);
 
   std::string className;
-  if (match(TokenType::Identifier)) {
+  if (isIdentifierLikeToken(current().type)) {
     className = current().value;
     advance();
   }
@@ -1784,7 +3046,7 @@ ExprPtr Parser::parseClassExpression() {
   ExprPtr superClass;
   if (match(TokenType::Extends)) {
     advance();
-    superClass = parsePrimary();
+    superClass = parseCall();
   }
 
   expect(TokenType::LeftBrace);
@@ -1815,7 +3077,7 @@ ExprPtr Parser::parseClassExpression() {
     }
 
     // Method name
-    if (match(TokenType::Identifier)) {
+    if (isIdentifierNameToken(current().type)) {
       std::string methodName = current().value;
       if (methodName == "constructor") {
         method.kind = MethodDefinition::Kind::Constructor;
@@ -1827,9 +3089,13 @@ ExprPtr Parser::parseClassExpression() {
     }
 
     // Parameters
+    ++functionDepth_;
+    if (method.isAsync) {
+      ++asyncFunctionDepth_;
+    }
     expect(TokenType::LeftParen);
     while (!match(TokenType::RightParen)) {
-      if (match(TokenType::Identifier)) {
+      if (isIdentifierLikeToken(current().type)) {
         method.params.push_back({current().value});
         advance();
         if (match(TokenType::Comma)) {
@@ -1842,11 +3108,34 @@ ExprPtr Parser::parseClassExpression() {
     expect(TokenType::RightParen);
 
     // Method body
+    bool disallowSuperCall = !superClass && !method.isStatic &&
+                             method.kind == MethodDefinition::Kind::Constructor;
+    if (disallowSuperCall) {
+      ++superCallDisallowDepth_;
+    }
     expect(TokenType::LeftBrace);
     while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-      method.body.push_back(parseStatement());
+      auto stmt = parseStatement();
+      if (!stmt) {
+        if (method.isAsync) {
+          --asyncFunctionDepth_;
+        }
+        --functionDepth_;
+        if (disallowSuperCall) {
+          --superCallDisallowDepth_;
+        }
+        return nullptr;
+      }
+      method.body.push_back(std::move(stmt));
     }
     expect(TokenType::RightBrace);
+    if (method.isAsync) {
+      --asyncFunctionDepth_;
+    }
+    --functionDepth_;
+    if (disallowSuperCall) {
+      --superCallDisallowDepth_;
+    }
 
     methods.push_back(std::move(method));
   }
@@ -1861,20 +3150,44 @@ ExprPtr Parser::parseClassExpression() {
 }
 
 ExprPtr Parser::parseNewExpression() {
+  Token newTok = current();
   expect(TokenType::New);
 
+  // MetaProperty: new.target
+  if (match(TokenType::Dot) &&
+      peek().type == TokenType::Identifier &&
+      peek().value == "target") {
+    advance();  // .
+    advance();  // target
+    return makeExpr(MetaProperty{"new", "target"}, newTok);
+  }
+
   auto callee = parseMember();
+  if (!callee) {
+    return nullptr;
+  }
+  if (isDirectDynamicImportCall(callee)) {
+    return nullptr;
+  }
 
   std::vector<ExprPtr> args;
   if (match(TokenType::LeftParen)) {
     advance();
     while (!match(TokenType::RightParen)) {
-      args.push_back(parseAssignment());
+      auto arg = parseAssignment();
+      if (!arg) {
+        return nullptr;
+      }
+      args.push_back(std::move(arg));
       if (!match(TokenType::RightParen)) {
-        expect(TokenType::Comma);
+        if (!expect(TokenType::Comma)) {
+          return nullptr;
+        }
       }
     }
-    expect(TokenType::RightParen);
+    if (!expect(TokenType::RightParen)) {
+      return nullptr;
+    }
   }
 
   NewExpr newExpr;
@@ -1887,19 +3200,52 @@ ExprPtr Parser::parseNewExpression() {
 ExprPtr Parser::parsePattern() {
   // Check for array destructuring pattern
   if (match(TokenType::LeftBracket)) {
-    return parseArrayPattern();
+    auto base = parseArrayPattern();
+    if (!base) {
+      return nullptr;
+    }
+    if (match(TokenType::Equal)) {
+      advance();
+      auto init = parseAssignment();
+      if (!init) {
+        return nullptr;
+      }
+      return std::make_unique<Expression>(AssignmentPattern{std::move(base), std::move(init)});
+    }
+    return base;
   }
 
   // Check for object destructuring pattern
   if (match(TokenType::LeftBrace)) {
-    return parseObjectPattern();
+    auto base = parseObjectPattern();
+    if (!base) {
+      return nullptr;
+    }
+    if (match(TokenType::Equal)) {
+      advance();
+      auto init = parseAssignment();
+      if (!init) {
+        return nullptr;
+      }
+      return std::make_unique<Expression>(AssignmentPattern{std::move(base), std::move(init)});
+    }
+    return base;
   }
 
-  // Otherwise it must be an identifier
-  if (match(TokenType::Identifier)) {
+  // Otherwise it must be an identifier (binding)
+  if (isIdentifierLikeToken(current().type)) {
     std::string name = current().value;
     advance();
-    return std::make_unique<Expression>(Identifier{name});
+    auto base = std::make_unique<Expression>(Identifier{name});
+    if (match(TokenType::Equal)) {
+      advance();
+      auto init = parseAssignment();
+      if (!init) {
+        return nullptr;
+      }
+      return std::make_unique<Expression>(AssignmentPattern{std::move(base), std::move(init)});
+    }
+    return base;
   }
 
   return nullptr;
@@ -1978,7 +3324,7 @@ ExprPtr Parser::parseObjectPattern() {
 
     // Parse property key
     ExprPtr key;
-    if (match(TokenType::Identifier)) {
+    if (isIdentifierNameToken(current().type)) {
       std::string name = current().value;
       advance();
       key = std::make_unique<Expression>(Identifier{name});
@@ -1996,6 +3342,19 @@ ExprPtr Parser::parseObjectPattern() {
       advance();
       value = parsePattern();
       if (!value) {
+        return nullptr;
+      }
+    } else if (match(TokenType::Equal)) {
+      // Shorthand with default initializer (e.g., {x = 1})
+      advance();
+      auto init = parseAssignment();
+      if (!init) {
+        return nullptr;
+      }
+      if (auto* id = std::get_if<Identifier>(&key->node)) {
+        auto left = std::make_unique<Expression>(Identifier{id->name});
+        value = std::make_unique<Expression>(AssignmentPattern{std::move(left), std::move(init)});
+      } else {
         return nullptr;
       }
     } else {
