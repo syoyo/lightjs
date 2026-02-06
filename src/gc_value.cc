@@ -53,6 +53,10 @@ void Array::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& element : elements) {
         addValueReferences(element, refs);
     }
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
 }
 
 bool Object::getSlot(int offset, Value& out) const {
@@ -87,6 +91,17 @@ void Promise::getReferences(std::vector<GCObject*>& refs) const {
     addValueReferences(result, refs);
     for (const auto& chainedPromise : chainedPromises) {
         if (chainedPromise) refs.push_back(chainedPromise.get());
+    }
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+}
+
+void Regex::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
     }
 }
 

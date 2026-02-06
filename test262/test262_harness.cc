@@ -7,10 +7,133 @@
 
 namespace lightjs {
 
+namespace {
+bool isSameValue(const Value& actual, const Value& expected) {
+  if (actual.data.index() != expected.data.index()) {
+    return false;
+  }
+
+  if (actual.isUndefined() || actual.isNull()) {
+    return true;
+  }
+  if (actual.isBool()) {
+    return std::get<bool>(actual.data) == std::get<bool>(expected.data);
+  }
+  if (actual.isNumber()) {
+    double a = std::get<double>(actual.data);
+    double b = std::get<double>(expected.data);
+    if (std::isnan(a) && std::isnan(b)) {
+      return true;
+    }
+    if (a == 0.0 && b == 0.0) {
+      return std::signbit(a) == std::signbit(b);
+    }
+    return a == b;
+  }
+  if (actual.isBigInt()) {
+    return std::get<BigInt>(actual.data).value == std::get<BigInt>(expected.data).value;
+  }
+  if (actual.isSymbol()) {
+    return std::get<Symbol>(actual.data).id == std::get<Symbol>(expected.data).id;
+  }
+  if (actual.isString()) {
+    return std::get<std::string>(actual.data) == std::get<std::string>(expected.data);
+  }
+  if (actual.isFunction()) {
+    return std::get<std::shared_ptr<Function>>(actual.data) ==
+           std::get<std::shared_ptr<Function>>(expected.data);
+  }
+  if (actual.isArray()) {
+    return std::get<std::shared_ptr<Array>>(actual.data) ==
+           std::get<std::shared_ptr<Array>>(expected.data);
+  }
+  if (actual.isObject()) {
+    return std::get<std::shared_ptr<Object>>(actual.data) ==
+           std::get<std::shared_ptr<Object>>(expected.data);
+  }
+  if (actual.isTypedArray()) {
+    return std::get<std::shared_ptr<TypedArray>>(actual.data) ==
+           std::get<std::shared_ptr<TypedArray>>(expected.data);
+  }
+  if (actual.isPromise()) {
+    return std::get<std::shared_ptr<Promise>>(actual.data) ==
+           std::get<std::shared_ptr<Promise>>(expected.data);
+  }
+  if (actual.isRegex()) {
+    return std::get<std::shared_ptr<Regex>>(actual.data) ==
+           std::get<std::shared_ptr<Regex>>(expected.data);
+  }
+  if (actual.isMap()) {
+    return std::get<std::shared_ptr<Map>>(actual.data) ==
+           std::get<std::shared_ptr<Map>>(expected.data);
+  }
+  if (actual.isSet()) {
+    return std::get<std::shared_ptr<Set>>(actual.data) ==
+           std::get<std::shared_ptr<Set>>(expected.data);
+  }
+  if (actual.isError()) {
+    return std::get<std::shared_ptr<Error>>(actual.data) ==
+           std::get<std::shared_ptr<Error>>(expected.data);
+  }
+  if (actual.isGenerator()) {
+    return std::get<std::shared_ptr<Generator>>(actual.data) ==
+           std::get<std::shared_ptr<Generator>>(expected.data);
+  }
+  if (actual.isProxy()) {
+    return std::get<std::shared_ptr<Proxy>>(actual.data) ==
+           std::get<std::shared_ptr<Proxy>>(expected.data);
+  }
+  if (actual.isWeakMap()) {
+    return std::get<std::shared_ptr<WeakMap>>(actual.data) ==
+           std::get<std::shared_ptr<WeakMap>>(expected.data);
+  }
+  if (actual.isWeakSet()) {
+    return std::get<std::shared_ptr<WeakSet>>(actual.data) ==
+           std::get<std::shared_ptr<WeakSet>>(expected.data);
+  }
+  if (actual.isArrayBuffer()) {
+    return std::get<std::shared_ptr<ArrayBuffer>>(actual.data) ==
+           std::get<std::shared_ptr<ArrayBuffer>>(expected.data);
+  }
+  if (actual.isDataView()) {
+    return std::get<std::shared_ptr<DataView>>(actual.data) ==
+           std::get<std::shared_ptr<DataView>>(expected.data);
+  }
+  if (actual.isClass()) {
+    return std::get<std::shared_ptr<Class>>(actual.data) ==
+           std::get<std::shared_ptr<Class>>(expected.data);
+  }
+  if (actual.isWasmInstance()) {
+    return std::get<std::shared_ptr<WasmInstanceJS>>(actual.data) ==
+           std::get<std::shared_ptr<WasmInstanceJS>>(expected.data);
+  }
+  if (actual.isWasmMemory()) {
+    return std::get<std::shared_ptr<WasmMemoryJS>>(actual.data) ==
+           std::get<std::shared_ptr<WasmMemoryJS>>(expected.data);
+  }
+  if (actual.isReadableStream()) {
+    return std::get<std::shared_ptr<ReadableStream>>(actual.data) ==
+           std::get<std::shared_ptr<ReadableStream>>(expected.data);
+  }
+  if (actual.isWritableStream()) {
+    return std::get<std::shared_ptr<WritableStream>>(actual.data) ==
+           std::get<std::shared_ptr<WritableStream>>(expected.data);
+  }
+  if (actual.isTransformStream()) {
+    return std::get<std::shared_ptr<TransformStream>>(actual.data) ==
+           std::get<std::shared_ptr<TransformStream>>(expected.data);
+  }
+
+  return false;
+}
+}  // namespace
+
 void installTest262Harness(std::shared_ptr<Environment> env) {
   // Test262 Error constructor
   auto Test262Error = std::make_shared<Function>();
   Test262Error->isNative = true;
+  Test262Error->isConstructor = true;
+  Test262Error->properties["prototype"] = Value(std::make_shared<Object>());
   Test262Error->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto error = std::make_shared<Object>();
     error->properties["message"] = args.empty() ? Value(std::string("")) : args[0];
@@ -121,9 +244,6 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
 
   env->define("$262", Value($262));
 
-  // assert object with extended methods
-  auto assert = std::make_shared<Object>();
-
   // Basic assert function
   auto assertFunc = std::make_shared<Function>();
   assertFunc->isNative = true;
@@ -147,22 +267,9 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     if (args.size() < 2) {
       throw std::runtime_error("assert.sameValue requires at least 2 arguments");
     }
-
-    bool same = false;
     const auto& actual = args[0];
     const auto& expected = args[1];
-
-    if (actual.data.index() == expected.data.index()) {
-      if (std::holds_alternative<double>(actual.data)) {
-        double a = std::get<double>(actual.data);
-        double b = std::get<double>(expected.data);
-        same = (a == b) || (std::isnan(a) && std::isnan(b));
-      } else if (std::holds_alternative<BigInt>(actual.data)) {
-        same = std::get<BigInt>(actual.data).value == std::get<BigInt>(expected.data).value;
-      } else {
-        same = actual.toString() == expected.toString();
-      }
-    }
+    bool same = isSameValue(actual, expected);
 
     if (!same) {
       std::string message = args.size() > 2 ? args[2].toString()
@@ -171,7 +278,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     }
     return Value(Undefined{});
   };
-  assert->properties["sameValue"] = Value(sameValue);
+  assertCallable->properties["sameValue"] = Value(sameValue);
 
   // assert.notSameValue
   auto notSameValue = std::make_shared<Function>();
@@ -180,22 +287,9 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     if (args.size() < 2) {
       throw std::runtime_error("assert.notSameValue requires at least 2 arguments");
     }
-
-    bool same = false;
     const auto& actual = args[0];
     const auto& expected = args[1];
-
-    if (actual.data.index() == expected.data.index()) {
-      if (std::holds_alternative<double>(actual.data)) {
-        double a = std::get<double>(actual.data);
-        double b = std::get<double>(expected.data);
-        same = (a == b) || (std::isnan(a) && std::isnan(b));
-      } else if (std::holds_alternative<BigInt>(actual.data)) {
-        same = std::get<BigInt>(actual.data).value == std::get<BigInt>(expected.data).value;
-      } else {
-        same = actual.toString() == expected.toString();
-      }
-    }
+    bool same = isSameValue(actual, expected);
 
     if (same) {
       std::string message = args.size() > 2 ? args[2].toString()
@@ -204,7 +298,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     }
     return Value(Undefined{});
   };
-  assert->properties["notSameValue"] = Value(notSameValue);
+  assertCallable->properties["notSameValue"] = Value(notSameValue);
 
   // assert.throws
   auto throws = std::make_shared<Function>();
@@ -220,13 +314,24 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
 
     if (auto* f = std::get_if<std::shared_ptr<Function>>(&func.data)) {
       bool thrown = false;
+      Interpreter* interpreter = getGlobalInterpreter();
+
       try {
-        // Try to call the function
-        if ((*f)->isNative && (*f)->nativeFunc) {
+        if (interpreter) {
+          interpreter->clearError();
+          interpreter->callForHarness(Value(*f), {});
+          if (interpreter->hasError()) {
+            thrown = true;
+            interpreter->clearError();
+          }
+        } else if ((*f)->isNative && (*f)->nativeFunc) {
           (*f)->nativeFunc({});
         }
-      } catch (const std::exception& e) {
+      } catch (const std::exception&) {
         thrown = true;
+        if (interpreter) {
+          interpreter->clearError();
+        }
       }
 
       if (!thrown) {
@@ -236,7 +341,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
 
     return Value(Undefined{});
   };
-  assert->properties["throws"] = Value(throws);
+  assertCallable->properties["throws"] = Value(throws);
 
   // compareArray helper
   auto compareArray = std::make_shared<Function>();
@@ -258,9 +363,10 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
 
     return Value(true);
   };
-  assert->properties["compareArray"] = Value(compareArray);
 
-  env->define("assert", Value(assert));
+  assertCallable->properties["compareArray"] = Value(compareArray);
+
+  env->define("assert", Value(assertCallable));
 
   // compareArray global function
   env->define("compareArray", Value(compareArray));
@@ -283,7 +389,11 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   isConstructor->isNative = true;
   isConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
-    return Value(std::holds_alternative<std::shared_ptr<Function>>(args[0].data));
+    if (!std::holds_alternative<std::shared_ptr<Function>>(args[0].data)) {
+      return Value(false);
+    }
+    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    return Value(fn->isConstructor);
   };
   env->define("isConstructor", Value(isConstructor));
 

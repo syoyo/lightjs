@@ -34,6 +34,7 @@ enum class TokenType {
   While,
   For,
   In,
+  Instanceof,
   Of,
   Do,
   Switch,
@@ -47,6 +48,7 @@ enum class TokenType {
   New,
   This,
   Typeof,
+  Void,
   Delete,
   Import,
   Export,
@@ -79,6 +81,10 @@ enum class TokenType {
 
   AmpAmp,
   PipePipe,
+  Amp,   // &
+  Pipe,  // |
+  Caret, // ^
+  Tilde, // ~
   Bang,
 
   PlusEqual,
@@ -120,16 +126,17 @@ struct Token {
   std::shared_ptr<std::string> internedValue;  // For interned strings (identifiers)
   uint32_t line;
   uint32_t column;
+  bool escaped;
 
-  Token() : type(TokenType::Error), line(0), column(0) {}
+  Token() : type(TokenType::Error), line(0), column(0), escaped(false) {}
   Token(TokenType t, std::string_view v, uint32_t l, uint32_t c)
-    : type(t), value(v), line(l), column(c) {}
+    : type(t), value(v), line(l), column(c), escaped(false) {}
   Token(TokenType t, uint32_t l, uint32_t c)
-    : type(t), line(l), column(c) {}
+    : type(t), line(l), column(c), escaped(false) {}
 
   // Constructor for interned strings
   Token(TokenType t, std::shared_ptr<std::string> interned, uint32_t l, uint32_t c)
-    : type(t), internedValue(interned), value(*interned), line(l), column(c) {}
+    : type(t), internedValue(interned), value(*interned), line(l), column(c), escaped(false) {}
 
   // Get the string value (interned or regular)
   const std::string& getString() const {

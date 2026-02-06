@@ -32,4 +32,24 @@ const std::string& WellKnownSymbols::toStringTagKey() {
   return key;
 }
 
+const Value& WellKnownSymbols::toPrimitive() {
+  static Value symbolToPrimitive(Symbol("Symbol.toPrimitive"));
+  return symbolToPrimitive;
+}
+
+const std::string& WellKnownSymbols::toPrimitiveKey() {
+  static const std::string key = WellKnownSymbols::toPrimitive().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::matchAll() {
+  static Value symbolMatchAll(Symbol("Symbol.matchAll"));
+  return symbolMatchAll;
+}
+
+const std::string& WellKnownSymbols::matchAllKey() {
+  static const std::string key = WellKnownSymbols::matchAll().toString();
+  return key;
+}
+
 }

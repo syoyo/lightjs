@@ -2,8 +2,38 @@
 #include "string_table.h"
 #include <unordered_map>
 #include <cctype>
+#include <stdexcept>
 
 namespace lightjs {
+
+namespace {
+int hexDigitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+void appendUtf8(std::string& out, uint32_t codepoint) {
+  if (codepoint <= 0x7F) {
+    out.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7FF) {
+    out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else if (codepoint <= 0xFFFF) {
+    out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else if (codepoint <= 0x10FFFF) {
+    out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+  } else {
+    throw std::runtime_error("Invalid unicode escape");
+  }
+}
+}  // namespace
 
 static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"let", TokenType::Let},
@@ -19,6 +49,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"while", TokenType::While},
   {"for", TokenType::For},
   {"in", TokenType::In},
+  {"instanceof", TokenType::Instanceof},
   {"of", TokenType::Of},
   {"do", TokenType::Do},
   {"switch", TokenType::Switch},
@@ -32,6 +63,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"new", TokenType::New},
   {"this", TokenType::This},
   {"typeof", TokenType::Typeof},
+  {"void", TokenType::Void},
   {"delete", TokenType::Delete},
   {"import", TokenType::Import},
   {"export", TokenType::Export},
@@ -80,8 +112,18 @@ bool Lexer::isAtEnd() const {
 
 void Lexer::skipWhitespace() {
   while (!isAtEnd()) {
-    char c = current();
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+    unsigned char c = static_cast<unsigned char>(current());
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') {
+      advance();
+    } else if (c == 0xC2 && static_cast<unsigned char>(peek()) == 0xA0) {
+      // U+00A0 NO-BREAK SPACE
+      advance();
+      advance();
+    } else if (c == 0xEF && static_cast<unsigned char>(peek()) == 0xBB &&
+               static_cast<unsigned char>(peek(2)) == 0xBF) {
+      // U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)
+      advance();
+      advance();
       advance();
     } else {
       break;
@@ -120,15 +162,142 @@ bool Lexer::isAlphaNumeric(char c) {
   return isAlpha(c) || isDigit(c);
 }
 
+bool Lexer::isIdentifierStart(unsigned char c) {
+  return isAlpha(static_cast<char>(c)) || c >= 0x80;
+}
+
+bool Lexer::isIdentifierPart(unsigned char c) {
+  return isAlphaNumeric(static_cast<char>(c)) || c >= 0x80;
+}
+
 std::optional<Token> Lexer::readNumber() {
   uint32_t startLine = line_;
   uint32_t startColumn = column_;
   size_t start = pos_;
-  bool hasDot = false;
+  auto throwSyntaxError = [](const std::string& message) {
+    throw std::runtime_error("SyntaxError: " + message);
+  };
 
-  while (!isAtEnd() && isDigit(current())) {
+  auto digitForBase = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+
+  auto consumeExponent = [&]() {
+    if (isAtEnd() || (current() != 'e' && current() != 'E')) return;
     advance();
+    if (!isAtEnd() && (current() == '+' || current() == '-')) {
+      advance();
+    }
+    if (isAtEnd() || !isDigit(current())) {
+      throwSyntaxError("Invalid exponent in numeric literal");
+    }
+    while (!isAtEnd() && isDigit(current())) {
+      advance();
+    }
+  };
+
+  // Leading-dot decimal number: .123, .123e1
+  if (!isAtEnd() && current() == '.') {
+    advance();
+    if (isAtEnd() || !isDigit(current())) {
+      throwSyntaxError("Invalid numeric literal");
+    }
+    while (!isAtEnd() && isDigit(current())) {
+      advance();
+    }
+    consumeExponent();
+    if (!isAtEnd() && current() == 'n') {
+      throwSyntaxError("BigInt literal cannot have a decimal point");
+    }
+    return Token(TokenType::Number, source_.substr(start, pos_ - start), startLine, startColumn);
   }
+
+  // Non-decimal literal: 0x..., 0o..., 0b...
+  if (!isAtEnd() && current() == '0' &&
+      !isAtEnd() && (peek() == 'x' || peek() == 'X' || peek() == 'o' || peek() == 'O' || peek() == 'b' || peek() == 'B')) {
+    char prefix = peek();
+    int base = 10;
+    if (prefix == 'x' || prefix == 'X') base = 16;
+    if (prefix == 'o' || prefix == 'O') base = 8;
+    if (prefix == 'b' || prefix == 'B') base = 2;
+
+    advance();  // 0
+    advance();  // x/o/b
+
+    bool sawDigit = false;
+    bool prevSeparator = false;
+
+    while (!isAtEnd()) {
+      char c = current();
+      if (c == 'n') {
+        break;
+      }
+      if (c == '_') {
+        if (!sawDigit || prevSeparator) {
+          throwSyntaxError("Invalid numeric separator in literal");
+        }
+        prevSeparator = true;
+        advance();
+        continue;
+      }
+
+      int d = digitForBase(c);
+      if (d >= 0) {
+        if (d >= base) {
+          throwSyntaxError("Invalid digit in numeric literal");
+        }
+        sawDigit = true;
+        prevSeparator = false;
+        advance();
+        continue;
+      }
+
+      if (std::isalnum(static_cast<unsigned char>(c))) {
+        throwSyntaxError("Invalid digit in numeric literal");
+      }
+      break;
+    }
+
+    if (!sawDigit || prevSeparator) {
+      throwSyntaxError("Invalid numeric literal");
+    }
+
+    if (!isAtEnd() && current() == 'n') {
+      advance();
+      return Token(TokenType::BigInt, source_.substr(start, pos_ - start - 1), startLine, startColumn);
+    }
+
+    return Token(TokenType::Number, source_.substr(start, pos_ - start), startLine, startColumn);
+  }
+
+  // Decimal literal with optional separators.
+  bool prevSeparator = false;
+  while (!isAtEnd()) {
+    char c = current();
+    if (isDigit(c)) {
+      prevSeparator = false;
+      advance();
+      continue;
+    }
+    if (c == '_') {
+      if (pos_ == start || prevSeparator || !isDigit(peek())) {
+        throwSyntaxError("Invalid numeric separator in literal");
+      }
+      prevSeparator = true;
+      advance();
+      continue;
+    }
+    break;
+  }
+  if (prevSeparator) {
+    throwSyntaxError("Invalid numeric separator in literal");
+  }
+
+  bool hasDot = false;
+  bool hasExponent = false;
 
   if (!isAtEnd() && current() == '.' && isDigit(peek())) {
     hasDot = true;
@@ -139,18 +308,27 @@ std::optional<Token> Lexer::readNumber() {
   }
 
   if (!isAtEnd() && (current() == 'e' || current() == 'E')) {
-    advance();
-    if (!isAtEnd() && (current() == '+' || current() == '-')) {
-      advance();
-    }
-    while (!isAtEnd() && isDigit(current())) {
-      advance();
-    }
+    hasExponent = true;
+    consumeExponent();
   }
 
-  if (!isAtEnd() && current() == 'n' && !hasDot) {
+  if (!isAtEnd() && current() == 'n') {
+    if (hasDot || hasExponent) {
+      throwSyntaxError("Invalid BigInt literal");
+    }
+
+    std::string raw(source_.substr(start, pos_ - start));
+    std::string normalized;
+    normalized.reserve(raw.size());
+    for (char c : raw) {
+      if (c != '_') normalized.push_back(c);
+    }
+    if (normalized.size() > 1 && normalized[0] == '0') {
+      throwSyntaxError("Legacy octal-like BigInt literal is not allowed");
+    }
+
     advance();
-    return Token(TokenType::BigInt, source_.substr(start, pos_ - start - 1), startLine, startColumn);
+    return Token(TokenType::BigInt, raw, startLine, startColumn);
   }
 
   return Token(TokenType::Number, source_.substr(start, pos_ - start), startLine, startColumn);
@@ -174,6 +352,41 @@ std::optional<Token> Lexer::readString(char quote) {
           case '\\': str += '\\'; break;
           case '"': str += '"'; break;
           case '\'': str += '\''; break;
+          case 'u': {
+            advance();  // consume 'u'
+            uint32_t codepoint = 0;
+            if (!isAtEnd() && current() == '{') {
+              advance();  // consume '{'
+              bool sawDigit = false;
+              while (!isAtEnd() && current() != '}') {
+                int d = hexDigitValue(current());
+                if (d < 0) {
+                  throw std::runtime_error("Invalid unicode escape in string");
+                }
+                sawDigit = true;
+                codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+                advance();
+              }
+              if (!sawDigit || isAtEnd() || current() != '}') {
+                throw std::runtime_error("Invalid unicode escape in string");
+              }
+              advance();  // consume '}'
+            } else {
+              for (int i = 0; i < 4; ++i) {
+                if (isAtEnd()) {
+                  throw std::runtime_error("Invalid unicode escape in string");
+                }
+                int d = hexDigitValue(current());
+                if (d < 0) {
+                  throw std::runtime_error("Invalid unicode escape in string");
+                }
+                codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+                advance();
+              }
+            }
+            appendUtf8(str, codepoint);
+            continue;
+          }
           default: str += c; break;
         }
         advance();
@@ -238,24 +451,85 @@ std::optional<Token> Lexer::readTemplateLiteral() {
 std::optional<Token> Lexer::readIdentifier() {
   uint32_t startLine = line_;
   uint32_t startColumn = column_;
-  size_t start = pos_;
 
-  while (!isAtEnd() && isAlphaNumeric(current())) {
-    advance();
+  std::string ident;
+  bool first = true;
+  bool hadEscape = false;
+
+  while (!isAtEnd()) {
+    unsigned char c = static_cast<unsigned char>(current());
+    if (isIdentifierPart(c)) {
+      ident.push_back(current());
+      advance();
+      first = false;
+      continue;
+    }
+
+    if (current() == '\\' && peek() == 'u') {
+      hadEscape = true;
+      advance();  // '\'
+      advance();  // 'u'
+
+      uint32_t codepoint = 0;
+      if (current() == '{') {
+        advance();  // '{'
+        bool sawDigit = false;
+        while (!isAtEnd() && current() != '}') {
+          int d = hexDigitValue(current());
+          if (d < 0) {
+            throw std::runtime_error("Invalid unicode escape in identifier");
+          }
+          sawDigit = true;
+          codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+          advance();
+        }
+        if (!sawDigit || isAtEnd() || current() != '}') {
+          throw std::runtime_error("Invalid unicode escape in identifier");
+        }
+        advance();  // '}'
+      } else {
+        for (int i = 0; i < 4; i++) {
+          if (isAtEnd()) {
+            throw std::runtime_error("Invalid unicode escape in identifier");
+          }
+          int d = hexDigitValue(current());
+          if (d < 0) {
+            throw std::runtime_error("Invalid unicode escape in identifier");
+          }
+          codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+          advance();
+        }
+      }
+
+      bool validStart = codepoint > 0x7f || isAlpha(static_cast<char>(codepoint));
+      bool validPart = codepoint > 0x7f || isAlphaNumeric(static_cast<char>(codepoint));
+      if ((first && !validStart) || (!first && !validPart)) {
+        throw std::runtime_error("Invalid identifier escape");
+      }
+      appendUtf8(ident, codepoint);
+      first = false;
+      continue;
+    }
+
+    break;
   }
 
-  std::string_view ident = source_.substr(start, pos_ - start);
+  std::string_view identView(ident);
 
-  auto it = keywords.find(ident);
+  auto it = keywords.find(identView);
   if (it != keywords.end()) {
     // Keywords: intern for memory efficiency
-    auto internedKeyword = StringTable::instance().intern(ident);
-    return Token(it->second, internedKeyword, startLine, startColumn);
+    auto internedKeyword = StringTable::instance().intern(identView);
+    Token tok(it->second, internedKeyword, startLine, startColumn);
+    tok.escaped = hadEscape;
+    return tok;
   }
 
   // Regular identifiers: intern for property name deduplication
-  auto internedIdent = StringTable::instance().intern(ident);
-  return Token(TokenType::Identifier, internedIdent, startLine, startColumn);
+  auto internedIdent = StringTable::instance().intern(identView);
+  Token tok(TokenType::Identifier, internedIdent, startLine, startColumn);
+  tok.escaped = hadEscape;
+  return tok;
 }
 
 std::optional<Token> Lexer::readRegex() {
@@ -302,6 +576,8 @@ bool Lexer::expectsRegex(TokenType type) {
          type == TokenType::LeftBracket ||
          type == TokenType::Comma ||
          type == TokenType::Semicolon ||
+         type == TokenType::Await ||
+         type == TokenType::Yield ||
          type == TokenType::Return ||
          type == TokenType::Colon ||
          type == TokenType::Question ||
@@ -318,9 +594,14 @@ bool Lexer::expectsRegex(TokenType type) {
          type == TokenType::GreaterEqual ||
          type == TokenType::Plus ||
          type == TokenType::Minus ||
+         type == TokenType::Tilde ||
          type == TokenType::Star ||
          type == TokenType::Slash ||
          type == TokenType::Percent ||
+         type == TokenType::Amp ||
+         type == TokenType::Pipe ||
+         type == TokenType::Caret ||
+         type == TokenType::Void ||
          type == TokenType::LeftBrace;
 }
 
@@ -352,6 +633,13 @@ std::vector<Token> Lexer::tokenize() {
       continue;
     }
 
+    if (c == '.' && isDigit(peek())) {
+      if (auto token = readNumber()) {
+        tokens.push_back(*token);
+      }
+      continue;
+    }
+
     if (c == '"' || c == '\'') {
       if (auto token = readString(c)) {
         tokens.push_back(*token);
@@ -366,7 +654,12 @@ std::vector<Token> Lexer::tokenize() {
       continue;
     }
 
-    if (isAlpha(c)) {
+    if (isIdentifierStart(static_cast<unsigned char>(c)) || (c == '\\' && peek() == 'u')) {
+      if (!tokens.empty() &&
+          (tokens.back().type == TokenType::Number || tokens.back().type == TokenType::BigInt) &&
+          tokens.back().line == startLine) {
+        throw std::runtime_error("Invalid numeric literal");
+      }
       if (auto token = readIdentifier()) {
         tokens.push_back(*token);
       }
@@ -430,7 +723,7 @@ std::vector<Token> Lexer::tokenize() {
             advance();
             advance();
           }
-        } else if (peek() == '.') {
+        } else if (peek() == '.' && !isDigit(peek(2))) {
           tokens.emplace_back(TokenType::QuestionDot, startLine, startColumn);
           advance();
           advance();
@@ -577,6 +870,7 @@ std::vector<Token> Lexer::tokenize() {
             advance();
           }
         } else {
+          tokens.emplace_back(TokenType::Amp, startLine, startColumn);
           advance();
         }
         break;
@@ -593,11 +887,21 @@ std::vector<Token> Lexer::tokenize() {
             advance();
           }
         } else {
+          tokens.emplace_back(TokenType::Pipe, startLine, startColumn);
           advance();
         }
         break;
-      default:
+      case '^':
+        tokens.emplace_back(TokenType::Caret, startLine, startColumn);
         advance();
+        break;
+      case '~':
+        tokens.emplace_back(TokenType::Tilde, startLine, startColumn);
+        advance();
+        break;
+      default:
+        throw std::runtime_error("Unexpected character '" + std::string(1, c) + "' at line " +
+                                 std::to_string(startLine) + ", column " + std::to_string(startColumn));
         break;
     }
   }

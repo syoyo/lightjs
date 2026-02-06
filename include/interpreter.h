@@ -8,6 +8,8 @@
 #include <optional>
 #include <memory>
 #include <iostream>
+#include <exception>
+#include <utility>
 
 #if LIGHTJS_HAS_COROUTINES
 #include <coroutine>
@@ -24,6 +26,7 @@ namespace lightjs {
 struct Task {
   struct promise_type {
     Value result = Value(Undefined{});
+    std::exception_ptr exception;
 
     Task get_return_object() {
       return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -37,7 +40,7 @@ struct Task {
     }
 
     void unhandled_exception() {
-      std::terminate();
+      exception = std::current_exception();
     }
   };
 
@@ -67,6 +70,9 @@ struct Task {
 
   Value result() {
     if (handle && handle.done()) {
+      if (handle.promise().exception) {
+        std::rethrow_exception(handle.promise().exception);
+      }
       return handle.promise().result;
     }
     return Value(Undefined{});
@@ -188,6 +194,8 @@ public:
   // Environment management for modules
   std::shared_ptr<Environment> getEnvironment() const { return env_; }
   void setEnvironment(std::shared_ptr<Environment> env) { env_ = env; }
+  void setSuppressMicrotasks(bool value) { suppressMicrotasks_ = value; }
+  bool suppressMicrotasks() const { return suppressMicrotasks_; }
 
   // Stack depth limit for recursion protection
   // Keep this well below what would cause a C stack overflow (~3000-4000 on typical systems)
@@ -197,11 +205,15 @@ public:
   bool hasError() const;
   Value getError() const;
   void clearError();
+  Value callForHarness(const Value& callee,
+                       const std::vector<Value>& args,
+                       const Value& thisValue = Value(Undefined{}));
 
 private:
   std::shared_ptr<Environment> env_;
   size_t stackDepth_ = 0;
   StackTraceManager stackTrace_;
+  bool suppressMicrotasks_ = false;
 
   // RAII helper for stack depth tracking
   struct StackGuard {
@@ -257,6 +269,9 @@ private:
   };
 
   ControlFlow flow_;
+  Value lastMemberBase_ = Value(Undefined{});
+  bool hasLastMemberBase_ = false;
+  bool strictMode_ = false;
 
   struct IteratorRecord {
     enum class Kind { Generator, Array, String, IteratorObject };
@@ -276,6 +291,9 @@ private:
   std::optional<IteratorRecord> getIterator(const Value& iterable);
   Value iteratorNext(IteratorRecord& record);
   Value callFunction(const Value& callee, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
+  bool isObjectLike(const Value& value) const;
+  std::pair<bool, Value> getPropertyForPrimitive(const Value& receiver, const std::string& key);
+  Value toPrimitiveValue(const Value& input, bool preferString);
 
   Task evaluateBinary(const BinaryExpr& expr);
   Task evaluateUnary(const UnaryExpr& expr);

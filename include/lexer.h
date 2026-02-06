@@ -38,6 +38,8 @@ private:
   static bool isDigit(char c);
   static bool isAlpha(char c);
   static bool isAlphaNumeric(char c);
+  static bool isIdentifierStart(unsigned char c);
+  static bool isIdentifierPart(unsigned char c);
   static bool expectsRegex(TokenType type);
 };
 
