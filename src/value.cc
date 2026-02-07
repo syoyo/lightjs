@@ -846,6 +846,8 @@ std::shared_ptr<Promise> Promise::rejected(const Value& reason) {
   return promise;
 }
 
+static bool isInternalProperty(const std::string& key);
+
 // Object static methods implementation
 Value Object_keys(const std::vector<Value>& args) {
   if (args.empty() || !args[0].isObject()) {
@@ -857,6 +859,9 @@ Value Object_keys(const std::vector<Value>& args) {
   auto result = std::make_shared<Array>();
 
   for (const auto& [key, value] : obj->properties) {
+    // Skip internal and non-enumerable properties
+    if (isInternalProperty(key)) continue;
+    if (obj->properties.count("__non_enum_" + key)) continue;
     result->elements.push_back(Value(key));
   }
 
@@ -938,12 +943,21 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     return Value(false);
   }
 
+  std::string key = args[1].toString();
+
+  // Handle Function objects
+  if (args[0].isFunction()) {
+    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    // Internal properties are not own properties
+    if (isInternalProperty(key)) return Value(false);
+    return Value(fn->properties.find(key) != fn->properties.end());
+  }
+
   if (!args[0].isObject()) {
     return Value(false);
   }
 
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  std::string key = args[1].toString();
 
   if (obj->isModuleNamespace) {
     if (key == WellKnownSymbols::toStringTagKey()) {
@@ -953,17 +967,41 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
                  obj->moduleExportNames.end());
   }
 
+  // Internal properties are not own properties
+  if (isInternalProperty(key)) return Value(false);
   return Value(obj->properties.find(key) != obj->properties.end());
 }
 
+static bool isInternalProperty(const std::string& key) {
+  if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+      key.substr(key.size() - 2) == "__") return true;
+  if (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_" ||
+      key.substr(0, 11) == "__non_enum_" || key.substr(0, 15) == "__non_writable_" ||
+      key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_") return true;
+  return false;
+}
+
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
-  if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = std::make_shared<Array>();
-    return Value(emptyArray);
+  auto result = std::make_shared<Array>();
+
+  if (args.empty()) {
+    return Value(result);
+  }
+
+  if (args[0].isFunction()) {
+    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    for (const auto& [key, value] : fn->properties) {
+      if (isInternalProperty(key)) continue;
+      result->elements.push_back(Value(key));
+    }
+    return Value(result);
+  }
+
+  if (!args[0].isObject()) {
+    return Value(result);
   }
 
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  auto result = std::make_shared<Array>();
 
   if (obj->isModuleNamespace) {
     for (const auto& key : obj->moduleExportNames) {
@@ -973,6 +1011,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
   }
 
   for (const auto& [key, value] : obj->properties) {
+    if (isInternalProperty(key)) continue;
     result->elements.push_back(Value(key));
   }
 

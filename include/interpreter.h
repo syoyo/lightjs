@@ -274,11 +274,12 @@ private:
   bool strictMode_ = false;
 
   struct IteratorRecord {
-    enum class Kind { Generator, Array, String, IteratorObject };
+    enum class Kind { Generator, Array, String, IteratorObject, TypedArray };
     Kind kind = Kind::Array;
     std::shared_ptr<Generator> generator;
     std::shared_ptr<Array> array;
     std::shared_ptr<Object> iteratorObject;
+    std::shared_ptr<TypedArray> typedArray;
     std::string stringValue;
     size_t index = 0;
   };
@@ -329,7 +330,7 @@ private:
   Task evaluateExportAll(const ExportAllDeclaration& stmt);
 
   // Helper for destructuring bindings
-  void bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst);
+  void bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet = false);
 
   // Helper to invoke a JavaScript function (used by native functions to call JS callbacks)
   Value invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));

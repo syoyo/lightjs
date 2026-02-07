@@ -119,6 +119,16 @@ void Lexer::skipWhitespace() {
       // U+00A0 NO-BREAK SPACE
       advance();
       advance();
+    } else if (c == 0xE2 && static_cast<unsigned char>(peek()) == 0x80) {
+      unsigned char third = static_cast<unsigned char>(peek(2));
+      if (third == 0xA8 || third == 0xA9) {
+        // U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR
+        advance();
+        advance();
+        advance();
+      } else {
+        break;
+      }
     } else if (c == 0xEF && static_cast<unsigned char>(peek()) == 0xBB &&
                static_cast<unsigned char>(peek(2)) == 0xBF) {
       // U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)
@@ -459,6 +469,20 @@ std::optional<Token> Lexer::readIdentifier() {
   while (!isAtEnd()) {
     unsigned char c = static_cast<unsigned char>(current());
     if (isIdentifierPart(c)) {
+      // Check for Unicode whitespace sequences that should NOT be identifier parts
+      if (c == 0xC2 && static_cast<unsigned char>(peek()) == 0xA0) {
+        break;  // U+00A0 NO-BREAK SPACE
+      }
+      if (c == 0xE2 && static_cast<unsigned char>(peek()) == 0x80) {
+        unsigned char third = static_cast<unsigned char>(peek(2));
+        if (third == 0xA8 || third == 0xA9) {
+          break;  // U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR
+        }
+      }
+      if (c == 0xEF && static_cast<unsigned char>(peek()) == 0xBB &&
+          static_cast<unsigned char>(peek(2)) == 0xBF) {
+        break;  // U+FEFF BOM
+      }
       ident.push_back(current());
       advance();
       first = false;

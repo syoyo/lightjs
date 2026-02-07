@@ -405,21 +405,8 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   };
   env->define("fnGlobalObject", Value(fnGlobalObject));
 
-  // verifyProperty helper
-  auto verifyProperty = std::make_shared<Function>();
-  verifyProperty->isNative = true;
-  verifyProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 3) return Value(false);
-
-    auto* obj = std::get_if<std::shared_ptr<Object>>(&args[0].data);
-    if (!obj) return Value(false);
-
-    std::string propName = args[1].toString();
-
-    // Check if property exists
-    return Value((*obj)->properties.find(propName) != (*obj)->properties.end());
-  };
-  env->define("verifyProperty", Value(verifyProperty));
+  // verifyProperty is provided by the JS harness (propertyHelper.js) when needed.
+  // We don't define a native version to avoid conflicts with the more complete JS implementation.
 
   // buildString helper
   auto buildString = std::make_shared<Function>();

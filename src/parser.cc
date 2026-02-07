@@ -763,6 +763,25 @@ StmtPtr Parser::parseForStatement() {
         isForInOrOf = true;
         isForOf = true;
       }
+    } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+      // Destructuring pattern: scan ahead past balanced brackets to find 'of' or 'in'
+      int depth = 1;
+      advance();
+      while (depth > 0 && !match(TokenType::EndOfFile)) {
+        if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace) || match(TokenType::LeftParen)) {
+          depth++;
+        } else if (match(TokenType::RightBracket) || match(TokenType::RightBrace) || match(TokenType::RightParen)) {
+          depth--;
+        }
+        advance();
+      }
+      if (match(TokenType::In)) {
+        isForInOrOf = true;
+        isForOf = false;
+      } else if (match(TokenType::Of)) {
+        isForInOrOf = true;
+        isForOf = true;
+      }
     }
   } else if (match(TokenType::Import) &&
              peek().type == TokenType::Dot &&
@@ -778,8 +797,45 @@ StmtPtr Parser::parseForStatement() {
              peek(3).type == TokenType::Of) {
     isForInOrOf = true;
     isForOf = true;
+  } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+    // Bare destructuring assignment: for ([a, b] of ...) or for ({a, b} of ...)
+    int depth = 1;
+    advance();
+    while (depth > 0 && !match(TokenType::EndOfFile)) {
+      if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace) || match(TokenType::LeftParen)) {
+        depth++;
+      } else if (match(TokenType::RightBracket) || match(TokenType::RightBrace) || match(TokenType::RightParen)) {
+        depth--;
+      }
+      advance();
+    }
+    if (match(TokenType::In)) {
+      isForInOrOf = true;
+      isForOf = false;
+    } else if (match(TokenType::Of)) {
+      isForInOrOf = true;
+      isForOf = true;
+    }
   } else if (match(TokenType::Identifier)) {
     advance();
+    // Skip member expressions (x.y, x[y], etc.)
+    while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
+      if (match(TokenType::Dot)) {
+        advance();
+        if (match(TokenType::Identifier) || isIdentifierLikeToken(current().type)) {
+          advance();
+        }
+      } else {
+        // Skip bracket content
+        advance();
+        int bracketDepth = 1;
+        while (bracketDepth > 0 && !match(TokenType::EndOfFile)) {
+          if (match(TokenType::LeftBracket)) bracketDepth++;
+          else if (match(TokenType::RightBracket)) bracketDepth--;
+          advance();
+        }
+      }
+    }
     if (match(TokenType::In)) {
       isForInOrOf = true;
       isForOf = false;
@@ -810,16 +866,23 @@ StmtPtr Parser::parseForStatement() {
       }
       advance();
 
-      if (!match(TokenType::Identifier)) {
+      // Parse pattern (identifier, array pattern, or object pattern)
+      ExprPtr pattern = parsePattern();
+      if (!pattern) {
         return nullptr;
       }
-      std::string name = current().value;
-      advance();
 
       VarDeclaration decl;
       decl.kind = kind;
-      decl.declarations.push_back({std::make_unique<Expression>(Identifier{name}), nullptr});
+      decl.declarations.push_back({std::move(pattern), nullptr});
       left = std::make_unique<Statement>(std::move(decl));
+    } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+      // Bare destructuring assignment pattern
+      auto pattern = parsePattern();
+      if (!pattern) {
+        return nullptr;
+      }
+      left = std::make_unique<Statement>(ExpressionStmt{std::move(pattern)});
     } else {
       auto expr = parseMember();
       if (!expr) {
@@ -1638,6 +1701,15 @@ normal_parse:
       match(TokenType::PipePipeEqual) || match(TokenType::QuestionQuestionEqual)) {
     if (!left || !isAssignmentTarget(*left)) {
       return nullptr;
+    }
+
+    // In strict mode, 'arguments' and 'eval' cannot be assignment targets
+    if (strictMode_) {
+      if (auto* ident = std::get_if<Identifier>(&left->node)) {
+        if (ident->name == "arguments" || ident->name == "eval") {
+          return nullptr;  // SyntaxError
+        }
+      }
     }
 
     AssignmentExpr::Op op;

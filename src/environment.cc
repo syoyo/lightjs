@@ -749,6 +749,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto asUintN = std::make_shared<Function>();
   asUintN->isNative = true;
   asUintN->properties["__throw_on_new__"] = Value(true);
+  asUintN->properties["name"] = Value(std::string("asUintN"));
+  asUintN->properties["length"] = Value(2.0);
   asUintN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
     uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
     int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
@@ -769,6 +771,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto asIntN = std::make_shared<Function>();
   asIntN->isNative = true;
   asIntN->properties["__throw_on_new__"] = Value(true);
+  asIntN->properties["name"] = Value(std::string("asIntN"));
+  asIntN->properties["length"] = Value(2.0);
   asIntN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
     uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
     int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
@@ -791,10 +795,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   bigIntFn->properties["asIntN"] = Value(asIntN);
 
   auto bigIntProto = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
   auto bigIntProtoToString = std::make_shared<Function>();
   bigIntProtoToString->isNative = true;
   bigIntProtoToString->properties["__throw_on_new__"] = Value(true);
   bigIntProtoToString->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoToString->properties["name"] = Value(std::string("toString"));
+  bigIntProtoToString->properties["length"] = Value(0.0);
   bigIntProtoToString->nativeFunc = [thisBigIntValue, formatBigInt](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       throw std::runtime_error("TypeError: BigInt.prototype.toString requires BigInt");
@@ -816,6 +823,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   bigIntProtoValueOf->isNative = true;
   bigIntProtoValueOf->properties["__throw_on_new__"] = Value(true);
   bigIntProtoValueOf->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoValueOf->properties["name"] = Value(std::string("valueOf"));
+  bigIntProtoValueOf->properties["length"] = Value(0.0);
   bigIntProtoValueOf->nativeFunc = [thisBigIntValue](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       throw std::runtime_error("TypeError: BigInt.prototype.valueOf requires BigInt");
@@ -828,6 +837,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   bigIntProtoToLocaleString->isNative = true;
   bigIntProtoToLocaleString->properties["__throw_on_new__"] = Value(true);
   bigIntProtoToLocaleString->properties["__uses_this_arg__"] = Value(true);
+  bigIntProtoToLocaleString->properties["name"] = Value(std::string("toLocaleString"));
+  bigIntProtoToLocaleString->properties["length"] = Value(0.0);
   bigIntProtoToLocaleString->nativeFunc = [thisBigIntValue](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       throw std::runtime_error("TypeError: BigInt.prototype.toLocaleString requires BigInt");
@@ -835,13 +846,31 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(std::to_string(thisBigIntValue(args[0])));
   };
   bigIntProto->properties["toLocaleString"] = Value(bigIntProtoToLocaleString);
+
+  // BigInt.prototype.constructor = BigInt
+  bigIntProto->properties["constructor"] = Value(bigIntFn);
+
+  // BigInt.prototype[Symbol.toStringTag] = "BigInt" (non-writable)
+  bigIntProto->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("BigInt"));
+  bigIntProto->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  bigIntProto->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+
+  // Mark all BigInt.prototype properties as non-enumerable
+  bigIntProto->properties["__non_enum_toString"] = Value(true);
+  bigIntProto->properties["__non_enum_valueOf"] = Value(true);
+  bigIntProto->properties["__non_enum_toLocaleString"] = Value(true);
+  bigIntProto->properties["__non_enum_constructor"] = Value(true);
+
   bigIntFn->properties["prototype"] = Value(bigIntProto);
+  bigIntFn->properties["__non_writable_prototype"] = Value(true);
+  bigIntFn->properties["__non_configurable_prototype"] = Value(true);
 
   env->define("BigInt", Value(bigIntFn));
 
   auto createTypedArrayConstructor = [](TypedArrayType type) {
     auto func = std::make_shared<Function>();
     func->isNative = true;
+    func->isConstructor = true;
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
         return Value(std::make_shared<TypedArray>(type, 0));
@@ -1395,13 +1424,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
       if (!global) break;
       searchStart = match.suffix().first;
-      if (match[0].length() == 0 && searchStart != input.cend()) {
-        if (unicodeMode) {
-          size_t byteOffset = static_cast<size_t>(searchStart - input.cbegin());
-          size_t advance = unicode::utf8SequenceLength(static_cast<uint8_t>(input[byteOffset]));
-          std::advance(searchStart, static_cast<std::ptrdiff_t>(advance));
+      if (match[0].length() == 0) {
+        if (searchStart != input.cend()) {
+          if (unicodeMode) {
+            size_t byteOffset = static_cast<size_t>(searchStart - input.cbegin());
+            size_t advance = unicode::utf8SequenceLength(static_cast<uint8_t>(input[byteOffset]));
+            std::advance(searchStart, static_cast<std::ptrdiff_t>(advance));
+          } else {
+            ++searchStart;
+          }
         } else {
-          ++searchStart;
+          break;  // empty match at end of string, stop
         }
       }
     }
@@ -2138,6 +2171,47 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   arrayPrototype->properties["constructor"] = Value(arrayConstructorObj);
   env->define("__array_prototype__", Value(arrayPrototype));
 
+  // Array.prototype.push - receives this (array) via __uses_this_arg__
+  auto arrayProtoPush = std::make_shared<Function>();
+  arrayProtoPush->isNative = true;
+  arrayProtoPush->properties["__uses_this_arg__"] = Value(true);
+  arrayProtoPush->properties["name"] = Value(std::string("push"));
+  arrayProtoPush->properties["length"] = Value(1.0);
+  arrayProtoPush->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      throw std::runtime_error("TypeError: Array.prototype.push called on non-array");
+    }
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    for (size_t i = 1; i < args.size(); ++i) {
+      arr->elements.push_back(args[i]);
+    }
+    return Value(static_cast<double>(arr->elements.size()));
+  };
+  arrayPrototype->properties["push"] = Value(arrayProtoPush);
+
+  // Array.prototype.join
+  auto arrayProtoJoin = std::make_shared<Function>();
+  arrayProtoJoin->isNative = true;
+  arrayProtoJoin->properties["__uses_this_arg__"] = Value(true);
+  arrayProtoJoin->properties["name"] = Value(std::string("join"));
+  arrayProtoJoin->properties["length"] = Value(1.0);
+  arrayProtoJoin->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      throw std::runtime_error("TypeError: Array.prototype.join called on non-array");
+    }
+    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    std::string separator = args.size() > 1 && !args[1].isUndefined() ? args[1].toString() : ",";
+    std::string result;
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+      if (i > 0) result += separator;
+      if (!arr->elements[i].isUndefined() && !arr->elements[i].isNull()) {
+        result += arr->elements[i].toString();
+      }
+    }
+    return Value(result);
+  };
+  arrayPrototype->properties["join"] = Value(arrayProtoJoin);
+
   // Array.isArray
   auto isArrayFn = std::make_shared<Function>();
   isArrayFn->isNative = true;
@@ -2316,6 +2390,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto promiseResolve = std::make_shared<Function>();
   promiseResolve->isNative = true;
   promiseResolve->properties["__uses_this_arg__"] = Value(true);
+  promiseResolve->properties["name"] = Value(std::string("resolve"));
+  promiseResolve->properties["length"] = Value(1.0);
   promiseResolve->nativeFunc = [callChecked, getProperty, env, promiseFunc](const std::vector<Value>& args) -> Value {
     Value resolution = args.size() > 1 ? args[1] : Value(Undefined{});
     if (resolution.isPromise()) {
@@ -2445,6 +2521,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.reject
   auto promiseReject = std::make_shared<Function>();
   promiseReject->isNative = true;
+  promiseReject->properties["name"] = Value(std::string("reject"));
+  promiseReject->properties["length"] = Value(1.0);
   promiseReject->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     auto promise = std::make_shared<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
@@ -2501,6 +2579,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.all
   auto promiseAll = std::make_shared<Function>();
   promiseAll->isNative = true;
+  promiseAll->properties["name"] = Value(std::string("all"));
+  promiseAll->properties["length"] = Value(1.0);
   promiseAll->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
@@ -2544,6 +2624,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto promiseAllSettled = std::make_shared<Function>();
   promiseAllSettled->isNative = true;
   promiseAllSettled->properties["__uses_this_arg__"] = Value(true);
+  promiseAllSettled->properties["name"] = Value(std::string("allSettled"));
+  promiseAllSettled->properties["length"] = Value(1.0);
   promiseAllSettled->nativeFunc = [callChecked, getProperty, env, promiseFunc](const std::vector<Value>& args) -> Value {
     Value constructor = args.empty() ? Value(Undefined{}) : args[0];
     Value iterable = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -2825,6 +2907,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       auto alreadyCalled = std::make_shared<bool>(false);
       auto resolveElement = std::make_shared<Function>();
       resolveElement->isNative = true;
+      resolveElement->properties["length"] = Value(1.0);
+      resolveElement->properties["name"] = Value(std::string(""));
       resolveElement->nativeFunc = [results, remaining, index, alreadyCalled, finalizeIfDone](const std::vector<Value>& innerArgs) -> Value {
         if (*alreadyCalled) {
           return Value(Undefined{});
@@ -2842,6 +2926,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
       auto rejectElement = std::make_shared<Function>();
       rejectElement->isNative = true;
+      rejectElement->properties["length"] = Value(1.0);
+      rejectElement->properties["name"] = Value(std::string(""));
       rejectElement->nativeFunc = [results, remaining, index, alreadyCalled, finalizeIfDone](const std::vector<Value>& innerArgs) -> Value {
         if (*alreadyCalled) {
           return Value(Undefined{});
@@ -3050,6 +3136,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.any - resolves when any promise fulfills, rejects if all reject
   auto promiseAny = std::make_shared<Function>();
   promiseAny->isNative = true;
+  promiseAny->properties["name"] = Value(std::string("any"));
+  promiseAny->properties["length"] = Value(1.0);
   promiseAny->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
@@ -3107,6 +3195,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.race - resolves or rejects with the first settled promise
   auto promiseRace = std::make_shared<Function>();
   promiseRace->isNative = true;
+  promiseRace->properties["name"] = Value(std::string("race"));
+  promiseRace->properties["length"] = Value(1.0);
   promiseRace->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
       auto promise = std::make_shared<Promise>();
@@ -3331,6 +3421,54 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectPrototype->properties["toString"] = Value(objectProtoToString);
 
+  // Object.prototype.propertyIsEnumerable
+  auto objectProtoPropertyIsEnumerable = std::make_shared<Function>();
+  objectProtoPropertyIsEnumerable->isNative = true;
+  objectProtoPropertyIsEnumerable->properties["__uses_this_arg__"] = Value(true);
+  objectProtoPropertyIsEnumerable->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+    Value thisVal = args[0];
+    std::string key = args[1].toString();
+
+    if (thisVal.isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(thisVal.data);
+      // name, length, prototype are non-enumerable on functions
+      if (key == "name" || key == "length" || key == "prototype") return Value(false);
+      // Internal properties
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") return Value(false);
+      auto it = fn->properties.find(key);
+      if (it == fn->properties.end()) return Value(false);
+      // Check enum marker: built-in function props default non-enumerable
+      auto enumIt = fn->properties.find("__enum_" + key);
+      return Value(enumIt != fn->properties.end());
+    }
+    if (thisVal.isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(thisVal.data);
+      // Internal properties
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") return Value(false);
+      auto it = obj->properties.find(key);
+      if (it == obj->properties.end()) return Value(false);
+      auto neIt = obj->properties.find("__non_enum_" + key);
+      return Value(neIt == obj->properties.end());
+    }
+    if (thisVal.isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(thisVal.data);
+      // Check if it's a valid index
+      try {
+        size_t idx = std::stoull(key);
+        if (idx < arr->elements.size()) return Value(true);
+      } catch (...) {}
+      auto it = arr->properties.find(key);
+      if (it == arr->properties.end()) return Value(false);
+      auto neIt = arr->properties.find("__non_enum_" + key);
+      return Value(neIt == arr->properties.end());
+    }
+    return Value(false);
+  };
+  objectPrototype->properties["propertyIsEnumerable"] = Value(objectProtoPropertyIsEnumerable);
+
   // Object.keys
   auto objectKeys = std::make_shared<Function>();
   objectKeys->isNative = true;
@@ -3460,6 +3598,26 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
       if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
         auto fn = std::get<std::shared_ptr<Function>>(ctor->data);
+        auto protoIt = fn->properties.find("prototype");
+        if (protoIt != fn->properties.end()) {
+          return protoIt->second;
+        }
+      }
+      return Value(Null{});
+    }
+    if (args[0].isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto protoIt = fn->properties.find("__proto__");
+      if (protoIt != fn->properties.end()) {
+        return protoIt->second;
+      }
+      // Default: Function.prototype (we don't have a formal one, return null)
+      return Value(Null{});
+    }
+    if (args[0].isBigInt()) {
+      // Return BigInt.prototype
+      if (auto bigIntCtor = env->get("BigInt"); bigIntCtor && bigIntCtor->isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
         auto protoIt = fn->properties.find("prototype");
         if (protoIt != fn->properties.end()) {
           return protoIt->second;
@@ -3645,6 +3803,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (args[0].isFunction()) {
       auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+
+      // Internal properties are not visible
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") {
+        return Value(Undefined{});
+      }
+
       auto getterIt = fn->properties.find("__get_" + key);
       if (getterIt != fn->properties.end() && getterIt->second.isFunction()) {
         descriptor->properties["get"] = getterIt->second;
@@ -3657,9 +3822,33 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (it != fn->properties.end()) {
         descriptor->properties["value"] = it->second;
       }
-      descriptor->properties["writable"] = Value(true);
-      descriptor->properties["enumerable"] = Value(true);
-      descriptor->properties["configurable"] = Value(true);
+
+      // name and length: non-writable, non-enumerable, configurable
+      if (key == "name" || key == "length") {
+        descriptor->properties["writable"] = Value(false);
+        descriptor->properties["enumerable"] = Value(false);
+        descriptor->properties["configurable"] = Value(true);
+      } else if (key == "prototype") {
+        bool protoWritable = fn->properties.find("__non_writable_prototype") == fn->properties.end();
+        bool protoConfigurable = fn->properties.find("__non_configurable_prototype") == fn->properties.end();
+        descriptor->properties["writable"] = Value(protoWritable);
+        descriptor->properties["enumerable"] = Value(false);
+        descriptor->properties["configurable"] = Value(protoConfigurable);
+      } else {
+        // Check for per-property attribute markers
+        bool writable = true;
+        bool enumerable = false; // Built-in function properties default to non-enumerable
+        bool configurable = true;
+        auto nwIt = fn->properties.find("__non_writable_" + key);
+        if (nwIt != fn->properties.end()) writable = false;
+        auto neIt = fn->properties.find("__enum_" + key);
+        if (neIt != fn->properties.end()) enumerable = true;
+        auto ncIt = fn->properties.find("__non_configurable_" + key);
+        if (ncIt != fn->properties.end()) configurable = false;
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(enumerable);
+        descriptor->properties["configurable"] = Value(configurable);
+      }
       return Value(descriptor);
     }
 
@@ -3720,14 +3909,37 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         descriptor->properties["configurable"] = Value(false);
         return Value(descriptor);
       }
-      auto it = obj->properties.find(key);
-      if (it == obj->properties.end()) {
+      // Internal properties are not visible
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") {
         return Value(Undefined{});
       }
-      descriptor->properties["value"] = it->second;
-      descriptor->properties["writable"] = Value(!obj->frozen);
-      descriptor->properties["enumerable"] = Value(true);
-      descriptor->properties["configurable"] = Value(!obj->sealed);
+
+      auto getterIt2 = obj->properties.find("__get_" + key);
+      auto it = obj->properties.find(key);
+      if (it == obj->properties.end() && getterIt2 == obj->properties.end()) {
+        return Value(Undefined{});
+      }
+      if (getterIt2 != obj->properties.end() && getterIt2->second.isFunction()) {
+        descriptor->properties["get"] = getterIt2->second;
+      }
+      if (it != obj->properties.end()) {
+        descriptor->properties["value"] = it->second;
+      }
+
+      // Check for per-property attribute markers
+      bool writable = !obj->frozen;
+      bool enumerable = true;
+      bool configurable = !obj->sealed;
+      auto nwIt = obj->properties.find("__non_writable_" + key);
+      if (nwIt != obj->properties.end()) writable = false;
+      auto neIt = obj->properties.find("__non_enum_" + key);
+      if (neIt != obj->properties.end()) enumerable = false;
+      auto ncIt = obj->properties.find("__non_configurable_" + key);
+      if (ncIt != obj->properties.end()) configurable = false;
+      descriptor->properties["writable"] = Value(writable);
+      descriptor->properties["enumerable"] = Value(enumerable);
+      descriptor->properties["configurable"] = Value(configurable);
       return Value(descriptor);
     }
 
@@ -3811,6 +4023,33 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         if (auto setField = readDescriptorField("set");
             setField.has_value() && setField->isFunction()) {
           obj->properties["__set_" + key] = *setField;
+        }
+
+        // Handle writable descriptor
+        if (auto writableField = readDescriptorField("writable"); writableField.has_value()) {
+          if (!writableField->toBool()) {
+            obj->properties["__non_writable_" + key] = Value(true);
+          } else {
+            obj->properties.erase("__non_writable_" + key);
+          }
+        }
+
+        // Handle enumerable descriptor
+        if (auto enumField = readDescriptorField("enumerable"); enumField.has_value()) {
+          if (!enumField->toBool()) {
+            obj->properties["__non_enum_" + key] = Value(true);
+          } else {
+            obj->properties.erase("__non_enum_" + key);
+          }
+        }
+
+        // Handle configurable descriptor
+        if (auto configField = readDescriptorField("configurable"); configField.has_value()) {
+          if (!configField->toBool()) {
+            obj->properties["__non_configurable_" + key] = Value(true);
+          } else {
+            obj->properties.erase("__non_configurable_" + key);
+          }
         }
       } else if (args[0].isFunction()) {
         auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
@@ -4110,6 +4349,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto stringMatchAll = std::make_shared<Function>();
   stringMatchAll->isNative = true;
   stringMatchAll->isConstructor = false;
+  stringMatchAll->properties["name"] = Value(std::string("matchAll"));
+  stringMatchAll->properties["length"] = Value(1.0);
   stringMatchAll->properties["__uses_this_arg__"] = Value(true);
   stringMatchAll->properties["__throw_on_new__"] = Value(true);
   stringMatchAll->nativeFunc = [regExpPrototype](const std::vector<Value>& args) -> Value {
@@ -4267,6 +4508,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string pattern;
     if (regexp.isRegex()) {
       pattern = std::get<std::shared_ptr<Regex>>(regexp.data)->pattern;
+    } else if (regexp.isUndefined()) {
+      pattern = "";  // RegExp(undefined) uses empty pattern
     } else {
       pattern = regexp.toString();
     }
@@ -4280,6 +4523,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return callChecked(matcher, {Value(input)}, rxValue);
   };
   stringPrototype->properties["matchAll"] = Value(stringMatchAll);
+  stringPrototype->properties["__non_enum_matchAll"] = Value(true);
   stringConstructorObj->properties["prototype"] = Value(stringPrototype);
 
   // For simplicity, we can make the Object callable by storing the function
@@ -4300,6 +4544,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Define globalThis pointing to the global object
   env->define("globalThis", Value(globalThisObj));
+  // 'this' at global scope should be globalThis
+  env->define("this", Value(globalThisObj));
 
   // Also add globalThis to itself
   globalThisObj->properties["globalThis"] = Value(globalThisObj);
@@ -4876,6 +5122,195 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("decodeURI", Value(decodeURIFn));
   globalThisObj->properties["decodeURI"] = Value(decodeURIFn);
+
+  // ===== Function constructor =====
+  auto functionConstructor = std::make_shared<Function>();
+  functionConstructor->isNative = true;
+  functionConstructor->isConstructor = true;
+  functionConstructor->properties["name"] = Value(std::string("Function"));
+  functionConstructor->properties["length"] = Value(1.0);
+  functionConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Minimal Function constructor - just returns an empty function
+    auto fn = std::make_shared<Function>();
+    fn->isNative = true;
+    fn->nativeFunc = [](const std::vector<Value>&) -> Value {
+      return Value(Undefined{});
+    };
+    return Value(fn);
+  };
+
+  // Function.prototype - a minimal prototype with call/apply/bind
+  // (actual call/apply/bind are handled dynamically in the interpreter)
+  auto functionPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  functionPrototype->properties["__proto__"] = Value(objectPrototype);
+
+  // Function.prototype.call - uses __uses_this_arg__ so args[0] = this (the function to call)
+  auto fpCall = std::make_shared<Function>();
+  fpCall->isNative = true;
+  fpCall->properties["name"] = Value(std::string("call"));
+  fpCall->properties["length"] = Value(1.0);
+  fpCall->properties["__uses_this_arg__"] = Value(true);
+  fpCall->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // args[0] = this (the function to invoke), args[1] = thisArg, args[2+] = call args
+    if (args.empty() || !args[0].isFunction()) {
+      throw std::runtime_error("TypeError: Function.prototype.call called on non-function");
+    }
+    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+    std::vector<Value> callArgs;
+    if (args.size() > 2) {
+      callArgs.insert(callArgs.end(), args.begin() + 2, args.end());
+    }
+    if (fn->isNative) {
+      // For native functions that use this_arg, prepend thisArg
+      auto itUsesThis = fn->properties.find("__uses_this_arg__");
+      if (itUsesThis != fn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+        std::vector<Value> nativeArgs;
+        nativeArgs.push_back(thisArg);
+        nativeArgs.insert(nativeArgs.end(), callArgs.begin(), callArgs.end());
+        return fn->nativeFunc(nativeArgs);
+      }
+      return fn->nativeFunc(callArgs);
+    }
+    Interpreter* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: Interpreter unavailable");
+    }
+    return interpreter->callForHarness(Value(fn), callArgs, thisArg);
+  };
+  functionPrototype->properties["call"] = Value(fpCall);
+  functionPrototype->properties["__non_enum_call"] = Value(true);
+
+  // Function.prototype.apply
+  auto fpApply = std::make_shared<Function>();
+  fpApply->isNative = true;
+  fpApply->properties["name"] = Value(std::string("apply"));
+  fpApply->properties["length"] = Value(2.0);
+  fpApply->properties["__uses_this_arg__"] = Value(true);
+  fpApply->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isFunction()) {
+      throw std::runtime_error("TypeError: Function.prototype.apply called on non-function");
+    }
+    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+    std::vector<Value> callArgs;
+    if (args.size() > 2 && args[2].isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(args[2].data);
+      callArgs = arr->elements;
+    }
+    if (fn->isNative) {
+      auto itUsesThis = fn->properties.find("__uses_this_arg__");
+      if (itUsesThis != fn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+        std::vector<Value> nativeArgs;
+        nativeArgs.push_back(thisArg);
+        nativeArgs.insert(nativeArgs.end(), callArgs.begin(), callArgs.end());
+        return fn->nativeFunc(nativeArgs);
+      }
+      return fn->nativeFunc(callArgs);
+    }
+    Interpreter* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: Interpreter unavailable");
+    }
+    return interpreter->callForHarness(Value(fn), callArgs, thisArg);
+  };
+  functionPrototype->properties["apply"] = Value(fpApply);
+  functionPrototype->properties["__non_enum_apply"] = Value(true);
+
+  // Function.prototype.bind
+  auto fpBind = std::make_shared<Function>();
+  fpBind->isNative = true;
+  fpBind->properties["name"] = Value(std::string("bind"));
+  fpBind->properties["length"] = Value(1.0);
+  fpBind->properties["__uses_this_arg__"] = Value(true);
+  fpBind->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // args[0] = this (the function to bind), args[1] = boundThis, args[2+] = bound args
+    if (args.empty() || !args[0].isFunction()) {
+      throw std::runtime_error("TypeError: Function.prototype.bind called on non-function");
+    }
+    auto targetFn = std::get<std::shared_ptr<Function>>(args[0].data);
+    Value boundThis = args.size() > 1 ? args[1] : Value(Undefined{});
+    std::vector<Value> boundArgs;
+    if (args.size() > 2) {
+      boundArgs.insert(boundArgs.end(), args.begin() + 2, args.end());
+    }
+    auto boundFn = std::make_shared<Function>();
+    boundFn->isNative = true;
+    std::string targetName = targetFn->properties.count("name") ? targetFn->properties["name"].toString() : "";
+    boundFn->properties["name"] = Value(std::string("bound " + targetName));
+    boundFn->nativeFunc = [targetFn, boundThis, boundArgs](const std::vector<Value>& callArgs) -> Value {
+      std::vector<Value> finalArgs = boundArgs;
+      finalArgs.insert(finalArgs.end(), callArgs.begin(), callArgs.end());
+      if (targetFn->isNative) {
+        auto itUsesThis = targetFn->properties.find("__uses_this_arg__");
+        if (itUsesThis != targetFn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+          std::vector<Value> nativeArgs;
+          nativeArgs.push_back(boundThis);
+          nativeArgs.insert(nativeArgs.end(), finalArgs.begin(), finalArgs.end());
+          return targetFn->nativeFunc(nativeArgs);
+        }
+        return targetFn->nativeFunc(finalArgs);
+      }
+      Interpreter* interpreter = getGlobalInterpreter();
+      if (!interpreter) {
+        throw std::runtime_error("TypeError: Interpreter unavailable");
+      }
+      return interpreter->callForHarness(Value(targetFn), finalArgs, boundThis);
+    };
+    return Value(boundFn);
+  };
+  functionPrototype->properties["bind"] = Value(fpBind);
+  functionPrototype->properties["__non_enum_bind"] = Value(true);
+
+  functionConstructor->properties["prototype"] = Value(functionPrototype);
+  env->define("Function", Value(functionConstructor));
+  globalThisObj->properties["Function"] = Value(functionConstructor);
+
+  // ===== Deferred prototype chain setup =====
+  // These must happen after all constructors are defined.
+
+  // BigInt.prototype.__proto__ = Object.prototype
+  if (auto bigIntCtor = env->get("BigInt"); bigIntCtor && bigIntCtor->isFunction()) {
+    auto bigIntFnPtr = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
+    auto protoIt = bigIntFnPtr->properties.find("prototype");
+    if (protoIt != bigIntFnPtr->properties.end() && protoIt->second.isObject()) {
+      auto bigIntProtoPtr = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      bigIntProtoPtr->properties["__proto__"] = Value(objectPrototype);
+    }
+    // BigInt.__proto__ = Function.prototype
+    bigIntFnPtr->properties["__proto__"] = Value(functionPrototype);
+  }
+
+  // Promise.prototype.__proto__ = Object.prototype (already set via promisePrototype)
+  // Promise.__proto__ = Function.prototype
+  if (auto promiseCtor = env->get("Promise"); promiseCtor && promiseCtor->isFunction()) {
+    auto promiseFnPtr = std::get<std::shared_ptr<Function>>(promiseCtor->data);
+    promiseFnPtr->properties["__proto__"] = Value(functionPrototype);
+  }
+
+  // Mark built-in constructors as non-enumerable on globalThis (per ES spec)
+  static const char* builtinNames[] = {
+    "BigInt", "Object", "Array", "String", "Number", "Boolean", "Symbol",
+    "Promise", "RegExp", "Map", "Set", "Proxy", "Reflect", "Error",
+    "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError",
+    "EvalError", "Function", "Date", "Math", "JSON", "console",
+    "ArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray",
+    "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+    "Float16Array", "Float32Array", "Float64Array",
+    "BigInt64Array", "BigUint64Array", "WeakRef", "FinalizationRegistry",
+    "globalThis", "undefined", "NaN", "Infinity",
+    "parseInt", "parseFloat", "isNaN", "isFinite",
+    "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
+    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "queueMicrotask", "structuredClone", "btoa", "atob",
+    "fetch", "crypto", "WebAssembly", "performance"
+  };
+  for (const char* name : builtinNames) {
+    if (globalThisObj->properties.count(name)) {
+      globalThisObj->properties["__non_enum_" + std::string(name)] = Value(true);
+    }
+  }
 
   return env;
 }

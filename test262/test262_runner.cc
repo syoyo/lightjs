@@ -251,14 +251,14 @@ private:
   std::string prepareTestCode(const std::string& testCode, const Test262Metadata& metadata) {
     std::stringstream prepared;
 
+    // Add strict mode FIRST so it's in the directive prologue
+    if (metadata.onlyStrict && !metadata.isRaw) {
+      prepared << "\"use strict\";\n";
+    }
+
     // Add harness includes
     for (const auto& include : metadata.includes) {
       prepared << loadHarness(include) << "\n";
-    }
-
-    // Add strict mode if needed
-    if (metadata.onlyStrict && !metadata.isRaw) {
-      prepared << "\"use strict\";\n";
     }
 
     // Add the test code

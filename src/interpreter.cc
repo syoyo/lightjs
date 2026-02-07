@@ -1278,6 +1278,21 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
         LIGHTJS_RETURN(Value(false));
       }
 
+      // Delete on function properties
+      if (obj.isFunction()) {
+        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        // name, length are non-configurable in some contexts; prototype is non-configurable
+        if (propName == "prototype") {
+          LIGHTJS_RETURN(Value(false));
+        }
+        // name, length are configurable per spec - allow delete
+        if (fnPtr->properties.count("__non_configurable_" + propName)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        fnPtr->properties.erase(propName);
+        LIGHTJS_RETURN(Value(true));
+      }
+
       if (obj.isObject()) {
         auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
         if (objPtr->isModuleNamespace) {
@@ -1297,6 +1312,10 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
           LIGHTJS_RETURN(Value(!isExport));
         }
         if (objPtr->frozen || objPtr->sealed) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        // Check __non_configurable_ marker
+        if (objPtr->properties.count("__non_configurable_" + propName)) {
           LIGHTJS_RETURN(Value(false));
         }
         bool deleted = false;
@@ -1450,12 +1469,178 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           auto rightTask = evaluate(*expr.right);
   Value right;
   LIGHTJS_RUN_TASK(rightTask, right);
+          if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+          // Named evaluation: set name on anonymous function/class
+          if (right.isFunction()) {
+            auto fn = std::get<std::shared_ptr<Function>>(right.data);
+            auto nameIt = fn->properties.find("name");
+            if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
+              fn->properties["name"] = Value(id->name);
+            }
+          } else if (right.isClass()) {
+            auto cls = std::get<std::shared_ptr<Class>>(right.data);
+            if (cls->name.empty()) {
+              cls->name = id->name;
+            }
+          }
           env_->set(id->name, right);
           LIGHTJS_RETURN(right);
         } else {
           LIGHTJS_RETURN(*current);
         }
+      } else {
+        // Unresolved LHS: throw ReferenceError
+        throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
+    }
+
+    // Logical assignment on member expressions - short-circuit
+    if (auto* member = std::get_if<MemberExpr>(&expr.left->node)) {
+      auto objTask = evaluate(*member->object);
+      Value obj;
+      LIGHTJS_RUN_TASK(objTask, obj);
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      // Throw TypeError for null/undefined base before evaluating property key
+      if (obj.isNull() || obj.isUndefined()) {
+        if (member->computed) {
+          // Evaluate computed property key first (spec: LHS before RHS)
+          auto propTask = evaluate(*member->property);
+          LIGHTJS_RUN_TASK_VOID(propTask);
+          if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        throwError(ErrorType::TypeError, "Cannot read properties of " + std::string(obj.isNull() ? "null" : "undefined"));
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+
+      std::string propName;
+      if (member->computed) {
+        auto propTask = evaluate(*member->property);
+        LIGHTJS_RUN_TASK_VOID(propTask);
+        if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+        propName = toPropertyKeyString(propTask.result());
+      } else {
+        if (auto* id = std::get_if<Identifier>(&member->property->node)) {
+          propName = id->name;
+        }
+      }
+
+      // Get current value (with getter support)
+      Value current(Undefined{});
+      bool hasGetter = false;
+      bool hasSetter = true; // assume settable by default
+      bool isWritable = true;
+      bool isExtensible = true;
+      bool propExists = false;
+      if (obj.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        // Check for getter
+        auto getterIt = objPtr->properties.find("__get_" + propName);
+        if (getterIt != objPtr->properties.end() && getterIt->second.isFunction()) {
+          hasGetter = true;
+          current = callFunction(getterIt->second, {}, obj);
+          propExists = true;
+        } else {
+          auto it = objPtr->properties.find(propName);
+          if (it != objPtr->properties.end()) {
+            current = it->second;
+            propExists = true;
+          }
+        }
+        // Check setter status
+        auto setterIt = objPtr->properties.find("__set_" + propName);
+        if (hasGetter && setterIt == objPtr->properties.end()) {
+          // Getter exists but no setter - assignment will fail
+          hasSetter = false;
+        }
+        // Check non-writable marker
+        auto nwIt = objPtr->properties.find("__non_writable_" + propName);
+        if (nwIt != objPtr->properties.end() && nwIt->second.toBool()) {
+          isWritable = false;
+        }
+        // Check extensible (Object.preventExtensions sets sealed=true)
+        if (objPtr->sealed || objPtr->frozen) {
+          isExtensible = false;
+        }
+      } else if (obj.isFunction()) {
+        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        auto it = fnPtr->properties.find(propName);
+        if (it != fnPtr->properties.end()) {
+          current = it->second;
+          propExists = true;
+        }
+      } else if (obj.isArray()) {
+        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        size_t idx = 0;
+        bool isIdx = false;
+        try { idx = std::stoull(propName); isIdx = true; } catch (...) {}
+        if (isIdx && idx < arrPtr->elements.size()) {
+          current = arrPtr->elements[idx];
+          propExists = true;
+        }
+      }
+
+      // Short-circuit check
+      bool shouldAssign = false;
+      if (expr.op == AssignmentExpr::Op::AndAssign) {
+        shouldAssign = current.toBool();
+      } else if (expr.op == AssignmentExpr::Op::OrAssign) {
+        shouldAssign = !current.toBool();
+      } else if (expr.op == AssignmentExpr::Op::NullishAssign) {
+        shouldAssign = (current.isNull() || current.isUndefined());
+      }
+
+      if (!shouldAssign) {
+        LIGHTJS_RETURN(current);
+      }
+
+      // Check if assignment is allowed before evaluating RHS
+      if (!isWritable && propExists) {
+        // Evaluate RHS first (spec requires it)
+        auto rightTask2 = evaluate(*expr.right);
+        LIGHTJS_RUN_TASK_VOID(rightTask2);
+        throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "'");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (!hasSetter && propExists) {
+        auto rightTask2 = evaluate(*expr.right);
+        LIGHTJS_RUN_TASK_VOID(rightTask2);
+        throwError(ErrorType::TypeError, "Cannot set property " + propName + " which has only a getter");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (!isExtensible && !propExists) {
+        auto rightTask2 = evaluate(*expr.right);
+        LIGHTJS_RUN_TASK_VOID(rightTask2);
+        throwError(ErrorType::TypeError, "Cannot add property " + propName + ", object is not extensible");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+
+      // Evaluate RHS only if we need to assign
+      auto rightTask2 = evaluate(*expr.right);
+      Value right2;
+      LIGHTJS_RUN_TASK(rightTask2, right2);
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      // Assign (with setter support)
+      if (obj.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        auto setterIt = objPtr->properties.find("__set_" + propName);
+        if (setterIt != objPtr->properties.end() && setterIt->second.isFunction()) {
+          callFunction(setterIt->second, {right2}, obj);
+        } else {
+          objPtr->properties[propName] = right2;
+        }
+      } else if (obj.isFunction()) {
+        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        fnPtr->properties[propName] = right2;
+      } else if (obj.isArray()) {
+        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        size_t idx = 0;
+        try { idx = std::stoull(propName); } catch (...) {}
+        if (idx < arrPtr->elements.size()) arrPtr->elements[idx] = right2;
+      }
+      LIGHTJS_RETURN(right2);
     }
   }
 
@@ -1574,6 +1759,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         LIGHTJS_RETURN(right);
       }
 
+      // Check __non_writable_ marker
+      if (objPtr->properties.count("__non_writable_" + propName)) {
+        LIGHTJS_RETURN(right);
+      }
+
       // Check if object is sealed (can't add new properties)
       bool isNewProperty = objPtr->properties.find(propName) == objPtr->properties.end();
       if (objPtr->sealed && isNewProperty) {
@@ -1633,6 +1823,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isFunction()) {
       auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+      // name and length are non-writable on functions - silently ignore assignment
+      if (propName == "name" || propName == "length") {
+        LIGHTJS_RETURN(right);
+      }
+      // Check __non_writable_ marker
+      if (funcPtr->properties.count("__non_writable_" + propName)) {
+        LIGHTJS_RETURN(right);
+      }
       if (expr.op == AssignmentExpr::Op::Assign) {
         funcPtr->properties[propName] = right;
       } else {
@@ -2744,6 +2942,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(it->second);
     }
 
+    // Object.prototype methods - hasOwnProperty
+    if (propName == "hasOwnProperty") {
+      auto hopFn = std::make_shared<Function>();
+      hopFn->isNative = true;
+      hopFn->nativeFunc = [objPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        std::string key = args[0].toString();
+        if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") return Value(false);
+        if (key.size() > 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) return Value(false);
+        if (key.size() > 10 && key.substr(0, 10) == "__non_enum") return Value(false);
+        if (key.size() > 14 && key.substr(0, 14) == "__non_writable") return Value(false);
+        if (key.size() > 18 && key.substr(0, 18) == "__non_configurable") return Value(false);
+        return Value(objPtr->properties.count(key) > 0);
+      };
+      LIGHTJS_RETURN(Value(hopFn));
+    }
+
     // Some constructor singletons (notably Array) store prototype metadata
     // separately for runtime compatibility.
     if (propName == "prototype") {
@@ -2764,6 +2979,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto callFn = std::make_shared<Function>();
       callFn->isNative = true;
       callFn->properties["__throw_on_new__"] = Value(true);
+      callFn->properties["name"] = Value(std::string("call"));
+      callFn->properties["length"] = Value(1.0);
       callFn->nativeFunc = [this, funcPtr](const std::vector<Value>& args) -> Value {
         Value thisArg = args.empty() ? Value(Undefined{}) : args[0];
         std::vector<Value> callArgs;
@@ -2773,6 +2990,71 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         return callFunction(Value(funcPtr), callArgs, thisArg);
       };
       LIGHTJS_RETURN(Value(callFn));
+    }
+
+    if (propName == "apply") {
+      auto applyFn = std::make_shared<Function>();
+      applyFn->isNative = true;
+      applyFn->properties["__throw_on_new__"] = Value(true);
+      applyFn->properties["name"] = Value(std::string("apply"));
+      applyFn->properties["length"] = Value(2.0);
+      applyFn->nativeFunc = [this, funcPtr](const std::vector<Value>& args) -> Value {
+        Value thisArg = args.empty() ? Value(Undefined{}) : args[0];
+        std::vector<Value> callArgs;
+        if (args.size() > 1 && args[1].isArray()) {
+          auto arr = std::get<std::shared_ptr<Array>>(args[1].data);
+          callArgs = arr->elements;
+        }
+        return callFunction(Value(funcPtr), callArgs, thisArg);
+      };
+      LIGHTJS_RETURN(Value(applyFn));
+    }
+
+    if (propName == "bind") {
+      auto bindFn = std::make_shared<Function>();
+      bindFn->isNative = true;
+      bindFn->properties["__throw_on_new__"] = Value(true);
+      bindFn->properties["name"] = Value(std::string("bind"));
+      bindFn->properties["length"] = Value(1.0);
+      bindFn->nativeFunc = [this, funcPtr](const std::vector<Value>& args) -> Value {
+        Value boundThis = args.empty() ? Value(Undefined{}) : args[0];
+        std::vector<Value> boundArgs;
+        if (args.size() > 1) {
+          boundArgs.insert(boundArgs.end(), args.begin() + 1, args.end());
+        }
+        auto boundFn = std::make_shared<Function>();
+        boundFn->isNative = true;
+        boundFn->properties["name"] = Value(std::string("bound " + (funcPtr->properties.count("name") ? funcPtr->properties["name"].toString() : "")));
+        auto capturedThis = this;
+        auto capturedFuncPtr = funcPtr;
+        auto capturedBoundThis = boundThis;
+        auto capturedBoundArgs = boundArgs;
+        boundFn->nativeFunc = [capturedThis, capturedFuncPtr, capturedBoundThis, capturedBoundArgs](const std::vector<Value>& callArgs) -> Value {
+          std::vector<Value> finalArgs = capturedBoundArgs;
+          finalArgs.insert(finalArgs.end(), callArgs.begin(), callArgs.end());
+          return capturedThis->callFunction(Value(capturedFuncPtr), finalArgs, capturedBoundThis);
+        };
+        return Value(boundFn);
+      };
+      LIGHTJS_RETURN(Value(bindFn));
+    }
+
+    // hasOwnProperty from Object.prototype
+    if (propName == "hasOwnProperty") {
+      auto hopFn = std::make_shared<Function>();
+      hopFn->isNative = true;
+      hopFn->nativeFunc = [funcPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        std::string key = args[0].toString();
+        // Internal properties are not visible
+        if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") return Value(false);
+        if (key.size() > 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) return Value(false);
+        if (key.size() > 10 && key.substr(0, 10) == "__non_enum") return Value(false);
+        if (key.size() > 14 && key.substr(0, 14) == "__non_writable") return Value(false);
+        if (key.size() > 18 && key.substr(0, 18) == "__non_configurable") return Value(false);
+        return Value(funcPtr->properties.count(key) > 0);
+      };
+      LIGHTJS_RETURN(Value(hopFn));
     }
 
     auto it = funcPtr->properties.find(propName);
@@ -4614,6 +4896,12 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       record.index = 0;
       return record;
     }
+    if (value.isTypedArray()) {
+      record.kind = IteratorRecord::Kind::TypedArray;
+      record.typedArray = std::get<std::shared_ptr<TypedArray>>(value.data);
+      record.index = 0;
+      return record;
+    }
     if (value.isObject()) {
       // Only treat as IteratorObject if it has a 'next' method (i.e., it's already an iterator)
       // Otherwise, fall through to check for Symbol.iterator
@@ -4715,6 +5003,13 @@ Value Interpreter::iteratorNext(IteratorRecord& record) {
         return makeIteratorResult(Value(Undefined{}), true);
       }
       return callFunction(nextIt->second, {}, Value(record.iteratorObject));
+    }
+    case IteratorRecord::Kind::TypedArray: {
+      if (!record.typedArray || record.index >= record.typedArray->length) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      Value value = record.typedArray->getElement(record.index++);
+      return makeIteratorResult(value, false);
     }
   }
 
@@ -5048,6 +5343,10 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
   func->closure = env_;
   func->properties["name"] = Value(expr.name);
+  // Regular functions (non-arrow, non-method) are constructors
+  if (!expr.isArrow) {
+    func->isConstructor = true;
+  }
 
   LIGHTJS_RETURN(Value(func));
 }
@@ -5502,7 +5801,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
 }
 
 // Helper for recursively binding destructuring patterns
-void Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst) {
+void Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet) {
   if (auto* assign = std::get_if<AssignmentPattern>(&pattern.node)) {
     Value boundValue = value;
     if (boundValue.isUndefined()) {
@@ -5511,13 +5810,19 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       LIGHTJS_RUN_TASK(initTask, initValue);
       boundValue = initValue;
     }
-    bindDestructuringPattern(*assign->left, boundValue, isConst);
+    bindDestructuringPattern(*assign->left, boundValue, isConst, useSet);
     return;
   }
 
   if (auto* id = std::get_if<Identifier>(&pattern.node)) {
     // Simple identifier
-    env_->define(id->name, value, isConst);
+    if (useSet) {
+      if (!env_->set(id->name, value)) {
+        env_->define(id->name, value);
+      }
+    } else {
+      env_->define(id->name, value, isConst);
+    }
   } else if (auto* arrayPat = std::get_if<ArrayPattern>(&pattern.node)) {
     // Array destructuring
     std::shared_ptr<Array> arr;
@@ -5534,7 +5839,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       Value elemValue = (i < arr->elements.size()) ? arr->elements[i] : Value(Undefined{});
 
       // Recursively bind (handles nested patterns)
-      bindDestructuringPattern(*arrayPat->elements[i], elemValue, isConst);
+      bindDestructuringPattern(*arrayPat->elements[i], elemValue, isConst, useSet);
     }
 
     // Handle rest element
@@ -5543,7 +5848,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
         restArr->elements.push_back(arr->elements[i]);
       }
-      bindDestructuringPattern(*arrayPat->rest, Value(restArr), isConst);
+      bindDestructuringPattern(*arrayPat->rest, Value(restArr), isConst, useSet);
     }
   } else if (auto* objPat = std::get_if<ObjectPattern>(&pattern.node)) {
     // Object destructuring
@@ -5571,7 +5876,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       Value propValue = obj->properties.count(keyName) ? obj->properties[keyName] : Value(Undefined{});
 
       // Recursively bind (handles nested patterns)
-      bindDestructuringPattern(*prop.value, propValue, isConst);
+      bindDestructuringPattern(*prop.value, propValue, isConst, useSet);
     }
 
     // Handle rest properties
@@ -5582,7 +5887,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
           restObj->properties[key] = val;
         }
       }
-      bindDestructuringPattern(*objPat->rest, Value(restObj), isConst);
+      bindDestructuringPattern(*objPat->rest, Value(restObj), isConst, useSet);
     }
   }
   // Other node types are ignored (error case in real JS)
@@ -5720,6 +6025,8 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
   func->closure = env_;
   func->properties["name"] = Value(decl.id.name);
+  // Function declarations are always constructors
+  func->isConstructor = true;
 
   env_->define(decl.id.name, Value(func));
   LIGHTJS_RETURN(Value(Undefined{}));
@@ -5907,11 +6214,24 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     }
   }
 
+  auto isInternalProp = [](const std::string& key) -> bool {
+    return key.size() >= 4 && key.substr(0, 2) == "__" &&
+           key.substr(key.size() - 2) == "__";
+  };
+
   // Iterate over object properties
   if (auto* objPtr = std::get_if<std::shared_ptr<Object>>(&obj.data)) {
     std::vector<std::string> keys;
     keys.reserve((*objPtr)->properties.size());
     for (const auto& [key, _] : (*objPtr)->properties) {
+      // Skip internal properties (__*__)
+      if (isInternalProp(key)) continue;
+      // Skip properties starting with __get_, __set_, __non_enum_, __non_writable_, __non_configurable_, __enum_
+      if (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_" ||
+          key.substr(0, 11) == "__non_enum_" || key.substr(0, 15) == "__non_writable_" ||
+          key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_") continue;
+      // Skip non-enumerable properties
+      if ((*objPtr)->properties.count("__non_enum_" + key)) continue;
       keys.push_back(key);
     }
     std::sort(keys.begin(), keys.end());
@@ -5923,6 +6243,39 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       auto bodyTask = evaluate(*stmt.body);
   LIGHTJS_RUN_TASK(bodyTask, result);
 
+      if (flow_.type == ControlFlow::Type::Break) {
+        flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        flow_.type = ControlFlow::Type::None;
+        continue;
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  }
+
+  // Iterate over function properties
+  if (auto* fnPtr = std::get_if<std::shared_ptr<Function>>(&obj.data)) {
+    std::vector<std::string> keys;
+    for (const auto& [key, _] : (*fnPtr)->properties) {
+      // Skip internal properties
+      if (isInternalProp(key)) continue;
+      if (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_" ||
+          key.substr(0, 11) == "__non_enum_" || key.substr(0, 15) == "__non_writable_" ||
+          key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_") continue;
+      // name, length, prototype are non-enumerable on functions
+      if (key == "name" || key == "length" || key == "prototype") continue;
+      // Built-in function properties are non-enumerable unless explicitly marked
+      if (!(*fnPtr)->properties.count("__enum_" + key)) continue;
+      keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    for (const auto& key : keys) {
+      env_->set(varName, Value(key));
+      auto bodyTask = evaluate(*stmt.body);
+      LIGHTJS_RUN_TASK(bodyTask, result);
       if (flow_.type == ControlFlow::Type::Break) {
         flow_.type = ControlFlow::Type::None;
         break;
@@ -5950,20 +6303,34 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
 
   Value result = Value(Undefined{});
 
-  // Get the variable name from the left side
+  // Determine the LHS binding type
+  enum class ForOfLHS { SimpleVar, DestructuringVar, ExpressionTarget };
+  ForOfLHS lhsType = ForOfLHS::SimpleVar;
   std::string varName;
+  bool isConst = false;
+  const Expression* lhsPattern = nullptr;
+  const Expression* lhsExpr = nullptr;
+
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
+    isConst = (varDecl->kind == VarDeclaration::Kind::Const);
     if (!varDecl->declarations.empty()) {
-      // For now, only support simple identifier patterns in for-in/for-of
-      if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
+      const auto& pattern = varDecl->declarations[0].pattern;
+      if (auto* id = std::get_if<Identifier>(&pattern->node)) {
         varName = id->name;
+        lhsType = ForOfLHS::SimpleVar;
+        env_->define(varName, Value(Undefined{}));
+      } else {
+        lhsType = ForOfLHS::DestructuringVar;
+        lhsPattern = pattern.get();
       }
-      // Define the variable in the loop scope
-      env_->define(varName, Value(Undefined{}));
     }
   } else if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.left->node)) {
     if (auto* ident = std::get_if<Identifier>(&exprStmt->expression->node)) {
       varName = ident->name;
+      lhsType = ForOfLHS::SimpleVar;
+    } else {
+      lhsType = ForOfLHS::ExpressionTarget;
+      lhsExpr = exprStmt->expression.get();
     }
   }
 
@@ -6041,7 +6408,35 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       }
     }
 
-    env_->set(varName, currentValue);
+    // Assign value to LHS
+    if (lhsType == ForOfLHS::SimpleVar) {
+      env_->set(varName, currentValue);
+    } else if (lhsType == ForOfLHS::DestructuringVar) {
+      bindDestructuringPattern(*lhsPattern, currentValue, isConst);
+    } else if (lhsType == ForOfLHS::ExpressionTarget && lhsExpr) {
+      // Bare destructuring assignment or member expression target
+      if (std::get_if<ArrayPattern>(&lhsExpr->node) || std::get_if<ObjectPattern>(&lhsExpr->node)) {
+        // Destructuring assignment (for ({a, b} of ...) or for ([a, b] of ...))
+        bindDestructuringPattern(*lhsExpr, currentValue, false, true);
+      } else if (auto* member = std::get_if<MemberExpr>(& lhsExpr->node)) {
+        auto objTask = evaluate(*member->object);
+        Value objVal;
+        LIGHTJS_RUN_TASK(objTask, objVal);
+        if (objVal.isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(objVal.data);
+          std::string prop;
+          if (member->computed) {
+            auto propTask = evaluate(*member->property);
+            Value propVal;
+            LIGHTJS_RUN_TASK(propTask, propVal);
+            prop = propVal.toString();
+          } else if (auto* propId = std::get_if<Identifier>(&member->property->node)) {
+            prop = propId->name;
+          }
+          obj->properties[prop] = currentValue;
+        }
+      }
+    }
 
     auto bodyTask = evaluate(*stmt.body);
     LIGHTJS_RUN_TASK(bodyTask, result);
