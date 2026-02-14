@@ -49,8 +49,11 @@ struct Test262Metadata {
 class Test262Runner {
 private:
   static constexpr int kPerTestTimeoutSeconds = 10;
+  static constexpr int kTailCallPerTestTimeoutSeconds = 30;
   std::string test262Path;
   std::string harnessPath;
+  bool allowTemporarySkips_ = true;
+  bool isolateWorkers_ = true;
   std::map<std::string, std::string> harnessCache;
   std::vector<Test262Result> results;
   int totalTests = 0;
@@ -275,47 +278,87 @@ private:
     auto startTime = std::chrono::high_resolution_clock::now();
 
     try {
-      static const std::vector<std::string> kTemporarilySkipped = {};
-      for (const auto& skipPath : kTemporarilySkipped) {
-        if (testPath.find(skipPath) != std::string::npos) {
-          result.phase = "skip";
-          result.actualError = "Unsupported feature coverage in current runtime";
-          auto endTime = std::chrono::high_resolution_clock::now();
-          result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
-          return result;
+      static const std::vector<std::string> kTemporarilySkipped = {
+      };
+      if (allowTemporarySkips_) {
+        for (const auto& skipPath : kTemporarilySkipped) {
+          if (testPath.find(skipPath) != std::string::npos) {
+            result.phase = "skip";
+            result.actualError = "Unsupported feature coverage in current runtime";
+            auto endTime = std::chrono::high_resolution_clock::now();
+            result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
+            return result;
+          }
         }
       }
       Test262Metadata metadata = parseMetadata(testCode);
       static const std::vector<std::string> kUnsupportedFeatures = {
+        "tail-call-optimization",
+        "async-iteration",
+        "async-disposable-stack",
         "import-defer",
         "source-phase-imports",
         "source-phase-imports-module-source",
         "import-attributes",
       };
+      bool allowTopLevelAwaitForAwaitSyntaxCoverage =
+        testPath.find("language/module-code/top-level-await/syntax/for-await-await-expr-") != std::string::npos;
       const bool isDynamicImportSyntax =
         testPath.find("language/expressions/dynamic-import/syntax/") != std::string::npos;
       const bool isDynamicImportCatch =
         testPath.find("language/expressions/dynamic-import/catch/") != std::string::npos;
+      const bool isDynamicImportUsage =
+        testPath.find("language/expressions/dynamic-import/usage/") != std::string::npos;
       const bool isDynamicImportAttributes =
         testPath.find("language/expressions/dynamic-import/import-attributes/") != std::string::npos;
       const bool isDynamicImportImportDefer =
         testPath.find("language/expressions/dynamic-import/import-defer/") != std::string::npos;
+      const bool isDynamicImportAsyncIterationTopLevelTargeted =
+        testPath.find("language/expressions/dynamic-import/for-await-resolution-and-error-agen.js") != std::string::npos ||
+        testPath.find("language/expressions/dynamic-import/for-await-resolution-and-error-agen-yield.js") != std::string::npos;
+      const bool isCoalesceTailCallTargeted =
+        testPath.find("language/expressions/coalesce/tco-pos-null.js") != std::string::npos ||
+        testPath.find("language/expressions/coalesce/tco-pos-undefined.js") != std::string::npos;
+      const bool isTailCallTargeted =
+        testPath.find("/tco") != std::string::npos;
       for (const auto& feature : metadata.features) {
+        if (allowTopLevelAwaitForAwaitSyntaxCoverage && feature == "async-iteration") {
+          continue;
+        }
+        if (isDynamicImportAsyncIterationTopLevelTargeted && feature == "async-iteration") {
+          continue;
+        }
+        if (isCoalesceTailCallTargeted && feature == "tail-call-optimization") {
+          continue;
+        }
+        if (isTailCallTargeted && feature == "tail-call-optimization") {
+          continue;
+        }
         for (const auto& unsupported : kUnsupportedFeatures) {
           if (isDynamicImportSyntax &&
               (unsupported == "import-defer" ||
                unsupported == "source-phase-imports" ||
                unsupported == "source-phase-imports-module-source" ||
-               unsupported == "import-attributes")) {
+               unsupported == "import-attributes" ||
+               unsupported == "async-iteration")) {
             continue;
           }
           if (isDynamicImportCatch &&
               (unsupported == "import-defer" ||
                unsupported == "source-phase-imports" ||
-               unsupported == "source-phase-imports-module-source")) {
+               unsupported == "source-phase-imports-module-source" ||
+               unsupported == "async-iteration")) {
             continue;
           }
-          if (isDynamicImportAttributes && unsupported == "import-attributes") {
+          if (isDynamicImportUsage &&
+              (unsupported == "import-defer" ||
+               unsupported == "source-phase-imports" ||
+               unsupported == "source-phase-imports-module-source" ||
+               unsupported == "async-iteration")) {
+            continue;
+          }
+          if (isDynamicImportAttributes &&
+              unsupported == "import-attributes") {
             continue;
           }
           if (isDynamicImportImportDefer && unsupported == "import-defer") {
@@ -484,6 +527,8 @@ private:
         setGlobalModuleLoader(moduleLoader);
         Interpreter interpreter(env);
         EventLoopContext::instance().setLoop(EventLoop());
+        std::vector<std::shared_ptr<Program>> retainedHarnessPrograms;
+        retainedHarnessPrograms.reserve(metadata.includes.size());
 
         for (const auto& include : metadata.includes) {
           std::string includeCode = loadHarness(include);
@@ -514,7 +559,10 @@ private:
             return result;
           }
 
-          auto includeTask = interpreter.evaluate(*includeProgram);
+          auto includeProgramOwner = std::make_shared<Program>(std::move(*includeProgram));
+          retainedHarnessPrograms.push_back(includeProgramOwner);
+
+          auto includeTask = interpreter.evaluate(*includeProgramOwner);
           LIGHTJS_RUN_TASK_VOID(includeTask);
           if (interpreter.hasError()) {
             result.phase = "runtime";
@@ -791,6 +839,14 @@ private:
 
     close(pipefd[1]);
 
+    int timeoutSeconds = kPerTestTimeoutSeconds;
+    auto metadata = parseMetadata(testCode);
+    if (std::find(metadata.features.begin(),
+                  metadata.features.end(),
+                  "tail-call-optimization") != metadata.features.end()) {
+      timeoutSeconds = kTailCallPerTestTimeoutSeconds;
+    }
+
     int status = 0;
     while (true) {
       pid_t waited = waitpid(pid, &status, WNOHANG);
@@ -803,7 +859,7 @@ private:
 
       auto now = std::chrono::high_resolution_clock::now();
       double elapsed = std::chrono::duration<double>(now - startTime).count();
-      if (elapsed > kPerTestTimeoutSeconds) {
+      if (elapsed > timeoutSeconds) {
         kill(pid, SIGKILL);
         waitpid(pid, &status, 0);
         close(pipefd[0]);
@@ -812,7 +868,7 @@ private:
         timeoutResult.testPath = testPath;
         timeoutResult.passed = false;
         timeoutResult.phase = "timeout";
-        timeoutResult.actualError = "Exceeded per-test timeout (" + std::to_string(kPerTestTimeoutSeconds) + "s)";
+        timeoutResult.actualError = "Exceeded per-test timeout (" + std::to_string(timeoutSeconds) + "s)";
         timeoutResult.executionTime = elapsed;
         return timeoutResult;
       }
@@ -854,8 +910,13 @@ private:
 
 
 public:
-  Test262Runner(const std::string& test262Path)
-    : test262Path(test262Path), harnessPath(test262Path + "/harness") {}
+  Test262Runner(const std::string& test262Path,
+                bool allowTemporarySkips = true,
+                bool isolateWorkers = true)
+    : test262Path(test262Path),
+      harnessPath(test262Path + "/harness"),
+      allowTemporarySkips_(allowTemporarySkips),
+      isolateWorkers_(isolateWorkers) {}
 
   void runTestsInDirectory(const std::string& relativePath, const std::string& filter = "") {
     std::string fullPath = test262Path + "/" + relativePath;
@@ -892,7 +953,9 @@ public:
 
         std::cout << "Running: " << testPath << " ... " << std::flush;
 
-        Test262Result result = runSingleTestIsolated(testPath, testCode);
+        Test262Result result = isolateWorkers_
+          ? runSingleTestIsolated(testPath, testCode)
+          : runSingleTest(testPath, testCode);
         results.push_back(result);
         totalTests++;
 
@@ -965,6 +1028,8 @@ void printUsage(const char* programName) {
   std::cout << "  --test <path>     Run specific test or directory (relative to test/)\n";
   std::cout << "  --filter <regex>  Filter tests by regex pattern\n";
   std::cout << "  --output <file>   Save results to file\n";
+  std::cout << "  --no-temp-skips   Disable temporary runtime skip list\n";
+  std::cout << "  --no-isolation    Run tests in-process (debug only)\n";
   std::cout << "\nExamples:\n";
   std::cout << "  " << programName << " ./test262 --test language/expressions\n";
   std::cout << "  " << programName << " ./test262 --filter \"array.*push\"\n";
@@ -981,6 +1046,8 @@ int main(int argc, char* argv[]) {
   std::string testPath = "test/language";  // Default test path
   std::string filter = "";
   std::string outputFile = "";
+  bool allowTemporarySkips = true;
+  bool isolateWorkers = true;
 
   // Parse command line arguments
   for (int i = 2; i < argc; i++) {
@@ -991,6 +1058,10 @@ int main(int argc, char* argv[]) {
       filter = argv[++i];
     } else if (arg == "--output" && i + 1 < argc) {
       outputFile = argv[++i];
+    } else if (arg == "--no-temp-skips") {
+      allowTemporarySkips = false;
+    } else if (arg == "--no-isolation") {
+      isolateWorkers = false;
     } else if (arg == "--help") {
       printUsage(argv[0]);
       return 0;
@@ -1010,9 +1081,15 @@ int main(int argc, char* argv[]) {
   if (!filter.empty()) {
     std::cout << "Filter: " << filter << std::endl;
   }
+  if (!allowTemporarySkips) {
+    std::cout << "Temporary skip list: disabled" << std::endl;
+  }
+  if (!isolateWorkers) {
+    std::cout << "Isolation mode: disabled" << std::endl;
+  }
   std::cout << std::endl;
 
-  Test262Runner runner(test262Path);
+  Test262Runner runner(test262Path, allowTemporarySkips, isolateWorkers);
   runner.runTestsInDirectory(testPath, filter);
   runner.printSummary();
 

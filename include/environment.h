@@ -25,10 +25,12 @@ public:
   std::optional<Value> get(const std::string& name) const;
   bool set(const std::string& name, const Value& value);
   bool has(const std::string& name) const;
+  bool isConst(const std::string& name) const;
 
   static std::shared_ptr<Environment> createGlobal();
   std::shared_ptr<Environment> createChild();
   std::shared_ptr<Object> getGlobal() const;
+  Environment* getRoot();
 
 private:
   std::shared_ptr<Environment> parent_;

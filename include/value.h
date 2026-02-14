@@ -80,6 +80,9 @@ struct Function : public GCObject {
   std::vector<FunctionParam> params;
   std::optional<std::string> restParam;
   std::shared_ptr<void> body;
+  // Keeps parsed AST storage alive when params/body point into transient parses
+  // (e.g. Function constructor-created functions).
+  std::shared_ptr<void> astOwner;
   std::shared_ptr<void> closure;
   bool isNative;
   bool isAsync;

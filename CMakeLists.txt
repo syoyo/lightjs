@@ -264,10 +264,11 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/wasm/wasm_decoder.h
   include/wasm_js.h
   include/streams.h
+  include/symbols.h
 )
 
-# Create main library target
-add_library(lightjs ${LIGHTJS_CORE_SOURCES})
+# Create main library target (headers included for dependency tracking)
+add_library(lightjs ${LIGHTJS_CORE_SOURCES} ${LIGHTJS_PUBLIC_HEADERS})
 add_library(LightJS::lightjs ALIAS lightjs)
 
 # Set library properties

@@ -206,6 +206,7 @@ struct ObjectPattern {
   struct Property {
     ExprPtr key;
     ExprPtr value;  // Pattern to bind to
+    bool computed = false;
   };
   std::vector<Property> properties;
   ExprPtr rest;  // Rest properties (...rest)
@@ -320,6 +321,11 @@ struct ForStmt {
   StmtPtr body;
 };
 
+struct WithStmt {
+  ExprPtr object;
+  StmtPtr body;
+};
+
 struct ForInStmt {
   StmtPtr left;  // VarDeclaration or Identifier
   ExprPtr right;
@@ -348,8 +354,17 @@ struct SwitchStmt {
   std::vector<SwitchCase> cases;
 };
 
-struct BreakStmt {};
-struct ContinueStmt {};
+struct BreakStmt {
+  std::string label;
+};
+struct ContinueStmt {
+  std::string label;
+};
+
+struct LabelledStmt {
+  std::string label;
+  StmtPtr body;
+};
 
 struct ThrowStmt {
   ExprPtr argument;
@@ -413,12 +428,14 @@ struct Statement {
     IfStmt,
     WhileStmt,
     ForStmt,
+    WithStmt,
     ForInStmt,
     ForOfStmt,
     DoWhileStmt,
     SwitchStmt,
     BreakStmt,
     ContinueStmt,
+    LabelledStmt,
     ThrowStmt,
     TryStmt,
     ImportDeclaration,

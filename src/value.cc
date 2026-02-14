@@ -13,6 +13,45 @@ namespace {
 void queuePromiseCallback(std::function<void()> callback) {
   EventLoopContext::instance().getLoop().queueMicrotask(std::move(callback));
 }
+
+void resolveChainedPromise(const std::shared_ptr<Promise>& target, const Value& value) {
+  if (!target || target->state != PromiseState::Pending) {
+    return;
+  }
+
+  if (value.isPromise()) {
+    auto nested = std::get<std::shared_ptr<Promise>>(value.data);
+    if (!nested) {
+      target->resolve(value);
+      return;
+    }
+    if (nested.get() == target.get()) {
+      target->reject(Value(std::make_shared<Error>(
+        ErrorType::TypeError, "Cannot resolve promise with itself")));
+      return;
+    }
+    if (nested->state == PromiseState::Fulfilled) {
+      resolveChainedPromise(target, nested->result);
+      return;
+    }
+    if (nested->state == PromiseState::Rejected) {
+      target->reject(nested->result);
+      return;
+    }
+    nested->then(
+      [target](Value fulfilled) -> Value {
+        resolveChainedPromise(target, fulfilled);
+        return fulfilled;
+      },
+      [target](Value reason) -> Value {
+        target->reject(reason);
+        return reason;
+      });
+    return;
+  }
+
+  target->resolve(value);
+}
 }  // namespace
 
 // Initialize static member for Symbol IDs
@@ -614,7 +653,7 @@ void Promise::resolve(Value val) {
       }
       try {
         Value callbackResult = callback ? callback(val) : val;
-        chainedPromise->resolve(callbackResult);
+        resolveChainedPromise(chainedPromise, callbackResult);
       } catch (const std::exception& e) {
         chainedPromise->reject(Value(std::string(e.what())));
       } catch (...) {
@@ -647,7 +686,7 @@ void Promise::reject(Value val) {
       if (callback) {
         try {
           Value callbackResult = callback(val);
-          chainedPromise->resolve(callbackResult);
+          resolveChainedPromise(chainedPromise, callbackResult);
         } catch (const std::exception& e) {
           chainedPromise->reject(Value(std::string(e.what())));
         } catch (...) {
@@ -675,7 +714,7 @@ std::shared_ptr<Promise> Promise::then(
       if (onFulfilled) {
         try {
           Value callbackResult = onFulfilled(settled);
-          chainedPromise->resolve(callbackResult);
+          resolveChainedPromise(chainedPromise, callbackResult);
         } catch (const std::exception& e) {
           chainedPromise->reject(Value(std::string(e.what())));
         } catch (...) {
@@ -691,7 +730,7 @@ std::shared_ptr<Promise> Promise::then(
       if (onRejected) {
         try {
           Value callbackResult = onRejected(settled);
-          chainedPromise->resolve(callbackResult);
+          resolveChainedPromise(chainedPromise, callbackResult);
         } catch (const std::exception& e) {
           chainedPromise->reject(Value(std::string(e.what())));
         } catch (...) {

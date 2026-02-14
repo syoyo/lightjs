@@ -196,10 +196,21 @@ public:
   void setEnvironment(std::shared_ptr<Environment> env) { env_ = env; }
   void setSuppressMicrotasks(bool value) { suppressMicrotasks_ = value; }
   bool suppressMicrotasks() const { return suppressMicrotasks_; }
+  bool inDirectEvalInvocation() const { return activeDirectEvalInvocation_; }
 
   // Stack depth limit for recursion protection
   // Keep this well below what would cause a C stack overflow (~3000-4000 on typical systems)
+#if defined(__SANITIZE_ADDRESS__)
+  static constexpr size_t MAX_STACK_DEPTH = 256;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  static constexpr size_t MAX_STACK_DEPTH = 256;
+#else
   static constexpr size_t MAX_STACK_DEPTH = 2000;
+#endif
+#else
+  static constexpr size_t MAX_STACK_DEPTH = 2000;
+#endif
 
   // Check if there's a pending thrown error
   bool hasError() const;
@@ -235,12 +246,14 @@ private:
 
     Type type = Type::None;
     Value value;
+    std::string label;
     ResumeMode resumeMode = ResumeMode::None;
     Value resumeValue = Value(Undefined{});
 
     void reset() {
       type = Type::None;
       value = Value(Undefined{});
+      label.clear();
       resumeMode = ResumeMode::None;
       resumeValue = Value(Undefined{});
     }
@@ -272,6 +285,14 @@ private:
   Value lastMemberBase_ = Value(Undefined{});
   bool hasLastMemberBase_ = false;
   bool strictMode_ = false;
+  bool inTailPosition_ = false;
+  std::shared_ptr<Function> activeFunction_ = nullptr;
+  bool pendingSelfTailCall_ = false;
+  std::vector<Value> pendingSelfTailArgs_;
+  Value pendingSelfTailThis_ = Value(Undefined{});
+  bool pendingDirectEvalCall_ = false;
+  bool activeDirectEvalInvocation_ = false;
+  std::vector<std::shared_ptr<Function>> activeNamedExpressionStack_;
 
   struct IteratorRecord {
     enum class Kind { Generator, Array, String, IteratorObject, TypedArray };
@@ -291,6 +312,7 @@ private:
                          const Value& resumeValue = Value(Undefined{}));
   std::optional<IteratorRecord> getIterator(const Value& iterable);
   Value iteratorNext(IteratorRecord& record);
+  void iteratorClose(IteratorRecord& record);
   Value callFunction(const Value& callee, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
   bool isObjectLike(const Value& value) const;
   std::pair<bool, Value> getPropertyForPrimitive(const Value& receiver, const std::string& key);
@@ -308,6 +330,8 @@ private:
   Task evaluateFunction(const FunctionExpr& expr);
   Task evaluateAwait(const AwaitExpr& expr);
   Task evaluateYield(const YieldExpr& expr);
+  Task constructValue(Value callee, const std::vector<Value>& args,
+                      const Value& newTargetOverride = Value(Undefined{}));
   Task evaluateNew(const NewExpr& expr);
   Task evaluateClass(const ClassExpr& expr);
 
@@ -318,6 +342,7 @@ private:
   Task evaluateBlock(const BlockStmt& stmt);
   Task evaluateIf(const IfStmt& stmt);
   Task evaluateWhile(const WhileStmt& stmt);
+  Task evaluateWith(const WithStmt& stmt);
   Task evaluateDoWhile(const DoWhileStmt& stmt);
   Task evaluateFor(const ForStmt& stmt);
   Task evaluateForIn(const ForInStmt& stmt);

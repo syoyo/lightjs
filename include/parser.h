@@ -42,6 +42,7 @@ private:
   StmtPtr parseReturnStatement();
   StmtPtr parseIfStatement();
   StmtPtr parseWhileStatement();
+  StmtPtr parseWithStatement();
   StmtPtr parseDoWhileStatement();
   StmtPtr parseForStatement();
   StmtPtr parseSwitchStatement();

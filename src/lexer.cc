@@ -48,6 +48,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"else", TokenType::Else},
   {"while", TokenType::While},
   {"for", TokenType::For},
+  {"with", TokenType::With},
   {"in", TokenType::In},
   {"instanceof", TokenType::Instanceof},
   {"of", TokenType::Of},
@@ -392,6 +393,31 @@ std::optional<Token> Lexer::readString(char quote) {
                 }
                 codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
                 advance();
+              }
+            }
+            // Handle surrogate pairs: high surrogate followed by \uXXXX low surrogate
+            if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+              // Check for low surrogate \uXXXX
+              if (!isAtEnd() && current() == '\\' && pos_ + 1 < source_.size() && source_[pos_ + 1] == 'u') {
+                size_t savedPos = pos_;
+                advance(); // consume '\'
+                advance(); // consume 'u'
+                uint32_t low = 0;
+                bool validLow = true;
+                for (int i = 0; i < 4; ++i) {
+                  if (isAtEnd()) { validLow = false; break; }
+                  int d = hexDigitValue(current());
+                  if (d < 0) { validLow = false; break; }
+                  low = (low << 4) + static_cast<uint32_t>(d);
+                  advance();
+                }
+                if (validLow && low >= 0xDC00 && low <= 0xDFFF) {
+                  // Combine surrogate pair
+                  codepoint = 0x10000 + (codepoint - 0xD800) * 0x400 + (low - 0xDC00);
+                } else {
+                  // Not a valid low surrogate, rewind
+                  pos_ = savedPos;
+                }
               }
             }
             appendUtf8(str, codepoint);

@@ -1,4 +1,7 @@
+#include "test262_harness.h"
 #include "environment.h"
+#include "lexer.h"
+#include "parser.h"
 #include "value.h"
 #include "interpreter.h"
 #include <cmath>
@@ -158,15 +161,37 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   auto createRealm = std::make_shared<Function>();
   createRealm->isNative = true;
   createRealm->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto realmEnv = createTest262Environment();
     auto realm = std::make_shared<Object>();
-    auto global = std::make_shared<Object>();
-    realm->properties["global"] = Value(global);
+    realm->properties["global"] = Value(realmEnv->getGlobal());
 
     auto $eval = std::make_shared<Function>();
     $eval->isNative = true;
-    $eval->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      // Simplified eval for realm
-      return Value(Undefined{});
+    $eval->nativeFunc = [realmEnv](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isString()) {
+        return Value(Undefined{});
+      }
+      try {
+        Lexer lexer(args[0].toString());
+        auto tokens = lexer.tokenize();
+        Parser parser(tokens);
+        auto program = parser.parse();
+        if (!program) {
+          throw std::runtime_error("SyntaxError: Parse error");
+        }
+        Interpreter interpreter(realmEnv);
+        auto task = interpreter.evaluate(*program);
+        Value result = Value(Undefined{});
+        LIGHTJS_RUN_TASK(task, result);
+        if (interpreter.hasError()) {
+          Value err = interpreter.getError();
+          interpreter.clearError();
+          throw std::runtime_error(err.toString());
+        }
+        return result;
+      } catch (const std::exception& e) {
+        throw std::runtime_error(e.what());
+      }
     };
     realm->properties["eval"] = Value($eval);
 

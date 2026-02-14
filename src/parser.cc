@@ -2,6 +2,7 @@
 #include "lexer.h"
 #include <stdexcept>
 #include <cctype>
+#include <set>
 
 namespace lightjs {
 
@@ -111,6 +112,7 @@ bool isIdentifierNameToken(TokenType type) {
     case TokenType::Else:
     case TokenType::While:
     case TokenType::For:
+    case TokenType::With:
     case TokenType::In:
     case TokenType::Instanceof:
     case TokenType::Of:
@@ -151,6 +153,79 @@ bool isUpdateTarget(const Expression& expr) {
   }
   if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
     return !member->optional;
+  }
+  return false;
+}
+
+// Collect all bound names from a destructuring pattern for duplicate checking
+void collectBoundNames(const Expression& expr, std::vector<std::string>& names) {
+  if (auto* id = std::get_if<Identifier>(&expr.node)) {
+    names.push_back(id->name);
+  } else if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (auto& elem : arrPat->elements) {
+      if (elem) collectBoundNames(*elem, names);
+    }
+    if (arrPat->rest) collectBoundNames(*arrPat->rest, names);
+  } else if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (auto& prop : objPat->properties) {
+      if (prop.value) collectBoundNames(*prop.value, names);
+    }
+    if (objPat->rest) collectBoundNames(*objPat->rest, names);
+  } else if (auto* assign = std::get_if<AssignmentPattern>(&expr.node)) {
+    if (assign->left) collectBoundNames(*assign->left, names);
+  } else if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    if (spread->argument) collectBoundNames(*spread->argument, names);
+  }
+}
+
+// Collect var-declared names from a statement tree (for redeclaration checks)
+void collectVarDeclaredNames(const Statement& stmt, std::vector<std::string>& names) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    if (varDecl->kind == VarDeclaration::Kind::Var) {
+      for (auto& decl : varDecl->declarations) {
+        if (decl.pattern) collectBoundNames(*decl.pattern, names);
+      }
+    }
+  } else if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (auto& s : block->body) {
+      if (s) collectVarDeclaredNames(*s, names);
+    }
+  } else if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->consequent) collectVarDeclaredNames(*ifStmt->consequent, names);
+    if (ifStmt->alternate) collectVarDeclaredNames(*ifStmt->alternate, names);
+  } else if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init) collectVarDeclaredNames(*forStmt->init, names);
+    if (forStmt->body) collectVarDeclaredNames(*forStmt->body, names);
+  } else if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->body) collectVarDeclaredNames(*whileStmt->body, names);
+  } else if (auto* labeled = std::get_if<LabelledStmt>(&stmt.node)) {
+    if (labeled->body) collectVarDeclaredNames(*labeled->body, names);
+  } else if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (auto& s : tryStmt->block) {
+      if (s) collectVarDeclaredNames(*s, names);
+    }
+    for (auto& s : tryStmt->handler.body) {
+      if (s) collectVarDeclaredNames(*s, names);
+    }
+    for (auto& s : tryStmt->finalizer) {
+      if (s) collectVarDeclaredNames(*s, names);
+    }
+  } else if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    for (auto& c : switchStmt->cases) {
+      for (auto& s : c.consequent) {
+        if (s) collectVarDeclaredNames(*s, names);
+      }
+    }
+  }
+}
+
+bool hasDuplicateBoundNames(const Expression& pattern) {
+  std::vector<std::string> names;
+  collectBoundNames(pattern, names);
+  std::set<std::string> seen;
+  for (auto& name : names) {
+    if (seen.count(name)) return true;
+    seen.insert(name);
   }
   return false;
 }
@@ -298,6 +373,14 @@ bool Parser::isIdentifierLikeToken(TokenType type) const {
   if (type == TokenType::Yield) {
     return canUseYieldAsIdentifier();
   }
+  // In non-strict mode, 'let' can be used as an identifier
+  if (type == TokenType::Let && !strictMode_) {
+    return true;
+  }
+  // 'async' is a contextual keyword, not a reserved word - can be used as identifier
+  if (type == TokenType::Async) {
+    return true;
+  }
   return false;
 }
 
@@ -332,11 +415,15 @@ std::optional<Program> Parser::parse() {
 }
 
 StmtPtr Parser::parseStatement() {
-  // Parse labeled statements and ignore label metadata for now.
+  // Parse labeled statements
   if (match(TokenType::Identifier) && peek().type == TokenType::Colon) {
+    const Token& tok = current();
+    std::string label = tok.value;
     advance();  // label identifier
     advance();  // :
-    return parseStatement();
+    auto body = parseStatement();
+    if (!body) return nullptr;
+    return makeStmt(LabelledStmt{label, std::move(body)}, tok);
   }
 
   switch (current().type) {
@@ -346,6 +433,20 @@ StmtPtr Parser::parseStatement() {
       return makeStmt(ExpressionStmt{makeExpr(NullLiteral{}, tok)}, tok);
     }
     case TokenType::Let:
+      // In non-strict mode, 'let' can be an identifier expression
+      if (!strictMode_) {
+        auto nextType = peek().type;
+        bool nextOnSameLine = (peek().line == current().line);
+        // 'let' followed by binding pattern on same line → declaration
+        // 'let' followed by newline or non-pattern → identifier expression
+        if (!nextOnSameLine ||
+            (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
+             nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
+             nextType != TokenType::Yield)) {
+          return parseExpressionStatement();
+        }
+      }
+      [[fallthrough]];
     case TokenType::Const:
     case TokenType::Var:
       return parseVarDeclaration();
@@ -364,6 +465,8 @@ StmtPtr Parser::parseStatement() {
       return parseIfStatement();
     case TokenType::While:
       return parseWhileStatement();
+    case TokenType::With:
+      return parseWithStatement();
     case TokenType::Do:
       return parseDoWhileStatement();
     case TokenType::For:
@@ -373,14 +476,24 @@ StmtPtr Parser::parseStatement() {
     case TokenType::Break: {
       const Token& tok = current();
       advance();
+      std::string label;
+      if (match(TokenType::Identifier) && current().line == tok.line) {
+        label = current().value;
+        advance();
+      }
       consumeSemicolon();
-      return makeStmt(BreakStmt{}, tok);
+      return makeStmt(BreakStmt{label}, tok);
     }
     case TokenType::Continue: {
       const Token& tok = current();
       advance();
+      std::string label;
+      if (match(TokenType::Identifier) && current().line == tok.line) {
+        label = current().value;
+        advance();
+      }
       consumeSemicolon();
-      return makeStmt(ContinueStmt{}, tok);
+      return makeStmt(ContinueStmt{label}, tok);
     }
     case TokenType::Throw: {
       const Token& tok = current();
@@ -675,9 +788,22 @@ StmtPtr Parser::parseReturnStatement() {
 
   ExprPtr argument = nullptr;
   if (!match(TokenType::Semicolon) && !match(TokenType::EndOfFile)) {
-    argument = parseExpression();
+    argument = parseAssignment();
     if (!argument) {
       return nullptr;
+    }
+    if (match(TokenType::Comma)) {
+      std::vector<ExprPtr> sequence;
+      sequence.push_back(std::move(argument));
+      while (match(TokenType::Comma)) {
+        advance();
+        auto nextExpr = parseAssignment();
+        if (!nextExpr) {
+          return nullptr;
+        }
+        sequence.push_back(std::move(nextExpr));
+      }
+      argument = std::make_unique<Expression>(SequenceExpr{std::move(sequence)});
     }
   }
 
@@ -735,6 +861,30 @@ StmtPtr Parser::parseWhileStatement() {
   return makeStmt(WhileStmt{std::move(test), std::move(body)}, startTok);
 }
 
+StmtPtr Parser::parseWithStatement() {
+  const Token& startTok = current();
+  if (strictMode_) {
+    return nullptr;
+  }
+
+  expect(TokenType::With);
+  if (!expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
+
+  auto object = parseExpression();
+  if (!object || !expect(TokenType::RightParen)) {
+    return nullptr;
+  }
+
+  auto body = parseStatement();
+  if (!body) {
+    return nullptr;
+  }
+
+  return makeStmt(WithStmt{std::move(object), std::move(body)}, startTok);
+}
+
 StmtPtr Parser::parseForStatement() {
   expect(TokenType::For);
   bool isAwait = false;
@@ -754,7 +904,8 @@ StmtPtr Parser::parseForStatement() {
   // Try to detect for...in or for...of pattern
   if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
     advance();
-    if (match(TokenType::Identifier)) {
+    // Allow 'let' as identifier in non-strict mode (e.g., 'var let of [23]')
+    if (match(TokenType::Identifier) || (!strictMode_ && match(TokenType::Let))) {
       advance();
       if (match(TokenType::In)) {
         isForInOrOf = true;
@@ -816,7 +967,40 @@ StmtPtr Parser::parseForStatement() {
       isForInOrOf = true;
       isForOf = true;
     }
-  } else if (match(TokenType::Identifier)) {
+  } else if (match(TokenType::LeftParen)) {
+    // Parenthesized LHS: for ((x) of ...) or for ((x.y) in ...)
+    int parenDepth = 1;
+    advance();
+    while (parenDepth > 0 && !match(TokenType::EndOfFile)) {
+      if (match(TokenType::LeftParen)) parenDepth++;
+      else if (match(TokenType::RightParen)) parenDepth--;
+      advance();
+    }
+    // After closing paren, check for member expressions
+    while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
+      if (match(TokenType::Dot)) {
+        advance();
+        if (match(TokenType::Identifier) || isIdentifierLikeToken(current().type)) {
+          advance();
+        }
+      } else {
+        advance();
+        int bracketDepth = 1;
+        while (bracketDepth > 0 && !match(TokenType::EndOfFile)) {
+          if (match(TokenType::LeftBracket)) bracketDepth++;
+          else if (match(TokenType::RightBracket)) bracketDepth--;
+          advance();
+        }
+      }
+    }
+    if (match(TokenType::In)) {
+      isForInOrOf = true;
+      isForOf = false;
+    } else if (match(TokenType::Of)) {
+      isForInOrOf = true;
+      isForOf = true;
+    }
+  } else if (match(TokenType::Identifier) || match(TokenType::Async) || match(TokenType::Of)) {
     advance();
     // Skip member expressions (x.y, x[y], etc.)
     while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
@@ -872,6 +1056,20 @@ StmtPtr Parser::parseForStatement() {
         return nullptr;
       }
 
+      // Check for duplicate bound names in let/const declarations
+      if (kind != VarDeclaration::Kind::Var && hasDuplicateBoundNames(*pattern)) {
+        return nullptr;
+      }
+
+      // BoundNames of ForDeclaration must not contain "let"
+      if (kind != VarDeclaration::Kind::Var) {
+        std::vector<std::string> boundNames;
+        collectBoundNames(*pattern, boundNames);
+        for (auto& name : boundNames) {
+          if (name == "let") return nullptr;
+        }
+      }
+
       VarDeclaration decl;
       decl.kind = kind;
       decl.declarations.push_back({std::move(pattern), nullptr});
@@ -896,6 +1094,10 @@ StmtPtr Parser::parseForStatement() {
 
     bool isOf = match(TokenType::Of);
     if (isOf) {
+      // The 'of' keyword must not contain escape sequences
+      if (current().escaped) {
+        return nullptr;
+      }
       advance();
     } else {
       if (!expect(TokenType::In)) {
@@ -907,9 +1109,71 @@ StmtPtr Parser::parseForStatement() {
     if (!right || !expect(TokenType::RightParen)) {
       return nullptr;
     }
+
+    // Declarations are not allowed as for-in/for-of body
+    if (match(TokenType::Function) || match(TokenType::Class)) {
+      return nullptr;
+    }
+    // `let` or `const` declarations not allowed as body
+    if (match(TokenType::Const)) {
+      return nullptr;
+    }
+    if (match(TokenType::Let)) {
+      // ExpressionStatement lookahead restriction: 'let [' is always forbidden
+      if (peek().type == TokenType::LeftBracket) {
+        return nullptr;
+      }
+      if (strictMode_) {
+        // In strict mode, 'let' is always a declaration keyword - reject as body
+        return nullptr;
+      }
+      // In non-strict mode, only reject 'let' followed by declaration pattern on same line
+      if (peek().line == current().line &&
+          (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+        return nullptr;
+      }
+      // Otherwise: let as identifier expression (handled by parseStatement)
+    }
+    // `async function` not allowed as body
+    if (match(TokenType::Async) && peek().type == TokenType::Function) {
+      return nullptr;
+    }
+
     auto body = parseStatement();
     if (!body) {
       return nullptr;
+    }
+
+    // Check for labeled function declarations in body (also forbidden)
+    {
+      const Statement* check = body.get();
+      while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+        check = lab->body.get();
+      }
+      if (std::get_if<FunctionDeclaration>(&check->node)) {
+        return nullptr;
+      }
+    }
+
+    // Check that var declarations in body don't redeclare let/const head bindings
+    if (left) {
+      if (auto* varDecl = std::get_if<VarDeclaration>(&left->node)) {
+        if (varDecl->kind == VarDeclaration::Kind::Let ||
+            varDecl->kind == VarDeclaration::Kind::Const) {
+          std::vector<std::string> headNames;
+          for (auto& decl : varDecl->declarations) {
+            if (decl.pattern) collectBoundNames(*decl.pattern, headNames);
+          }
+          std::vector<std::string> bodyVarNames;
+          collectVarDeclaredNames(*body, bodyVarNames);
+          std::set<std::string> headSet(headNames.begin(), headNames.end());
+          for (auto& name : bodyVarNames) {
+            if (headSet.count(name)) {
+              return nullptr;  // var redeclares head let/const binding
+            }
+          }
+        }
+      }
     }
 
     if (isOf) {
@@ -2245,11 +2509,23 @@ ExprPtr Parser::parseCall() {
       }
       // Tagged template call: tag`...`
       std::vector<ExprPtr> args;
-      auto arg = parsePrimary();
-      if (!arg) {
+      auto templateArg = parsePrimary();
+      if (!templateArg) {
         return nullptr;
       }
-      args.push_back(std::move(arg));
+      if (auto* templateLiteral = std::get_if<TemplateLiteral>(&templateArg->node)) {
+        ArrayExpr templateParts;
+        for (const auto& quasi : templateLiteral->quasis) {
+          templateParts.elements.push_back(
+            std::make_unique<Expression>(StringLiteral{quasi}));
+        }
+        args.push_back(std::make_unique<Expression>(std::move(templateParts)));
+        for (auto& subst : templateLiteral->expressions) {
+          args.push_back(std::move(subst));
+        }
+      } else {
+        args.push_back(std::move(templateArg));
+      }
 
       CallExpr call;
       call.callee = std::move(expr);
@@ -2508,6 +2784,13 @@ ExprPtr Parser::parsePrimary() {
     return makeExpr(Identifier{name}, tok);
   }
 
+  // In non-strict mode, 'let' can be used as an identifier
+  if (match(TokenType::Let) && !strictMode_) {
+    const Token& tok = current();
+    advance();
+    return makeExpr(Identifier{"let"}, tok);
+  }
+
   // Dynamic import: import(specifier), import.meta, import.source(specifier), import.defer(specifier)
   if (match(TokenType::Import)) {
     Token importTok = current();
@@ -2599,9 +2882,13 @@ ExprPtr Parser::parsePrimary() {
   }
 
   if (match(TokenType::Async)) {
-    if (peek().type == TokenType::Function) {
+    if (!current().escaped && peek().type == TokenType::Function) {
       return parseFunctionExpression();
     }
+    // 'async' used as identifier (not followed by function, or escaped)
+    const Token& tok = current();
+    advance();
+    return makeExpr(Identifier{"async"}, tok);
   }
 
   if (match(TokenType::Function)) {
@@ -2632,12 +2919,18 @@ ExprPtr Parser::parsePrimary() {
     if (!expr) {
       return nullptr;
     }
-    while (match(TokenType::Comma)) {
-      advance();
-      expr = parseAssignment();
-      if (!expr) {
-        return nullptr;
+    if (match(TokenType::Comma)) {
+      std::vector<ExprPtr> sequence;
+      sequence.push_back(std::move(expr));
+      while (match(TokenType::Comma)) {
+        advance();
+        auto next = parseAssignment();
+        if (!next) {
+          return nullptr;
+        }
+        sequence.push_back(std::move(next));
       }
+      expr = std::make_unique<Expression>(SequenceExpr{std::move(sequence)});
     }
     if (!expect(TokenType::RightParen)) {
       return nullptr;
@@ -2667,6 +2960,13 @@ ExprPtr Parser::parseArrayExpression() {
     if (!elements.empty()) {
       expect(TokenType::Comma);
       if (match(TokenType::RightBracket)) break;
+    }
+
+    // Handle holes (elision): consecutive commas like [,] or [1,,2]
+    if (match(TokenType::Comma)) {
+      // Push nullptr for the hole (will become undefined)
+      elements.push_back(nullptr);
+      continue;
     }
 
     // Check for spread element
@@ -3304,11 +3604,34 @@ ExprPtr Parser::parsePattern() {
     return base;
   }
 
-  // Otherwise it must be an identifier (binding)
+  // Otherwise it must be an identifier (binding) or member expression (assignment target)
   if (isIdentifierLikeToken(current().type)) {
     std::string name = current().value;
     advance();
     auto base = std::make_unique<Expression>(Identifier{name});
+    // Check for member expression (e.g., x.y, obj['key'])
+    while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
+      if (match(TokenType::Dot)) {
+        advance();
+        if (!isIdentifierNameToken(current().type)) break;
+        auto prop = std::make_unique<Expression>(Identifier{current().value});
+        advance();
+        MemberExpr mem;
+        mem.object = std::move(base);
+        mem.property = std::move(prop);
+        mem.computed = false;
+        base = std::make_unique<Expression>(std::move(mem));
+      } else {
+        advance();
+        auto prop = parseAssignment();
+        if (!prop || !expect(TokenType::RightBracket)) return nullptr;
+        MemberExpr mem;
+        mem.object = std::move(base);
+        mem.property = std::move(prop);
+        mem.computed = true;
+        base = std::make_unique<Expression>(std::move(mem));
+      }
+    }
     if (match(TokenType::Equal)) {
       advance();
       auto init = parseAssignment();
@@ -3342,6 +3665,10 @@ ExprPtr Parser::parseArrayPattern() {
       advance();
       pattern.rest = parsePattern();
       if (!pattern.rest) {
+        return nullptr;
+      }
+      // Rest element does not support initializer: [...x = y] is SyntaxError
+      if (std::get_if<AssignmentPattern>(&pattern.rest->node)) {
         return nullptr;
       }
       // Rest must be last element
@@ -3396,14 +3723,27 @@ ExprPtr Parser::parseObjectPattern() {
 
     // Parse property key
     ExprPtr key;
-    if (isIdentifierNameToken(current().type)) {
+    bool isComputed = false;
+    if (match(TokenType::LeftBracket)) {
+      // Computed property key: {[expr]: pattern}
+      isComputed = true;
+      advance();
+      key = parseAssignment();
+      if (!key || !expect(TokenType::RightBracket)) {
+        return nullptr;
+      }
+    } else if (isIdentifierNameToken(current().type)) {
       std::string name = current().value;
       advance();
       key = std::make_unique<Expression>(Identifier{name});
     } else if (match(TokenType::String)) {
-      std::string value = current().value;
+      std::string strVal = current().value;
       advance();
-      key = std::make_unique<Expression>(StringLiteral{value});
+      key = std::make_unique<Expression>(StringLiteral{strVal});
+    } else if (match(TokenType::Number)) {
+      std::string numVal = current().value;
+      advance();
+      key = std::make_unique<Expression>(NumberLiteral{std::stod(numVal)});
     } else {
       return nullptr;
     }
@@ -3441,6 +3781,7 @@ ExprPtr Parser::parseObjectPattern() {
     ObjectPattern::Property prop;
     prop.key = std::move(key);
     prop.value = std::move(value);
+    prop.computed = isComputed;
     pattern.properties.push_back(std::move(prop));
   }
 

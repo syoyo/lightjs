@@ -33,6 +33,7 @@ enum class TokenType {
   Else,
   While,
   For,
+  With,
   In,
   Instanceof,
   Of,
