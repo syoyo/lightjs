@@ -170,6 +170,22 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
     if (it != fn->properties.end()) {
       return {true, it->second};
     }
+    // Walk prototype chain for functions
+    auto protoIt = fn->properties.find("__proto__");
+    if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
+      auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      int depth = 0;
+      while (proto && depth < 16) {
+        auto found = proto->properties.find(key);
+        if (found != proto->properties.end()) {
+          return {true, found->second};
+        }
+        auto nextProto = proto->properties.find("__proto__");
+        if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+        proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+        depth++;
+      }
+    }
     return {false, Value(Undefined{})};
   }
 
@@ -1200,9 +1216,27 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         LIGHTJS_RETURN(Value(false));
       }
 
+      // Helper lambda to walk prototype chain for 'in' operator
+      auto hasPropertyInChain = [&](const std::unordered_map<std::string, Value>& props) -> bool {
+        if (props.find(propName) != props.end()) return true;
+        auto protoIt = props.find("__proto__");
+        if (protoIt != props.end() && protoIt->second.isObject()) {
+          auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          int depth = 0;
+          while (proto && depth < 50) {
+            if (proto->properties.find(propName) != proto->properties.end()) return true;
+            auto nextProto = proto->properties.find("__proto__");
+            if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+            proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+            depth++;
+          }
+        }
+        return false;
+      };
+
       if (right.isObject()) {
         auto objPtr = std::get<std::shared_ptr<Object>>(right.data);
-        LIGHTJS_RETURN(Value(objPtr->properties.find(propName) != objPtr->properties.end()));
+        LIGHTJS_RETURN(Value(hasPropertyInChain(objPtr->properties)));
       }
 
       if (right.isArray()) {
@@ -1212,7 +1246,12 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           LIGHTJS_RETURN(Value(idx < arrPtr->elements.size()));
         }
         if (propName == "length") LIGHTJS_RETURN(Value(true));
-        LIGHTJS_RETURN(Value(arrPtr->properties.find(propName) != arrPtr->properties.end()));
+        LIGHTJS_RETURN(Value(hasPropertyInChain(arrPtr->properties)));
+      }
+
+      if (right.isFunction()) {
+        auto fnPtr = std::get<std::shared_ptr<Function>>(right.data);
+        LIGHTJS_RETURN(Value(hasPropertyInChain(fnPtr->properties)));
       }
 
       // 'in' on primitives returns false
@@ -3568,6 +3607,30 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto it = funcPtr->properties.find(propName);
     if (it != funcPtr->properties.end()) {
       LIGHTJS_RETURN(it->second);
+    }
+
+    // Walk prototype chain (__proto__) for functions
+    {
+      auto protoIt = funcPtr->properties.find("__proto__");
+      if (protoIt != funcPtr->properties.end() && protoIt->second.isObject()) {
+        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        int depth = 0;
+        while (proto && depth < 50) {
+          auto protoGetterIt = proto->properties.find("__get_" + propName);
+          if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
+            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+          }
+          auto found = proto->properties.find(propName);
+          if (found != proto->properties.end()) {
+            LIGHTJS_RETURN(found->second);
+          }
+          auto nextProto = proto->properties.find("__proto__");
+          if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          depth++;
+        }
+      }
     }
   }
 
