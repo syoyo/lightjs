@@ -1329,21 +1329,21 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       // OrdinaryHasInstance: walk the prototype chain
       // Get the constructor's .prototype property
       auto getCtorPrototype = [&](const Value& ctor) -> std::shared_ptr<Object> {
+        std::unordered_map<std::string, Value>* props = nullptr;
         if (ctor.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(ctor.data);
-          auto protoIt = fn->properties.find("prototype");
-          if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
-            return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          props = &std::get<std::shared_ptr<Function>>(ctor.data)->properties;
+        } else if (ctor.isObject()) {
+          props = &std::get<std::shared_ptr<Object>>(ctor.data)->properties;
+        } else if (ctor.isClass()) {
+          auto cls = std::get<std::shared_ptr<Class>>(ctor.data);
+          if (cls->constructor) {
+            props = &cls->constructor->properties;
           }
         }
-        if (ctor.isClass()) {
-          auto cls = std::get<std::shared_ptr<Class>>(ctor.data);
-          // Class stores prototype via its constructor function
-          if (cls->constructor) {
-            auto protoIt = cls->constructor->properties.find("prototype");
-            if (protoIt != cls->constructor->properties.end() && protoIt->second.isObject()) {
-              return std::get<std::shared_ptr<Object>>(protoIt->second.data);
-            }
+        if (props) {
+          auto protoIt = props->find("prototype");
+          if (protoIt != props->end() && protoIt->second.isObject()) {
+            return std::get<std::shared_ptr<Object>>(protoIt->second.data);
           }
         }
         return nullptr;
@@ -1352,10 +1352,15 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       auto ctorProto = getCtorPrototype(ctorValue);
       if (!ctorProto) {
         // Check if prototype property exists but is not an object → TypeError
+        std::unordered_map<std::string, Value>* checkProps = nullptr;
         if (ctorValue.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
-          auto protoIt = fn->properties.find("prototype");
-          if (protoIt != fn->properties.end() && !protoIt->second.isObject()) {
+          checkProps = &std::get<std::shared_ptr<Function>>(ctorValue.data)->properties;
+        } else if (ctorValue.isObject()) {
+          checkProps = &std::get<std::shared_ptr<Object>>(ctorValue.data)->properties;
+        }
+        if (checkProps) {
+          auto protoIt = checkProps->find("prototype");
+          if (protoIt != checkProps->end() && !protoIt->second.isObject()) {
             throwError(ErrorType::TypeError, "Function has non-object prototype in instanceof check");
             LIGHTJS_RETURN(Value(false));
           }
@@ -4547,6 +4552,31 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propIt != arrPtr->properties.end()) {
       LIGHTJS_RETURN(propIt->second);
     }
+
+    // Walk prototype chain (__proto__) for arrays
+    {
+      auto protoIt = arrPtr->properties.find("__proto__");
+      if (protoIt != arrPtr->properties.end() && protoIt->second.isObject()) {
+        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        int depth = 0;
+        while (proto && depth < 50) {
+          // Check getter on prototype
+          auto protoGetterIt = proto->properties.find("__get_" + propName);
+          if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
+            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+          }
+          auto found = proto->properties.find(propName);
+          if (found != proto->properties.end()) {
+            LIGHTJS_RETURN(found->second);
+          }
+          auto nextProto = proto->properties.find("__proto__");
+          if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          depth++;
+        }
+      }
+    }
   }
 
   if (obj.isMap()) {
@@ -6342,11 +6372,18 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 
   // Set __proto__ to Array.prototype for prototype chain resolution
   auto arrCtor = env_->get("Array");
-  if (arrCtor && arrCtor->isFunction()) {
-    auto arrFunc = std::get<std::shared_ptr<Function>>(arrCtor->data);
-    auto protoIt = arrFunc->properties.find("prototype");
-    if (protoIt != arrFunc->properties.end() && protoIt->second.isObject()) {
-      arr->properties["__proto__"] = protoIt->second;
+  if (arrCtor) {
+    std::unordered_map<std::string, Value>* ctorProps = nullptr;
+    if (arrCtor->isFunction()) {
+      ctorProps = &std::get<std::shared_ptr<Function>>(arrCtor->data)->properties;
+    } else if (arrCtor->isObject()) {
+      ctorProps = &std::get<std::shared_ptr<Object>>(arrCtor->data)->properties;
+    }
+    if (ctorProps) {
+      auto protoIt = ctorProps->find("prototype");
+      if (protoIt != ctorProps->end() && protoIt->second.isObject()) {
+        arr->properties["__proto__"] = protoIt->second;
+      }
     }
   }
 
@@ -6399,11 +6436,18 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 
   // Set __proto__ to Object.prototype for prototype chain resolution
   auto objCtor = env_->get("Object");
-  if (objCtor && objCtor->isFunction()) {
-    auto objFunc = std::get<std::shared_ptr<Function>>(objCtor->data);
-    auto protoIt = objFunc->properties.find("prototype");
-    if (protoIt != objFunc->properties.end() && protoIt->second.isObject()) {
-      obj->properties["__proto__"] = protoIt->second;
+  if (objCtor) {
+    std::unordered_map<std::string, Value>* ctorProps = nullptr;
+    if (objCtor->isFunction()) {
+      ctorProps = &std::get<std::shared_ptr<Function>>(objCtor->data)->properties;
+    } else if (objCtor->isObject()) {
+      ctorProps = &std::get<std::shared_ptr<Object>>(objCtor->data)->properties;
+    }
+    if (ctorProps) {
+      auto protoIt = ctorProps->find("prototype");
+      if (protoIt != ctorProps->end() && protoIt->second.isObject()) {
+        obj->properties["__proto__"] = protoIt->second;
+      }
     }
   }
 
@@ -7432,13 +7476,36 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
 }
 
 // Recursively collect var declarations from a statement and hoist them
+// Helper: collect bound names from a pattern expression for var hoisting
+static void collectVarHoistNames(const Expression& expr, std::vector<std::string>& names) {
+  if (auto* id = std::get_if<Identifier>(&expr.node)) {
+    names.push_back(id->name);
+  } else if (auto* assign = std::get_if<AssignmentPattern>(&expr.node)) {
+    if (assign->left) collectVarHoistNames(*assign->left, names);
+  } else if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& elem : arrPat->elements) {
+      if (elem) collectVarHoistNames(*elem, names);
+    }
+    if (arrPat->rest) collectVarHoistNames(*arrPat->rest, names);
+  } else if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.value) collectVarHoistNames(*prop.value, names);
+    }
+    if (objPat->rest) collectVarHoistNames(*objPat->rest, names);
+  }
+}
+
 void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
     if (varDecl->kind == VarDeclaration::Kind::Var) {
       for (const auto& declarator : varDecl->declarations) {
-        if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
-          if (!env_->has(id->name)) {
-            env_->define(id->name, Value(Undefined{}));
+        std::vector<std::string> names;
+        if (declarator.pattern) {
+          collectVarHoistNames(*declarator.pattern, names);
+        }
+        for (const auto& name : names) {
+          if (!env_->has(name)) {
+            env_->define(name, Value(Undefined{}));
           }
         }
       }

@@ -554,7 +554,12 @@ StmtPtr Parser::parseVarDeclaration() {
     }
 
     ExprPtr init = nullptr;
-    if (match(TokenType::Equal)) {
+    // If parsePattern() consumed the '=' and created an AssignmentPattern,
+    // unwrap it: the left side is the pattern, right side is the initializer
+    if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
+      init = std::move(assignPat->right);
+      pattern = std::move(assignPat->left);
+    } else if (match(TokenType::Equal)) {
       advance();
       init = parseExpression();
       if (!init) {
@@ -903,9 +908,17 @@ StmtPtr Parser::parseForStatement() {
 
   // Try to detect for...in or for...of pattern
   if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+    auto declType = current().type;
     advance();
+    // In non-strict mode, 'let' directly followed by 'in'/'of' means 'let' is an identifier
+    if (!strictMode_ && declType == TokenType::Let && match(TokenType::In)) {
+      isForInOrOf = true;
+      isForOf = false;
+    } else if (!strictMode_ && declType == TokenType::Let && match(TokenType::Of)) {
+      isForInOrOf = true;
+      isForOf = true;
     // Allow 'let' as identifier in non-strict mode (e.g., 'var let of [23]')
-    if (match(TokenType::Identifier) || (!strictMode_ && match(TokenType::Let))) {
+    } else if (match(TokenType::Identifier) || (!strictMode_ && match(TokenType::Let))) {
       advance();
       if (match(TokenType::In)) {
         isForInOrOf = true;
@@ -1040,7 +1053,10 @@ StmtPtr Parser::parseForStatement() {
   if (isForInOrOf) {
     // Parse for...in or for...of
     StmtPtr left = nullptr;
-    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+    // In non-strict mode, 'let' directly followed by 'in'/'of' is an identifier, not a declaration
+    bool letAsIdentifier = !strictMode_ && match(TokenType::Let) &&
+      (peek().type == TokenType::In || peek().type == TokenType::Of);
+    if (!letAsIdentifier && (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var))) {
       VarDeclaration::Kind kind;
       switch (current().type) {
         case TokenType::Let: kind = VarDeclaration::Kind::Let; break;
@@ -1105,8 +1121,21 @@ StmtPtr Parser::parseForStatement() {
       }
     }
 
-    auto right = parseExpression();
-    if (!right || !expect(TokenType::RightParen)) {
+    // Parse RHS expression - allow comma sequences (SequenceExpression)
+    auto right = parseAssignment();
+    if (!right) return nullptr;
+    if (match(TokenType::Comma)) {
+      std::vector<ExprPtr> sequence;
+      sequence.push_back(std::move(right));
+      while (match(TokenType::Comma)) {
+        advance();
+        auto next = parseAssignment();
+        if (!next) return nullptr;
+        sequence.push_back(std::move(next));
+      }
+      right = std::make_unique<Expression>(SequenceExpr{std::move(sequence)});
+    }
+    if (!expect(TokenType::RightParen)) {
       return nullptr;
     }
 
@@ -2768,6 +2797,13 @@ ExprPtr Parser::parsePrimary() {
     std::string name = tok.value;
     advance();
     return makeExpr(Identifier{name}, tok);
+  }
+
+  // In non-strict mode, 'let' can be used as an identifier
+  if (match(TokenType::Let) && !strictMode_) {
+    const Token& tok = current();
+    advance();
+    return makeExpr(Identifier{"let"}, tok);
   }
 
   if (match(TokenType::Await) && canUseAwaitAsIdentifier()) {

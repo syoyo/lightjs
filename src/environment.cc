@@ -5910,10 +5910,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // Function.prototype - a minimal prototype with call/apply/bind
-  // (actual call/apply/bind are handled dynamically in the interpreter)
+  // Per spec, Function.prototype is itself callable (it's a function that accepts any arguments and returns undefined)
   auto functionPrototype = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   functionPrototype->properties["__proto__"] = Value(objectPrototype);
+  functionPrototype->properties["__callable_object__"] = Value(true);
 
   // Function.prototype.call - uses __uses_this_arg__ so args[0] = this (the function to call)
   auto fpCall = std::make_shared<Function>();
