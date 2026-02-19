@@ -293,6 +293,7 @@ private:
   bool pendingDirectEvalCall_ = false;
   bool activeDirectEvalInvocation_ = false;
   std::vector<std::shared_ptr<Function>> activeNamedExpressionStack_;
+  std::string pendingIterationLabel_;  // Label for next iteration statement (consumed once)
 
   struct IteratorRecord {
     enum class Kind { Generator, Array, String, IteratorObject, TypedArray };
@@ -303,6 +304,7 @@ private:
     std::shared_ptr<TypedArray> typedArray;
     std::string stringValue;
     size_t index = 0;
+    Value nextMethod;  // Cached next() method per GetIterator spec (7.4.1)
   };
 
   static Value makeIteratorResult(const Value& value, bool done);

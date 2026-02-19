@@ -291,6 +291,7 @@ Environment::Environment(std::shared_ptr<Environment> parent)
 
 void Environment::define(const std::string& name, const Value& value, bool isConst) {
   bindings_[name] = value;
+  tdzBindings_.erase(name);  // Remove TDZ when initialized
   if (isConst) {
     constants_[name] = true;
   }
@@ -301,6 +302,28 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
       globalObj->properties[name] = value;
     }
   }
+}
+
+void Environment::defineTDZ(const std::string& name) {
+  bindings_[name] = Value(Undefined{});
+  tdzBindings_[name] = true;
+}
+
+void Environment::removeTDZ(const std::string& name) {
+  tdzBindings_.erase(name);
+}
+
+bool Environment::isTDZ(const std::string& name) const {
+  // Check if binding exists in this scope and is in TDZ
+  auto bindIt = bindings_.find(name);
+  if (bindIt != bindings_.end()) {
+    return tdzBindings_.find(name) != tdzBindings_.end();
+  }
+  // If not found in this scope, check parent
+  if (parent_) {
+    return parent_->isTDZ(name);
+  }
+  return false;
 }
 
 std::optional<Value> Environment::get(const std::string& name) const {
@@ -479,9 +502,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   consoleObj->properties["assert"] = Value(consoleAssertFn);
 
   env->define("console", Value(consoleObj));
-  env->define("undefined", Value(Undefined{}));
-  env->define("Infinity", Value(std::numeric_limits<double>::infinity()));
-  env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()));
+  env->define("undefined", Value(Undefined{}), true);  // non-writable per spec
+  env->define("Infinity", Value(std::numeric_limits<double>::infinity()), true);
+  env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()), true);
 
   auto evalFn = std::make_shared<Function>();
   evalFn->isNative = true;
@@ -4563,7 +4586,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectDefineProperty->isNative = true;
   objectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 3 ||
-        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex())) {
+        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isArray())) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
     std::string key = args[1].toString();
@@ -4672,7 +4695,65 @@ std::shared_ptr<Environment> Environment::createGlobal() {
             setField.has_value() && setField->isFunction()) {
           promise->properties["__set_" + key] = *setField;
         }
-      } else {
+      } else if (args[0].isArray()) {
+        auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+          // For numeric keys, set in elements array; for others, use properties
+          bool isNumeric = true;
+          size_t idx = 0;
+          try { idx = std::stoul(key); } catch (...) { isNumeric = false; }
+          if (isNumeric && idx < arr->elements.size()) {
+            arr->elements[idx] = *valueField;
+          } else {
+            arr->properties[key] = *valueField;
+          }
+        }
+
+        if (auto getField = readDescriptorField("get");
+            getField.has_value() && getField->isFunction()) {
+          arr->properties["__get_" + key] = *getField;
+          // For numeric indices, ensure elements array covers this index
+          // so iteration sees it (getter takes priority over element value)
+          bool isNumIdx = true;
+          size_t gIdx = 0;
+          try { gIdx = std::stoul(key); } catch (...) { isNumIdx = false; }
+          if (isNumIdx && gIdx >= arr->elements.size()) {
+            arr->elements.resize(gIdx + 1, Value(Undefined{}));
+          }
+        }
+
+        if (auto setField = readDescriptorField("set");
+            setField.has_value() && setField->isFunction()) {
+          arr->properties["__set_" + key] = *setField;
+        }
+
+        // Handle writable descriptor
+        if (auto writableField = readDescriptorField("writable"); writableField.has_value()) {
+          if (!writableField->toBool()) {
+            arr->properties["__non_writable_" + key] = Value(true);
+          } else {
+            arr->properties.erase("__non_writable_" + key);
+          }
+        }
+
+        // Handle enumerable descriptor
+        if (auto enumField = readDescriptorField("enumerable"); enumField.has_value()) {
+          if (!enumField->toBool()) {
+            arr->properties["__non_enum_" + key] = Value(true);
+          } else {
+            arr->properties.erase("__non_enum_" + key);
+          }
+        }
+
+        // Handle configurable descriptor
+        if (auto configField = readDescriptorField("configurable"); configField.has_value()) {
+          if (!configField->toBool()) {
+            arr->properties["__non_configurable_" + key] = Value(true);
+          } else {
+            arr->properties.erase("__non_configurable_" + key);
+          }
+        }
+      } else if (args[0].isRegex()) {
         auto regex = std::get<std::shared_ptr<Regex>>(args[0].data);
         if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
           regex->properties[key] = *valueField;
@@ -5976,7 +6057,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     "Float16Array", "Float32Array", "Float64Array",
     "BigInt64Array", "BigUint64Array", "WeakRef", "FinalizationRegistry",
     "globalThis", "undefined", "NaN", "Infinity",
-    "parseInt", "parseFloat", "isNaN", "isFinite",
+    "eval", "parseInt", "parseFloat", "isNaN", "isFinite",
     "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
     "setTimeout", "clearTimeout", "setInterval", "clearInterval",
     "queueMicrotask", "structuredClone", "btoa", "atob",
