@@ -7606,15 +7606,21 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   // Get the variable name from the left side
   std::string varName;
   bool isVarDecl = false;
+  bool isLetOrConst = false;
+  bool isConst = false;
   const Expression* memberExpr = nullptr;  // For MemberExpr targets
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isVarDecl = true;
+    isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let || varDecl->kind == VarDeclaration::Kind::Const);
+    isConst = (varDecl->kind == VarDeclaration::Kind::Const);
     if (!varDecl->declarations.empty()) {
       if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
         varName = id->name;
       }
       // For var declarations, define in loop scope
-      env_->define(varName, Value(Undefined{}));
+      if (!isLetOrConst) {
+        env_->define(varName, Value(Undefined{}));
+      }
     }
   } else if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.left->node)) {
     if (auto* ident = std::get_if<Identifier>(&exprStmt->expression->node)) {
@@ -7642,7 +7648,15 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   };
 
   // Helper to assign a key to the loop variable
+  // For let/const, creates a fresh child environment per iteration
   auto assignKey = [&](const std::string& key) -> void {
+    if (isLetOrConst && !varName.empty()) {
+      // Create a fresh scope for each iteration (per-iteration binding)
+      auto iterEnv = env_->createChild();
+      env_ = iterEnv;
+      env_->define(varName, Value(key), isConst);
+      return;
+    }
     if (memberExpr) {
       if (auto* member = std::get_if<MemberExpr>(&memberExpr->node)) {
         auto objTask = evaluate(*member->object);
@@ -7744,10 +7758,13 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       }
       if (!exists) continue;
 
+      auto loopEnv = env_;  // Save loop environment
       assignKey(key);
 
       auto bodyTask = evaluate(*stmt.body);
   LIGHTJS_RUN_TASK(bodyTask, result);
+
+      if (isLetOrConst) env_ = loopEnv;  // Restore to loop scope
 
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -7781,9 +7798,11 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     }
 
     for (const auto& key : keys) {
+      auto loopEnv = env_;
       assignKey(key);
       auto bodyTask = evaluate(*stmt.body);
       LIGHTJS_RUN_TASK(bodyTask, result);
+      if (isLetOrConst) env_ = loopEnv;
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
         break;
@@ -7814,9 +7833,11 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     }
 
     for (const auto& key : keys) {
+      auto loopEnv = env_;
       assignKey(key);
       auto bodyTask = evaluate(*stmt.body);
       LIGHTJS_RUN_TASK(bodyTask, result);
+      if (isLetOrConst) env_ = loopEnv;
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
         break;
