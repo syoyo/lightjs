@@ -381,8 +381,10 @@ bool Parser::isIdentifierLikeToken(TokenType type) const {
   if (type == TokenType::Async) {
     return true;
   }
-  // 'get' and 'set' are contextual keywords (only special in property definitions)
-  if (type == TokenType::Get || type == TokenType::Set) {
+  // 'get', 'set', 'from', 'as', 'of', 'static' are contextual keywords
+  if (type == TokenType::Get || type == TokenType::Set ||
+      type == TokenType::From || type == TokenType::As ||
+      type == TokenType::Of || type == TokenType::Static) {
     return true;
   }
   return false;
@@ -2810,8 +2812,10 @@ ExprPtr Parser::parsePrimary() {
     return makeExpr(Identifier{"let"}, tok);
   }
 
-  // 'get' and 'set' are contextual keywords - can be used as identifiers
-  if (match(TokenType::Get) || match(TokenType::Set)) {
+  // Contextual keywords can be used as identifiers
+  if (match(TokenType::Get) || match(TokenType::Set) ||
+      match(TokenType::From) || match(TokenType::As) ||
+      match(TokenType::Of) || match(TokenType::Static)) {
     const Token& tok = current();
     advance();
     return makeExpr(Identifier{tok.value}, tok);
