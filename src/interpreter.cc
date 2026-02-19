@@ -4695,6 +4695,89 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       };
       LIGHTJS_RETURN(Value(fn));
     }
+    if (propName == "forEach") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, mapPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+        for (size_t i = 0; i < mapPtr->entries.size(); ++i) {
+          auto& entry = mapPtr->entries[i];
+          invokeFunction(callback, {entry.second, entry.first, Value(mapPtr)}, thisArg);
+        }
+        return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "entries" || propName == iteratorKey) {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
+        auto iterObj = std::make_shared<Object>();
+        auto indexPtr = std::make_shared<size_t>(0);
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
+          if (*indexPtr >= mapPtr->entries.size()) {
+            return makeIteratorResult(Value(Undefined{}), true);
+          }
+          auto& entry = mapPtr->entries[*indexPtr];
+          auto pair = std::make_shared<Array>();
+          pair->elements.push_back(entry.first);
+          pair->elements.push_back(entry.second);
+          (*indexPtr)++;
+          return makeIteratorResult(Value(pair), false);
+        };
+        iterObj->properties["next"] = Value(nextFn);
+        return Value(iterObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "keys") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
+        auto iterObj = std::make_shared<Object>();
+        auto indexPtr = std::make_shared<size_t>(0);
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
+          if (*indexPtr >= mapPtr->entries.size()) {
+            return makeIteratorResult(Value(Undefined{}), true);
+          }
+          Value key = mapPtr->entries[*indexPtr].first;
+          (*indexPtr)++;
+          return makeIteratorResult(key, false);
+        };
+        iterObj->properties["next"] = Value(nextFn);
+        return Value(iterObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "values") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
+        auto iterObj = std::make_shared<Object>();
+        auto indexPtr = std::make_shared<size_t>(0);
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
+          if (*indexPtr >= mapPtr->entries.size()) {
+            return makeIteratorResult(Value(Undefined{}), true);
+          }
+          Value val = mapPtr->entries[*indexPtr].second;
+          (*indexPtr)++;
+          return makeIteratorResult(val, false);
+        };
+        iterObj->properties["next"] = Value(nextFn);
+        return Value(iterObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
     if (propName == "constructor") {
       if (auto ctor = env_->get("Map")) {
         LIGHTJS_RETURN(*ctor);
@@ -4743,6 +4826,67 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
         setPtr->clear();
         return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "forEach") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [this, setPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isFunction()) {
+          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
+        }
+        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
+        for (size_t i = 0; i < setPtr->values.size(); ++i) {
+          invokeFunction(callback, {setPtr->values[i], setPtr->values[i], Value(setPtr)}, thisArg);
+        }
+        return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "values" || propName == "keys" || propName == iteratorKey) {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
+        auto iterObj = std::make_shared<Object>();
+        auto indexPtr = std::make_shared<size_t>(0);
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
+          if (*indexPtr >= setPtr->values.size()) {
+            return makeIteratorResult(Value(Undefined{}), true);
+          }
+          Value val = setPtr->values[*indexPtr];
+          (*indexPtr)++;
+          return makeIteratorResult(val, false);
+        };
+        iterObj->properties["next"] = Value(nextFn);
+        return Value(iterObj);
+      };
+      LIGHTJS_RETURN(Value(fn));
+    }
+    if (propName == "entries") {
+      auto fn = std::make_shared<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
+        auto iterObj = std::make_shared<Object>();
+        auto indexPtr = std::make_shared<size_t>(0);
+        auto nextFn = std::make_shared<Function>();
+        nextFn->isNative = true;
+        nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
+          if (*indexPtr >= setPtr->values.size()) {
+            return makeIteratorResult(Value(Undefined{}), true);
+          }
+          Value val = setPtr->values[*indexPtr];
+          auto pair = std::make_shared<Array>();
+          pair->elements.push_back(val);
+          pair->elements.push_back(val);
+          (*indexPtr)++;
+          return makeIteratorResult(Value(pair), false);
+        };
+        iterObj->properties["next"] = Value(nextFn);
+        return Value(iterObj);
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -5798,6 +5942,49 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       record.kind = IteratorRecord::Kind::TypedArray;
       record.typedArray = std::get<std::shared_ptr<TypedArray>>(value.data);
       record.index = 0;
+      return record;
+    }
+    if (value.isMap()) {
+      auto mapPtr = std::get<std::shared_ptr<Map>>(value.data);
+      auto iterObj = std::make_shared<Object>();
+      auto indexPtr = std::make_shared<size_t>(0);
+      auto nextFn = std::make_shared<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
+        if (*indexPtr >= mapPtr->entries.size()) {
+          return makeIteratorResult(Value(Undefined{}), true);
+        }
+        auto& entry = mapPtr->entries[*indexPtr];
+        auto pair = std::make_shared<Array>();
+        pair->elements.push_back(entry.first);
+        pair->elements.push_back(entry.second);
+        (*indexPtr)++;
+        return makeIteratorResult(Value(pair), false);
+      };
+      iterObj->properties["next"] = Value(nextFn);
+      record.kind = IteratorRecord::Kind::IteratorObject;
+      record.iteratorObject = iterObj;
+      record.nextMethod = Value(nextFn);
+      return record;
+    }
+    if (value.isSet()) {
+      auto setPtr = std::get<std::shared_ptr<Set>>(value.data);
+      auto iterObj = std::make_shared<Object>();
+      auto indexPtr = std::make_shared<size_t>(0);
+      auto nextFn = std::make_shared<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
+        if (*indexPtr >= setPtr->values.size()) {
+          return makeIteratorResult(Value(Undefined{}), true);
+        }
+        Value val = setPtr->values[*indexPtr];
+        (*indexPtr)++;
+        return makeIteratorResult(val, false);
+      };
+      iterObj->properties["next"] = Value(nextFn);
+      record.kind = IteratorRecord::Kind::IteratorObject;
+      record.iteratorObject = iterObj;
+      record.nextMethod = Value(nextFn);
       return record;
     }
     if (value.isObject()) {
