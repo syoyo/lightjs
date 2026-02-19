@@ -310,9 +310,24 @@ Task Interpreter::evaluate(const Program& program) {
     }
   }
 
+  // Hoisting phase 1: Hoist var declarations (recursive scan)
+  hoistVarDeclarations(program.body);
+
+  // Hoisting phase 2: Hoist function declarations (top-level only)
+  for (const auto& stmt : program.body) {
+    if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+      auto task = evaluate(*stmt);
+      LIGHTJS_RUN_TASK_VOID(task);
+    }
+  }
+
   Value result = Value(Undefined{});
   for (const auto& stmt : program.body) {
     if (program.isModule && std::holds_alternative<ImportDeclaration>(stmt->node)) {
+      continue;
+    }
+    // Skip function declarations - already hoisted
+    if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
       continue;
     }
     auto task = evaluate(*stmt);
@@ -654,6 +669,11 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   Value left;
   LIGHTJS_RUN_TASK(leftTask, left);
 
+  // Check for throw flow from left operand evaluation
+  if (flow_.type == ControlFlow::Type::Throw) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
   // Short-circuit evaluation for logical operators
   if (expr.op == BinaryExpr::Op::LogicalAnd) {
     if (!left.toBool()) {
@@ -686,6 +706,11 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   auto rightTask = evaluate(*expr.right);
   Value right;
   LIGHTJS_RUN_TASK(rightTask, right);
+
+  // Check for throw flow from operand evaluation
+  if (flow_.type == ControlFlow::Type::Throw) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
 
   // Fast path: both operands are numbers (most common case in loops)
   const bool leftIsNum = left.isNumber();
@@ -1194,6 +1219,30 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       LIGHTJS_RETURN(Value(false));
     }
     case BinaryExpr::Op::Instanceof: {
+      // Per spec: if RHS is not callable, throw TypeError
+      // Objects that are not functions/classes don't have [[HasInstance]]
+      if (!right.isFunction() && !right.isClass()) {
+        // Check for callable objects (e.g., Proxy with apply trap)
+        bool isCallable = false;
+        if (right.isObject()) {
+          auto obj = std::get<std::shared_ptr<Object>>(right.data);
+          auto callableIt = obj->properties.find("__callable_object__");
+          if (callableIt != obj->properties.end() &&
+              callableIt->second.isBool() && callableIt->second.toBool()) {
+            isCallable = true;
+          }
+        }
+        if (!isCallable) {
+          throwError(ErrorType::TypeError, "Right-hand side of instanceof is not callable");
+          LIGHTJS_RETURN(Value(false));
+        }
+      }
+      // Per spec: if LHS is a primitive (not object-like), return false
+      if (!left.isObject() && !left.isArray() && !left.isFunction() &&
+          !left.isRegex() && !left.isPromise() && !left.isError() &&
+          !left.isClass() && !left.isProxy()) {
+        LIGHTJS_RETURN(Value(false));
+      }
       auto unwrapConstructor = [&](const Value& ctor) -> Value {
         if (ctor.isObject()) {
           auto obj = std::get<std::shared_ptr<Object>>(ctor.data);
@@ -1265,11 +1314,93 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         if (tagIt != ctor->properties.end() && tagIt->second.isNumber()) {
           auto err = std::get<std::shared_ptr<Error>>(left.data);
           int expected = static_cast<int>(std::get<double>(tagIt->second.data));
-          LIGHTJS_RETURN(Value(static_cast<int>(err->type) == expected));
+          // Exact match (e.g., new TypeError instanceof TypeError)
+          if (static_cast<int>(err->type) == expected) {
+            LIGHTJS_RETURN(Value(true));
+          }
+          // Base Error constructor matches all error types (inheritance)
+          if (expected == static_cast<int>(ErrorType::Error)) {
+            LIGHTJS_RETURN(Value(true));
+          }
+          LIGHTJS_RETURN(Value(false));
         }
       }
 
-      // Built-in type checks for instanceof when __constructor__ is not set
+      // OrdinaryHasInstance: walk the prototype chain
+      // Get the constructor's .prototype property
+      auto getCtorPrototype = [&](const Value& ctor) -> std::shared_ptr<Object> {
+        if (ctor.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(ctor.data);
+          auto protoIt = fn->properties.find("prototype");
+          if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
+            return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          }
+        }
+        if (ctor.isClass()) {
+          auto cls = std::get<std::shared_ptr<Class>>(ctor.data);
+          // Class stores prototype via its constructor function
+          if (cls->constructor) {
+            auto protoIt = cls->constructor->properties.find("prototype");
+            if (protoIt != cls->constructor->properties.end() && protoIt->second.isObject()) {
+              return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+            }
+          }
+        }
+        return nullptr;
+      };
+
+      auto ctorProto = getCtorPrototype(ctorValue);
+      if (!ctorProto) {
+        // Check if prototype property exists but is not an object → TypeError
+        if (ctorValue.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+          auto protoIt = fn->properties.find("prototype");
+          if (protoIt != fn->properties.end() && !protoIt->second.isObject()) {
+            throwError(ErrorType::TypeError, "Function has non-object prototype in instanceof check");
+            LIGHTJS_RETURN(Value(false));
+          }
+        }
+      }
+      if (ctorProto) {
+        // Get the instance's __proto__ chain
+        auto getProto = [](const Value& val) -> std::shared_ptr<Object> {
+          std::unordered_map<std::string, Value>* props = nullptr;
+          if (val.isObject()) {
+            props = &std::get<std::shared_ptr<Object>>(val.data)->properties;
+          } else if (val.isArray()) {
+            props = &std::get<std::shared_ptr<Array>>(val.data)->properties;
+          } else if (val.isFunction()) {
+            props = &std::get<std::shared_ptr<Function>>(val.data)->properties;
+          } else if (val.isRegex()) {
+            props = &std::get<std::shared_ptr<Regex>>(val.data)->properties;
+          } else if (val.isPromise()) {
+            props = &std::get<std::shared_ptr<Promise>>(val.data)->properties;
+          }
+          if (props) {
+            auto it = props->find("__proto__");
+            if (it != props->end() && it->second.isObject()) {
+              return std::get<std::shared_ptr<Object>>(it->second.data);
+            }
+          }
+          return nullptr;
+        };
+
+        auto proto = getProto(left);
+        int depth = 0;
+        while (proto && depth < 100) {
+          if (proto == ctorProto) {
+            LIGHTJS_RETURN(Value(true));
+          }
+          auto protoIt = proto->properties.find("__proto__");
+          if (protoIt == proto->properties.end() || !protoIt->second.isObject()) {
+            break;
+          }
+          proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          depth++;
+        }
+      }
+
+      // Built-in type checks for instanceof when __proto__ chain not available
       if (ctorValue.isFunction()) {
         auto ctor = std::get<std::shared_ptr<Function>>(ctorValue.data);
         auto nameIt = ctor->properties.find("name");
@@ -6042,11 +6173,24 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     Value result = Value(Undefined{});
     bool returned = false;
 
+    // Hoist var and function declarations in async function body
+    hoistVarDeclarations(*bodyPtr);
+    for (const auto& stmt : *bodyPtr) {
+      if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+        auto task = evaluate(*stmt);
+        LIGHTJS_RUN_TASK_VOID(task);
+      }
+    }
+
     auto prevFlow = flow_;
     flow_ = ControlFlow{};
 
     try {
       for (const auto& stmt : *bodyPtr) {
+        // Skip function declarations - already hoisted
+        if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+          continue;
+        }
         auto stmtTask = evaluate(*stmt);
         Value stmtResult = Value(Undefined{});
         LIGHTJS_RUN_TASK(stmtTask, stmtResult);
@@ -6104,6 +6248,15 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     env_ = env_->createChild();
     bindParameters(env_);
 
+    // Hoist var and function declarations in function body
+    hoistVarDeclarations(*bodyPtr);
+    for (const auto& hoistStmt : *bodyPtr) {
+      if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
+        auto hoistTask = evaluate(*hoistStmt);
+        LIGHTJS_RUN_TASK_VOID(hoistTask);
+      }
+    }
+
     bool returned = false;
     bool tailCallSelf = false;
     flow_ = ControlFlow{};
@@ -6112,6 +6265,10 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     pendingSelfTailThis_ = Value(Undefined{});
 
     for (const auto& stmt : *bodyPtr) {
+      // Skip function declarations - already hoisted
+      if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+        continue;
+      }
       auto stmtTask = evaluate(*stmt);
       Value stmtResult = Value(Undefined{});
       LIGHTJS_RUN_TASK(stmtTask, stmtResult);
@@ -6182,6 +6339,17 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 
   auto arr = std::make_shared<Array>();
   GarbageCollector::instance().reportAllocation(sizeof(Array));
+
+  // Set __proto__ to Array.prototype for prototype chain resolution
+  auto arrCtor = env_->get("Array");
+  if (arrCtor && arrCtor->isFunction()) {
+    auto arrFunc = std::get<std::shared_ptr<Function>>(arrCtor->data);
+    auto protoIt = arrFunc->properties.find("prototype");
+    if (protoIt != arrFunc->properties.end() && protoIt->second.isObject()) {
+      arr->properties["__proto__"] = protoIt->second;
+    }
+  }
+
   for (const auto& elem : expr.elements) {
     // Handle holes (elision) - nullptr elements become undefined
     if (!elem) {
@@ -6228,6 +6396,16 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 
   auto obj = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+  // Set __proto__ to Object.prototype for prototype chain resolution
+  auto objCtor = env_->get("Object");
+  if (objCtor && objCtor->isFunction()) {
+    auto objFunc = std::get<std::shared_ptr<Function>>(objCtor->data);
+    auto protoIt = objFunc->properties.find("prototype");
+    if (protoIt != objFunc->properties.end() && protoIt->second.isObject()) {
+      obj->properties["__proto__"] = protoIt->second;
+    }
+  }
 
   for (const auto& prop : expr.properties) {
     if (prop.isSpread) {
@@ -7245,11 +7423,65 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
 
     // Use the unified destructuring helper
     bool isConst = (decl.kind == VarDeclaration::Kind::Const);
-    bindDestructuringPattern(*declarator.pattern, value, isConst);
+    // For var declarations, use set() to update the hoisted binding in function scope
+    // rather than define() which would create a new binding in the current block scope
+    bool useSet = (decl.kind == VarDeclaration::Kind::Var);
+    bindDestructuringPattern(*declarator.pattern, value, isConst, useSet);
   }
   LIGHTJS_RETURN(Value(Undefined{}));
 }
 
+// Recursively collect var declarations from a statement and hoist them
+void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    if (varDecl->kind == VarDeclaration::Kind::Var) {
+      for (const auto& declarator : varDecl->declarations) {
+        if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
+          if (!env_->has(id->name)) {
+            env_->define(id->name, Value(Undefined{}));
+          }
+        }
+      }
+    }
+  } else if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    hoistVarDeclarations(block->body);
+  } else if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->consequent) hoistVarDeclarationsFromStmt(*ifStmt->consequent);
+    if (ifStmt->alternate) hoistVarDeclarationsFromStmt(*ifStmt->alternate);
+  } else if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->body) hoistVarDeclarationsFromStmt(*whileStmt->body);
+  } else if (auto* doWhile = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhile->body) hoistVarDeclarationsFromStmt(*doWhile->body);
+  } else if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init) hoistVarDeclarationsFromStmt(*forStmt->init);
+    if (forStmt->body) hoistVarDeclarationsFromStmt(*forStmt->body);
+  } else if (auto* forIn = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forIn->left) hoistVarDeclarationsFromStmt(*forIn->left);
+    if (forIn->body) hoistVarDeclarationsFromStmt(*forIn->body);
+  } else if (auto* forOf = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOf->left) hoistVarDeclarationsFromStmt(*forOf->left);
+    if (forOf->body) hoistVarDeclarationsFromStmt(*forOf->body);
+  } else if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    for (const auto& caseClause : switchStmt->cases) {
+      hoistVarDeclarations(caseClause.consequent);
+    }
+  } else if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    hoistVarDeclarations(tryStmt->block);
+    if (tryStmt->hasHandler) hoistVarDeclarations(tryStmt->handler.body);
+    if (tryStmt->hasFinalizer) hoistVarDeclarations(tryStmt->finalizer);
+  } else if (auto* labelled = std::get_if<LabelledStmt>(&stmt.node)) {
+    if (labelled->body) hoistVarDeclarationsFromStmt(*labelled->body);
+  } else if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->body) hoistVarDeclarationsFromStmt(*withStmt->body);
+  }
+}
+
+// Hoist var declarations and function declarations from a list of statements
+void Interpreter::hoistVarDeclarations(const std::vector<StmtPtr>& body) {
+  for (const auto& stmt : body) {
+    hoistVarDeclarationsFromStmt(*stmt);
+  }
+}
 
 Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   auto func = std::make_shared<Function>();

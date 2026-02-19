@@ -339,6 +339,8 @@ private:
 
   Task evaluateVarDecl(const VarDeclaration& decl);
   Task evaluateFuncDecl(const FunctionDeclaration& decl);
+  void hoistVarDeclarations(const std::vector<StmtPtr>& body);
+  void hoistVarDeclarationsFromStmt(const Statement& stmt);
   Task evaluateReturn(const ReturnStmt& stmt);
   Task evaluateExprStmt(const ExpressionStmt& stmt);
   Task evaluateBlock(const BlockStmt& stmt);

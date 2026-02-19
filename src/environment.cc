@@ -2303,6 +2303,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return Value(result);
       }
       for (const auto& [key, _] : obj->properties) {
+        // Skip internal properties (__*__ and __get_/__set_/__non_enum_/etc.)
+        if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+            key.substr(key.size() - 2) == "__") continue;
+        if (key.size() >= 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) continue;
+        if (key.size() >= 7 && key.substr(0, 7) == "__enum_") continue;
+        if (key.size() >= 11 && key.substr(0, 11) == "__non_enum_") continue;
+        if (key.size() >= 15 && key.substr(0, 15) == "__non_writable_") continue;
+        if (key.size() >= 19 && key.substr(0, 19) == "__non_configurable_") continue;
         result->elements.push_back(Value(key));
       }
     } else if (args[0].isArray()) {
@@ -4001,12 +4009,15 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto objectPrototype = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   objectConstructor->properties["prototype"] = Value(objectPrototype);
+  objectPrototype->properties["constructor"] = Value(objectConstructor);
+  objectPrototype->properties["__non_enum_constructor"] = Value(true);
 
   auto objectProtoHasOwnProperty = std::make_shared<Function>();
   objectProtoHasOwnProperty->isNative = true;
   objectProtoHasOwnProperty->properties["__uses_this_arg__"] = Value(true);
   objectProtoHasOwnProperty->nativeFunc = Object_hasOwnProperty;
   objectPrototype->properties["hasOwnProperty"] = Value(objectProtoHasOwnProperty);
+  objectPrototype->properties["__non_enum_hasOwnProperty"] = Value(true);
 
   auto objectProtoToString = std::make_shared<Function>();
   objectProtoToString->isNative = true;
@@ -4034,6 +4045,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(std::string("[object ") + tag + "]");
   };
   objectPrototype->properties["toString"] = Value(objectProtoToString);
+  objectPrototype->properties["__non_enum_toString"] = Value(true);
 
   // Object.prototype.propertyIsEnumerable
   auto objectProtoPropertyIsEnumerable = std::make_shared<Function>();
@@ -4082,6 +4094,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(false);
   };
   objectPrototype->properties["propertyIsEnumerable"] = Value(objectProtoPropertyIsEnumerable);
+  objectPrototype->properties["__non_enum_propertyIsEnumerable"] = Value(true);
 
   // Object.keys
   auto objectKeys = std::make_shared<Function>();

@@ -708,7 +708,13 @@ std::vector<Token> Lexer::tokenize() {
       if (!tokens.empty() &&
           (tokens.back().type == TokenType::Number || tokens.back().type == TokenType::BigInt) &&
           tokens.back().line == startLine) {
-        throw std::runtime_error("Invalid numeric literal");
+        // Only error if the identifier immediately follows the number (no whitespace)
+        auto& prevToken = tokens.back();
+        size_t numEnd = prevToken.column + prevToken.value.size();
+        if (prevToken.type == TokenType::BigInt) numEnd++; // BigInt has 'n' suffix not in value
+        if (startColumn <= numEnd) {
+          throw std::runtime_error("Invalid numeric literal");
+        }
       }
       if (auto token = readIdentifier()) {
         tokens.push_back(*token);
