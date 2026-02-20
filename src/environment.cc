@@ -5906,6 +5906,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     fnPrototype->properties["__proto__"] = Value(objectPrototype);
     fn->properties["prototype"] = Value(fnPrototype);
 
+    // Set __proto__ to Function.prototype for proper prototype chain
+    auto funcVal = env->get("Function");
+    if (funcVal.has_value() && funcVal->isFunction()) {
+      auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+      auto protoIt = funcCtor->properties.find("prototype");
+      if (protoIt != funcCtor->properties.end()) {
+        fn->properties["__proto__"] = protoIt->second;
+      }
+    }
+
     return Value(fn);
   };
 
@@ -6034,7 +6044,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   functionPrototype->properties["bind"] = Value(fpBind);
   functionPrototype->properties["__non_enum_bind"] = Value(true);
 
+  functionPrototype->properties["constructor"] = Value(functionConstructor);
+  functionPrototype->properties["__non_enum_constructor"] = Value(true);
   functionConstructor->properties["prototype"] = Value(functionPrototype);
+  // Set Function constructor's own __proto__ to Function.prototype
+  functionConstructor->properties["__proto__"] = Value(functionPrototype);
   env->define("Function", Value(functionConstructor));
   globalThisObj->properties["Function"] = Value(functionConstructor);
 

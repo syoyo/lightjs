@@ -289,6 +289,42 @@ bool isAssignmentTarget(const Expression& expr) {
   return false;
 }
 
+// Check if an assignment pattern contains eval/arguments as simple targets (invalid in strict mode)
+bool hasStrictModeInvalidTargets(const Expression& expr) {
+  if (auto* ident = std::get_if<Identifier>(&expr.node)) {
+    return ident->name == "eval" || ident->name == "arguments";
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& elem : arr->elements) {
+      if (elem && hasStrictModeInvalidTargets(*elem)) return true;
+    }
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.value && hasStrictModeInvalidTargets(*prop.value)) return true;
+    }
+  }
+  if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& elem : arrPat->elements) {
+      if (elem && hasStrictModeInvalidTargets(*elem)) return true;
+    }
+    if (arrPat->rest && hasStrictModeInvalidTargets(*arrPat->rest)) return true;
+  }
+  if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.value && hasStrictModeInvalidTargets(*prop.value)) return true;
+    }
+    if (objPat->rest && hasStrictModeInvalidTargets(*objPat->rest)) return true;
+  }
+  if (auto* assign = std::get_if<AssignmentPattern>(&expr.node)) {
+    if (assign->left && hasStrictModeInvalidTargets(*assign->left)) return true;
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    if (spread->argument && hasStrictModeInvalidTargets(*spread->argument)) return true;
+  }
+  return false;
+}
+
 bool isDirectDynamicImportCall(const ExprPtr& expr) {
   if (!expr || expr->parenthesized) {
     return false;
@@ -448,7 +484,10 @@ StmtPtr Parser::parseStatement() {
         if (!nextOnSameLine ||
             (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
              nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
-             nextType != TokenType::Yield)) {
+             nextType != TokenType::Yield && nextType != TokenType::Async &&
+             nextType != TokenType::Get && nextType != TokenType::Set &&
+             nextType != TokenType::From && nextType != TokenType::As &&
+             nextType != TokenType::Of && nextType != TokenType::Static)) {
           return parseExpressionStatement();
         }
       }
@@ -557,6 +596,17 @@ StmtPtr Parser::parseVarDeclaration() {
     ExprPtr pattern = parsePattern();
     if (!pattern) {
       return nullptr;
+    }
+
+    // Strict mode: reject 'eval' and 'arguments' as binding names
+    if (strictMode_) {
+      std::vector<std::string> boundNames;
+      collectBoundNames(*pattern, boundNames);
+      for (auto& name : boundNames) {
+        if (name == "eval" || name == "arguments") {
+          return nullptr;
+        }
+      }
     }
 
     ExprPtr init = nullptr;
@@ -916,13 +966,15 @@ StmtPtr Parser::parseForStatement() {
   if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
     auto declType = current().type;
     advance();
-    // In non-strict mode, 'let' directly followed by 'in'/'of' means 'let' is an identifier
+    // In non-strict mode, 'let' directly followed by 'in' means 'let' is an identifier
     if (!strictMode_ && declType == TokenType::Let && match(TokenType::In)) {
       isForInOrOf = true;
       isForOf = false;
     } else if (!strictMode_ && declType == TokenType::Let && match(TokenType::Of)) {
-      isForInOrOf = true;
-      isForOf = true;
+      // SPEC: for (let of ...) is always a SyntaxError
+      // The lookahead restriction [lookahead != let] applies to for-of LHS
+      pos_ = savedPos;
+      return nullptr;
     // Allow 'let' as identifier in non-strict mode (e.g., 'var let of [23]')
     } else if (match(TokenType::Identifier) || (!strictMode_ && match(TokenType::Let))) {
       advance();
@@ -1059,9 +1111,10 @@ StmtPtr Parser::parseForStatement() {
   if (isForInOrOf) {
     // Parse for...in or for...of
     StmtPtr left = nullptr;
-    // In non-strict mode, 'let' directly followed by 'in'/'of' is an identifier, not a declaration
+    // In non-strict mode, 'let' directly followed by 'in' is an identifier, not a declaration
+    // Note: 'let' followed by 'of' was already rejected above (spec lookahead restriction)
     bool letAsIdentifier = !strictMode_ && match(TokenType::Let) &&
-      (peek().type == TokenType::In || peek().type == TokenType::Of);
+      peek().type == TokenType::In;
     if (!letAsIdentifier && (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var))) {
       VarDeclaration::Kind kind;
       switch (current().type) {
@@ -1076,6 +1129,17 @@ StmtPtr Parser::parseForStatement() {
       ExprPtr pattern = parsePattern();
       if (!pattern) {
         return nullptr;
+      }
+
+      // Strict mode: reject 'eval' and 'arguments' as binding names
+      if (strictMode_) {
+        std::vector<std::string> boundNames;
+        collectBoundNames(*pattern, boundNames);
+        for (auto& name : boundNames) {
+          if (name == "eval" || name == "arguments") {
+            return nullptr;
+          }
+        }
       }
 
       // Check for duplicate bound names in let/const declarations
@@ -1102,6 +1166,10 @@ StmtPtr Parser::parseForStatement() {
       if (!pattern) {
         return nullptr;
       }
+      // Strict mode: reject eval/arguments as assignment targets in destructuring
+      if (strictMode_ && hasStrictModeInvalidTargets(*pattern)) {
+        return nullptr;
+      }
       left = std::make_unique<Statement>(ExpressionStmt{std::move(pattern)});
     } else {
       auto expr = parseMember();
@@ -1109,6 +1177,10 @@ StmtPtr Parser::parseForStatement() {
         return nullptr;
       }
       if (!isAssignmentTarget(*expr)) {
+        return nullptr;
+      }
+      // Strict mode: reject eval/arguments as simple assignment targets
+      if (strictMode_ && hasStrictModeInvalidTargets(*expr)) {
         return nullptr;
       }
       left = std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
@@ -1120,6 +1192,23 @@ StmtPtr Parser::parseForStatement() {
       if (current().escaped) {
         return nullptr;
       }
+      // SPEC: for (async of ...) is a SyntaxError (lookahead restriction)
+      // But for (\u0061sync of ...) and for ((async) of ...) are allowed
+      if (left) {
+        auto* exprStmt = std::get_if<ExpressionStmt>(&left->node);
+        if (exprStmt && exprStmt->expression) {
+          auto* ident = std::get_if<Identifier>(&exprStmt->expression->node);
+          if (ident && ident->name == "async") {
+            // Check if the 'async' token was NOT escaped
+            // We need to check if the original token was literally 'async'
+            // (not an escape sequence like \u0061sync)
+            // Since parseMember already consumed it, check if the token before 'of' was escaped
+            if (pos_ >= 2 && tokens_[pos_ - 1].type == TokenType::Async && !tokens_[pos_ - 1].escaped) {
+              return nullptr;
+            }
+          }
+        }
+      }
       advance();
     } else {
       if (!expect(TokenType::In)) {
@@ -1127,10 +1216,15 @@ StmtPtr Parser::parseForStatement() {
       }
     }
 
-    // Parse RHS expression - allow comma sequences (SequenceExpression)
+    // Parse RHS expression
+    // For-of only allows AssignmentExpression; for-in allows Expression (comma sequences)
     auto right = parseAssignment();
     if (!right) return nullptr;
     if (match(TokenType::Comma)) {
+      if (isOf) {
+        // SyntaxError: comma expression not allowed after 'of'
+        return nullptr;
+      }
       std::vector<ExprPtr> sequence;
       sequence.push_back(std::move(right));
       while (match(TokenType::Comma)) {

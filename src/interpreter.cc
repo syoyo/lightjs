@@ -1343,9 +1343,6 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       };
 
       Value ctorValue = unwrapConstructor(right);
-      if ((ctorValue.isFunction() || ctorValue.isClass()) && matchesConstructor(left, ctorValue)) {
-        LIGHTJS_RETURN(Value(true));
-      }
 
       if (left.isError() && ctorValue.isFunction()) {
         auto ctor = std::get<std::shared_ptr<Function>>(ctorValue.data);
@@ -1388,14 +1385,16 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         return nullptr;
       };
 
-      auto ctorProto = getCtorPrototype(ctorValue);
+      // Use the original RHS (right) for prototype chain walk, not the unwrapped ctorValue
+      // This is important when RHS is a callable object like Function.prototype
+      auto ctorProto = getCtorPrototype(right);
       if (!ctorProto) {
         // Check if prototype property exists but is not an object → TypeError
         std::unordered_map<std::string, Value>* checkProps = nullptr;
-        if (ctorValue.isFunction()) {
-          checkProps = &std::get<std::shared_ptr<Function>>(ctorValue.data)->properties;
-        } else if (ctorValue.isObject()) {
-          checkProps = &std::get<std::shared_ptr<Object>>(ctorValue.data)->properties;
+        if (right.isFunction()) {
+          checkProps = &std::get<std::shared_ptr<Function>>(right.data)->properties;
+        } else if (right.isObject()) {
+          checkProps = &std::get<std::shared_ptr<Object>>(right.data)->properties;
         }
         if (checkProps) {
           auto protoIt = checkProps->find("prototype");
@@ -1442,6 +1441,11 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
           depth++;
         }
+      }
+
+      // Fallback: check __constructor__ tag (for objects without proper __proto__ chain)
+      if ((ctorValue.isFunction() || ctorValue.isClass()) && matchesConstructor(left, ctorValue)) {
+        LIGHTJS_RETURN(Value(true));
       }
 
       // Built-in type checks for instanceof when __proto__ chain not available
@@ -6785,6 +6789,16 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
     func->properties["prototype"] = Value(proto);
   }
 
+  // Set __proto__ to Function.prototype for proper prototype chain
+  auto funcVal = env_->getRoot()->get("Function");
+  if (funcVal.has_value() && funcVal->isFunction()) {
+    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+    auto protoIt = funcCtor->properties.find("prototype");
+    if (protoIt != funcCtor->properties.end()) {
+      func->properties["__proto__"] = protoIt->second;
+    }
+  }
+
   LIGHTJS_RETURN(Value(func));
 }
 
@@ -7328,6 +7342,11 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
           throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
           return;
         }
+        if (strictMode_) {
+          // In strict mode, assignment to undeclared variable is a ReferenceError
+          throwError(ErrorType::ReferenceError, id->name + " is not defined");
+          return;
+        }
         // In non-strict mode, assignment to undeclared variable creates global
         env_->getRoot()->define(id->name, value);
       }
@@ -7833,6 +7852,16 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   proto->properties["__non_enum_constructor"] = Value(true);
   func->properties["prototype"] = Value(proto);
 
+  // Set __proto__ to Function.prototype for proper prototype chain
+  auto funcVal = env_->getRoot()->get("Function");
+  if (funcVal.has_value() && funcVal->isFunction()) {
+    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+    auto protoIt = funcCtor->properties.find("prototype");
+    if (protoIt != funcCtor->properties.end()) {
+      func->properties["__proto__"] = protoIt->second;
+    }
+  }
+
   env_->define(decl.id.name, Value(func));
   LIGHTJS_RETURN(Value(Undefined{}));
 }
@@ -8158,6 +8187,8 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   bool isLetOrConst = false;
   bool isConst = false;
   const Expression* memberExpr = nullptr;  // For MemberExpr targets
+  const Expression* dstrPattern = nullptr;  // For destructuring patterns
+  bool dstrIsDecl = false;  // true if destructuring is from var/let/const declaration
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isVarDecl = true;
     isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let || varDecl->kind == VarDeclaration::Kind::Const);
@@ -8165,9 +8196,13 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     if (!varDecl->declarations.empty()) {
       if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
         varName = id->name;
+      } else {
+        // Destructuring pattern in declaration: for (var [a, b] in ...) or for (let {x} in ...)
+        dstrPattern = varDecl->declarations[0].pattern.get();
+        dstrIsDecl = true;
       }
       // For var declarations, define in loop scope
-      if (!isLetOrConst) {
+      if (!isLetOrConst && !varName.empty()) {
         env_->define(varName, Value(Undefined{}));
       }
     }
@@ -8176,6 +8211,11 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       varName = ident->name;
     } else if (std::get_if<MemberExpr>(&exprStmt->expression->node)) {
       memberExpr = exprStmt->expression.get();
+    } else if (std::get_if<ArrayPattern>(&exprStmt->expression->node) ||
+               std::get_if<ObjectPattern>(&exprStmt->expression->node)) {
+      // Expression destructuring: for ([a, b] in ...) or for ({x} in ...)
+      dstrPattern = exprStmt->expression.get();
+      dstrIsDecl = false;
     }
   }
 
@@ -8199,6 +8239,15 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   // Helper to assign a key to the loop variable
   // For let/const, creates a fresh child environment per iteration
   auto assignKey = [&](const std::string& key) -> void {
+    if (dstrPattern) {
+      // Destructuring pattern: bind key through destructuring
+      if (isLetOrConst) {
+        auto iterEnv = env_->createChild();
+        env_ = iterEnv;
+      }
+      bindDestructuringPattern(*dstrPattern, Value(key), isConst, !dstrIsDecl);
+      return;
+    }
     if (isLetOrConst && !varName.empty()) {
       // Create a fresh scope for each iteration (per-iteration binding)
       auto iterEnv = env_->createChild();
@@ -8417,10 +8466,12 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   std::string varName;
   bool isConst = false;
   bool isLetOrConst = false;
+  bool isDeclaration = false;  // true for var/let/const declarations, false for expression targets
   const Expression* lhsPattern = nullptr;
   const Expression* lhsExpr = nullptr;
 
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
+    isDeclaration = true;
     isConst = (varDecl->kind == VarDeclaration::Kind::Const);
     isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let ||
                     varDecl->kind == VarDeclaration::Kind::Const);
@@ -8621,8 +8672,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         throwError(ErrorType::TypeError, "Assignment to constant variable '" + varName + "'");
         env_ = prevEnv;
         LIGHTJS_RETURN(Value(Undefined{}));
-      } else {
+      } else if (isDeclaration) {
+        // var/let declaration: define in scope
         env_->define(varName, currentValue);
+      } else {
+        // Expression target: update existing variable in parent scope
+        if (!env_->set(varName, currentValue)) {
+          env_->define(varName, currentValue);
+        }
       }
     } else if (lhsType == ForOfLHS::DestructuringVar) {
       bindDestructuringPattern(*lhsPattern, currentValue, isConst);
