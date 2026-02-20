@@ -3917,6 +3917,10 @@ ExprPtr Parser::parseObjectPattern() {
     } else {
       // Shorthand - use key as both key and value pattern
       if (auto* id = std::get_if<Identifier>(&key->node)) {
+        // In strict mode, yield is not a valid IdentifierReference
+        if (strictMode_ && id->name == "yield") {
+          return nullptr;  // SyntaxError: yield not valid in strict mode
+        }
         value = std::make_unique<Expression>(Identifier{id->name});
       } else {
         return nullptr;  // Shorthand only works with identifiers

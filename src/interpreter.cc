@@ -107,6 +107,9 @@ bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
 }
 }  // namespace
 
+// Forward declaration for TDZ initialization
+static void collectVarHoistNames(const Expression& expr, std::vector<std::string>& names);
+
 Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {
   setGlobalInterpreter(this);
 }
@@ -321,6 +324,22 @@ Task Interpreter::evaluate(const Program& program) {
         LIGHTJS_RUN_TASK_VOID(task);
         if (flow_.type != ControlFlow::Type::None) {
           break;
+        }
+      }
+    }
+  }
+
+  // Hoisting phase 0: Initialize TDZ for let/const declarations (non-recursive)
+  for (const auto& stmt : program.body) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        for (const auto& declarator : varDecl->declarations) {
+          std::vector<std::string> names;
+          collectVarHoistNames(*declarator.pattern, names);
+          for (const auto& name : names) {
+            env_->defineTDZ(name);
+          }
         }
       }
     }
@@ -1612,6 +1631,19 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
         LIGHTJS_RETURN(Value(true));
       }
 
+      // Delete on class properties
+      if (obj.isClass()) {
+        auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+        if (clsPtr->properties.count("__non_configurable_" + propName)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        clsPtr->properties.erase(propName);
+        clsPtr->properties.erase("__non_writable_" + propName);
+        clsPtr->properties.erase("__non_enum_" + propName);
+        clsPtr->properties.erase("__enum_" + propName);
+        LIGHTJS_RETURN(Value(true));
+      }
+
       // Can't delete from primitives
       LIGHTJS_RETURN(Value(false));
     }
@@ -1742,8 +1774,12 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             }
           } else if (right.isClass()) {
             auto cls = std::get<std::shared_ptr<Class>>(right.data);
-            if (cls->name.empty()) {
+            // Per spec: HasOwnProperty(v, "name") check before SetFunctionName
+            if (cls->properties.find("name") == cls->properties.end()) {
               cls->name = id->name;
+              cls->properties["name"] = Value(id->name);
+              cls->properties["__non_writable_name"] = Value(true);
+              cls->properties["__non_enum_name"] = Value(true);
             }
           }
           env_->set(id->name, right);
@@ -1912,6 +1948,12 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
   LIGHTJS_RUN_TASK(rightTask, right);
 
   if (auto* id = std::get_if<Identifier>(&expr.left->node)) {
+    // Check TDZ before any assignment to identifier
+    if (env_->isTDZ(id->name)) {
+      throwError(ErrorType::ReferenceError,
+                 "Cannot access '" + id->name + "' before initialization");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     if (expr.op == AssignmentExpr::Op::Assign) {
       if (!env_->set(id->name, right)) {
         if (env_->isConst(id->name)) {
@@ -3422,6 +3464,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   if (obj.isClass()) {
     auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+    // Check own properties first (name, length, static methods, etc.)
+    auto propIt = clsPtr->properties.find(propName);
+    if (propIt != clsPtr->properties.end()) {
+      LIGHTJS_RETURN(propIt->second);
+    }
     auto methodIt = clsPtr->methods.find(propName);
     if (methodIt != clsPtr->methods.end()) {
       LIGHTJS_RETURN(Value(methodIt->second));
@@ -3429,9 +3476,6 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto staticIt = clsPtr->staticMethods.find(propName);
     if (staticIt != clsPtr->staticMethods.end()) {
       LIGHTJS_RETURN(Value(staticIt->second));
-    }
-    if (propName == "name") {
-      LIGHTJS_RETURN(Value(clsPtr->name));
     }
   }
 
@@ -7287,6 +7331,8 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       cls->constructor = func;
     } else if (method.isStatic) {
       cls->staticMethods[method.key.name] = func;
+      // Static methods become own properties of the class
+      cls->properties[method.key.name] = Value(func);
     } else if (method.kind == MethodDefinition::Kind::Get) {
       cls->getters[method.key.name] = func;
     } else if (method.kind == MethodDefinition::Kind::Set) {
@@ -7295,6 +7341,20 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       cls->methods[method.key.name] = func;
     }
   }
+
+  // Set name as own property (per spec: SetFunctionName)
+  // Named classes always get a name property; anonymous classes don't (until named evaluation)
+  if (!cls->name.empty()) {
+    cls->properties["name"] = Value(cls->name);
+    cls->properties["__non_writable_name"] = Value(true);
+    cls->properties["__non_enum_name"] = Value(true);
+  }
+
+  // Set length property (constructor parameter count)
+  int ctorLen = cls->constructor ? (int)cls->constructor->params.size() : 0;
+  cls->properties["length"] = Value((double)ctorLen);
+  cls->properties["__non_writable_length"] = Value(true);
+  cls->properties["__non_enum_length"] = Value(true);
 
   LIGHTJS_RETURN(Value(cls));
 }
@@ -7322,8 +7382,13 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
           }
         } else if (isAnonymousFnDef) {
           if (auto* cls = std::get_if<std::shared_ptr<Class>>(&boundValue.data)) {
-            if ((*cls)->name.empty()) {
+            // Per spec: HasOwnProperty(v, "name") check before SetFunctionName
+            bool hasNameProperty = (*cls)->properties.find("name") != (*cls)->properties.end();
+            if (!hasNameProperty) {
               (*cls)->name = leftId->name;
+              (*cls)->properties["name"] = Value(leftId->name);
+              (*cls)->properties["__non_writable_name"] = Value(true);
+              (*cls)->properties["__non_enum_name"] = Value(true);
             }
           }
         }
@@ -7334,6 +7399,12 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
   }
 
   if (auto* id = std::get_if<Identifier>(&pattern.node)) {
+    // Check TDZ before assignment (e.g., assigning to `let` variable before its declaration)
+    if (useSet && env_->isTDZ(id->name)) {
+      throwError(ErrorType::ReferenceError,
+                 "Cannot access '" + id->name + "' before initialization");
+      return;
+    }
     // Simple identifier
     if (useSet) {
       if (!env_->set(id->name, value)) {
@@ -7895,6 +7966,22 @@ Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
   auto prevEnv = env_;
   env_ = env_->createChild();
 
+  // Initialize TDZ for let/const declarations in this block (non-recursive)
+  for (const auto& s : stmt.body) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        for (const auto& declarator : varDecl->declarations) {
+          std::vector<std::string> names;
+          collectVarHoistNames(*declarator.pattern, names);
+          for (const auto& name : names) {
+            env_->defineTDZ(name);
+          }
+        }
+      }
+    }
+  }
+
   Value result = Value(Undefined{});
   for (const auto& s : stmt.body) {
     auto task = evaluate(*s);
@@ -8174,14 +8261,9 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   std::string myLabel = pendingIterationLabel_;
   pendingIterationLabel_.clear();
 
-  // Evaluate the right-hand side (the object to iterate over)
-  auto rightTask = evaluate(*stmt.right);
-  Value obj;
-  LIGHTJS_RUN_TASK(rightTask, obj);
-
   Value result = Value(Undefined{});
 
-  // Get the variable name from the left side
+  // Get the variable name from the left side (before evaluating RHS, for TDZ)
   std::string varName;
   bool isVarDecl = false;
   bool isLetOrConst = false;
@@ -8189,6 +8271,27 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   const Expression* memberExpr = nullptr;  // For MemberExpr targets
   const Expression* dstrPattern = nullptr;  // For destructuring patterns
   bool dstrIsDecl = false;  // true if destructuring is from var/let/const declaration
+
+  // Helper to collect bound names from a pattern for TDZ
+  std::function<void(const Expression&, std::vector<std::string>&)> collectBoundNames;
+  collectBoundNames = [&collectBoundNames](const Expression& expr, std::vector<std::string>& names) {
+    if (auto* id = std::get_if<Identifier>(&expr.node)) {
+      names.push_back(id->name);
+    } else if (auto* arr = std::get_if<ArrayPattern>(&expr.node)) {
+      for (const auto& elem : arr->elements) {
+        if (elem) collectBoundNames(*elem, names);
+      }
+      if (arr->rest) collectBoundNames(*arr->rest, names);
+    } else if (auto* obj = std::get_if<ObjectPattern>(&expr.node)) {
+      for (const auto& prop : obj->properties) {
+        if (prop.value) collectBoundNames(*prop.value, names);
+      }
+      if (obj->rest) collectBoundNames(*obj->rest, names);
+    } else if (auto* assign = std::get_if<AssignmentPattern>(&expr.node)) {
+      if (assign->left) collectBoundNames(*assign->left, names);
+    }
+  };
+
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isVarDecl = true;
     isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let || varDecl->kind == VarDeclaration::Kind::Const);
@@ -8218,6 +8321,33 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       dstrIsDecl = false;
     }
   }
+
+  // Per spec (ForIn/OfHeadEvaluation): create TDZ environment for let/const bound names
+  // before evaluating the RHS expression.
+  auto envBeforeTDZ = env_;
+  if (isLetOrConst) {
+    std::vector<std::string> tdzNames;
+    if (!varName.empty()) {
+      tdzNames.push_back(varName);
+    } else if (dstrPattern) {
+      collectBoundNames(*dstrPattern, tdzNames);
+    }
+    if (!tdzNames.empty()) {
+      auto tdzEnv = env_->createChild();
+      for (const auto& name : tdzNames) {
+        tdzEnv->defineTDZ(name);
+      }
+      env_ = tdzEnv;
+    }
+  }
+
+  // Evaluate the right-hand side (the object to iterate over)
+  auto rightTask = evaluate(*stmt.right);
+  Value obj;
+  LIGHTJS_RUN_TASK(rightTask, obj);
+
+  // Restore env after RHS evaluation (remove TDZ from execution context)
+  env_ = envBeforeTDZ;
 
   // For-in over null/undefined should not execute the body (spec 13.7.5.11 step 5)
   if (obj.isNull() || obj.isUndefined()) {
@@ -8470,6 +8600,26 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   const Expression* lhsPattern = nullptr;
   const Expression* lhsExpr = nullptr;
 
+  // Helper to collect bound names from a pattern for TDZ
+  std::function<void(const Expression&, std::vector<std::string>&)> collectBoundNames;
+  collectBoundNames = [&collectBoundNames](const Expression& expr, std::vector<std::string>& names) {
+    if (auto* id = std::get_if<Identifier>(&expr.node)) {
+      names.push_back(id->name);
+    } else if (auto* arr = std::get_if<ArrayPattern>(&expr.node)) {
+      for (const auto& elem : arr->elements) {
+        if (elem) collectBoundNames(*elem, names);
+      }
+      if (arr->rest) collectBoundNames(*arr->rest, names);
+    } else if (auto* obj = std::get_if<ObjectPattern>(&expr.node)) {
+      for (const auto& prop : obj->properties) {
+        if (prop.value) collectBoundNames(*prop.value, names);
+      }
+      if (obj->rest) collectBoundNames(*obj->rest, names);
+    } else if (auto* assign = std::get_if<AssignmentPattern>(&expr.node)) {
+      if (assign->left) collectBoundNames(*assign->left, names);
+    }
+  };
+
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isDeclaration = true;
     isConst = (varDecl->kind == VarDeclaration::Kind::Const);
@@ -8483,9 +8633,6 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         // For var declarations, define in the outer scope
         if (varDecl->kind == VarDeclaration::Kind::Var) {
           env_->define(varName, Value(Undefined{}));
-        } else {
-          // For let/const: create TDZ binding before evaluating RHS
-          env_->defineTDZ(varName);
         }
       } else {
         lhsType = ForOfLHS::DestructuringVar;
@@ -8502,6 +8649,26 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     }
   }
 
+  // Per spec (ForIn/OfHeadEvaluation): create TDZ environment for let/const bound names
+  // before evaluating the RHS expression. Closures created during RHS evaluation will
+  // capture this TDZ env, so accessing the variable will always throw ReferenceError.
+  auto envBeforeTDZ = env_;
+  if (isLetOrConst) {
+    std::vector<std::string> tdzNames;
+    if (!varName.empty()) {
+      tdzNames.push_back(varName);
+    } else if (lhsPattern) {
+      collectBoundNames(*lhsPattern, tdzNames);
+    }
+    if (!tdzNames.empty()) {
+      auto tdzEnv = env_->createChild();
+      for (const auto& name : tdzNames) {
+        tdzEnv->defineTDZ(name);
+      }
+      env_ = tdzEnv;
+    }
+  }
+
   // Evaluate the right-hand side (the iterable to iterate over)
   auto rightTask = evaluate(*stmt.right);
   Value iterable;
@@ -8511,10 +8678,9 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  // Remove TDZ after RHS evaluation (will be re-bound per iteration)
-  if (isLetOrConst && !varName.empty()) {
-    env_->removeTDZ(varName);
-  }
+  // Restore env after RHS evaluation (spec step 4: set LexicalEnvironment to oldEnv)
+  // The TDZ child env persists for any closures that captured it.
+  env_ = envBeforeTDZ;
 
   std::optional<IteratorRecord> iteratorOpt;
   if (stmt.isAwait && iterable.isObject()) {

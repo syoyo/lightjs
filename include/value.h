@@ -108,6 +108,7 @@ struct Class : public GCObject {
   std::unordered_map<std::string, std::shared_ptr<Function>> staticMethods;  // Static methods
   std::unordered_map<std::string, std::shared_ptr<Function>> getters;        // Getter methods
   std::unordered_map<std::string, std::shared_ptr<Function>> setters;        // Setter methods
+  std::unordered_map<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
   std::shared_ptr<void> closure;  // Closure environment
 
   Class() = default;

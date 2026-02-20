@@ -4420,13 +4420,43 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectGetOwnPropertyDescriptor->isNative = true;
   objectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 ||
-        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex())) {
+        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isClass())) {
       return Value(Undefined{});
     }
     std::string key = args[1].toString();
 
     auto descriptor = std::make_shared<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+    if (args[0].isClass()) {
+      auto cls = std::get<std::shared_ptr<Class>>(args[0].data);
+      // Internal properties are not visible
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") {
+        return Value(Undefined{});
+      }
+      auto it = cls->properties.find(key);
+      if (it == cls->properties.end()) {
+        return Value(Undefined{});
+      }
+      descriptor->properties["value"] = it->second;
+      // Check for per-property attribute markers
+      if (key == "name" || key == "length") {
+        // Default: non-writable, non-enumerable, configurable
+        bool writable = cls->properties.find("__non_writable_" + key) == cls->properties.end();
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(false);
+        descriptor->properties["configurable"] = Value(true);
+      } else {
+        bool writable = cls->properties.find("__non_writable_" + key) == cls->properties.end();
+        bool enumerable = cls->properties.find("__enum_" + key) != cls->properties.end();
+        bool configurable = cls->properties.find("__non_configurable_" + key) == cls->properties.end();
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(enumerable);
+        descriptor->properties["configurable"] = Value(configurable);
+      }
+      return Value(descriptor);
+    }
 
     if (args[0].isFunction()) {
       auto fn = std::get<std::shared_ptr<Function>>(args[0].data);

@@ -992,6 +992,13 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     return Value(fn->properties.find(key) != fn->properties.end());
   }
 
+  // Handle Class objects
+  if (args[0].isClass()) {
+    auto cls = std::get<std::shared_ptr<Class>>(args[0].data);
+    if (isInternalProperty(key)) return Value(false);
+    return Value(cls->properties.find(key) != cls->properties.end());
+  }
+
   if (!args[0].isObject()) {
     return Value(false);
   }
