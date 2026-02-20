@@ -2234,12 +2234,26 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   reflectObj->properties["construct"] = Value(reflectConstruct);
 
-  // Reflect.getPrototypeOf(target) - returns null (limited prototype support)
+  // Reflect.getPrototypeOf(target) - delegates to Object.getPrototypeOf logic
   auto reflectGetPrototypeOf = std::make_shared<Function>();
   reflectGetPrototypeOf->isNative = true;
-  reflectGetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  reflectGetPrototypeOf->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Null{});
-    // LightJS has limited prototype support, return null
+    if (args[0].isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto protoIt = fn->properties.find("__proto__");
+      if (protoIt != fn->properties.end()) return protoIt->second;
+      if (auto funcCtor = env->get("Function"); funcCtor && funcCtor->isFunction()) {
+        auto funcFn = std::get<std::shared_ptr<Function>>(funcCtor->data);
+        auto fpIt = funcFn->properties.find("prototype");
+        if (fpIt != funcFn->properties.end()) return fpIt->second;
+      }
+    }
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto it = obj->properties.find("__proto__");
+      if (it != obj->properties.end()) return it->second;
+    }
     return Value(Null{});
   };
   reflectObj->properties["getPrototypeOf"] = Value(reflectGetPrototypeOf);
@@ -2258,6 +2272,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectIsExtensible->isNative = true;
   reflectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
+    if (args[0].isFunction() || args[0].isArray()) {
+      return Value(true);  // Functions and arrays are always extensible
+    }
     if (args[0].isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
       if (obj->isModuleNamespace) {
@@ -4238,7 +4255,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (protoIt != fn->properties.end()) {
         return protoIt->second;
       }
-      // Default: Function.prototype (we don't have a formal one, return null)
+      // Default: Function.prototype
+      if (auto funcCtor = env->get("Function"); funcCtor && funcCtor->isFunction()) {
+        auto funcFn = std::get<std::shared_ptr<Function>>(funcCtor->data);
+        auto fpIt = funcFn->properties.find("prototype");
+        if (fpIt != funcFn->properties.end()) {
+          return fpIt->second;
+        }
+      }
       return Value(Null{});
     }
     if (args[0].isBigInt()) {
@@ -4288,7 +4312,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto objectIsExtensible = std::make_shared<Function>();
   objectIsExtensible->isNative = true;
   objectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isObject()) {
+    if (args.empty()) return Value(false);
+    if (args[0].isFunction() || args[0].isArray()) {
+      return Value(true);  // Functions and arrays are always extensible
+    }
+    if (!args[0].isObject()) {
       return Value(false);
     }
     auto obj = std::get<std::shared_ptr<Object>>(args[0].data);

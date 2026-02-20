@@ -747,6 +747,11 @@ bool Module::evaluateBody(Interpreter* interpreter) {
   interpreter->setEnvironment(environment_);
   state_ = State::Evaluating;
 
+  // Hoist var declarations before evaluating the body (like scripts do).
+  // This is needed because `export var x = ...` uses set() not define(),
+  // which requires the variable to already exist from hoisting.
+  interpreter->hoistVarDeclarations(ast_->body);
+
   try {
     while (nextStatementIndex_ < ast_->body.size()) {
       const auto& stmtPtr = ast_->body[nextStatementIndex_];

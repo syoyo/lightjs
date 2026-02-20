@@ -1036,8 +1036,16 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
 
   if (args[0].isFunction()) {
     auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    // Ensure spec-mandated order: length, name first, then rest
+    if (fn->properties.count("length")) {
+      result->elements.push_back(Value(std::string("length")));
+    }
+    if (fn->properties.count("name")) {
+      result->elements.push_back(Value(std::string("name")));
+    }
     for (const auto& [key, value] : fn->properties) {
       if (isInternalProperty(key)) continue;
+      if (key == "length" || key == "name") continue;
       result->elements.push_back(Value(key));
     }
     return Value(result);

@@ -184,6 +184,7 @@ inline Value runTask(Task&& t) {
 #endif // LIGHTJS_HAS_COROUTINES
 
 class Interpreter {
+  friend class Module;
 public:
   explicit Interpreter(std::shared_ptr<Environment> env);
 

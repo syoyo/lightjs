@@ -6818,6 +6818,13 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
   func->closure = env_;
+  // Compute length: number of params before first default parameter
+  size_t funcLength = 0;
+  for (const auto& param : expr.params) {
+    if (param.defaultValue) break;
+    funcLength++;
+  }
+  func->properties["length"] = Value(static_cast<double>(funcLength));
   func->properties["name"] = Value(expr.name);
   if (!expr.name.empty()) {
     func->properties["__named_expression__"] = Value(true);
@@ -7880,6 +7887,11 @@ void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
     if (labelled->body) hoistVarDeclarationsFromStmt(*labelled->body);
   } else if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
     if (withStmt->body) hoistVarDeclarationsFromStmt(*withStmt->body);
+  } else if (auto* exportNamed = std::get_if<ExportNamedDeclaration>(&stmt.node)) {
+    // Handle export var declarations: export var x = ...
+    if (exportNamed->declaration) {
+      hoistVarDeclarationsFromStmt(*exportNamed->declaration);
+    }
   }
 }
 
@@ -7912,6 +7924,13 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
   func->closure = env_;
+  // Compute length: number of params before first default parameter
+  size_t funcDeclLen = 0;
+  for (const auto& param : decl.params) {
+    if (param.defaultValue) break;
+    funcDeclLen++;
+  }
+  func->properties["length"] = Value(static_cast<double>(funcDeclLen));
   func->properties["name"] = Value(decl.id.name);
   // Function declarations are always constructors
   func->isConstructor = true;

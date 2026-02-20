@@ -1021,6 +1021,7 @@ StmtPtr Parser::parseForStatement() {
     isForOf = true;
   } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
     // Bare destructuring assignment: for ([a, b] of ...) or for ({a, b} of ...)
+    // Also handles MemberExpression: for ([expr][idx] in ...) or for ({}.prop in ...)
     int depth = 1;
     advance();
     while (depth > 0 && !match(TokenType::EndOfFile)) {
@@ -1030,6 +1031,24 @@ StmtPtr Parser::parseForStatement() {
         depth--;
       }
       advance();
+    }
+    // Continue past member expression chains (e.g., [let][1] or {}.prop)
+    while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
+      if (match(TokenType::Dot)) {
+        advance();
+        if (match(TokenType::Identifier) || isIdentifierLikeToken(current().type)) {
+          advance();
+        }
+      } else {
+        // Computed member access [expr]
+        advance();
+        int bracketDepth = 1;
+        while (bracketDepth > 0 && !match(TokenType::EndOfFile)) {
+          if (match(TokenType::LeftBracket)) bracketDepth++;
+          else if (match(TokenType::RightBracket)) bracketDepth--;
+          advance();
+        }
+      }
     }
     if (match(TokenType::In)) {
       isForInOrOf = true;
@@ -1161,16 +1180,40 @@ StmtPtr Parser::parseForStatement() {
       decl.declarations.push_back({std::move(pattern), nullptr});
       left = std::make_unique<Statement>(std::move(decl));
     } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
-      // Bare destructuring assignment pattern
-      auto pattern = parsePattern();
-      if (!pattern) {
-        return nullptr;
+      // Check if this is a MemberExpression (e.g., [let][1]) rather than destructuring
+      // by peeking past the balanced brackets to see if member access follows
+      size_t peekPos = pos_;
+      int peekDepth = 1;
+      peekPos++; // skip opening bracket/brace
+      while (peekDepth > 0 && peekPos < tokens_.size()) {
+        auto t = tokens_[peekPos].type;
+        if (t == TokenType::LeftBracket || t == TokenType::LeftBrace || t == TokenType::LeftParen)
+          peekDepth++;
+        else if (t == TokenType::RightBracket || t == TokenType::RightBrace || t == TokenType::RightParen)
+          peekDepth--;
+        peekPos++;
       }
-      // Strict mode: reject eval/arguments as assignment targets in destructuring
-      if (strictMode_ && hasStrictModeInvalidTargets(*pattern)) {
-        return nullptr;
+      bool isMemberExpr = peekPos < tokens_.size() &&
+        (tokens_[peekPos].type == TokenType::LeftBracket ||
+         tokens_[peekPos].type == TokenType::Dot);
+
+      if (isMemberExpr) {
+        // Parse as MemberExpression (e.g., [let][1].prop)
+        auto expr = parseMember();
+        if (!expr) return nullptr;
+        left = std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
+      } else {
+        // Bare destructuring assignment pattern
+        auto pattern = parsePattern();
+        if (!pattern) {
+          return nullptr;
+        }
+        // Strict mode: reject eval/arguments as assignment targets in destructuring
+        if (strictMode_ && hasStrictModeInvalidTargets(*pattern)) {
+          return nullptr;
+        }
+        left = std::make_unique<Statement>(ExpressionStmt{std::move(pattern)});
       }
-      left = std::make_unique<Statement>(ExpressionStmt{std::move(pattern)});
     } else {
       auto expr = parseMember();
       if (!expr) {
