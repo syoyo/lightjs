@@ -424,8 +424,23 @@ Task Interpreter::evaluate(const Statement& stmt) {
       }
     }
 
-    // Process methods
+    // Process methods and fields
     for (const auto& method : node->methods) {
+      // Handle field declarations
+      if (method.kind == MethodDefinition::Kind::Field) {
+        Class::FieldInit fi;
+        fi.name = method.key.name;
+        fi.isPrivate = method.isPrivate;
+        if (method.initializer) {
+          fi.initExpr = std::shared_ptr<void>(
+            const_cast<Expression*>(method.initializer.get()),
+            [](void*){} // No-op deleter
+          );
+        }
+        cls->fieldInitializers.push_back(std::move(fi));
+        continue;
+      }
+
       auto func = std::make_shared<Function>();
       func->isNative = false;
       func->isAsync = method.isAsync;
@@ -460,6 +475,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
         cls->constructor = func;
       } else if (method.isStatic) {
         cls->staticMethods[method.key.name] = func;
+        cls->properties[method.key.name] = Value(func);
       } else if (method.kind == MethodDefinition::Kind::Get) {
         cls->getters[method.key.name] = func;
       } else if (method.kind == MethodDefinition::Kind::Set) {
@@ -1847,6 +1863,92 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         }
       }
 
+      // Handle private field logical assignment (#name)
+      if (!propName.empty() && propName[0] == '#' && obj.isObject()) {
+        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        std::shared_ptr<Class> cls;
+        auto ctorIt = objPtr->properties.find("__constructor__");
+        if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
+          cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+        }
+
+        Value current(Undefined{});
+        bool isMethod = false;
+        bool hasPrivateGetter = false;
+        bool hasPrivateSetter = false;
+
+        if (cls) {
+          auto getterIt = cls->getters.find(propName);
+          if (getterIt != cls->getters.end()) {
+            hasPrivateGetter = true;
+            current = invokeFunction(getterIt->second, {}, obj);
+          }
+          auto setterIt = cls->setters.find(propName);
+          if (setterIt != cls->setters.end()) {
+            hasPrivateSetter = true;
+          }
+          auto methodIt = cls->methods.find(propName);
+          if (methodIt != cls->methods.end()) {
+            isMethod = true;
+            current = Value(methodIt->second);
+          }
+        }
+
+        if (!hasPrivateGetter && !isMethod) {
+          std::string mangledName = "__private_" + propName + "__";
+          auto it = objPtr->properties.find(mangledName);
+          if (it != objPtr->properties.end()) {
+            current = it->second;
+          }
+        }
+
+        // Short-circuit check
+        bool shouldAssign = false;
+        if (expr.op == AssignmentExpr::Op::AndAssign) {
+          shouldAssign = current.toBool();
+        } else if (expr.op == AssignmentExpr::Op::OrAssign) {
+          shouldAssign = !current.toBool();
+        } else if (expr.op == AssignmentExpr::Op::NullishAssign) {
+          shouldAssign = (current.isNull() || current.isUndefined());
+        }
+
+        if (!shouldAssign) {
+          LIGHTJS_RETURN(current);
+        }
+
+        // Check if assignment is allowed
+        if (isMethod) {
+          auto rightTask2 = evaluate(*expr.right);
+          LIGHTJS_RUN_TASK_VOID(rightTask2);
+          throwError(ErrorType::TypeError, "Cannot assign to private method " + propName);
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        if (hasPrivateGetter && !hasPrivateSetter) {
+          auto rightTask2 = evaluate(*expr.right);
+          LIGHTJS_RUN_TASK_VOID(rightTask2);
+          throwError(ErrorType::TypeError, "Cannot set property " + propName + " which has only a getter");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+
+        // Evaluate RHS
+        auto rightTask2 = evaluate(*expr.right);
+        Value right2;
+        LIGHTJS_RUN_TASK(rightTask2, right2);
+        if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+        // Assign via setter or mangled property
+        if (hasPrivateSetter && cls) {
+          auto setterIt = cls->setters.find(propName);
+          if (setterIt != cls->setters.end()) {
+            invokeFunction(setterIt->second, {right2}, obj);
+          }
+        } else {
+          std::string mangledName = "__private_" + propName + "__";
+          objPtr->properties[mangledName] = right2;
+        }
+        LIGHTJS_RETURN(right2);
+      }
+
       // Get current value (with getter support)
       Value current(Undefined{});
       bool hasGetter = false;
@@ -2083,6 +2185,42 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+
+      // Handle private field assignment (#name)
+      if (!propName.empty() && propName[0] == '#') {
+        std::shared_ptr<Class> cls;
+        auto ctorIt = objPtr->properties.find("__constructor__");
+        if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
+          cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+        }
+
+        // Check for private setter
+        if (cls) {
+          auto setterIt = cls->setters.find(propName);
+          if (setterIt != cls->setters.end()) {
+            invokeFunction(setterIt->second, {right}, obj);
+            LIGHTJS_RETURN(right);
+          }
+          // Cannot assign to private methods
+          auto methodIt = cls->methods.find(propName);
+          if (methodIt != cls->methods.end()) {
+            throwError(ErrorType::TypeError, "Cannot assign to private method " + propName);
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          // Cannot assign to getter-only
+          auto getterIt = cls->getters.find(propName);
+          if (getterIt != cls->getters.end()) {
+            throwError(ErrorType::TypeError, "Cannot set property " + propName + " which has only a getter");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        }
+
+        // Assign to mangled private field
+        std::string mangledName = "__private_" + propName + "__";
+        objPtr->properties[mangledName] = right;
+        LIGHTJS_RETURN(right);
+      }
+
       if (objPtr->isModuleNamespace) {
         // Module namespace exotic objects reject writes.
         if (strictMode_) {
@@ -3565,6 +3703,40 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         objPtr->properties["__deferred_pending__"] = Value(false);
       }
+    }
+
+    // Handle private field/method/getter access (#name)
+    if (!propName.empty() && propName[0] == '#') {
+      // Find the class from the constructor tag
+      auto ctorIt = objPtr->properties.find("__constructor__");
+      std::shared_ptr<Class> cls;
+      if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
+        cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+      }
+
+      // Check class getters for this private name
+      if (cls) {
+        auto getterIt = cls->getters.find(propName);
+        if (getterIt != cls->getters.end()) {
+          LIGHTJS_RETURN(invokeFunction(getterIt->second, {}, obj));
+        }
+        // Check class methods for this private name
+        auto methodIt = cls->methods.find(propName);
+        if (methodIt != cls->methods.end()) {
+          LIGHTJS_RETURN(Value(methodIt->second));
+        }
+      }
+
+      // Check mangled private field on instance
+      std::string mangledName = "__private_" + propName + "__";
+      auto it = objPtr->properties.find(mangledName);
+      if (it != objPtr->properties.end()) {
+        LIGHTJS_RETURN(it->second);
+      }
+
+      // Private field not found
+      throwError(ErrorType::TypeError, "Cannot read private member " + propName + " from an object whose class did not declare it");
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     // Check for getter first
@@ -7238,6 +7410,25 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         env_->define(*func->restParam, Value(restArr));
       }
 
+      // Set __constructor__ before field init so private accessor lookup works
+      instance->properties["__constructor__"] = callee;
+
+      // Evaluate field initializers before constructor body
+      for (const auto& fi : cls->fieldInitializers) {
+        Value fieldVal(Undefined{});
+        if (fi.initExpr) {
+          auto initExpr = std::static_pointer_cast<Expression>(fi.initExpr);
+          auto initTask = evaluate(*initExpr);
+          LIGHTJS_RUN_TASK(initTask, fieldVal);
+        }
+        if (fi.isPrivate) {
+          // Store as mangled private property: __private_#name__
+          instance->properties["__private_" + fi.name + "__"] = fieldVal;
+        } else {
+          instance->properties[fi.name] = fieldVal;
+        }
+      }
+
       // Execute constructor body
       auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
       auto prevFlow = flow_;
@@ -7297,6 +7488,32 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         obj->properties["constructor"] = callee;
       }
       LIGHTJS_RETURN(result);
+    }
+
+    // No explicit constructor - evaluate field initializers
+    if (!cls->fieldInitializers.empty()) {
+      instance->properties["__constructor__"] = callee;
+
+      auto prevEnv = env_;
+      env_ = std::static_pointer_cast<Environment>(cls->closure);
+      env_ = env_->createChild();
+      env_->define("this", Value(instance));
+
+      for (const auto& fi : cls->fieldInitializers) {
+        Value fieldVal(Undefined{});
+        if (fi.initExpr) {
+          auto initExpr = std::static_pointer_cast<Expression>(fi.initExpr);
+          auto initTask = evaluate(*initExpr);
+          LIGHTJS_RUN_TASK(initTask, fieldVal);
+        }
+        if (fi.isPrivate) {
+          instance->properties["__private_" + fi.name + "__"] = fieldVal;
+        } else {
+          instance->properties[fi.name] = fieldVal;
+        }
+      }
+
+      env_ = prevEnv;
     }
 
     instance->properties["__constructor__"] = callee;
@@ -7456,8 +7673,23 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
   }
 
-  // Process methods
+  // Process methods and fields
   for (const auto& method : expr.methods) {
+    // Handle field declarations
+    if (method.kind == MethodDefinition::Kind::Field) {
+      Class::FieldInit fi;
+      fi.name = method.key.name;
+      fi.isPrivate = method.isPrivate;
+      if (method.initializer) {
+        fi.initExpr = std::shared_ptr<void>(
+          const_cast<Expression*>(method.initializer.get()),
+          [](void*){} // No-op deleter
+        );
+      }
+      cls->fieldInitializers.push_back(std::move(fi));
+      continue;
+    }
+
     // Create function from method definition
     auto func = std::make_shared<Function>();
     func->isNative = false;

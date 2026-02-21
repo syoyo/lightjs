@@ -96,6 +96,7 @@ bool parseNumberLiteral(const std::string& raw, double& out) {
 bool isIdentifierNameToken(TokenType type) {
   switch (type) {
     case TokenType::Identifier:
+    case TokenType::PrivateIdentifier:
     case TokenType::True:
     case TokenType::False:
     case TokenType::Null:
@@ -746,6 +747,12 @@ StmtPtr Parser::parseClassDeclaration() {
 
   std::vector<MethodDefinition> methods;
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+    // Skip semicolons
+    if (match(TokenType::Semicolon)) {
+      advance();
+      continue;
+    }
+
     MethodDefinition method;
 
     // Check for static
@@ -754,80 +761,118 @@ StmtPtr Parser::parseClassDeclaration() {
       advance();
     }
 
-    // Check for async
-    if (match(TokenType::Async)) {
+    // Check for async (only if followed by a method name + '(')
+    if (match(TokenType::Async) && peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::Equal && peek().type != TokenType::RightBrace) {
       method.isAsync = true;
       advance();
     }
 
-    // Check for getter/setter
-    if (match(TokenType::Get)) {
-      method.kind = MethodDefinition::Kind::Get;
-      advance();
-    } else if (match(TokenType::Set)) {
-      method.kind = MethodDefinition::Kind::Set;
-      advance();
+    // Check for getter/setter - only if followed by name + '('
+    if ((match(TokenType::Get) || match(TokenType::Set)) &&
+        (isIdentifierNameToken(peek().type) || peek().type == TokenType::PrivateIdentifier)) {
+      // Peek ahead: if the token after the name is '(', it's a getter/setter
+      // Otherwise treat get/set as a field name
+      size_t saved = pos_;
+      TokenType savedType = current().type;
+      advance(); // consume get/set
+      bool isGetterSetter = false;
+      if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
+        advance(); // consume name
+        if (match(TokenType::LeftParen)) {
+          isGetterSetter = true;
+        }
+      }
+      // Restore position
+      pos_ = saved;
+
+      if (isGetterSetter) {
+        if (savedType == TokenType::Get) {
+          method.kind = MethodDefinition::Kind::Get;
+        } else {
+          method.kind = MethodDefinition::Kind::Set;
+        }
+        advance(); // consume get/set
+      }
     }
 
-    // Method name
-    if (isIdentifierNameToken(current().type)) {
-      std::string methodName = current().value;
-      if (methodName == "constructor") {
+    // Member name (identifier or private identifier)
+    if (match(TokenType::PrivateIdentifier)) {
+      method.isPrivate = true;
+      method.key.name = current().value; // includes '#' prefix
+      advance();
+    } else if (isIdentifierNameToken(current().type)) {
+      std::string memberName = current().value;
+      if (memberName == "constructor" && method.kind == MethodDefinition::Kind::Method) {
         method.kind = MethodDefinition::Kind::Constructor;
       }
-      method.key.name = methodName;
+      method.key.name = memberName;
       advance();
     } else {
       return nullptr;
     }
 
-    // Parameters
-    ++functionDepth_;
-    if (method.isAsync) {
-      ++asyncFunctionDepth_;
-    }
-    expect(TokenType::LeftParen);
-    while (!match(TokenType::RightParen)) {
-      if (isIdentifierLikeToken(current().type)) {
-        method.params.push_back({current().value});
-        advance();
-        if (match(TokenType::Comma)) {
+    // Distinguish field vs method: if '(' follows, it's a method; otherwise a field
+    if (match(TokenType::LeftParen)) {
+      // Method/constructor/getter/setter
+      ++functionDepth_;
+      if (method.isAsync) {
+        ++asyncFunctionDepth_;
+      }
+      advance(); // consume '('
+      while (!match(TokenType::RightParen)) {
+        if (isIdentifierLikeToken(current().type)) {
+          method.params.push_back({current().value});
           advance();
+          if (match(TokenType::Comma)) {
+            advance();
+          }
+        } else {
+          break;
         }
-      } else {
-        break;
       }
-    }
-    expect(TokenType::RightParen);
+      expect(TokenType::RightParen);
 
-    // Method body
-    bool disallowSuperCall = !superClass && !method.isStatic &&
-                             method.kind == MethodDefinition::Kind::Constructor;
-    if (disallowSuperCall) {
-      ++superCallDisallowDepth_;
-    }
-    expect(TokenType::LeftBrace);
-    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-      auto stmt = parseStatement();
-      if (!stmt) {
-        if (method.isAsync) {
-          --asyncFunctionDepth_;
-        }
-        --functionDepth_;
-        if (disallowSuperCall) {
-          --superCallDisallowDepth_;
-        }
-        return nullptr;
+      // Method body
+      bool disallowSuperCall = !superClass && !method.isStatic &&
+                               method.kind == MethodDefinition::Kind::Constructor;
+      if (disallowSuperCall) {
+        ++superCallDisallowDepth_;
       }
-      method.body.push_back(std::move(stmt));
-    }
-    expect(TokenType::RightBrace);
-    if (method.isAsync) {
-      --asyncFunctionDepth_;
-    }
-    --functionDepth_;
-    if (disallowSuperCall) {
-      --superCallDisallowDepth_;
+      expect(TokenType::LeftBrace);
+      while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+        auto stmt = parseStatement();
+        if (!stmt) {
+          if (method.isAsync) {
+            --asyncFunctionDepth_;
+          }
+          --functionDepth_;
+          if (disallowSuperCall) {
+            --superCallDisallowDepth_;
+          }
+          return nullptr;
+        }
+        method.body.push_back(std::move(stmt));
+      }
+      expect(TokenType::RightBrace);
+      if (method.isAsync) {
+        --asyncFunctionDepth_;
+      }
+      --functionDepth_;
+      if (disallowSuperCall) {
+        --superCallDisallowDepth_;
+      }
+    } else {
+      // Field declaration
+      method.kind = MethodDefinition::Kind::Field;
+      if (match(TokenType::Equal)) {
+        advance(); // consume '='
+        method.initializer = parseAssignment();
+      }
+      // Consume optional semicolon
+      if (match(TokenType::Semicolon)) {
+        advance();
+      }
     }
 
     methods.push_back(std::move(method));
@@ -2779,8 +2824,20 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr, bool inOptionalChain) {
       return nullptr;
     } else if (match(TokenType::Dot)) {
       advance();
-      // Accept identifiers OR keywords as property names
-      // Keywords like catch, finally, class, etc. can be property names in JS
+      // Accept identifiers, keywords, or private identifiers as property names
+      if (match(TokenType::PrivateIdentifier)) {
+        // Private field access: obj.#field → MemberExpr with #-prefixed name
+        auto prop = std::make_unique<Expression>(Identifier{current().value});
+        advance();
+        MemberExpr member;
+        member.object = std::move(expr);
+        member.property = std::move(prop);
+        member.computed = false;
+        member.optional = false;
+        member.inOptionalChain = inOptionalChain;
+        expr = std::make_unique<Expression>(std::move(member));
+        continue;
+      }
       if (isIdentifierNameToken(current().type)) {
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
@@ -3613,6 +3670,12 @@ ExprPtr Parser::parseClassExpression() {
 
   std::vector<MethodDefinition> methods;
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+    // Skip semicolons
+    if (match(TokenType::Semicolon)) {
+      advance();
+      continue;
+    }
+
     MethodDefinition method;
 
     // Check for static
@@ -3621,80 +3684,112 @@ ExprPtr Parser::parseClassExpression() {
       advance();
     }
 
-    // Check for async
-    if (match(TokenType::Async)) {
+    // Check for async (only if followed by a method name + '(')
+    if (match(TokenType::Async) && peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::Equal && peek().type != TokenType::RightBrace) {
       method.isAsync = true;
       advance();
     }
 
-    // Check for getter/setter
-    if (match(TokenType::Get)) {
-      method.kind = MethodDefinition::Kind::Get;
+    // Check for getter/setter - only if followed by name + '('
+    if ((match(TokenType::Get) || match(TokenType::Set)) &&
+        (isIdentifierNameToken(peek().type) || peek().type == TokenType::PrivateIdentifier)) {
+      size_t saved = pos_;
+      TokenType savedType = current().type;
       advance();
-    } else if (match(TokenType::Set)) {
-      method.kind = MethodDefinition::Kind::Set;
-      advance();
+      bool isGetterSetter = false;
+      if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
+        advance();
+        if (match(TokenType::LeftParen)) {
+          isGetterSetter = true;
+        }
+      }
+      pos_ = saved;
+
+      if (isGetterSetter) {
+        if (savedType == TokenType::Get) {
+          method.kind = MethodDefinition::Kind::Get;
+        } else {
+          method.kind = MethodDefinition::Kind::Set;
+        }
+        advance();
+      }
     }
 
-    // Method name
-    if (isIdentifierNameToken(current().type)) {
-      std::string methodName = current().value;
-      if (methodName == "constructor") {
+    // Member name (identifier or private identifier)
+    if (match(TokenType::PrivateIdentifier)) {
+      method.isPrivate = true;
+      method.key.name = current().value;
+      advance();
+    } else if (isIdentifierNameToken(current().type)) {
+      std::string memberName = current().value;
+      if (memberName == "constructor" && method.kind == MethodDefinition::Kind::Method) {
         method.kind = MethodDefinition::Kind::Constructor;
       }
-      method.key.name = methodName;
+      method.key.name = memberName;
       advance();
     } else {
       return nullptr;
     }
 
-    // Parameters
-    ++functionDepth_;
-    if (method.isAsync) {
-      ++asyncFunctionDepth_;
-    }
-    expect(TokenType::LeftParen);
-    while (!match(TokenType::RightParen)) {
-      if (isIdentifierLikeToken(current().type)) {
-        method.params.push_back({current().value});
-        advance();
-        if (match(TokenType::Comma)) {
+    // Distinguish field vs method
+    if (match(TokenType::LeftParen)) {
+      ++functionDepth_;
+      if (method.isAsync) {
+        ++asyncFunctionDepth_;
+      }
+      advance();
+      while (!match(TokenType::RightParen)) {
+        if (isIdentifierLikeToken(current().type)) {
+          method.params.push_back({current().value});
           advance();
+          if (match(TokenType::Comma)) {
+            advance();
+          }
+        } else {
+          break;
         }
-      } else {
-        break;
       }
-    }
-    expect(TokenType::RightParen);
+      expect(TokenType::RightParen);
 
-    // Method body
-    bool disallowSuperCall = !superClass && !method.isStatic &&
-                             method.kind == MethodDefinition::Kind::Constructor;
-    if (disallowSuperCall) {
-      ++superCallDisallowDepth_;
-    }
-    expect(TokenType::LeftBrace);
-    while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-      auto stmt = parseStatement();
-      if (!stmt) {
-        if (method.isAsync) {
-          --asyncFunctionDepth_;
-        }
-        --functionDepth_;
-        if (disallowSuperCall) {
-          --superCallDisallowDepth_;
-        }
-        return nullptr;
+      bool disallowSuperCall = !superClass && !method.isStatic &&
+                               method.kind == MethodDefinition::Kind::Constructor;
+      if (disallowSuperCall) {
+        ++superCallDisallowDepth_;
       }
-      method.body.push_back(std::move(stmt));
-    }
-    expect(TokenType::RightBrace);
-    if (method.isAsync) {
-      --asyncFunctionDepth_;
-    }
-    --functionDepth_;
-    if (disallowSuperCall) {
-      --superCallDisallowDepth_;
+      expect(TokenType::LeftBrace);
+      while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+        auto stmt = parseStatement();
+        if (!stmt) {
+          if (method.isAsync) {
+            --asyncFunctionDepth_;
+          }
+          --functionDepth_;
+          if (disallowSuperCall) {
+            --superCallDisallowDepth_;
+          }
+          return nullptr;
+        }
+        method.body.push_back(std::move(stmt));
+      }
+      expect(TokenType::RightBrace);
+      if (method.isAsync) {
+        --asyncFunctionDepth_;
+      }
+      --functionDepth_;
+      if (disallowSuperCall) {
+        --superCallDisallowDepth_;
+      }
+    } else {
+      // Field declaration
+      method.kind = MethodDefinition::Kind::Field;
+      if (match(TokenType::Equal)) {
+        advance();
+        method.initializer = parseAssignment();
+      }
+      if (match(TokenType::Semicolon)) {
+        advance();
+      }
     }
 
     methods.push_back(std::move(method));

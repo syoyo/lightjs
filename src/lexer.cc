@@ -955,6 +955,20 @@ std::vector<Token> Lexer::tokenize() {
         tokens.emplace_back(TokenType::Tilde, startLine, startColumn);
         advance();
         break;
+      case '#': {
+        advance(); // consume '#'
+        std::string privName = "#";
+        while (!isAtEnd() && isIdentifierPart(static_cast<unsigned char>(current()))) {
+          privName.push_back(current());
+          advance();
+        }
+        if (privName.size() == 1) {
+          throw std::runtime_error("SyntaxError: Invalid private field at line " +
+                                   std::to_string(startLine) + ", column " + std::to_string(startColumn));
+        }
+        tokens.emplace_back(TokenType::PrivateIdentifier, privName, startLine, startColumn);
+        break;
+      }
       default:
         throw std::runtime_error("Unexpected character '" + std::string(1, c) + "' at line " +
                                  std::to_string(startLine) + ", column " + std::to_string(startColumn));

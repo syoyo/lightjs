@@ -111,6 +111,14 @@ struct Class : public GCObject {
   std::unordered_map<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
   std::shared_ptr<void> closure;  // Closure environment
 
+  // Field initializers (public and private) - evaluated during construction
+  struct FieldInit {
+    std::string name;       // Field name (e.g., "x" or "#x")
+    bool isPrivate;
+    std::shared_ptr<void> initExpr;  // Stores Expression* for initializer (nullable = undefined)
+  };
+  std::vector<FieldInit> fieldInitializers;
+
   Class() = default;
   Class(const std::string& n) : name(n) {}
 

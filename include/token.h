@@ -15,6 +15,7 @@ enum class TokenType {
   TemplateLiteral,
   Regex,
   Identifier,
+  PrivateIdentifier,  // #fieldName
 
   True,
   False,

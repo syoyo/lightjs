@@ -172,14 +172,16 @@ struct NewExpr {
 struct ThisExpr {};
 
 struct MethodDefinition {
-  enum class Kind { Constructor, Method, Get, Set };
+  enum class Kind { Constructor, Method, Get, Set, Field };
   Kind kind;
   Identifier key;
   std::vector<Identifier> params;
   std::vector<StmtPtr> body;
+  ExprPtr initializer;  // For field initializers (Kind::Field)
   bool isStatic;
   bool isAsync;
-  MethodDefinition() : kind(Kind::Method), isStatic(false), isAsync(false) {}
+  bool isPrivate;
+  MethodDefinition() : kind(Kind::Method), isStatic(false), isAsync(false), isPrivate(false) {}
 
   // Add move constructor and assignment
   MethodDefinition(MethodDefinition&&) = default;
