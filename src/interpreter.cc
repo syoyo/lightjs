@@ -6710,8 +6710,27 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
         for (char ch : str) {
           arr->elements.push_back(Value(std::string(1, ch)));
         }
+      } else if (val.isObject()) {
+        // Try iterator protocol: object with .next() method
+        auto obj = std::get<std::shared_ptr<Object>>(val.data);
+        auto nextIt = obj->properties.find("next");
+        if (nextIt != obj->properties.end() && nextIt->second.isFunction()) {
+          for (size_t iterLimit = 0; iterLimit < 100000; ++iterLimit) {
+            Value step = callFunction(nextIt->second, {}, val);
+            if (step.isObject()) {
+              auto stepObj = std::get<std::shared_ptr<Object>>(step.data);
+              auto doneIt = stepObj->properties.find("done");
+              if (doneIt != stepObj->properties.end() && doneIt->second.toBool()) break;
+              auto valueIt = stepObj->properties.find("value");
+              arr->elements.push_back(valueIt != stepObj->properties.end() ? valueIt->second : Value(Undefined{}));
+            } else {
+              break;
+            }
+          }
+        } else {
+          arr->elements.push_back(val);
+        }
       } else {
-        // Other iterables could be supported here
         arr->elements.push_back(val);
       }
     } else {
