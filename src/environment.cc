@@ -3286,17 +3286,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseAllSettled->nativeFunc = [callChecked, getProperty, env, promiseFunc](const std::vector<Value>& args) -> Value {
     Value constructor = args.empty() ? Value(Undefined{}) : args[0];
     Value iterable = args.size() > 1 ? args[1] : Value(Undefined{});
-    auto resultPromise = std::make_shared<Promise>();
-    GarbageCollector::instance().reportAllocation(sizeof(Promise));
-    resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
     auto typeErrorValue = [](const std::string& msg) -> Value {
       return Value(std::make_shared<Error>(ErrorType::TypeError, msg));
-    };
-
-    auto rejectAndReturn = [&](const Value& reason) -> Value {
-      resultPromise->reject(reason);
-      return Value(resultPromise);
     };
 
     auto callWithThis = [](const Value& callee,
@@ -3346,7 +3338,67 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return true;
     };
 
-    auto getPropertyWithThrow = [&](const Value& receiver,
+    // === NewPromiseCapability(C) ===
+    // Validate constructor is callable/constructable
+    if (!constructor.isFunction() && !constructor.isClass()) {
+      throw std::runtime_error("TypeError: Promise.allSettled called on non-constructor");
+    }
+
+    auto capResolve = std::make_shared<Value>(Value(Undefined{}));
+    auto capReject = std::make_shared<Value>(Value(Undefined{}));
+
+    auto executor = std::make_shared<Function>();
+    executor->isNative = true;
+    executor->isConstructor = false;
+    executor->nativeFunc = [capResolve, capReject](const std::vector<Value>& executorArgs) -> Value {
+      // GetCapabilitiesExecutor: spec steps 4-7
+      if (!capResolve->isUndefined()) {
+        throw std::runtime_error("TypeError: Promise resolve function already set");
+      }
+      if (!capReject->isUndefined()) {
+        throw std::runtime_error("TypeError: Promise reject function already set");
+      }
+      *capResolve = executorArgs.size() > 0 ? executorArgs[0] : Value(Undefined{});
+      *capReject = executorArgs.size() > 1 ? executorArgs[1] : Value(Undefined{});
+      return Value(Undefined{});
+    };
+
+    Interpreter* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: Interpreter unavailable");
+    }
+    interpreter->clearError();
+    Value resultPromiseValue = interpreter->constructFromNative(constructor, {Value(executor)});
+    if (interpreter->hasError()) {
+      Value err = interpreter->getError();
+      interpreter->clearError();
+      if (err.isError()) {
+        auto errPtr = std::get<std::shared_ptr<Error>>(err.data);
+        throw std::runtime_error(errPtr->message);
+      }
+      throw std::runtime_error("TypeError: Failed to construct promise");
+    }
+
+    // Validate resolve and reject are callable
+    if (!capResolve->isFunction() || !capReject->isFunction()) {
+      throw std::runtime_error("TypeError: Promise resolve or reject function is not callable");
+    }
+
+    auto alreadyResolved = std::make_shared<bool>(false);
+    auto resultPromiseVal = std::make_shared<Value>(resultPromiseValue);
+
+    // Helper to reject the capability and return the result promise
+    auto rejectCapability = [&callWithThis, capReject](const Value& reason) {
+      Value out, thrown;
+      callWithThis(*capReject, {reason}, Value(Undefined{}), out, thrown);
+    };
+
+    auto rejectAndReturn = [&rejectCapability, &resultPromiseValue](const Value& reason) -> Value {
+      rejectCapability(reason);
+      return resultPromiseValue;
+    };
+
+    auto getPropertyWithThrow = [&callWithThis, &env](const Value& receiver,
                                     const std::string& key,
                                     Value& out,
                                     bool& found,
@@ -3444,6 +3496,24 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         return true;
       }
+      if (receiver.isClass()) {
+        auto cls = std::get<std::shared_ptr<Class>>(receiver.data);
+        auto getterIt = cls->properties.find("__get_" + key);
+        if (getterIt != cls->properties.end()) {
+          found = true;
+          if (!getterIt->second.isFunction()) {
+            out = Value(Undefined{});
+            return true;
+          }
+          return callWithThis(getterIt->second, {}, receiver, out, thrown);
+        }
+        auto it = cls->properties.find(key);
+        if (it != cls->properties.end()) {
+          found = true;
+          out = it->second;
+        }
+        return true;
+      }
 
       return true;
     };
@@ -3462,15 +3532,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     auto remaining = std::make_shared<size_t>(1);
 
     auto resolveResultPromise = std::make_shared<std::function<void(const Value&)>>();
-    *resolveResultPromise = [resultPromise, resolveResultPromise, getPropertyWithThrow, callWithThis](const Value& finalValue) {
-      if (resultPromise->state != PromiseState::Pending) {
+    *resolveResultPromise = [alreadyResolved, capResolve, capReject, resultPromiseVal,
+                             resolveResultPromise, getPropertyWithThrow, callWithThis](const Value& finalValue) {
+      if (*alreadyResolved) {
         return;
       }
 
       if (finalValue.isPromise()) {
         auto nested = std::get<std::shared_ptr<Promise>>(finalValue.data);
-        if (nested.get() == resultPromise.get()) {
-          resultPromise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself")));
+        // Check self-reference
+        if (resultPromiseVal->isPromise() &&
+            nested.get() == std::get<std::shared_ptr<Promise>>(resultPromiseVal->data).get()) {
+          *alreadyResolved = true;
+          Value out, thrown;
+          callWithThis(*capReject, {Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself"))},
+                       Value(Undefined{}), out, thrown);
           return;
         }
         if (nested->state == PromiseState::Fulfilled) {
@@ -3478,7 +3554,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           return;
         }
         if (nested->state == PromiseState::Rejected) {
-          resultPromise->reject(nested->result);
+          *alreadyResolved = true;
+          Value out, thrown;
+          callWithThis(*capReject, {nested->result}, Value(Undefined{}), out, thrown);
           return;
         }
         nested->then(
@@ -3486,8 +3564,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
             (*resolveResultPromise)(fulfilled);
             return fulfilled;
           },
-          [resultPromise](Value reason) -> Value {
-            resultPromise->reject(reason);
+          [alreadyResolved, capReject, callWithThis](Value reason) -> Value {
+            if (!*alreadyResolved) {
+              *alreadyResolved = true;
+              Value out, thrown;
+              callWithThis(*capReject, {reason}, Value(Undefined{}), out, thrown);
+            }
             return reason;
           });
         return;
@@ -3499,7 +3581,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         bool hasThen = false;
         Value thenThrown;
         if (!getPropertyWithThrow(finalValue, "then", thenValue, hasThen, thenThrown)) {
-          resultPromise->reject(thenThrown);
+          *alreadyResolved = true;
+          Value out, thrown;
+          callWithThis(*capReject, {thenThrown}, Value(Undefined{}), out, thrown);
           return;
         }
         if (hasThen && thenValue.isFunction()) {
@@ -3517,13 +3601,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           };
           auto rejectFn = std::make_shared<Function>();
           rejectFn->isNative = true;
-          rejectFn->nativeFunc = [resultPromise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
+          rejectFn->nativeFunc = [alreadyResolved, capReject, callWithThis, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
             if (*alreadyCalled) {
               return Value(Undefined{});
             }
             *alreadyCalled = true;
-            Value reason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
-            resultPromise->reject(reason);
+            if (!*alreadyResolved) {
+              *alreadyResolved = true;
+              Value reason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+              Value out, thrown;
+              callWithThis(*capReject, {reason}, Value(Undefined{}), out, thrown);
+            }
             return Value(Undefined{});
           };
 
@@ -3531,13 +3619,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           Value thenCallThrown;
           if (!callWithThis(thenValue, {Value(resolveFn), Value(rejectFn)}, finalValue, ignored, thenCallThrown) &&
               !*alreadyCalled) {
-            resultPromise->reject(thenCallThrown);
+            *alreadyResolved = true;
+            Value out, thrown;
+            callWithThis(*capReject, {thenCallThrown}, Value(Undefined{}), out, thrown);
           }
           return;
         }
       }
 
-      resultPromise->resolve(finalValue);
+      *alreadyResolved = true;
+      Value out, thrown;
+      if (!callWithThis(*capResolve, {finalValue}, Value(Undefined{}), out, thrown)) {
+        // If resolve throws, reject the capability with the thrown error
+        Value out2, thrown2;
+        callWithThis(*capReject, {thrown}, Value(Undefined{}), out2, thrown2);
+      }
     };
 
     auto finalizeIfDone = [remaining, results, resolveResultPromise]() {
@@ -3697,7 +3793,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     const auto& iteratorKey = WellKnownSymbols::iteratorKey();
     size_t nextIndex = 0;
+    // Check if array has a custom/poisoned Symbol.iterator getter before using fast path
+    bool useArrayFastPath = false;
     if (iterable.isArray()) {
+      auto arr = std::get<std::shared_ptr<Array>>(iterable.data);
+      auto getterIt = arr->properties.find("__get_" + iteratorKey);
+      auto propIt = arr->properties.find(iteratorKey);
+      if (getterIt == arr->properties.end() && propIt == arr->properties.end()) {
+        useArrayFastPath = true;
+      }
+    }
+    if (useArrayFastPath) {
       auto arr = std::get<std::shared_ptr<Array>>(iterable.data);
       for (const auto& value : arr->elements) {
         Value failureReason;
@@ -3786,7 +3892,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     (*remaining)--;
     finalizeIfDone();
-    return Value(resultPromise);
+    return resultPromiseValue;
   };
   promiseConstructor->properties["allSettled"] = Value(promiseAllSettled);
 

@@ -220,6 +220,8 @@ public:
   Value callForHarness(const Value& callee,
                        const std::vector<Value>& args,
                        const Value& thisValue = Value(Undefined{}));
+  Value constructFromNative(const Value& constructor,
+                            const std::vector<Value>& args);
 
 private:
   std::shared_ptr<Environment> env_;

@@ -143,6 +143,15 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     error->properties["name"] = Value(std::string("Test262Error"));
     return Value(error);
   };
+  // Test262Error.thrower - throws a Test262Error (defined in sta.js)
+  auto throwerFunc = std::make_shared<Function>();
+  throwerFunc->isNative = true;
+  throwerFunc->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    std::string message = args.empty() ? "" : args[0].toString();
+    throw std::runtime_error("Test262Error: " + message);
+  };
+  Test262Error->properties["thrower"] = Value(throwerFunc);
+
   env->define("Test262Error", Value(Test262Error));
 
   // $ERROR function (throws Test262Error)

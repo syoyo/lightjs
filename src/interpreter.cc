@@ -133,8 +133,16 @@ Value Interpreter::callForHarness(const Value& callee,
   return callFunction(callee, args, thisValue);
 }
 
+Value Interpreter::constructFromNative(const Value& constructor,
+                                       const std::vector<Value>& args) {
+  auto task = constructValue(constructor, args);
+  Value result;
+  LIGHTJS_RUN_TASK(task, result);
+  return result;
+}
+
 bool Interpreter::isObjectLike(const Value& value) const {
-  return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() || value.isProxy();
+  return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() || value.isProxy() || value.isPromise();
 }
 
 std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receiver, const std::string& key) {
@@ -401,6 +409,18 @@ Task Interpreter::evaluate(const Statement& stmt) {
   LIGHTJS_RUN_TASK(superTask, superVal);
       if (superVal.isClass()) {
         cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+      } else if (superVal.isFunction()) {
+        cls->properties["__super_constructor__"] = superVal;
+        // Inherit static properties from Function super class
+        auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+        for (const auto& [key, val] : superFunc->properties) {
+          if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
+          if (key == "name" || key == "length" || key == "prototype" ||
+              key == "caller" || key == "arguments") continue;
+          if (cls->properties.find(key) == cls->properties.end()) {
+            cls->properties[key] = val;
+          }
+        }
       }
     }
 
@@ -430,6 +450,8 @@ Task Interpreter::evaluate(const Statement& stmt) {
       }
       if (cls->superClass) {
         func->properties["__super_class__"] = Value(cls->superClass);
+      } else if (cls->properties.find("__super_constructor__") != cls->properties.end()) {
+        func->properties["__super_class__"] = cls->properties["__super_constructor__"];
       } else if (auto objectCtor = env_->get("Object")) {
         func->properties["__super_class__"] = *objectCtor;
       }
@@ -2322,6 +2344,36 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
       LIGHTJS_RETURN(right);
     }
+
+    if (obj.isClass()) {
+      auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+      // Check __non_writable_ marker
+      if (clsPtr->properties.count("__non_writable_" + propName)) {
+        LIGHTJS_RETURN(right);
+      }
+      if (expr.op == AssignmentExpr::Op::Assign) {
+        clsPtr->properties[propName] = right;
+      } else {
+        Value current = clsPtr->properties[propName];
+        switch (expr.op) {
+          case AssignmentExpr::Op::AddAssign:
+            clsPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
+            break;
+          case AssignmentExpr::Op::SubAssign:
+            clsPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
+            break;
+          case AssignmentExpr::Op::MulAssign:
+            clsPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
+            break;
+          case AssignmentExpr::Op::DivAssign:
+            clsPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
+            break;
+          default:
+            clsPtr->properties[propName] = right;
+        }
+      }
+      LIGHTJS_RETURN(right);
+    }
   }
 
   LIGHTJS_RETURN(right);
@@ -2512,6 +2564,21 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       }
       args.push_back(argVal);
     }
+  }
+
+  // Handle super() calls as construction (ES2020: super() calls [[Construct]])
+  if (std::holds_alternative<SuperExpr>(expr.callee->node)) {
+    Value newTarget = Value(Undefined{});
+    if (auto nt = env_->get("__new_target__")) {
+      newTarget = *nt;
+    }
+    Value result = LIGHTJS_AWAIT(constructValue(callee, args, newTarget));
+    if (flow_.type != ControlFlow::Type::None) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    // Update 'this' binding to the super-constructed value
+    env_->set("this", result);
+    LIGHTJS_RETURN(result);
   }
 
   if (inTailPosition_ && strictMode_ && callee.isFunction() && activeFunction_) {
@@ -7139,6 +7206,11 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
       // Bind super class if exists
       if (cls->superClass) {
         env_->define("__super__", Value(cls->superClass));
+      } else {
+        auto superCtorIt = cls->properties.find("__super_constructor__");
+        if (superCtorIt != cls->properties.end()) {
+          env_->define("__super__", superCtorIt->second);
+        }
       }
 
       // Bind parameters
@@ -7180,8 +7252,51 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         }
       }
 
+      // Get the final `this` value (super() may have replaced it)
+      Value finalThis = Value(instance);
+      if (auto currentThis = env_->get("this")) {
+        finalThis = *currentThis;
+      }
+
       flow_ = prevFlow;
       env_ = prevEnv;
+
+      setConstructorTag(finalThis);
+      // If super() replaced `this` with a different type, set `constructor` property
+      // to point to this class (simulates prototype.constructor inheritance)
+      if (finalThis.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(finalThis.data);
+        p->properties["constructor"] = callee;
+      } else if (finalThis.isObject() &&
+                 std::get<std::shared_ptr<Object>>(finalThis.data).get() != instance.get()) {
+        auto obj = std::get<std::shared_ptr<Object>>(finalThis.data);
+        obj->properties["constructor"] = callee;
+      } else if (finalThis.isArray()) {
+        auto arr = std::get<std::shared_ptr<Array>>(finalThis.data);
+        arr->properties["constructor"] = callee;
+      }
+      LIGHTJS_RETURN(finalThis);
+    }
+
+    // No explicit constructor with Function super: implicitly call super(...args)
+    // ES2020: default constructor for derived class is constructor(...args) { super(...args); }
+    // Only for class-extends-Function (not class-extends-Class, which is handled above)
+    auto superCtorIt = cls->properties.find("__super_constructor__");
+    if (superCtorIt != cls->properties.end()) {
+      Value superVal = superCtorIt->second;
+      Value result = LIGHTJS_AWAIT(constructValue(superVal, args, effectiveNewTarget));
+      if (flow_.type != ControlFlow::Type::None) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      setConstructorTag(result);
+      if (result.isPromise()) {
+        auto p = std::get<std::shared_ptr<Promise>>(result.data);
+        p->properties["constructor"] = callee;
+      } else if (result.isObject()) {
+        auto obj = std::get<std::shared_ptr<Object>>(result.data);
+        obj->properties["constructor"] = callee;
+      }
+      LIGHTJS_RETURN(result);
     }
 
     instance->properties["__constructor__"] = callee;
@@ -7265,9 +7380,17 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
   LIGHTJS_RUN_TASK(stmtTask, result);
 
       if (flow_.type == ControlFlow::Type::Return) {
-        // If constructor returns an object, use that; otherwise use the instance
+        // If constructor returns an object-like value, use that; otherwise use the instance
+        // ES spec: "If Type(result) is Object, return result."
         if (flow_.value.isObject()) {
           instance = std::get<std::shared_ptr<Object>>(flow_.value.data);
+        } else if (isObjectLike(flow_.value)) {
+          // Constructor returned a non-plain-Object type (Promise, Array, Function, etc.)
+          Value returnedVal = flow_.value;
+          flow_ = prevFlow;
+          env_ = prevEnv;
+          setConstructorTag(returnedVal);
+          LIGHTJS_RETURN(returnedVal);
         }
         break;
       }
@@ -7319,6 +7442,17 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
   LIGHTJS_RUN_TASK(superTask, superVal);
     if (superVal.isClass()) {
       cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+    } else if (superVal.isFunction()) {
+      cls->properties["__super_constructor__"] = superVal;
+      auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+      for (const auto& [key, val] : superFunc->properties) {
+        if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
+        if (key == "name" || key == "length" || key == "prototype" ||
+            key == "caller" || key == "arguments") continue;
+        if (cls->properties.find(key) == cls->properties.end()) {
+          cls->properties[key] = val;
+        }
+      }
     }
   }
 
@@ -7349,6 +7483,8 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
     if (cls->superClass) {
       func->properties["__super_class__"] = Value(cls->superClass);
+    } else if (cls->properties.find("__super_constructor__") != cls->properties.end()) {
+      func->properties["__super_class__"] = cls->properties["__super_constructor__"];
     } else if (auto objectCtor = env_->get("Object")) {
       func->properties["__super_class__"] = *objectCtor;
     }
