@@ -1921,7 +1921,27 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
 #endif
 
-    return Value(allMatches);
+    // Return a RegExpStringIterator (object with .next() method)
+    auto iterObj = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto idx = std::make_shared<size_t>(0);
+    auto nextFn = std::make_shared<Function>();
+    nextFn->isNative = true;
+    nextFn->nativeFunc = [allMatches, idx](const std::vector<Value>& /*args*/) -> Value {
+      auto result = std::make_shared<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      if (*idx < allMatches->elements.size()) {
+        result->properties["value"] = allMatches->elements[*idx];
+        result->properties["done"] = Value(false);
+        (*idx)++;
+      } else {
+        result->properties["value"] = Value(Undefined{});
+        result->properties["done"] = Value(true);
+      }
+      return Value(result);
+    };
+    iterObj->properties["next"] = Value(nextFn);
+    return Value(iterObj);
   };
   regExpPrototype->properties[WellKnownSymbols::matchAllKey()] = Value(regExpMatchAll);
 
