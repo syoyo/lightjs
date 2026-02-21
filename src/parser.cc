@@ -3777,6 +3777,35 @@ ExprPtr Parser::parsePattern() {
 
   // Check for object destructuring pattern
   if (match(TokenType::LeftBrace)) {
+    // Peek past balanced {}: if followed by . or [, it's an object literal + member access
+    // e.g., [{set y(v){...}}.y] = [23]
+    size_t peekPos = pos_ + 1;
+    int depth = 1;
+    while (depth > 0 && peekPos < tokens_.size()) {
+      auto t = tokens_[peekPos].type;
+      if (t == TokenType::LeftBrace || t == TokenType::LeftBracket || t == TokenType::LeftParen)
+        depth++;
+      else if (t == TokenType::RightBrace || t == TokenType::RightBracket || t == TokenType::RightParen)
+        depth--;
+      peekPos++;
+    }
+    bool isObjLiteralMember = peekPos < tokens_.size() &&
+        (tokens_[peekPos].type == TokenType::Dot ||
+         tokens_[peekPos].type == TokenType::LeftBracket);
+
+    if (isObjLiteralMember) {
+      // Parse as object literal expression + member access
+      auto base = parseMember();
+      if (!base) return nullptr;
+      if (match(TokenType::Equal)) {
+        advance();
+        auto init = parseAssignment();
+        if (!init) return nullptr;
+        return std::make_unique<Expression>(AssignmentPattern{std::move(base), std::move(init)});
+      }
+      return base;
+    }
+
     auto base = parseObjectPattern();
     if (!base) {
       return nullptr;
