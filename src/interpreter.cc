@@ -6214,6 +6214,16 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       return record;
     }
     if (value.isArray()) {
+      // Check if Array.prototype[Symbol.iterator] has been deleted
+      auto arrayProtoOpt = env_->get("__array_prototype__");
+      if (arrayProtoOpt.has_value() && arrayProtoOpt->isObject()) {
+        auto protoObj = std::get<std::shared_ptr<Object>>(arrayProtoOpt->data);
+        const auto& iterKey = WellKnownSymbols::iteratorKey();
+        if (protoObj->properties.find(iterKey) == protoObj->properties.end()) {
+          // Symbol.iterator deleted from Array.prototype - not iterable
+          return std::nullopt;
+        }
+      }
       record.kind = IteratorRecord::Kind::Array;
       record.array = std::get<std::shared_ptr<Array>>(value.data);
       record.index = 0;
@@ -6619,6 +6629,37 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         targetEnv->define(func->params[i].name, defaultTask.result());
       } else {
         targetEnv->define(func->params[i].name, Value(Undefined{}));
+      }
+    }
+
+    // Mapped arguments: in sloppy mode with simple params, create getters
+    // so formal param changes are reflected when iterating arguments
+    if (!func->isStrict && !func->restParam.has_value()) {
+      bool hasSimpleParams = true;
+      for (const auto& p : func->params) {
+        if (p.defaultValue || p.name.empty()) { hasSimpleParams = false; break; }
+      }
+      if (hasSimpleParams) {
+        for (size_t i = 0; i < func->params.size() && i < currentArgs.size(); ++i) {
+          std::string paramName = func->params[i].name;
+          std::string idxStr = std::to_string(i);
+          auto getter = std::make_shared<Function>();
+          getter->isNative = true;
+          getter->nativeFunc = [targetEnv, paramName](const std::vector<Value>&) -> Value {
+            auto val = targetEnv->get(paramName);
+            return val.has_value() ? *val : Value(Undefined{});
+          };
+          argumentsArray->properties["__get_" + idxStr] = Value(getter);
+          auto setter = std::make_shared<Function>();
+          setter->isNative = true;
+          setter->nativeFunc = [targetEnv, paramName](const std::vector<Value>& args) -> Value {
+            if (!args.empty()) {
+              targetEnv->set(paramName, args[0]);
+            }
+            return Value(Undefined{});
+          };
+          argumentsArray->properties["__set_" + idxStr] = Value(setter);
+        }
       }
     }
 
@@ -7861,6 +7902,20 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
     }
     std::shared_ptr<Array> arr;
     if (value.isArray()) {
+      // Check if Array.prototype[Symbol.iterator] has been deleted
+      bool iteratorDeleted = false;
+      auto arrayProtoOpt = env_->get("__array_prototype__");
+      if (arrayProtoOpt.has_value() && arrayProtoOpt->isObject()) {
+        auto protoObj = std::get<std::shared_ptr<Object>>(arrayProtoOpt->data);
+        const auto& iterKey = WellKnownSymbols::iteratorKey();
+        if (protoObj->properties.find(iterKey) == protoObj->properties.end()) {
+          iteratorDeleted = true;
+        }
+      }
+      if (iteratorDeleted) {
+        throwError(ErrorType::TypeError, value.toString() + " is not iterable");
+        return;
+      }
       arr = std::get<std::shared_ptr<Array>>(value.data);
     } else if (value.isString()) {
       // Strings are iterable - convert to array of chars

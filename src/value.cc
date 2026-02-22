@@ -886,6 +886,7 @@ std::shared_ptr<Promise> Promise::rejected(const Value& reason) {
 }
 
 static bool isInternalProperty(const std::string& key);
+static bool isSymbolKey(const std::string& key);
 
 // Object static methods implementation
 Value Object_keys(const std::vector<Value>& args) {
@@ -898,8 +899,9 @@ Value Object_keys(const std::vector<Value>& args) {
   auto result = std::make_shared<Array>();
 
   for (const auto& [key, value] : obj->properties) {
-    // Skip internal and non-enumerable properties
+    // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
+    if (isSymbolKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
     result->elements.push_back(Value(key));
   }
@@ -917,6 +919,10 @@ Value Object_values(const std::vector<Value>& args) {
   auto result = std::make_shared<Array>();
 
   for (const auto& [key, value] : obj->properties) {
+    // Skip internal, non-enumerable, and Symbol-keyed properties
+    if (isInternalProperty(key)) continue;
+    if (isSymbolKey(key)) continue;
+    if (obj->properties.count("__non_enum_" + key)) continue;
     result->elements.push_back(value);
   }
 
@@ -933,6 +939,10 @@ Value Object_entries(const std::vector<Value>& args) {
   auto result = std::make_shared<Array>();
 
   for (const auto& [key, value] : obj->properties) {
+    // Skip internal, non-enumerable, and Symbol-keyed properties
+    if (isInternalProperty(key)) continue;
+    if (isSymbolKey(key)) continue;
+    if (obj->properties.count("__non_enum_" + key)) continue;
     auto entry = std::make_shared<Array>();
     entry->elements.push_back(Value(key));
     entry->elements.push_back(value);
@@ -1027,6 +1037,11 @@ static bool isInternalProperty(const std::string& key) {
   return false;
 }
 
+// Symbol-keyed properties are stored as "Symbol(<description>)" strings
+static bool isSymbolKey(const std::string& key) {
+  return key.size() >= 8 && key.substr(0, 7) == "Symbol(" && key.back() == ')';
+}
+
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
   auto result = std::make_shared<Array>();
 
@@ -1066,6 +1081,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
 
   for (const auto& [key, value] : obj->properties) {
     if (isInternalProperty(key)) continue;
+    if (isSymbolKey(key)) continue;
     result->elements.push_back(Value(key));
   }
 

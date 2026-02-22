@@ -2739,6 +2739,39 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   arrayPrototype->properties["join"] = Value(arrayProtoJoin);
 
+  // Array.prototype[Symbol.iterator] - values iterator
+  {
+    const auto& iterKey = WellKnownSymbols::iteratorKey();
+    auto arrayProtoIterator = std::make_shared<Function>();
+    arrayProtoIterator->isNative = true;
+    arrayProtoIterator->properties["__uses_this_arg__"] = Value(true);
+    arrayProtoIterator->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isArray()) {
+        return Value(Undefined{});
+      }
+      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+      auto iterObj = std::make_shared<Object>();
+      auto indexPtr = std::make_shared<size_t>(0);
+      auto nextFn = std::make_shared<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [arr, indexPtr](const std::vector<Value>&) -> Value {
+        auto result = std::make_shared<Object>();
+        if (*indexPtr >= arr->elements.size()) {
+          result->properties["value"] = Value(Undefined{});
+          result->properties["done"] = Value(true);
+        } else {
+          result->properties["value"] = arr->elements[*indexPtr];
+          result->properties["done"] = Value(false);
+          (*indexPtr)++;
+        }
+        return Value(result);
+      };
+      iterObj->properties["next"] = Value(nextFn);
+      return Value(iterObj);
+    };
+    arrayPrototype->properties[iterKey] = Value(arrayProtoIterator);
+  }
+
   // Array.isArray
   auto isArrayFn = std::make_shared<Function>();
   isArrayFn->isNative = true;
