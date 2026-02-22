@@ -7897,54 +7897,224 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       if (it != obj->properties.end() && it->second.isFunction()) {
         Value iterResult = callFunction(it->second, {}, value);
         if (iterResult.isObject()) {
-          // Use iterator protocol to lazily collect elements
           auto iterObj = std::get<std::shared_ptr<Object>>(iterResult.data);
-          arr = std::make_shared<Array>();
           auto nextIt = iterObj->properties.find("next");
           if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
-            size_t needed = arrayPat->elements.size();
-            bool hasRest = (arrayPat->rest != nullptr);
+            // Single-pass lazy destructuring with IteratorClose protocol
+            IteratorRecord iterRec;
+            iterRec.kind = IteratorRecord::Kind::IteratorObject;
+            iterRec.iteratorObject = iterObj;
             bool iteratorDone = false;
-            for (size_t i = 0; i < needed || hasRest; ++i) {
+
+            // Helper lambda: advance iterator, return value or Undefined
+            // If next() throws, marks iterator done and returns (no IteratorClose per spec)
+            auto advanceIterator = [&]() -> Value {
+              if (iteratorDone) return Value(Undefined{});
               Value stepResult = callFunction(nextIt->second, {}, iterResult);
-              // If next() throws, spec says iterator is considered done
-              if (flow_.type == ControlFlow::Type::Throw) { iteratorDone = true; return; }
-              if (!stepResult.isObject()) { iteratorDone = true; break; }
+              if (flow_.type == ControlFlow::Type::Throw) {
+                iteratorDone = true;
+                return Value(Undefined{});
+              }
+              if (!stepResult.isObject()) { iteratorDone = true; return Value(Undefined{}); }
               auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
-              // Check for getter on 'done' property
+              // Check done (with getter support)
               bool isDone = false;
-              auto doneGetterIt = stepObj->properties.find("__get_done");
-              if (doneGetterIt != stepObj->properties.end() && doneGetterIt->second.isFunction()) {
-                Value doneVal = callFunction(doneGetterIt->second, {}, stepResult);
-                if (flow_.type == ControlFlow::Type::Throw) { iteratorDone = true; return; }
+              auto doneGetterIt2 = stepObj->properties.find("__get_done");
+              if (doneGetterIt2 != stepObj->properties.end() && doneGetterIt2->second.isFunction()) {
+                Value doneVal = callFunction(doneGetterIt2->second, {}, stepResult);
+                if (flow_.type == ControlFlow::Type::Throw) { iteratorDone = true; return Value(Undefined{}); }
                 isDone = doneVal.toBool();
               } else {
                 auto doneIt2 = stepObj->properties.find("done");
                 isDone = (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool());
               }
-              if (isDone) { iteratorDone = true; break; }
-              // Check for getter on 'value' property
+              if (isDone) { iteratorDone = true; return Value(Undefined{}); }
+              // Get value (with getter support)
               Value elemVal;
-              auto valGetterIt = stepObj->properties.find("__get_value");
-              if (valGetterIt != stepObj->properties.end() && valGetterIt->second.isFunction()) {
-                elemVal = callFunction(valGetterIt->second, {}, stepResult);
-                if (flow_.type == ControlFlow::Type::Throw) { iteratorDone = true; return; }
+              auto valGetterIt2 = stepObj->properties.find("__get_value");
+              if (valGetterIt2 != stepObj->properties.end() && valGetterIt2->second.isFunction()) {
+                elemVal = callFunction(valGetterIt2->second, {}, stepResult);
+                if (flow_.type == ControlFlow::Type::Throw) { iteratorDone = true; return Value(Undefined{}); }
               } else {
-                auto valIt = stepObj->properties.find("value");
-                elemVal = (valIt != stepObj->properties.end()) ? valIt->second : Value(Undefined{});
+                auto valIt2 = stepObj->properties.find("value");
+                elemVal = (valIt2 != stepObj->properties.end()) ? valIt2->second : Value(Undefined{});
               }
-              arr->elements.push_back(elemVal);
-              if (i >= needed && !hasRest) break;
+              return elemVal;
+            };
+
+            // Helper lambda: close iterator preserving original throw (spec 7.4.6 step 7)
+            auto closeWithThrow = [&]() {
+              if (iteratorDone) return;
+              auto savedFlow = flow_;
+              flow_.type = ControlFlow::Type::None;
+              iteratorClose(iterRec);
+              flow_ = savedFlow;  // Original throw always wins
+            };
+
+            // Single-pass element processing
+            for (size_t i = 0; i < arrayPat->elements.size(); ++i) {
+              if (!arrayPat->elements[i]) {
+                // Hole/elision: advance iterator to consume slot
+                advanceIterator();
+                if (flow_.type == ControlFlow::Type::Throw) return;
+                continue;
+              }
+
+              auto& elem = *arrayPat->elements[i];
+
+              // Unwrap AssignmentPattern to get target and default
+              const Expression* target = &elem;
+              const Expression* defaultExpr = nullptr;
+              if (auto* assignPat = std::get_if<AssignmentPattern>(&elem.node)) {
+                target = assignPat->left.get();
+                defaultExpr = assignPat->right.get();
+              }
+
+              if (auto* memberTarget = std::get_if<MemberExpr>(&target->node)) {
+                // MemberExpr target: evaluate target reference FIRST (spec order)
+                auto objTask = evaluate(*memberTarget->object);
+                Value objVal = Value(Undefined{});
+                LIGHTJS_RUN_TASK(objTask, objVal);
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+
+                std::string prop;
+                if (memberTarget->computed) {
+                  auto propTask = evaluate(*memberTarget->property);
+                  Value propVal = Value(Undefined{});
+                  LIGHTJS_RUN_TASK(propTask, propVal);
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  prop = propVal.toString();
+                } else if (auto* propId = std::get_if<Identifier>(&memberTarget->property->node)) {
+                  prop = propId->name;
+                }
+
+                // THEN advance iterator to get value
+                Value elemValue = advanceIterator();
+                if (flow_.type == ControlFlow::Type::Throw) return; // next() threw, no close
+
+                // Handle default value if undefined
+                if (elemValue.isUndefined() && defaultExpr) {
+                  auto defaultTask = evaluate(*defaultExpr);
+                  LIGHTJS_RUN_TASK(defaultTask, elemValue);
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                }
+
+                // Bind value to pre-evaluated reference
+                if (objVal.isObject()) {
+                  auto obj2 = std::get<std::shared_ptr<Object>>(objVal.data);
+                  auto setterIt = obj2->properties.find("__set_" + prop);
+                  if (setterIt != obj2->properties.end() && setterIt->second.isFunction()) {
+                    callFunction(setterIt->second, {elemValue}, objVal);
+                  } else {
+                    obj2->properties[prop] = elemValue;
+                  }
+                } else if (objVal.isArray()) {
+                  auto arrRef = std::get<std::shared_ptr<Array>>(objVal.data);
+                  if (memberTarget->computed) {
+                    size_t idx = static_cast<size_t>(std::stod(prop));
+                    if (idx < arrRef->elements.size()) {
+                      arrRef->elements[idx] = elemValue;
+                    }
+                  }
+                }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+              } else {
+                // Identifier or nested pattern: advance iterator first, then bind
+                Value elemValue = advanceIterator();
+                if (flow_.type == ControlFlow::Type::Throw) return; // next() threw, no close
+
+                // Handle default value if undefined
+                if (elemValue.isUndefined() && defaultExpr) {
+                  auto defaultTask = evaluate(*defaultExpr);
+                  LIGHTJS_RUN_TASK(defaultTask, elemValue);
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                }
+
+                bindDestructuringPattern(*target, elemValue, isConst, useSet);
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+              }
             }
-            // IteratorClose: if iterator was not exhausted, close it
+
+            // Handle rest element
+            if (arrayPat->rest) {
+              auto& restTarget = *arrayPat->rest;
+
+              // Unwrap AssignmentPattern for rest (rare but possible)
+              const Expression* restActualTarget = &restTarget;
+              if (auto* assignPat = std::get_if<AssignmentPattern>(&restTarget.node)) {
+                restActualTarget = assignPat->left.get();
+              }
+
+              if (auto* memberTarget = std::get_if<MemberExpr>(&restActualTarget->node)) {
+                // MemberExpr rest target: evaluate target reference FIRST
+                auto objTask = evaluate(*memberTarget->object);
+                Value objVal = Value(Undefined{});
+                LIGHTJS_RUN_TASK(objTask, objVal);
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+
+                std::string prop;
+                if (memberTarget->computed) {
+                  auto propTask = evaluate(*memberTarget->property);
+                  Value propVal = Value(Undefined{});
+                  LIGHTJS_RUN_TASK(propTask, propVal);
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  prop = propVal.toString();
+                } else if (auto* propId = std::get_if<Identifier>(&memberTarget->property->node)) {
+                  prop = propId->name;
+                }
+
+                // Collect remaining values
+                auto restArr = std::make_shared<Array>();
+                while (!iteratorDone) {
+                  Value v = advanceIterator();
+                  if (flow_.type == ControlFlow::Type::Throw) return;
+                  if (iteratorDone) break;
+                  restArr->elements.push_back(v);
+                }
+
+                // Bind to pre-evaluated reference
+                if (objVal.isObject()) {
+                  auto obj2 = std::get<std::shared_ptr<Object>>(objVal.data);
+                  auto setterIt = obj2->properties.find("__set_" + prop);
+                  if (setterIt != obj2->properties.end() && setterIt->second.isFunction()) {
+                    callFunction(setterIt->second, {Value(restArr)}, objVal);
+                  } else {
+                    obj2->properties[prop] = Value(restArr);
+                  }
+                } else if (objVal.isArray()) {
+                  auto arrRef = std::get<std::shared_ptr<Array>>(objVal.data);
+                  if (memberTarget->computed) {
+                    size_t idx = static_cast<size_t>(std::stod(prop));
+                    if (idx < arrRef->elements.size()) {
+                      arrRef->elements[idx] = Value(restArr);
+                    }
+                  }
+                }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+              } else {
+                // Identifier or nested pattern rest: collect remaining, then bind
+                auto restArr = std::make_shared<Array>();
+                while (!iteratorDone) {
+                  Value v = advanceIterator();
+                  if (flow_.type == ControlFlow::Type::Throw) return;
+                  if (iteratorDone) break;
+                  restArr->elements.push_back(v);
+                }
+                bindDestructuringPattern(*restActualTarget, Value(restArr), isConst, useSet);
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+              }
+            }
+
+            // Final IteratorClose if iterator not exhausted
             if (!iteratorDone) {
-              IteratorRecord closeRec;
-              closeRec.kind = IteratorRecord::Kind::IteratorObject;
-              closeRec.iteratorObject = iterObj;
-              iteratorClose(closeRec);
+              iteratorClose(iterRec);
               if (flow_.type == ControlFlow::Type::Throw) return;
             }
+            // Done - skip the default binding loop below
+            return;
           }
+          // next method not found - treat as empty iterable
+          arr = std::make_shared<Array>();
         } else {
           arr = std::make_shared<Array>();
         }
