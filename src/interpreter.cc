@@ -374,7 +374,13 @@ Task Interpreter::evaluate(const Program& program) {
       continue;
     }
     auto task = evaluate(*stmt);
-  LIGHTJS_RUN_TASK(task, result);
+    // VarDeclaration (let/const/var) produces empty completion - don't update result
+    // This ensures eval('7; let x;') returns 7, not undefined
+    if (std::holds_alternative<VarDeclaration>(stmt->node)) {
+      LIGHTJS_RUN_TASK_VOID(task);
+    } else {
+      LIGHTJS_RUN_TASK(task, result);
+    }
 
     if (flow_.type != ControlFlow::Type::None) {
       break;
@@ -2150,6 +2156,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       LIGHTJS_RETURN(right);
     }
 
+    // Check const before compound assignment
+    if (env_->isConst(id->name)) {
+      throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     if (auto current = env_->get(id->name)) {
       Value result;
       switch (expr.op) {
@@ -2574,6 +2585,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
 Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
   if (auto* id = std::get_if<Identifier>(&expr.argument->node)) {
+    // Check const before update
+    if (env_->isConst(id->name)) {
+      throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     if (auto current = env_->get(id->name)) {
       if (current->isBigInt()) {
         int64_t oldVal = current->toBigInt();
