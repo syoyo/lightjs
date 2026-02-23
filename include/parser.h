@@ -18,6 +18,7 @@ private:
   size_t pos_ = 0;
   bool isModule_ = false;
   bool strictMode_ = false;
+  bool error_ = false;  // Set on syntax errors to abort parsing
   int superCallDisallowDepth_ = 0;
   int functionDepth_ = 0;
   int asyncFunctionDepth_ = 0;

@@ -985,20 +985,49 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       LIGHTJS_RETURN(Value(lhs.toNumber() >= rhs.toNumber()));
     }
     case BinaryExpr::Op::Equal: {
+      // Abstract Equality Comparison (ES spec 7.2.14)
       Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      // null == undefined (and vice versa)
+      if ((lhs.isNull() && rhs.isUndefined()) || (lhs.isUndefined() && rhs.isNull())) {
+        LIGHTJS_RETURN(Value(true));
+      }
+      if (lhs.isNull() || lhs.isUndefined() || rhs.isNull() || rhs.isUndefined()) {
+        LIGHTJS_RETURN(Value(false));
+      }
+      // Same type: use strict equality semantics
+      if (lhs.isString() && rhs.isString()) {
+        LIGHTJS_RETURN(Value(std::get<std::string>(lhs.data) == std::get<std::string>(rhs.data)));
+      }
+      if (lhs.isBool() && rhs.isBool()) {
+        LIGHTJS_RETURN(Value(std::get<bool>(lhs.data) == std::get<bool>(rhs.data)));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() == rhs.toBigInt()));
       }
+      // Different types: coerce to number
       LIGHTJS_RETURN(Value(lhs.toNumber() == rhs.toNumber()));
     }
     case BinaryExpr::Op::NotEqual: {
+      // Abstract Inequality: negate Abstract Equality
       Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if ((lhs.isNull() && rhs.isUndefined()) || (lhs.isUndefined() && rhs.isNull())) {
+        LIGHTJS_RETURN(Value(false));
+      }
+      if (lhs.isNull() || lhs.isUndefined() || rhs.isNull() || rhs.isUndefined()) {
+        LIGHTJS_RETURN(Value(true));
+      }
+      if (lhs.isString() && rhs.isString()) {
+        LIGHTJS_RETURN(Value(std::get<std::string>(lhs.data) != std::get<std::string>(rhs.data)));
+      }
+      if (lhs.isBool() && rhs.isBool()) {
+        LIGHTJS_RETURN(Value(std::get<bool>(lhs.data) != std::get<bool>(rhs.data)));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() != rhs.toBigInt()));
       }
@@ -1809,6 +1838,8 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             auto nameIt = fn->properties.find("name");
             if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
               fn->properties["name"] = Value(id->name);
+              fn->properties["__non_writable_name"] = Value(true);
+              fn->properties["__non_enum_name"] = Value(true);
             }
           } else if (right.isClass()) {
             auto cls = std::get<std::shared_ptr<Class>>(right.data);
@@ -2079,6 +2110,30 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
     if (expr.op == AssignmentExpr::Op::Assign) {
+      // Function name inference: only for IsAnonymousFunctionDefinition (spec 13.15.5.3)
+      bool isAnonFnDef = false;
+      if (auto* fnExpr = std::get_if<FunctionExpr>(&expr.right->node)) {
+        isAnonFnDef = fnExpr->name.empty();
+      } else if (auto* clsExpr = std::get_if<ClassExpr>(&expr.right->node)) {
+        isAnonFnDef = clsExpr->name.empty();
+      }
+      if (isAnonFnDef && right.isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(right.data);
+        auto nameIt = fn->properties.find("name");
+        if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
+          fn->properties["name"] = Value(id->name);
+          fn->properties["__non_writable_name"] = Value(true);
+          fn->properties["__non_enum_name"] = Value(true);
+        }
+      } else if (isAnonFnDef && right.isClass()) {
+        auto cls = std::get<std::shared_ptr<Class>>(right.data);
+        if (cls->properties.find("name") == cls->properties.end()) {
+          cls->name = id->name;
+          cls->properties["name"] = Value(id->name);
+          cls->properties["__non_writable_name"] = Value(true);
+          cls->properties["__non_enum_name"] = Value(true);
+        }
+      }
       if (!env_->set(id->name, right)) {
         if (env_->isConst(id->name)) {
           throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
@@ -8424,6 +8479,38 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
       }
     }
 
+    // Function name inference: set .name on anonymous functions assigned to variables
+    // Per spec, only applies when IsAnonymousFunctionDefinition(Initializer) is true:
+    // the initializer must directly be a function/class expression (not comma expr etc.)
+    if (declarator.init) {
+      if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
+        bool isAnonFnDef = false;
+        if (auto* fnExpr = std::get_if<FunctionExpr>(&declarator.init->node)) {
+          // Anonymous function expression (not named like `function foo() {}`)
+          isAnonFnDef = fnExpr->name.empty();
+        } else if (std::get_if<ClassExpr>(&declarator.init->node)) {
+          isAnonFnDef = value.isClass() && std::get<std::shared_ptr<Class>>(value.data)->name.empty();
+        }
+        if (isAnonFnDef && value.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(value.data);
+          auto nameIt = fn->properties.find("name");
+          if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
+            fn->properties["name"] = Value(id->name);
+            fn->properties["__non_writable_name"] = Value(true);
+            fn->properties["__non_enum_name"] = Value(true);
+          }
+        } else if (isAnonFnDef && value.isClass()) {
+          auto cls = std::get<std::shared_ptr<Class>>(value.data);
+          if (cls->properties.find("name") == cls->properties.end()) {
+            cls->name = id->name;
+            cls->properties["name"] = Value(id->name);
+            cls->properties["__non_writable_name"] = Value(true);
+            cls->properties["__non_enum_name"] = Value(true);
+          }
+        }
+      }
+    }
+
     // Use the unified destructuring helper
     bool isConst = (decl.kind == VarDeclaration::Kind::Const);
     // For var declarations, use set() to update the hoisted binding in function scope
@@ -8808,9 +8895,52 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   if (stmt.init) {
     auto initTask = evaluate(*stmt.init);
     LIGHTJS_RUN_TASK_VOID(initTask);
+    // If init threw (e.g. destructuring null/undefined), propagate the error
+    if (flow_.type == ControlFlow::Type::Throw) {
+      env_ = prevEnv;
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+  }
+
+  // Collect per-iteration let bindings for freshness (ES6 13.7.4.7)
+  // Only let bindings are refreshed per iteration; const bindings are not (they can't change)
+  std::vector<std::string> perIterationBindings;
+  if (stmt.init) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.init->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let) {
+        for (const auto& declarator : varDecl->declarations) {
+          std::vector<std::string> names;
+          if (declarator.pattern) {
+            // Use simple name extraction for identifiers
+            if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
+              names.push_back(id->name);
+            }
+          }
+          for (const auto& name : names) {
+            perIterationBindings.push_back(name);
+          }
+        }
+      }
+    }
   }
 
   Value result = Value(Undefined{});
+
+  // CreatePerIterationEnvironment helper (ES6 14.7.4.4)
+  // Creates a fresh scope copying let bindings, so closures capture per-iteration values
+  auto createPerIterationEnv = [&]() {
+    if (perIterationBindings.empty()) return;
+    auto outerEnv = env_->getParent();
+    auto iterEnv = outerEnv->createChild();
+    for (const auto& name : perIterationBindings) {
+      auto val = env_->get(name);
+      iterEnv->define(name, val.has_value() ? *val : Value(Undefined{}));
+    }
+    env_ = iterEnv;
+  };
+
+  // Initial CreatePerIterationEnvironment (spec step 2)
+  createPerIterationEnv();
 
   while (true) {
     if (stmt.test) {
@@ -8837,6 +8967,10 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
     } else if (flow_.type != ControlFlow::Type::None) {
       break;
     }
+
+    // CreatePerIterationEnvironment BEFORE update (spec step 3e)
+    // This ensures closures from body see their iteration's value, not the updated one
+    createPerIterationEnv();
 
     if (stmt.update) {
       auto updateTask = evaluate(*stmt.update);
@@ -9678,13 +9812,16 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       auto prevEnv = env_;
       env_ = catchEnv;
 
-      if (stmt.handler.paramPattern) {
-        bindDestructuringPattern(*stmt.handler.paramPattern, flow_.value, false);
-      } else if (!stmt.handler.param.name.empty()) {
-        env_->define(stmt.handler.param.name, flow_.value);
-      }
-
+      // Save thrown value and clear flow BEFORE binding - bindDestructuringPattern
+      // checks flow_.type == Throw internally and would exit early otherwise
+      Value thrownValue = flow_.value;
       flow_.type = ControlFlow::Type::None;
+
+      if (stmt.handler.paramPattern) {
+        bindDestructuringPattern(*stmt.handler.paramPattern, thrownValue, false);
+      } else if (!stmt.handler.param.name.empty()) {
+        env_->define(stmt.handler.param.name, thrownValue);
+      }
 
       for (const auto& catchStmt : stmt.handler.body) {
         auto catchTask = evaluate(*catchStmt);

@@ -32,6 +32,7 @@ public:
 
   static std::shared_ptr<Environment> createGlobal();
   std::shared_ptr<Environment> createChild();
+  std::shared_ptr<Environment> getParent() const { return parent_; }
   std::shared_ptr<Object> getGlobal() const;
   Environment* getRoot();
 

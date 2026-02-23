@@ -464,6 +464,11 @@ StmtPtr Parser::parseStatement() {
     std::string label = tok.value;
     advance();  // label identifier
     advance();  // :
+    // let/const are not allowed as the body of a labeled statement
+    if (match(TokenType::Let) || match(TokenType::Const)) {
+      error_ = true;
+      return nullptr;
+    }
     auto body = parseStatement();
     if (!body) return nullptr;
     return makeStmt(LabelledStmt{label, std::move(body)}, tok);
@@ -621,6 +626,15 @@ StmtPtr Parser::parseVarDeclaration() {
       init = parseExpression();
       if (!init) {
         return nullptr;
+      }
+    }
+
+    // const declarations must have initializers
+    if (kind == VarDeclaration::Kind::Const && !init) {
+      // Check if pattern is a simple identifier (not destructuring - destructuring gets init from AssignmentPattern)
+      if (std::get_if<Identifier>(&pattern->node)) {
+        error_ = true;
+        return nullptr;  // SyntaxError: Missing initializer in const declaration
       }
     }
 
@@ -928,6 +942,11 @@ StmtPtr Parser::parseIfStatement() {
     return nullptr;
   }
 
+  // let/const are not allowed as the body of an if statement
+  if (match(TokenType::Let) || match(TokenType::Const)) {
+    error_ = true;
+    return nullptr;
+  }
   auto consequent = parseStatement();
   if (!consequent) {
     return nullptr;
@@ -936,6 +955,11 @@ StmtPtr Parser::parseIfStatement() {
 
   if (match(TokenType::Else)) {
     advance();
+    // let/const are not allowed as the body of an else clause
+    if (match(TokenType::Let) || match(TokenType::Const)) {
+      error_ = true;
+      return nullptr;
+    }
     alternate = parseStatement();
     if (!alternate) {
       return nullptr;
@@ -957,6 +981,11 @@ StmtPtr Parser::parseWhileStatement() {
   }
   auto test = parseExpression();
   if (!test || !expect(TokenType::RightParen)) {
+    return nullptr;
+  }
+  // let/const are not allowed as the body of a while statement
+  if (match(TokenType::Let) || match(TokenType::Const)) {
+    error_ = true;
     return nullptr;
   }
   auto body = parseStatement();
@@ -1453,6 +1482,11 @@ StmtPtr Parser::parseForStatement() {
     return nullptr;
   }
 
+  // let/const are not allowed as the body of a for statement
+  if (match(TokenType::Let) || match(TokenType::Const)) {
+    error_ = true;
+    return nullptr;
+  }
   auto body = parseStatement();
   if (!body) {
     return nullptr;
@@ -1468,6 +1502,11 @@ StmtPtr Parser::parseForStatement() {
 
 StmtPtr Parser::parseDoWhileStatement() {
   expect(TokenType::Do);
+  // let/const are not allowed as the body of a do-while statement
+  if (match(TokenType::Let) || match(TokenType::Const)) {
+    error_ = true;
+    return nullptr;
+  }
   auto body = parseStatement();
   if (!body || !expect(TokenType::While) || !expect(TokenType::LeftParen)) {
     return nullptr;
@@ -1501,8 +1540,11 @@ StmtPtr Parser::parseSwitchStatement() {
         if (match(TokenType::Default)) {
           break;
         }
+        if (error_) return nullptr;
         if (auto stmt = parseStatement()) {
           consequent.push_back(std::move(stmt));
+        } else if (error_) {
+          return nullptr;
         }
       }
 
@@ -1513,8 +1555,11 @@ StmtPtr Parser::parseSwitchStatement() {
 
       std::vector<StmtPtr> consequent;
       while (!match(TokenType::Case) && !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+        if (error_) return nullptr;
         if (auto stmt = parseStatement()) {
           consequent.push_back(std::move(stmt));
+        } else if (error_) {
+          return nullptr;
         }
       }
 
@@ -1620,16 +1665,19 @@ StmtPtr Parser::parseTryStatement() {
 
     if (match(TokenType::LeftParen)) {
       advance();
-      if (!match(TokenType::RightParen)) {
-        auto pattern = parsePattern();
-        if (!pattern) {
-          return nullptr;
-        }
-        if (auto* id = std::get_if<Identifier>(&pattern->node)) {
-          handler.param = {id->name};
-        } else {
-          handler.paramPattern = std::move(pattern);
-        }
+      // catch() with empty parens is a SyntaxError (distinct from catch {})
+      if (match(TokenType::RightParen)) {
+        error_ = true;
+        return nullptr;
+      }
+      auto pattern = parsePattern();
+      if (!pattern) {
+        return nullptr;
+      }
+      if (auto* id = std::get_if<Identifier>(&pattern->node)) {
+        handler.param = {id->name};
+      } else {
+        handler.paramPattern = std::move(pattern);
       }
       expect(TokenType::RightParen);
     }
@@ -1647,6 +1695,11 @@ StmtPtr Parser::parseTryStatement() {
 
   if (match(TokenType::Finally)) {
     advance();
+    // finally must NOT have parameters: finally(e){} is a SyntaxError
+    if (match(TokenType::LeftParen)) {
+      error_ = true;
+      return nullptr;
+    }
     hasFinalizer = true;
     auto finallyBlock = parseBlockStatement();
     if (!finallyBlock) {
@@ -3983,8 +4036,7 @@ ExprPtr Parser::parseArrayPattern() {
       if (std::get_if<AssignmentPattern>(&pattern.rest->node)) {
         return nullptr;
       }
-      // Rest must be last element
-      expect(TokenType::RightBracket);
+      // Rest must be last element; break so the closing ] is consumed by expect() after loop
       break;
     }
 
@@ -4028,8 +4080,7 @@ ExprPtr Parser::parseObjectPattern() {
       if (!pattern.rest) {
         return nullptr;
       }
-      // Rest must be last element
-      expect(TokenType::RightBrace);
+      // Rest must be last element; break so the closing } is consumed by expect() after loop
       break;
     }
 
