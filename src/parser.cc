@@ -459,7 +459,7 @@ std::optional<Program> Parser::parse() {
 
 StmtPtr Parser::parseStatement() {
   // Parse labeled statements
-  if (match(TokenType::Identifier) && peek().type == TokenType::Colon) {
+  if (isIdentifierLikeToken(current().type) && peek().type == TokenType::Colon) {
     const Token& tok = current();
     std::string label = tok.value;
     advance();  // label identifier

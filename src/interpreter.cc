@@ -1865,6 +1865,15 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isSymbol()) LIGHTJS_RETURN(Value("symbol"));
       if (arg.isString()) LIGHTJS_RETURN(Value("string"));
       if (arg.isFunction()) LIGHTJS_RETURN(Value("function"));
+      if (arg.isClass()) LIGHTJS_RETURN(Value("function"));
+      // Check for callable objects (e.g., String, Object constructors)
+      if (arg.isObject()) {
+        auto obj = std::get<std::shared_ptr<Object>>(arg.data);
+        auto it = obj->properties.find("__callable_object__");
+        if (it != obj->properties.end() && it->second.isBool() && it->second.toBool()) {
+          LIGHTJS_RETURN(Value("function"));
+        }
+      }
       LIGHTJS_RETURN(Value("object"));
     }
     case UnaryExpr::Op::Void:
