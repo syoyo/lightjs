@@ -37,6 +37,52 @@ int32_t toInt32(double value) {
   return static_cast<int32_t>(wrapped);
 }
 
+// Helper: compute result of compound assignment (e.g., +=, -=, <<=, etc.)
+// Does NOT handle AddAssign (needs toPrimitiveValue which requires Interpreter context)
+// Does NOT handle AndAssign/OrAssign/NullishAssign (short-circuit semantics)
+Value computeCompoundOp(AssignmentExpr::Op op, const Value& current, const Value& right) {
+  switch (op) {
+    case AssignmentExpr::Op::SubAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() - right.toBigInt()));
+      return Value(current.toNumber() - right.toNumber());
+    case AssignmentExpr::Op::MulAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() * right.toBigInt()));
+      return Value(current.toNumber() * right.toNumber());
+    case AssignmentExpr::Op::DivAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() / right.toBigInt()));
+      return Value(current.toNumber() / right.toNumber());
+    case AssignmentExpr::Op::ModAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() % right.toBigInt()));
+      return Value(std::fmod(current.toNumber(), right.toNumber()));
+    case AssignmentExpr::Op::ExpAssign:
+      if (current.isBigInt() && right.isBigInt()) {
+        int64_t base = current.toBigInt(), exp = right.toBigInt(), r = 1;
+        for (int64_t i = 0; i < exp; ++i) r *= base;
+        return Value(BigInt(r));
+      }
+      return Value(std::pow(current.toNumber(), right.toNumber()));
+    case AssignmentExpr::Op::BitwiseAndAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() & right.toBigInt()));
+      return Value(static_cast<double>(toInt32(current.toNumber()) & toInt32(right.toNumber())));
+    case AssignmentExpr::Op::BitwiseOrAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() | right.toBigInt()));
+      return Value(static_cast<double>(toInt32(current.toNumber()) | toInt32(right.toNumber())));
+    case AssignmentExpr::Op::BitwiseXorAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() ^ right.toBigInt()));
+      return Value(static_cast<double>(toInt32(current.toNumber()) ^ toInt32(right.toNumber())));
+    case AssignmentExpr::Op::LeftShiftAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() << (right.toBigInt() & 63)));
+      return Value(static_cast<double>(toInt32(current.toNumber()) << (toInt32(right.toNumber()) & 0x1f)));
+    case AssignmentExpr::Op::RightShiftAssign:
+      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() >> (right.toBigInt() & 63)));
+      return Value(static_cast<double>(toInt32(current.toNumber()) >> (toInt32(right.toNumber()) & 0x1f)));
+    case AssignmentExpr::Op::UnsignedRightShiftAssign:
+      return Value(static_cast<double>(static_cast<uint32_t>(toInt32(current.toNumber())) >> (toInt32(right.toNumber()) & 0x1f)));
+    default:
+      return right;
+  }
+}
+
 std::string numberToPropertyKey(double value) {
   if (std::isnan(value)) return "NaN";
   if (std::isinf(value)) return value < 0 ? "-Infinity" : "Infinity";
@@ -807,6 +853,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       case BinaryExpr::Op::BitwiseAnd: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) & toInt32(r))));
       case BinaryExpr::Op::BitwiseOr: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) | toInt32(r))));
       case BinaryExpr::Op::BitwiseXor: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) ^ toInt32(r))));
+      case BinaryExpr::Op::LeftShift: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) << (toInt32(r) & 0x1f))));
+      case BinaryExpr::Op::RightShift: LIGHTJS_RETURN(Value(static_cast<double>(toInt32(l) >> (toInt32(r) & 0x1f))));
+      case BinaryExpr::Op::UnsignedRightShift: LIGHTJS_RETURN(Value(static_cast<double>(static_cast<uint32_t>(toInt32(l)) >> (toInt32(r) & 0x1f))));
       case BinaryExpr::Op::Less: LIGHTJS_RETURN(Value(l < r));
       case BinaryExpr::Op::Greater: LIGHTJS_RETURN(Value(l > r));
       case BinaryExpr::Op::LessEqual: LIGHTJS_RETURN(Value(l <= r));
@@ -925,6 +974,34 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
       LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) ^ toInt32(right.toNumber()))));
+    case BinaryExpr::Op::LeftShift:
+      if (left.isBigInt() && right.isBigInt()) {
+        int64_t lv = left.toBigInt();
+        int64_t rv = right.toBigInt();
+        LIGHTJS_RETURN(Value(BigInt(lv << (rv & 63))));
+      }
+      if (left.isBigInt() != right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) << (toInt32(right.toNumber()) & 0x1f))));
+    case BinaryExpr::Op::RightShift:
+      if (left.isBigInt() && right.isBigInt()) {
+        int64_t lv = left.toBigInt();
+        int64_t rv = right.toBigInt();
+        LIGHTJS_RETURN(Value(BigInt(lv >> (rv & 63))));
+      }
+      if (left.isBigInt() != right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) >> (toInt32(right.toNumber()) & 0x1f))));
+    case BinaryExpr::Op::UnsignedRightShift:
+      if (left.isBigInt() || right.isBigInt()) {
+        throwError(ErrorType::TypeError, "Cannot use unsigned right shift on BigInt");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      LIGHTJS_RETURN(Value(static_cast<double>(static_cast<uint32_t>(toInt32(left.toNumber())) >> (toInt32(right.toNumber()) & 0x1f))));
     case BinaryExpr::Op::Exp: {
       Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
@@ -2182,13 +2259,81 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           break;
         }
         case AssignmentExpr::Op::SubAssign:
-          result = Value(current->toNumber() - right.toNumber());
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() - right.toBigInt()));
+          } else {
+            result = Value(current->toNumber() - right.toNumber());
+          }
           break;
         case AssignmentExpr::Op::MulAssign:
-          result = Value(current->toNumber() * right.toNumber());
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() * right.toBigInt()));
+          } else {
+            result = Value(current->toNumber() * right.toNumber());
+          }
           break;
         case AssignmentExpr::Op::DivAssign:
-          result = Value(current->toNumber() / right.toNumber());
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() / right.toBigInt()));
+          } else {
+            result = Value(current->toNumber() / right.toNumber());
+          }
+          break;
+        case AssignmentExpr::Op::ModAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() % right.toBigInt()));
+          } else {
+            result = Value(std::fmod(current->toNumber(), right.toNumber()));
+          }
+          break;
+        case AssignmentExpr::Op::ExpAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            int64_t base = current->toBigInt();
+            int64_t exp = right.toBigInt();
+            int64_t r = 1;
+            for (int64_t i = 0; i < exp; ++i) r *= base;
+            result = Value(BigInt(r));
+          } else {
+            result = Value(std::pow(current->toNumber(), right.toNumber()));
+          }
+          break;
+        case AssignmentExpr::Op::BitwiseAndAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() & right.toBigInt()));
+          } else {
+            result = Value(static_cast<double>(toInt32(current->toNumber()) & toInt32(right.toNumber())));
+          }
+          break;
+        case AssignmentExpr::Op::BitwiseOrAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() | right.toBigInt()));
+          } else {
+            result = Value(static_cast<double>(toInt32(current->toNumber()) | toInt32(right.toNumber())));
+          }
+          break;
+        case AssignmentExpr::Op::BitwiseXorAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() ^ right.toBigInt()));
+          } else {
+            result = Value(static_cast<double>(toInt32(current->toNumber()) ^ toInt32(right.toNumber())));
+          }
+          break;
+        case AssignmentExpr::Op::LeftShiftAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() << (right.toBigInt() & 63)));
+          } else {
+            result = Value(static_cast<double>(toInt32(current->toNumber()) << (toInt32(right.toNumber()) & 0x1f)));
+          }
+          break;
+        case AssignmentExpr::Op::RightShiftAssign:
+          if (current->isBigInt() && right.isBigInt()) {
+            result = Value(BigInt(current->toBigInt() >> (right.toBigInt() & 63)));
+          } else {
+            result = Value(static_cast<double>(toInt32(current->toNumber()) >> (toInt32(right.toNumber()) & 0x1f)));
+          }
+          break;
+        case AssignmentExpr::Op::UnsignedRightShiftAssign:
+          result = Value(static_cast<double>(static_cast<uint32_t>(toInt32(current->toNumber())) >> (toInt32(right.toNumber()) & 0x1f)));
           break;
         default:
           result = right;
@@ -2348,20 +2493,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             }
             break;
           }
-          case AssignmentExpr::Op::SubAssign:
-            objPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            objPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            objPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
           default:
-            objPtr->properties[propName] = right;
+            objPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
         }
       }
-      LIGHTJS_RETURN(right);
+      LIGHTJS_RETURN(objPtr->properties[propName]);
     }
 
     if (obj.isFunction()) {
@@ -2378,22 +2514,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         funcPtr->properties[propName] = right;
       } else {
         Value current = funcPtr->properties[propName];
-        switch (expr.op) {
-          case AssignmentExpr::Op::AddAssign:
-            funcPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
-            break;
-          case AssignmentExpr::Op::SubAssign:
-            funcPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            funcPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            funcPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
-          default:
-            funcPtr->properties[propName] = right;
-        }
+        funcPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
       }
       LIGHTJS_RETURN(right);
     }
@@ -2404,23 +2525,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         promisePtr->properties[propName] = right;
       } else {
         Value current = promisePtr->properties[propName];
-        switch (expr.op) {
-          case AssignmentExpr::Op::AddAssign:
-            promisePtr->properties[propName] = Value(current.toNumber() + right.toNumber());
-            break;
-          case AssignmentExpr::Op::SubAssign:
-            promisePtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            promisePtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            promisePtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
-          default:
-            promisePtr->properties[propName] = right;
-            break;
-        }
+        promisePtr->properties[propName] = computeCompoundOp(expr.op, current, right);
       }
       LIGHTJS_RETURN(right);
     }
@@ -2457,17 +2562,8 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             }
             break;
           }
-          case AssignmentExpr::Op::SubAssign:
-            result = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            result = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            result = Value(current.toNumber() / right.toNumber());
-            break;
           default:
-            result = right;
+            result = computeCompoundOp(expr.op, current, right);
         }
         // Only extend array if index is in bounds (compound assignment on
         // out-of-bounds index matches arguments object behavior where length
@@ -2494,17 +2590,8 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             }
             break;
           }
-          case AssignmentExpr::Op::SubAssign:
-            arrPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            arrPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            arrPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
           default:
-            arrPtr->properties[propName] = right;
+            arrPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
         }
       }
       LIGHTJS_RETURN(arrPtr->properties[propName]);
@@ -2529,22 +2616,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         regexPtr->properties[propName] = right;
       } else {
         Value current = regexPtr->properties[propName];
-        switch (expr.op) {
-          case AssignmentExpr::Op::AddAssign:
-            regexPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
-            break;
-          case AssignmentExpr::Op::SubAssign:
-            regexPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            regexPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            regexPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
-          default:
-            regexPtr->properties[propName] = right;
-        }
+        regexPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
       }
       LIGHTJS_RETURN(right);
     }
@@ -2559,22 +2631,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         clsPtr->properties[propName] = right;
       } else {
         Value current = clsPtr->properties[propName];
-        switch (expr.op) {
-          case AssignmentExpr::Op::AddAssign:
-            clsPtr->properties[propName] = Value(current.toNumber() + right.toNumber());
-            break;
-          case AssignmentExpr::Op::SubAssign:
-            clsPtr->properties[propName] = Value(current.toNumber() - right.toNumber());
-            break;
-          case AssignmentExpr::Op::MulAssign:
-            clsPtr->properties[propName] = Value(current.toNumber() * right.toNumber());
-            break;
-          case AssignmentExpr::Op::DivAssign:
-            clsPtr->properties[propName] = Value(current.toNumber() / right.toNumber());
-            break;
-          default:
-            clsPtr->properties[propName] = right;
-        }
+        clsPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
       }
       LIGHTJS_RETURN(right);
     }
@@ -6852,6 +6909,22 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     Value result = Value(Undefined{});
     bool returned = false;
 
+    // Initialize TDZ for let/const declarations in async function body
+    for (const auto& s : *bodyPtr) {
+      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+        if (varDecl->kind == VarDeclaration::Kind::Let ||
+            varDecl->kind == VarDeclaration::Kind::Const) {
+          for (const auto& declarator : varDecl->declarations) {
+            std::vector<std::string> names;
+            collectVarHoistNames(*declarator.pattern, names);
+            for (const auto& name : names) {
+              env_->defineTDZ(name);
+            }
+          }
+        }
+      }
+    }
+
     // Hoist var and function declarations in async function body
     hoistVarDeclarations(*bodyPtr);
     for (const auto& stmt : *bodyPtr) {
@@ -6926,6 +6999,22 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     env_ = std::static_pointer_cast<Environment>(func->closure);
     env_ = env_->createChild();
     bindParameters(env_);
+
+    // Initialize TDZ for let/const declarations in function body
+    for (const auto& s : *bodyPtr) {
+      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+        if (varDecl->kind == VarDeclaration::Kind::Let ||
+            varDecl->kind == VarDeclaration::Kind::Const) {
+          for (const auto& declarator : varDecl->declarations) {
+            std::vector<std::string> names;
+            collectVarHoistNames(*declarator.pattern, names);
+            for (const auto& name : names) {
+              env_->defineTDZ(name);
+            }
+          }
+        }
+      }
+    }
 
     // Hoist var and function declarations in function body
     hoistVarDeclarations(*bodyPtr);
@@ -7543,6 +7632,23 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
 
       // Execute constructor body
       auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+
+      // Initialize TDZ for let/const declarations in constructor body
+      for (const auto& s : *bodyPtr) {
+        if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+          if (varDecl->kind == VarDeclaration::Kind::Let ||
+              varDecl->kind == VarDeclaration::Kind::Const) {
+            for (const auto& declarator : varDecl->declarations) {
+              std::vector<std::string> names;
+              collectVarHoistNames(*declarator.pattern, names);
+              for (const auto& name : names) {
+                env_->defineTDZ(name);
+              }
+            }
+          }
+        }
+      }
+
       auto prevFlow = flow_;
       flow_ = ControlFlow{};
 
@@ -7700,6 +7806,23 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
 
     // Execute function body
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+
+    // Initialize TDZ for let/const declarations in constructor body
+    for (const auto& s : *bodyPtr) {
+      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+        if (varDecl->kind == VarDeclaration::Kind::Let ||
+            varDecl->kind == VarDeclaration::Kind::Const) {
+          for (const auto& declarator : varDecl->declarations) {
+            std::vector<std::string> names;
+            collectVarHoistNames(*declarator.pattern, names);
+            for (const auto& name : names) {
+              env_->defineTDZ(name);
+            }
+          }
+        }
+      }
+    }
+
     Value result = Value(Undefined{});
     auto prevFlow = flow_;
     flow_ = ControlFlow{};
@@ -8448,6 +8571,23 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
   auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
   bool previousStrictMode = strictMode_;
   strictMode_ = func->isStrict;
+
+  // Initialize TDZ for let/const declarations in function body
+  for (const auto& s : *bodyPtr) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        for (const auto& declarator : varDecl->declarations) {
+          std::vector<std::string> names;
+          collectVarHoistNames(*declarator.pattern, names);
+          for (const auto& name : names) {
+            env_->defineTDZ(name);
+          }
+        }
+      }
+    }
+  }
+
   Value result = Value(Undefined{});
   bool returned = false;
 

@@ -651,6 +651,9 @@ bool Lexer::expectsRegex(TokenType type) {
          type == TokenType::Amp ||
          type == TokenType::Pipe ||
          type == TokenType::Caret ||
+         type == TokenType::LeftShift ||
+         type == TokenType::RightShift ||
+         type == TokenType::UnsignedRightShift ||
          type == TokenType::Void ||
          type == TokenType::LeftBrace;
 }
@@ -822,13 +825,16 @@ std::vector<Token> Lexer::tokenize() {
         break;
       case '*':
         if (peek() == '*') {
-          tokens.emplace_back(TokenType::StarStar, startLine, startColumn);
-          advance();
-          advance();
+          if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::StarStarEqual, startLine, startColumn);
+            advance(); advance(); advance();
+          } else {
+            tokens.emplace_back(TokenType::StarStar, startLine, startColumn);
+            advance(); advance();
+          }
         } else if (peek() == '=') {
           tokens.emplace_back(TokenType::StarEqual, startLine, startColumn);
-          advance();
-          advance();
+          advance(); advance();
         } else {
           tokens.emplace_back(TokenType::Star, startLine, startColumn);
           advance();
@@ -852,8 +858,13 @@ std::vector<Token> Lexer::tokenize() {
         }
         break;
       case '%':
-        tokens.emplace_back(TokenType::Percent, startLine, startColumn);
-        advance();
+        if (peek() == '=') {
+          tokens.emplace_back(TokenType::PercentEqual, startLine, startColumn);
+          advance(); advance();
+        } else {
+          tokens.emplace_back(TokenType::Percent, startLine, startColumn);
+          advance();
+        }
         break;
       case '=':
         if (peek() == '=') {
@@ -894,20 +905,42 @@ std::vector<Token> Lexer::tokenize() {
         }
         break;
       case '<':
-        if (peek() == '=') {
+        if (peek() == '<') {
+          if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::LeftShiftEqual, startLine, startColumn);
+            advance(); advance(); advance();
+          } else {
+            tokens.emplace_back(TokenType::LeftShift, startLine, startColumn);
+            advance(); advance();
+          }
+        } else if (peek() == '=') {
           tokens.emplace_back(TokenType::LessEqual, startLine, startColumn);
-          advance();
-          advance();
+          advance(); advance();
         } else {
           tokens.emplace_back(TokenType::Less, startLine, startColumn);
           advance();
         }
         break;
       case '>':
-        if (peek() == '=') {
+        if (peek() == '>') {
+          if (peek(2) == '>') {
+            if (peek(3) == '=') {
+              tokens.emplace_back(TokenType::UnsignedRightShiftEqual, startLine, startColumn);
+              advance(); advance(); advance(); advance();
+            } else {
+              tokens.emplace_back(TokenType::UnsignedRightShift, startLine, startColumn);
+              advance(); advance(); advance();
+            }
+          } else if (peek(2) == '=') {
+            tokens.emplace_back(TokenType::RightShiftEqual, startLine, startColumn);
+            advance(); advance(); advance();
+          } else {
+            tokens.emplace_back(TokenType::RightShift, startLine, startColumn);
+            advance(); advance();
+          }
+        } else if (peek() == '=') {
           tokens.emplace_back(TokenType::GreaterEqual, startLine, startColumn);
-          advance();
-          advance();
+          advance(); advance();
         } else {
           tokens.emplace_back(TokenType::Greater, startLine, startColumn);
           advance();
@@ -917,14 +950,14 @@ std::vector<Token> Lexer::tokenize() {
         if (peek() == '&') {
           if (peek(2) == '=') {
             tokens.emplace_back(TokenType::AmpAmpEqual, startLine, startColumn);
-            advance();
-            advance();
-            advance();
+            advance(); advance(); advance();
           } else {
             tokens.emplace_back(TokenType::AmpAmp, startLine, startColumn);
-            advance();
-            advance();
+            advance(); advance();
           }
+        } else if (peek() == '=') {
+          tokens.emplace_back(TokenType::AmpEqual, startLine, startColumn);
+          advance(); advance();
         } else {
           tokens.emplace_back(TokenType::Amp, startLine, startColumn);
           advance();
@@ -934,22 +967,27 @@ std::vector<Token> Lexer::tokenize() {
         if (peek() == '|') {
           if (peek(2) == '=') {
             tokens.emplace_back(TokenType::PipePipeEqual, startLine, startColumn);
-            advance();
-            advance();
-            advance();
+            advance(); advance(); advance();
           } else {
             tokens.emplace_back(TokenType::PipePipe, startLine, startColumn);
-            advance();
-            advance();
+            advance(); advance();
           }
+        } else if (peek() == '=') {
+          tokens.emplace_back(TokenType::PipeEqual, startLine, startColumn);
+          advance(); advance();
         } else {
           tokens.emplace_back(TokenType::Pipe, startLine, startColumn);
           advance();
         }
         break;
       case '^':
-        tokens.emplace_back(TokenType::Caret, startLine, startColumn);
-        advance();
+        if (peek() == '=') {
+          tokens.emplace_back(TokenType::CaretEqual, startLine, startColumn);
+          advance(); advance();
+        } else {
+          tokens.emplace_back(TokenType::Caret, startLine, startColumn);
+          advance();
+        }
         break;
       case '~':
         tokens.emplace_back(TokenType::Tilde, startLine, startColumn);

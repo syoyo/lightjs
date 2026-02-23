@@ -88,11 +88,22 @@ enum class TokenType {
   Caret, // ^
   Tilde, // ~
   Bang,
+  LeftShift,          // <<
+  RightShift,         // >>
+  UnsignedRightShift, // >>>
 
   PlusEqual,
   MinusEqual,
   StarEqual,
   SlashEqual,
+  PercentEqual,       // %=
+  StarStarEqual,      // **=
+  AmpEqual,           // &=
+  PipeEqual,          // |=
+  CaretEqual,         // ^=
+  LeftShiftEqual,     // <<=
+  RightShiftEqual,    // >>=
+  UnsignedRightShiftEqual,  // >>>=
   AmpAmpEqual,      // &&=
   PipePipeEqual,    // ||=
   QuestionQuestionEqual,  // ??=

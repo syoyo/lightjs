@@ -64,6 +64,7 @@ private:
   ExprPtr parseBitwiseAnd();
   ExprPtr parseEquality();
   ExprPtr parseRelational();
+  ExprPtr parseShift();
   ExprPtr parseAdditive();
   ExprPtr parseMultiplicative();
   ExprPtr parseExponentiation();

@@ -464,8 +464,17 @@ StmtPtr Parser::parseStatement() {
     std::string label = tok.value;
     advance();  // label identifier
     advance();  // :
-    // let/const are not allowed as the body of a labeled statement
-    if (match(TokenType::Let) || match(TokenType::Const)) {
+    // let/const/class/async-function are not allowed as the body of a labeled statement
+    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+      error_ = true;
+      return nullptr;
+    }
+    if (match(TokenType::Async) && peek().type == TokenType::Function) {
+      error_ = true;
+      return nullptr;
+    }
+    // In strict mode, function declarations are also not allowed
+    if (strictMode_ && match(TokenType::Function)) {
       error_ = true;
       return nullptr;
     }
@@ -983,14 +992,30 @@ StmtPtr Parser::parseWhileStatement() {
   if (!test || !expect(TokenType::RightParen)) {
     return nullptr;
   }
-  // let/const are not allowed as the body of a while statement
-  if (match(TokenType::Let) || match(TokenType::Const)) {
+  // let/const/class/async-function are not allowed as the body of a while statement
+  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    error_ = true;
+    return nullptr;
+  }
+  // async function declarations not allowed in single-statement position
+  if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
   auto body = parseStatement();
   if (!body) {
     return nullptr;
+  }
+  // Check for labeled function declarations in body (also forbidden)
+  {
+    const Statement* check = body.get();
+    while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+      check = lab->body.get();
+    }
+    if (std::get_if<FunctionDeclaration>(&check->node)) {
+      error_ = true;
+      return nullptr;
+    }
   }
 
   return makeStmt(WhileStmt{std::move(test), std::move(body)}, startTok);
@@ -1502,13 +1527,31 @@ StmtPtr Parser::parseForStatement() {
 
 StmtPtr Parser::parseDoWhileStatement() {
   expect(TokenType::Do);
-  // let/const are not allowed as the body of a do-while statement
-  if (match(TokenType::Let) || match(TokenType::Const)) {
+  // let/const/class/async-function are not allowed as the body of a do-while statement
+  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
   auto body = parseStatement();
-  if (!body || !expect(TokenType::While) || !expect(TokenType::LeftParen)) {
+  if (!body) {
+    return nullptr;
+  }
+  // Check for labeled function declarations in body (also forbidden)
+  {
+    const Statement* check = body.get();
+    while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+      check = lab->body.get();
+    }
+    if (std::get_if<FunctionDeclaration>(&check->node)) {
+      error_ = true;
+      return nullptr;
+    }
+  }
+  if (!expect(TokenType::While) || !expect(TokenType::LeftParen)) {
     return nullptr;
   }
   auto test = parseExpression();
@@ -2231,7 +2274,12 @@ normal_parse:
 
   if (match(TokenType::Equal) || match(TokenType::PlusEqual) ||
       match(TokenType::MinusEqual) || match(TokenType::StarEqual) ||
-      match(TokenType::SlashEqual) || match(TokenType::AmpAmpEqual) ||
+      match(TokenType::SlashEqual) || match(TokenType::PercentEqual) ||
+      match(TokenType::StarStarEqual) || match(TokenType::AmpEqual) ||
+      match(TokenType::PipeEqual) || match(TokenType::CaretEqual) ||
+      match(TokenType::LeftShiftEqual) || match(TokenType::RightShiftEqual) ||
+      match(TokenType::UnsignedRightShiftEqual) ||
+      match(TokenType::AmpAmpEqual) ||
       match(TokenType::PipePipeEqual) || match(TokenType::QuestionQuestionEqual)) {
     if (!left || !isAssignmentTarget(*left)) {
       return nullptr;
@@ -2253,6 +2301,14 @@ normal_parse:
       case TokenType::MinusEqual: op = AssignmentExpr::Op::SubAssign; break;
       case TokenType::StarEqual: op = AssignmentExpr::Op::MulAssign; break;
       case TokenType::SlashEqual: op = AssignmentExpr::Op::DivAssign; break;
+      case TokenType::PercentEqual: op = AssignmentExpr::Op::ModAssign; break;
+      case TokenType::StarStarEqual: op = AssignmentExpr::Op::ExpAssign; break;
+      case TokenType::AmpEqual: op = AssignmentExpr::Op::BitwiseAndAssign; break;
+      case TokenType::PipeEqual: op = AssignmentExpr::Op::BitwiseOrAssign; break;
+      case TokenType::CaretEqual: op = AssignmentExpr::Op::BitwiseXorAssign; break;
+      case TokenType::LeftShiftEqual: op = AssignmentExpr::Op::LeftShiftAssign; break;
+      case TokenType::RightShiftEqual: op = AssignmentExpr::Op::RightShiftAssign; break;
+      case TokenType::UnsignedRightShiftEqual: op = AssignmentExpr::Op::UnsignedRightShiftAssign; break;
       case TokenType::AmpAmpEqual: op = AssignmentExpr::Op::AndAssign; break;
       case TokenType::PipePipeEqual: op = AssignmentExpr::Op::OrAssign; break;
       case TokenType::QuestionQuestionEqual: op = AssignmentExpr::Op::NullishAssign; break;
@@ -2464,7 +2520,7 @@ ExprPtr Parser::parseEquality() {
 }
 
 ExprPtr Parser::parseRelational() {
-  auto left = parseAdditive();
+  auto left = parseShift();
   if (!left) {
     return nullptr;
   }
@@ -2482,6 +2538,33 @@ ExprPtr Parser::parseRelational() {
       case TokenType::In: op = BinaryExpr::Op::In; break;
       case TokenType::Instanceof: op = BinaryExpr::Op::Instanceof; break;
       default: op = BinaryExpr::Op::Less; break;
+    }
+    advance();
+
+    auto right = parseShift();
+    if (!right) {
+      return nullptr;
+    }
+    left = std::make_unique<Expression>(BinaryExpr{op, std::move(left), std::move(right)});
+  }
+
+  return left;
+}
+
+ExprPtr Parser::parseShift() {
+  auto left = parseAdditive();
+  if (!left) {
+    return nullptr;
+  }
+
+  while (match(TokenType::LeftShift) || match(TokenType::RightShift) ||
+         match(TokenType::UnsignedRightShift)) {
+    BinaryExpr::Op op;
+    switch (current().type) {
+      case TokenType::LeftShift: op = BinaryExpr::Op::LeftShift; break;
+      case TokenType::RightShift: op = BinaryExpr::Op::RightShift; break;
+      case TokenType::UnsignedRightShift: op = BinaryExpr::Op::UnsignedRightShift; break;
+      default: op = BinaryExpr::Op::LeftShift; break;
     }
     advance();
 

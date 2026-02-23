@@ -63,6 +63,7 @@ struct BinaryExpr {
     Equal, NotEqual, StrictEqual, StrictNotEqual,
     Less, Greater, LessEqual, GreaterEqual,
     BitwiseAnd, BitwiseXor, BitwiseOr,
+    LeftShift, RightShift, UnsignedRightShift,
     LogicalAnd, LogicalOr, NullishCoalescing,
     In, Instanceof  // Property/type checking operators
   };
@@ -78,7 +79,10 @@ struct UnaryExpr {
 };
 
 struct AssignmentExpr {
-  enum class Op { Assign, AddAssign, SubAssign, MulAssign, DivAssign, AndAssign, OrAssign, NullishAssign };
+  enum class Op { Assign, AddAssign, SubAssign, MulAssign, DivAssign, ModAssign, ExpAssign,
+    BitwiseAndAssign, BitwiseOrAssign, BitwiseXorAssign,
+    LeftShiftAssign, RightShiftAssign, UnsignedRightShiftAssign,
+    AndAssign, OrAssign, NullishAssign };
   Op op;
   ExprPtr left;
   ExprPtr right;
