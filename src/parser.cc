@@ -1532,14 +1532,54 @@ StmtPtr Parser::parseForStatement() {
     return nullptr;
   }
 
-  // let/const are not allowed as the body of a for statement
-  if (match(TokenType::Let) || match(TokenType::Const)) {
+  // Declarations are not allowed as the body of a for statement
+  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Function)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
   auto body = parseStatement();
   if (!body) {
     return nullptr;
+  }
+  // Check for labeled function declarations in body
+  {
+    const Statement* check = body.get();
+    while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+      check = lab->body.get();
+    }
+    if (std::get_if<FunctionDeclaration>(&check->node)) {
+      error_ = true;
+      return nullptr;
+    }
+  }
+  // Check that var declarations in body don't redeclare let/const head bindings
+  if (init) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&init->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        std::vector<std::string> headNames;
+        for (auto& decl : varDecl->declarations) {
+          if (decl.pattern) collectBoundNames(*decl.pattern, headNames);
+        }
+        std::vector<std::string> bodyVarNames;
+        collectVarDeclaredNames(*body, bodyVarNames);
+        std::set<std::string> headSet(headNames.begin(), headNames.end());
+        for (auto& name : bodyVarNames) {
+          if (headSet.count(name)) {
+            error_ = true;
+            return nullptr;
+          }
+        }
+      }
+    }
   }
 
   return std::make_unique<Statement>(ForStmt{
