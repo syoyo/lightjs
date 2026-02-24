@@ -562,6 +562,7 @@ StmtPtr Parser::parseStatement() {
       if (!argument) {
         return nullptr;
       }
+      consumeSemicolon();
       return makeStmt(ThrowStmt{std::move(argument)}, tok);
     }
     case TokenType::Try:
@@ -632,7 +633,7 @@ StmtPtr Parser::parseVarDeclaration() {
       pattern = std::move(assignPat->left);
     } else if (match(TokenType::Equal)) {
       advance();
-      init = parseExpression();
+      init = parseAssignment();
       if (!init) {
         return nullptr;
       }
@@ -912,6 +913,11 @@ StmtPtr Parser::parseClassDeclaration() {
 }
 
 StmtPtr Parser::parseReturnStatement() {
+  // return is not allowed outside function bodies
+  if (functionDepth_ == 0) {
+    error_ = true;
+    return nullptr;
+  }
   const Token& startTok = current();
   expect(TokenType::Return);
 
@@ -951,8 +957,12 @@ StmtPtr Parser::parseIfStatement() {
     return nullptr;
   }
 
-  // let/const are not allowed as the body of an if statement
-  if (match(TokenType::Let) || match(TokenType::Const)) {
+  // let/const/class are not allowed as the body of an if statement
+  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
@@ -960,12 +970,27 @@ StmtPtr Parser::parseIfStatement() {
   if (!consequent) {
     return nullptr;
   }
+  // Check for labeled function declarations in body (forbidden in strict mode + always for labeled)
+  {
+    const Statement* check = consequent.get();
+    while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+      check = lab->body.get();
+    }
+    if (std::get_if<FunctionDeclaration>(&check->node) && strictMode_) {
+      error_ = true;
+      return nullptr;
+    }
+  }
   StmtPtr alternate = nullptr;
 
   if (match(TokenType::Else)) {
     advance();
-    // let/const are not allowed as the body of an else clause
-    if (match(TokenType::Let) || match(TokenType::Const)) {
+    // let/const/class are not allowed as the body of an else clause
+    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+      error_ = true;
+      return nullptr;
+    }
+    if (match(TokenType::Async) && peek().type == TokenType::Function) {
       error_ = true;
       return nullptr;
     }
@@ -1565,16 +1590,44 @@ StmtPtr Parser::parseDoWhileStatement() {
 
 StmtPtr Parser::parseSwitchStatement() {
   expect(TokenType::Switch);
-  expect(TokenType::LeftParen);
+  if (!expect(TokenType::LeftParen)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::RightParen)) {
+    // switch() with empty expression is a SyntaxError
+    error_ = true;
+    return nullptr;
+  }
   auto discriminant = parseExpression();
-  expect(TokenType::RightParen);
-  expect(TokenType::LeftBrace);
+  if (!discriminant) {
+    error_ = true;
+    return nullptr;
+  }
+  if (!expect(TokenType::RightParen)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (!expect(TokenType::LeftBrace)) {
+    error_ = true;
+    return nullptr;
+  }
 
   std::vector<SwitchCase> cases;
+  bool hasDefault = false;
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
     if (match(TokenType::Case)) {
       advance();
+      if (match(TokenType::Colon)) {
+        // case: with no expression is a SyntaxError
+        error_ = true;
+        return nullptr;
+      }
       auto test = parseExpression();
+      if (!test) {
+        error_ = true;
+        return nullptr;
+      }
       expect(TokenType::Colon);
 
       std::vector<StmtPtr> consequent;
@@ -1593,11 +1646,17 @@ StmtPtr Parser::parseSwitchStatement() {
 
       cases.push_back(SwitchCase{std::move(test), std::move(consequent)});
     } else if (match(TokenType::Default)) {
+      if (hasDefault) {
+        error_ = true;
+        return nullptr;
+      }
+      hasDefault = true;
       advance();
       expect(TokenType::Colon);
 
       std::vector<StmtPtr> consequent;
-      while (!match(TokenType::Case) && !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
+      while (!match(TokenType::Case) && !match(TokenType::Default) &&
+             !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         if (error_) return nullptr;
         if (auto stmt = parseStatement()) {
           consequent.push_back(std::move(stmt));
@@ -1613,6 +1672,67 @@ StmtPtr Parser::parseSwitchStatement() {
   }
 
   expect(TokenType::RightBrace);
+
+  // ES spec 13.12.5: Early errors for CaseBlock declarations
+  // 1. No duplicate LexicallyDeclaredNames
+  // 2. No LexicallyDeclaredName that also appears in VarDeclaredNames
+  {
+    std::vector<std::string> lexNames;
+    std::vector<std::string> varNames;
+    for (const auto& sc : cases) {
+      for (const auto& stmt : sc.consequent) {
+        if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+          if (varDecl->kind == VarDeclaration::Kind::Let ||
+              varDecl->kind == VarDeclaration::Kind::Const) {
+            for (const auto& decl : varDecl->declarations) {
+              if (auto* ident = std::get_if<Identifier>(&decl.pattern->node)) {
+                for (const auto& existing : lexNames) {
+                  if (existing == ident->name) {
+                    error_ = true;
+                    return nullptr;
+                  }
+                }
+                lexNames.push_back(ident->name);
+              }
+            }
+          } else {
+            // var declarations
+            for (const auto& decl : varDecl->declarations) {
+              if (auto* ident = std::get_if<Identifier>(&decl.pattern->node)) {
+                varNames.push_back(ident->name);
+              }
+            }
+          }
+        } else if (auto* funcDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+          for (const auto& existing : lexNames) {
+            if (existing == funcDecl->id.name) {
+              error_ = true;
+              return nullptr;
+            }
+          }
+          lexNames.push_back(funcDecl->id.name);
+        } else if (auto* classDecl = std::get_if<ClassDeclaration>(&stmt->node)) {
+          for (const auto& existing : lexNames) {
+            if (existing == classDecl->id.name) {
+              error_ = true;
+              return nullptr;
+            }
+          }
+          lexNames.push_back(classDecl->id.name);
+        }
+      }
+    }
+    // Check var-lex conflicts
+    for (const auto& v : varNames) {
+      for (const auto& l : lexNames) {
+        if (v == l) {
+          error_ = true;
+          return nullptr;
+        }
+      }
+    }
+  }
+
   return std::make_unique<Statement>(SwitchStmt{std::move(discriminant), std::move(cases)});
 }
 
@@ -1954,7 +2074,33 @@ StmtPtr Parser::parseExportDeclaration() {
 }
 
 ExprPtr Parser::parseExpression() {
-  return parseAssignment();
+  auto expr = parseAssignment();
+  if (!expr) return nullptr;
+
+  if (!match(TokenType::Comma)) return expr;
+
+  // Comma operator: build SequenceExpr
+  SequenceExpr seq;
+  seq.expressions.push_back(std::move(expr));
+  while (match(TokenType::Comma)) {
+    // Don't consume comma if next token looks like it could be
+    // part of a parameter list (e.g., in for-loop init)
+    // But in expression context, comma is the sequence operator
+    auto savedPos = pos_;
+    advance(); // consume comma
+    auto next = parseAssignment();
+    if (!next) {
+      // If parsing failed after comma, restore and stop
+      pos_ = savedPos;
+      break;
+    }
+    seq.expressions.push_back(std::move(next));
+  }
+
+  if (seq.expressions.size() == 1) {
+    return std::move(seq.expressions[0]);
+  }
+  return std::make_unique<Expression>(std::move(seq));
 }
 
 ExprPtr Parser::parseAssignment() {
@@ -2334,11 +2480,11 @@ ExprPtr Parser::parseConditional() {
 
   if (match(TokenType::Question)) {
     advance();
-    auto consequent = parseExpression();
+    auto consequent = parseAssignment();
     if (!consequent || !expect(TokenType::Colon)) {
       return nullptr;
     }
-    auto alternate = parseExpression();
+    auto alternate = parseAssignment();
     if (!alternate) {
       return nullptr;
     }
@@ -2778,13 +2924,13 @@ ExprPtr Parser::parseCall() {
         // Check for spread element in arguments
         if (match(TokenType::DotDotDot)) {
           advance();
-          auto arg = parseExpression();
+          auto arg = parseAssignment();
           if (!arg) {
             return nullptr;
           }
           args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
         } else {
-          auto arg = parseExpression();
+          auto arg = parseAssignment();
           if (!arg) {
             return nullptr;
           }
@@ -2826,13 +2972,13 @@ ExprPtr Parser::parseCall() {
         // Check for spread element in arguments
         if (match(TokenType::DotDotDot)) {
           advance();
-          auto arg = parseExpression();
+          auto arg = parseAssignment();
           if (!arg) {
             return nullptr;
           }
           args.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
         } else {
-          auto arg = parseExpression();
+          auto arg = parseAssignment();
           if (!arg) {
             return nullptr;
           }
@@ -3353,10 +3499,10 @@ ExprPtr Parser::parseArrayExpression() {
     // Check for spread element
     if (match(TokenType::DotDotDot)) {
       advance();
-      auto arg = parseExpression();
+      auto arg = parseAssignment();
       elements.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
     } else {
-      elements.push_back(parseExpression());
+      elements.push_back(parseAssignment());
     }
   }
 
@@ -3379,7 +3525,7 @@ ExprPtr Parser::parseObjectExpression() {
     // Check for spread syntax
     if (match(TokenType::DotDotDot)) {
       advance();
-      auto spreadExpr = parseExpression();
+      auto spreadExpr = parseAssignment();
       if (!spreadExpr) {
         return nullptr;
       }
@@ -3471,14 +3617,17 @@ ExprPtr Parser::parseObjectExpression() {
           if (!expect(TokenType::LeftBrace)) {
             return nullptr;
           }
+          ++functionDepth_;
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
+              --functionDepth_;
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
+          --functionDepth_;
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -3524,14 +3673,17 @@ ExprPtr Parser::parseObjectExpression() {
           if (!expect(TokenType::LeftBrace)) {
             return nullptr;
           }
+          ++functionDepth_;
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
+              --functionDepth_;
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
+          --functionDepth_;
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -3596,7 +3748,7 @@ ExprPtr Parser::parseObjectExpression() {
             // Check for default value
             if (match(TokenType::Equal)) {
               advance();
-              param.defaultValue = parseExpression();
+              param.defaultValue = parseAssignment();
             }
             params.push_back(std::move(param));
           } else if (!match(TokenType::RightParen)) {
@@ -3609,6 +3761,7 @@ ExprPtr Parser::parseObjectExpression() {
         }
 
         // Parse function body
+        ++functionDepth_;
         if (isAsync) {
           ++asyncFunctionDepth_;
         }
@@ -3622,6 +3775,7 @@ ExprPtr Parser::parseObjectExpression() {
           if (isAsync) {
             --asyncFunctionDepth_;
           }
+          --functionDepth_;
           return nullptr;
         }
         std::vector<StmtPtr> body;
@@ -3634,6 +3788,7 @@ ExprPtr Parser::parseObjectExpression() {
             if (isAsync) {
               --asyncFunctionDepth_;
             }
+            --functionDepth_;
             return nullptr;
           }
           body.push_back(std::move(stmt));
@@ -3645,6 +3800,7 @@ ExprPtr Parser::parseObjectExpression() {
           if (isAsync) {
             --asyncFunctionDepth_;
           }
+          --functionDepth_;
           return nullptr;
         }
         if (isGenerator) {
@@ -3653,6 +3809,7 @@ ExprPtr Parser::parseObjectExpression() {
         if (isAsync) {
           --asyncFunctionDepth_;
         }
+        --functionDepth_;
 
         // Create FunctionExpr for the method
         FunctionExpr funcExpr;
@@ -3672,7 +3829,7 @@ ExprPtr Parser::parseObjectExpression() {
         if (!expect(TokenType::Colon)) {
           return nullptr;
         }
-        auto value = parseExpression();
+        auto value = parseAssignment();
         if (!value) {
           return nullptr;
         }

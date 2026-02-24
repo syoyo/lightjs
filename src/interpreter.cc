@@ -9885,6 +9885,10 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
   Value discriminant;
   LIGHTJS_RUN_TASK(discriminantTask, discriminant);
 
+  // Create a new lexical environment for the entire switch block (ES spec 13.12.11)
+  auto prevEnv = env_;
+  env_ = env_->createChild();
+
   Value result = Value(Undefined{});
   bool foundMatch = false;
   bool hasDefault = false;
@@ -9908,7 +9912,7 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
   Value testValue;
   LIGHTJS_RUN_TASK(testTask, testValue);
 
-      // Perform strict equality check
+      // Perform strict equality check (===)
       bool isEqual = false;
       if (discriminant.isBigInt() && testValue.isBigInt()) {
         isEqual = (discriminant.toBigInt() == testValue.toBigInt());
@@ -9922,6 +9926,15 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
         isEqual = true;
       } else if (discriminant.isUndefined() && testValue.isUndefined()) {
         isEqual = true;
+      } else if (discriminant.isFunction() && testValue.isFunction()) {
+        isEqual = (std::get<std::shared_ptr<Function>>(discriminant.data).get() ==
+                   std::get<std::shared_ptr<Function>>(testValue.data).get());
+      } else if (discriminant.isObject() && testValue.isObject()) {
+        isEqual = (std::get<std::shared_ptr<Object>>(discriminant.data).get() ==
+                   std::get<std::shared_ptr<Object>>(testValue.data).get());
+      } else if (discriminant.isArray() && testValue.isArray()) {
+        isEqual = (std::get<std::shared_ptr<Array>>(discriminant.data).get() ==
+                   std::get<std::shared_ptr<Array>>(testValue.data).get());
       }
 
       if (isEqual) {
@@ -9937,8 +9950,10 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 
         if (flow_.type == ControlFlow::Type::Break) {
           if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
+          env_ = prevEnv;
           LIGHTJS_RETURN(result);
         } else if (flow_.type != ControlFlow::Type::None) {
+          env_ = prevEnv;
           LIGHTJS_RETURN(result);
         }
       }
@@ -9954,13 +9969,16 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
+        env_ = prevEnv;
         LIGHTJS_RETURN(result);
       } else if (flow_.type != ControlFlow::Type::None) {
+        env_ = prevEnv;
         LIGHTJS_RETURN(result);
       }
     }
   }
 
+  env_ = prevEnv;
   LIGHTJS_RETURN(result);
 }
 
