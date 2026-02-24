@@ -1877,6 +1877,21 @@ StmtPtr Parser::parseTryStatement() {
       if (!pattern) {
         return nullptr;
       }
+      // Collect catch parameter bound names
+      std::vector<std::string> catchParamNames;
+      collectBoundNames(*pattern, catchParamNames);
+
+      // Check for duplicate names in destructuring catch param
+      {
+        std::set<std::string> seen;
+        for (const auto& name : catchParamNames) {
+          if (!seen.insert(name).second) {
+            error_ = true;
+            return nullptr;
+          }
+        }
+      }
+
       if (auto* id = std::get_if<Identifier>(&pattern->node)) {
         handler.param = {id->name};
       } else {
@@ -1893,6 +1908,44 @@ StmtPtr Parser::parseTryStatement() {
     if (!catchBlockStmt) {
       return nullptr;
     }
+
+    // Check that catch body doesn't redeclare catch param with let/const/function
+    if (!handler.param.name.empty() || handler.paramPattern) {
+      std::vector<std::string> catchParamNames;
+      if (!handler.param.name.empty()) {
+        catchParamNames.push_back(handler.param.name);
+      }
+      if (handler.paramPattern) {
+        collectBoundNames(*handler.paramPattern, catchParamNames);
+      }
+      std::set<std::string> paramSet(catchParamNames.begin(), catchParamNames.end());
+      for (const auto& stmt : catchBlockStmt->body) {
+        if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+          if (varDecl->kind == VarDeclaration::Kind::Let ||
+              varDecl->kind == VarDeclaration::Kind::Const) {
+            for (const auto& decl : varDecl->declarations) {
+              if (auto* ident = std::get_if<Identifier>(&decl.pattern->node)) {
+                if (paramSet.count(ident->name)) {
+                  error_ = true;
+                  return nullptr;
+                }
+              }
+            }
+          }
+        } else if (auto* funcDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+          if (paramSet.count(funcDecl->id.name)) {
+            error_ = true;
+            return nullptr;
+          }
+        } else if (auto* classDecl = std::get_if<ClassDeclaration>(&stmt->node)) {
+          if (paramSet.count(classDecl->id.name)) {
+            error_ = true;
+            return nullptr;
+          }
+        }
+      }
+    }
+
     handler.body = std::move(catchBlockStmt->body);
   }
 
