@@ -9960,20 +9960,22 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
     }
   }
 
-  // If no match found, execute default case
+  // If no match found, execute default case and fall through to subsequent cases
   if (!foundMatch && hasDefault) {
-    const auto& defaultCase = stmt.cases[defaultIndex];
-    for (const auto& consequentStmt : defaultCase.consequent) {
-      auto stmtTask = evaluate(*consequentStmt);
+    for (size_t i = defaultIndex; i < stmt.cases.size(); ++i) {
+      const auto& caseClause = stmt.cases[i];
+      for (const auto& consequentStmt : caseClause.consequent) {
+        auto stmtTask = evaluate(*consequentStmt);
   LIGHTJS_RUN_TASK(stmtTask, result);
 
-      if (flow_.type == ControlFlow::Type::Break) {
-        if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
-        env_ = prevEnv;
-        LIGHTJS_RETURN(result);
-      } else if (flow_.type != ControlFlow::Type::None) {
-        env_ = prevEnv;
-        LIGHTJS_RETURN(result);
+        if (flow_.type == ControlFlow::Type::Break) {
+          if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
+          env_ = prevEnv;
+          LIGHTJS_RETURN(result);
+        } else if (flow_.type != ControlFlow::Type::None) {
+          env_ = prevEnv;
+          LIGHTJS_RETURN(result);
+        }
       }
     }
   }
