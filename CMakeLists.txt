@@ -225,6 +225,7 @@ set(LIGHTJS_CORE_SOURCES
   src/wasm_js.cc
   src/simd.cc
   src/streams.cc
+  src/bigint_impl.cc
 )
 
 set(LIGHTJS_PUBLIC_HEADERS

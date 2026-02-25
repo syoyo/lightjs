@@ -14,6 +14,7 @@ A modern, compact JavaScript (ES2020) interpreter written in C++20
 - **No C++ exceptions** in hot paths (compile with `-fno-exceptions` where possible)
 - **No RTTI** (`-fno-rtti` enabled) - Reduced binary size
 - **CMake build system** - Cross-platform support
+- **No external dependencies** - Pure C++20, self-contained
 - **Security-focused** - Safe evaluation with bounded execution
 - **Garbage Collection** - Automatic memory management with reference counting and cycle detection
 

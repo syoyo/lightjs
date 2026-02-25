@@ -1,6 +1,6 @@
 #pragma once
 
-#include <boost/multiprecision/cpp_int.hpp>
+#include "bigint_impl.h"
 #include <cstdint>
 #include <cctype>
 #include <cstring>
@@ -11,8 +11,6 @@
 #include <algorithm>
 
 namespace lightjs::bigint {
-
-using BigIntValue = boost::multiprecision::cpp_int;
 
 inline std::string trimAsciiWhitespace(const std::string& input) {
   size_t start = 0;
