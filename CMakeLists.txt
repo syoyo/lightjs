@@ -230,6 +230,7 @@ set(LIGHTJS_CORE_SOURCES
 set(LIGHTJS_PUBLIC_HEADERS
   include/lightjs.h
   include/ast.h
+  include/bigint.h
   include/compat.h
   include/environment.h
   include/interpreter.h
@@ -265,6 +266,7 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/wasm_js.h
   include/streams.h
   include/symbols.h
+  include/value_core.h
 )
 
 # Create main library target (headers included for dependency tracking)
