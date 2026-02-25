@@ -3,6 +3,10 @@
 #include <stdexcept>
 #include <cctype>
 #include <set>
+#include <unordered_map>
+#include <cmath>
+#include <sstream>
+#include <iomanip>
 
 namespace lightjs {
 
@@ -15,42 +19,8 @@ int digitValue(char c) {
   return -1;
 }
 
-bool parseBigIntLiteral64(const std::string& raw, int64_t& out) {
-  if (raw.empty()) return false;
-
-  size_t i = 0;
-  int base = 10;
-  if (raw.size() >= 2 && raw[0] == '0') {
-    if (raw[1] == 'x' || raw[1] == 'X') {
-      base = 16;
-      i = 2;
-    } else if (raw[1] == 'o' || raw[1] == 'O') {
-      base = 8;
-      i = 2;
-    } else if (raw[1] == 'b' || raw[1] == 'B') {
-      base = 2;
-      i = 2;
-    }
-  }
-
-  bool sawDigit = false;
-  uint64_t value = 0;
-  for (; i < raw.size(); ++i) {
-    char c = raw[i];
-    if (c == '_') {
-      continue;
-    }
-    int d = digitValue(c);
-    if (d < 0 || d >= base) {
-      return false;
-    }
-    sawDigit = true;
-    value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
-  }
-
-  if (!sawDigit) return false;
-  out = static_cast<int64_t>(value);
-  return true;
+bool parseBigIntLiteral64(const std::string& raw, bigint::BigIntValue& out) {
+  return bigint::parseBigIntLiteral(raw, out);
 }
 
 bool parseNumberLiteral(const std::string& raw, double& out) {
@@ -93,10 +63,88 @@ bool parseNumberLiteral(const std::string& raw, double& out) {
   }
 }
 
+bool isWellFormedUnicodeString(const std::string& value) {
+  size_t i = 0;
+  while (i < value.size()) {
+    unsigned char lead = static_cast<unsigned char>(value[i]);
+    uint32_t codePoint = 0;
+    size_t trailCount = 0;
+
+    if (lead <= 0x7F) {
+      codePoint = lead;
+      trailCount = 0;
+    } else if ((lead & 0xE0) == 0xC0) {
+      codePoint = lead & 0x1F;
+      trailCount = 1;
+    } else if ((lead & 0xF0) == 0xE0) {
+      codePoint = lead & 0x0F;
+      trailCount = 2;
+    } else if ((lead & 0xF8) == 0xF0) {
+      codePoint = lead & 0x07;
+      trailCount = 3;
+    } else {
+      return false;
+    }
+
+    if (i + trailCount >= value.size()) {
+      return false;
+    }
+
+    for (size_t j = 1; j <= trailCount; ++j) {
+      unsigned char trail = static_cast<unsigned char>(value[i + j]);
+      if ((trail & 0xC0) != 0x80) {
+        return false;
+      }
+      codePoint = (codePoint << 6) | static_cast<uint32_t>(trail & 0x3F);
+    }
+
+    if (trailCount == 1 && codePoint < 0x80) {
+      return false;
+    }
+    if (trailCount == 2 && codePoint < 0x800) {
+      return false;
+    }
+    if (trailCount == 3 && codePoint < 0x10000) {
+      return false;
+    }
+    if (codePoint > 0x10FFFF) {
+      return false;
+    }
+    if (codePoint >= 0xD800 && codePoint <= 0xDFFF) {
+      return false;
+    }
+
+    i += trailCount + 1;
+  }
+  return true;
+}
+
+std::string numberToPropertyKey(double value) {
+  if (std::isnan(value)) return "NaN";
+  if (std::isinf(value)) return value < 0 ? "-Infinity" : "Infinity";
+  if (value == 0.0) return "0";
+
+  double integral = std::trunc(value);
+  if (integral == value) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(0) << value;
+    return oss.str();
+  }
+
+  std::ostringstream oss;
+  oss << std::setprecision(15) << value;
+  std::string out = oss.str();
+  auto dot = out.find('.');
+  if (dot != std::string::npos) {
+    while (!out.empty() && out.back() == '0') out.pop_back();
+    if (!out.empty() && out.back() == '.') out.pop_back();
+  }
+  return out;
+}
+
 bool isIdentifierNameToken(TokenType type) {
   switch (type) {
     case TokenType::Identifier:
-    case TokenType::PrivateIdentifier:
     case TokenType::True:
     case TokenType::False:
     case TokenType::Null:
@@ -146,6 +194,14 @@ bool isIdentifierNameToken(TokenType type) {
     default:
       return false;
   }
+}
+
+bool isStrictModeRestrictedIdentifier(const std::string& name) {
+  if (name == "eval" || name == "arguments") return true;
+  if (name == "implements" || name == "interface" || name == "package") return true;
+  if (name == "private" || name == "protected" || name == "public") return true;
+  if (name == "static" || name == "yield") return true;
+  return false;
 }
 
 bool isUpdateTarget(const Expression& expr) {
@@ -231,6 +287,531 @@ bool hasDuplicateBoundNames(const Expression& pattern) {
   return false;
 }
 
+bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body) {
+  for (const auto& stmt : body) {
+    if (!stmt) break;
+    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+    if (!exprStmt || !exprStmt->expression) {
+      break;
+    }
+    if (auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node)) {
+      if (str->value == "use strict") {
+        return true;
+      }
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+size_t directivePrologueLength(const std::vector<StmtPtr>& body) {
+  size_t n = 0;
+  for (const auto& stmt : body) {
+    if (!stmt) break;
+    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+    if (!exprStmt || !exprStmt->expression) break;
+    if (!std::get_if<StringLiteral>(&exprStmt->expression->node)) break;
+    ++n;
+  }
+  return n;
+}
+
+void insertPrologueAfterDirectives(std::vector<StmtPtr>& body, std::vector<StmtPtr>& prologue) {
+  if (prologue.empty()) return;
+  size_t insertAt = directivePrologueLength(body);
+  std::vector<StmtPtr> newBody;
+  newBody.reserve(body.size() + prologue.size());
+  for (size_t i = 0; i < insertAt && i < body.size(); ++i) {
+    newBody.push_back(std::move(body[i]));
+  }
+  for (auto& stmt : prologue) {
+    newBody.push_back(std::move(stmt));
+  }
+  for (size_t i = insertAt; i < body.size(); ++i) {
+    newBody.push_back(std::move(body[i]));
+  }
+  body = std::move(newBody);
+}
+
+bool expressionContainsSuper(const Expression& expr);
+bool statementContainsSuper(const Statement& stmt);
+
+bool expressionContainsSuper(const Expression& expr) {
+  if (std::holds_alternative<SuperExpr>(expr.node)) {
+    return true;
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionContainsSuper(*binary->left)) ||
+           (binary->right && expressionContainsSuper(*binary->right));
+  }
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionContainsSuper(*unary->argument);
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionContainsSuper(*assign->left)) ||
+           (assign->right && expressionContainsSuper(*assign->right));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionContainsSuper(*update->argument);
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && expressionContainsSuper(*call->callee)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionContainsSuper(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return (member->object && expressionContainsSuper(*member->object)) ||
+           (member->property && expressionContainsSuper(*member->property));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionContainsSuper(*cond->test)) ||
+           (cond->consequent && expressionContainsSuper(*cond->consequent)) ||
+           (cond->alternate && expressionContainsSuper(*cond->alternate));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionContainsSuper(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionContainsSuper(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionContainsSuper(*prop.key)) return true;
+      if (prop.value && expressionContainsSuper(*prop.value)) return true;
+    }
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionContainsSuper(*awaitExpr->argument);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionContainsSuper(*yieldExpr->argument);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionContainsSuper(*spread->argument);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionContainsSuper(*newExpr->callee)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionContainsSuper(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& e : arrPat->elements) {
+      if (e && expressionContainsSuper(*e)) return true;
+    }
+    return arrPat->rest && expressionContainsSuper(*arrPat->rest);
+  }
+  if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.key && expressionContainsSuper(*prop.key)) return true;
+      if (prop.value && expressionContainsSuper(*prop.value)) return true;
+    }
+    return objPat->rest && expressionContainsSuper(*objPat->rest);
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionContainsSuper(*assignPat->left)) ||
+           (assignPat->right && expressionContainsSuper(*assignPat->right));
+  }
+  return false;
+}
+
+bool statementContainsSuper(const Statement& stmt) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& decl : varDecl->declarations) {
+      if (decl.pattern && expressionContainsSuper(*decl.pattern)) return true;
+      if (decl.init && expressionContainsSuper(*decl.init)) return true;
+    }
+    return false;
+  }
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionContainsSuper(*exprStmt->expression);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionContainsSuper(*ret->argument);
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementContainsSuper(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionContainsSuper(*ifStmt->test)) return true;
+    if (ifStmt->consequent && statementContainsSuper(*ifStmt->consequent)) return true;
+    return ifStmt->alternate && statementContainsSuper(*ifStmt->alternate);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionContainsSuper(*whileStmt->test)) return true;
+    return whileStmt->body && statementContainsSuper(*whileStmt->body);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementContainsSuper(*forStmt->init)) return true;
+    if (forStmt->test && expressionContainsSuper(*forStmt->test)) return true;
+    if (forStmt->update && expressionContainsSuper(*forStmt->update)) return true;
+    return forStmt->body && statementContainsSuper(*forStmt->body);
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionContainsSuper(*withStmt->object)) return true;
+    return withStmt->body && statementContainsSuper(*withStmt->body);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementContainsSuper(*forInStmt->left)) return true;
+    if (forInStmt->right && expressionContainsSuper(*forInStmt->right)) return true;
+    return forInStmt->body && statementContainsSuper(*forInStmt->body);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementContainsSuper(*forOfStmt->left)) return true;
+    if (forOfStmt->right && expressionContainsSuper(*forOfStmt->right)) return true;
+    return forOfStmt->body && statementContainsSuper(*forOfStmt->body);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementContainsSuper(*doWhileStmt->body)) return true;
+    return doWhileStmt->test && expressionContainsSuper(*doWhileStmt->test);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionContainsSuper(*switchStmt->discriminant)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionContainsSuper(*c.test)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementContainsSuper(*s)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementContainsSuper(*label->body);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionContainsSuper(*throwStmt->argument);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementContainsSuper(*s)) return true;
+    }
+    if (tryStmt->handler.paramPattern && expressionContainsSuper(*tryStmt->handler.paramPattern)) return true;
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementContainsSuper(*s)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementContainsSuper(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    return exportDefault->declaration && expressionContainsSuper(*exportDefault->declaration);
+  }
+  return false;
+}
+
+bool expressionHasUndeclaredPrivateName(const Expression& expr, const std::set<std::string>& declared);
+bool statementHasUndeclaredPrivateName(const Statement& stmt, const std::set<std::string>& declared);
+
+bool expressionHasUndeclaredPrivateName(const Expression& expr, const std::set<std::string>& declared) {
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionHasUndeclaredPrivateName(*unary->argument, declared);
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionHasUndeclaredPrivateName(*binary->left, declared)) ||
+           (binary->right && expressionHasUndeclaredPrivateName(*binary->right, declared));
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionHasUndeclaredPrivateName(*assign->left, declared)) ||
+           (assign->right && expressionHasUndeclaredPrivateName(*assign->right, declared));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionHasUndeclaredPrivateName(*update->argument, declared);
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && expressionHasUndeclaredPrivateName(*call->callee, declared)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionHasUndeclaredPrivateName(*arg, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    // AllPrivateNamesValid: obj.#x / call().#x requires #x to be declared in the class body.
+    if (!member->computed && member->property &&
+        std::holds_alternative<Identifier>(member->property->node)) {
+      const auto& id = std::get<Identifier>(member->property->node);
+      if (!id.name.empty() && id.name[0] == '#') {
+        if (declared.count(id.name) == 0) {
+          return true;
+        }
+      }
+    }
+    return (member->object && expressionHasUndeclaredPrivateName(*member->object, declared)) ||
+           (member->property && expressionHasUndeclaredPrivateName(*member->property, declared));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionHasUndeclaredPrivateName(*cond->test, declared)) ||
+           (cond->consequent && expressionHasUndeclaredPrivateName(*cond->consequent, declared)) ||
+           (cond->alternate && expressionHasUndeclaredPrivateName(*cond->alternate, declared));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionHasUndeclaredPrivateName(*e, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionHasUndeclaredPrivateName(*e, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionHasUndeclaredPrivateName(*prop.key, declared)) return true;
+      if (prop.value && expressionHasUndeclaredPrivateName(*prop.value, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
+    for (const auto& param : fn->params) {
+      if (param.defaultValue && expressionHasUndeclaredPrivateName(*param.defaultValue, declared)) return true;
+    }
+    for (const auto& stmt : fn->body) {
+      if (stmt && statementHasUndeclaredPrivateName(*stmt, declared)) return true;
+    }
+    return false;
+  }
+  // Don't descend into nested classes: they'll validate their own private environment.
+  if (std::holds_alternative<ClassExpr>(expr.node)) {
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionHasUndeclaredPrivateName(*awaitExpr->argument, declared);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionHasUndeclaredPrivateName(*yieldExpr->argument, declared);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionHasUndeclaredPrivateName(*spread->argument, declared);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionHasUndeclaredPrivateName(*newExpr->callee, declared)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionHasUndeclaredPrivateName(*arg, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& e : arrPat->elements) {
+      if (e && expressionHasUndeclaredPrivateName(*e, declared)) return true;
+    }
+    return arrPat->rest && expressionHasUndeclaredPrivateName(*arrPat->rest, declared);
+  }
+  if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.key && expressionHasUndeclaredPrivateName(*prop.key, declared)) return true;
+      if (prop.value && expressionHasUndeclaredPrivateName(*prop.value, declared)) return true;
+    }
+    return objPat->rest && expressionHasUndeclaredPrivateName(*objPat->rest, declared);
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionHasUndeclaredPrivateName(*assignPat->left, declared)) ||
+           (assignPat->right && expressionHasUndeclaredPrivateName(*assignPat->right, declared));
+  }
+  return false;
+}
+
+bool statementHasUndeclaredPrivateName(const Statement& stmt, const std::set<std::string>& declared) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& decl : varDecl->declarations) {
+      if (decl.pattern && expressionHasUndeclaredPrivateName(*decl.pattern, declared)) return true;
+      if (decl.init && expressionHasUndeclaredPrivateName(*decl.init, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* fnDecl = std::get_if<FunctionDeclaration>(&stmt.node)) {
+    for (const auto& param : fnDecl->params) {
+      if (param.defaultValue && expressionHasUndeclaredPrivateName(*param.defaultValue, declared)) return true;
+    }
+    for (const auto& s : fnDecl->body) {
+      if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+    }
+    return false;
+  }
+  // Don't descend into nested classes: they'll validate their own private environment.
+  if (std::holds_alternative<ClassDeclaration>(stmt.node)) {
+    return false;
+  }
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionHasUndeclaredPrivateName(*exprStmt->expression, declared);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionHasUndeclaredPrivateName(*ret->argument, declared);
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionHasUndeclaredPrivateName(*ifStmt->test, declared)) return true;
+    if (ifStmt->consequent && statementHasUndeclaredPrivateName(*ifStmt->consequent, declared)) return true;
+    return ifStmt->alternate && statementHasUndeclaredPrivateName(*ifStmt->alternate, declared);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionHasUndeclaredPrivateName(*whileStmt->test, declared)) return true;
+    return whileStmt->body && statementHasUndeclaredPrivateName(*whileStmt->body, declared);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementHasUndeclaredPrivateName(*forStmt->init, declared)) return true;
+    if (forStmt->test && expressionHasUndeclaredPrivateName(*forStmt->test, declared)) return true;
+    if (forStmt->update && expressionHasUndeclaredPrivateName(*forStmt->update, declared)) return true;
+    return forStmt->body && statementHasUndeclaredPrivateName(*forStmt->body, declared);
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionHasUndeclaredPrivateName(*withStmt->object, declared)) return true;
+    return withStmt->body && statementHasUndeclaredPrivateName(*withStmt->body, declared);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementHasUndeclaredPrivateName(*forInStmt->left, declared)) return true;
+    if (forInStmt->right && expressionHasUndeclaredPrivateName(*forInStmt->right, declared)) return true;
+    return forInStmt->body && statementHasUndeclaredPrivateName(*forInStmt->body, declared);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementHasUndeclaredPrivateName(*forOfStmt->left, declared)) return true;
+    if (forOfStmt->right && expressionHasUndeclaredPrivateName(*forOfStmt->right, declared)) return true;
+    return forOfStmt->body && statementHasUndeclaredPrivateName(*forOfStmt->body, declared);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementHasUndeclaredPrivateName(*doWhileStmt->body, declared)) return true;
+    return doWhileStmt->test && expressionHasUndeclaredPrivateName(*doWhileStmt->test, declared);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionHasUndeclaredPrivateName(*switchStmt->discriminant, declared)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionHasUndeclaredPrivateName(*c.test, declared)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementHasUndeclaredPrivateName(*label->body, declared);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionHasUndeclaredPrivateName(*throwStmt->argument, declared);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+    }
+    if (tryStmt->handler.paramPattern && expressionHasUndeclaredPrivateName(*tryStmt->handler.paramPattern, declared)) return true;
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementHasUndeclaredPrivateName(*s, declared)) return true;
+    }
+    return false;
+  }
+  if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    return exportDefault->declaration && expressionHasUndeclaredPrivateName(*exportDefault->declaration, declared);
+  }
+  return false;
+}
+
+void collectTopLevelLexicallyDeclaredNames(const std::vector<StmtPtr>& body,
+                                           std::vector<std::string>& names) {
+  for (const auto& stmt : body) {
+    if (!stmt) continue;
+    if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        for (const auto& decl : varDecl->declarations) {
+          if (decl.pattern) collectBoundNames(*decl.pattern, names);
+        }
+      }
+      continue;
+    }
+    if (auto* fnDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+      names.push_back(fnDecl->id.name);
+      continue;
+    }
+    if (auto* clsDecl = std::get_if<ClassDeclaration>(&stmt->node)) {
+      names.push_back(clsDecl->id.name);
+      continue;
+    }
+  }
+}
+
+bool addNameIfUnique(const std::string& name, std::vector<std::string>& names) {
+  for (const auto& existing : names) {
+    if (existing == name) {
+      return false;
+    }
+  }
+  names.push_back(name);
+  return true;
+}
+
+bool collectStatementListLexicalNames(const std::vector<StmtPtr>& body,
+                                      std::vector<std::string>& names) {
+  for (const auto& stmt : body) {
+    if (!stmt) continue;
+    if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const) {
+        std::vector<std::string> boundNames;
+        for (const auto& decl : varDecl->declarations) {
+          if (decl.pattern) {
+            collectBoundNames(*decl.pattern, boundNames);
+          }
+        }
+        for (const auto& name : boundNames) {
+          if (!addNameIfUnique(name, names)) {
+            return false;
+          }
+        }
+      }
+      continue;
+    }
+    if (auto* clsDecl = std::get_if<ClassDeclaration>(&stmt->node)) {
+      if (!addNameIfUnique(clsDecl->id.name, names)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void collectStatementListVarNames(const std::vector<StmtPtr>& body,
+                                  std::vector<std::string>& names) {
+  for (const auto& stmt : body) {
+    if (stmt) {
+      collectVarDeclaredNames(*stmt, names);
+    }
+  }
+}
+
+bool hasNameCollision(const std::vector<std::string>& first,
+                      const std::vector<std::string>& second) {
+  for (const auto& a : first) {
+    for (const auto& b : second) {
+      if (a == b) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool isOptionalChain(const Expression& expr) {
   if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
     return member->optional;
@@ -254,6 +835,13 @@ bool hasUnparenthesizedLogicalOp(const ExprPtr& expr) {
 
 bool isAssignmentTarget(const Expression& expr) {
   if (std::holds_alternative<MetaProperty>(expr.node)) {
+    return false;
+  }
+
+  // Parenthesized AssignmentTargets are only valid for simple targets.
+  if (expr.parenthesized &&
+      !std::holds_alternative<Identifier>(expr.node) &&
+      !std::holds_alternative<MemberExpr>(expr.node)) {
     return false;
   }
 
@@ -385,13 +973,36 @@ void Parser::consumeSemicolon() {
   }
 }
 
+bool Parser::consumeSemicolonOrASI() {
+  if (match(TokenType::Semicolon)) {
+    advance();
+    return true;
+  }
+
+  if (match(TokenType::EndOfFile) || match(TokenType::RightBrace)) {
+    return true;
+  }
+
+  if (pos_ > 0) {
+    const Token& previous = tokens_[pos_ - 1];
+    if (current().line > previous.line) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool Parser::canUseAwaitAsIdentifier() const {
-  return asyncFunctionDepth_ == 0 && !isModule_;
+  if (!awaitContextStack_.empty()) {
+    return !awaitContextStack_.back();
+  }
+  return !isModule_;
 }
 
 bool Parser::canParseAwaitExpression() const {
-  if (asyncFunctionDepth_ > 0) {
-    return true;
+  if (!awaitContextStack_.empty()) {
+    return awaitContextStack_.back();
   }
   return isModule_ && functionDepth_ == 0;
 }
@@ -432,7 +1043,7 @@ std::optional<Program> Parser::parse() {
   program.isModule = isModule_;
   bool inDirectivePrologue = true;
   while (!match(TokenType::EndOfFile)) {
-    if (auto stmt = parseStatement()) {
+    if (auto stmt = parseStatement(true)) {
       if (inDirectivePrologue) {
         bool isDirectiveString = false;
         if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node)) {
@@ -454,10 +1065,26 @@ std::optional<Program> Parser::parse() {
       return std::nullopt;
     }
   }
+
+  // Early errors:
+  // 1. No duplicate lexically declared names in ScriptBody/ModuleBody.
+  // 2. No overlap between lexical and var-declared names.
+  {
+    std::vector<std::string> lexicalNames;
+    if (!collectStatementListLexicalNames(program.body, lexicalNames)) {
+      return std::nullopt;
+    }
+    std::vector<std::string> varNames;
+    collectStatementListVarNames(program.body, varNames);
+    if (hasNameCollision(lexicalNames, varNames)) {
+      return std::nullopt;
+    }
+  }
+
   return program;
 }
 
-StmtPtr Parser::parseStatement() {
+StmtPtr Parser::parseStatement(bool allowModuleItem) {
   // Parse labeled statements
   if (isIdentifierLikeToken(current().type) && peek().type == TokenType::Colon) {
     const Token& tok = current();
@@ -494,16 +1121,22 @@ StmtPtr Parser::parseStatement() {
       if (!strictMode_) {
         auto nextType = peek().type;
         bool nextOnSameLine = (peek().line == current().line);
-        // 'let' followed by binding pattern on same line → declaration
-        // 'let' followed by newline or non-pattern → identifier expression
-        if (!nextOnSameLine ||
-            (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
-             nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
-             nextType != TokenType::Yield && nextType != TokenType::Async &&
-             nextType != TokenType::Get && nextType != TokenType::Set &&
-             nextType != TokenType::From && nextType != TokenType::As &&
-             nextType != TokenType::Of && nextType != TokenType::Static)) {
-          return parseExpressionStatement();
+        // Inside async contexts, `let` followed by linebreak + `await` still
+        // starts a LexicalDeclaration (ASI does not apply here).
+        if (!(!nextOnSameLine &&
+              nextType == TokenType::Await &&
+              !canUseAwaitAsIdentifier())) {
+          // 'let' followed by binding pattern on same line → declaration
+          // 'let' followed by newline or non-pattern → identifier expression
+          if (!nextOnSameLine ||
+              (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
+               nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
+               nextType != TokenType::Yield && nextType != TokenType::Async &&
+               nextType != TokenType::Get && nextType != TokenType::Set &&
+               nextType != TokenType::From && nextType != TokenType::As &&
+               nextType != TokenType::Of && nextType != TokenType::Static)) {
+            return parseExpressionStatement();
+          }
         }
       }
       [[fallthrough]];
@@ -511,7 +1144,9 @@ StmtPtr Parser::parseStatement() {
     case TokenType::Var:
       return parseVarDeclaration();
     case TokenType::Async:
-      if (peek().type == TokenType::Function) {
+      if (!current().escaped &&
+          current().line == peek().line &&
+          peek().type == TokenType::Function) {
         return parseFunctionDeclaration();
       }
       return parseExpressionStatement();
@@ -569,16 +1204,22 @@ StmtPtr Parser::parseStatement() {
       return parseTryStatement();
     case TokenType::Import:
       if (current().escaped) {
+        error_ = true;
         return nullptr;
       }
       if (peek().type == TokenType::Dot || peek().type == TokenType::LeftParen) {
         return parseExpressionStatement();
       }
-      if (!isModule_) {
+      if (!isModule_ || !allowModuleItem) {
+        error_ = true;
         return nullptr;
       }
       return parseImportDeclaration();
     case TokenType::Export:
+      if (!allowModuleItem) {
+        error_ = true;
+        return nullptr;
+      }
       return parseExportDeclaration();
     case TokenType::LeftBrace:
       return parseBlockStatement();
@@ -619,7 +1260,7 @@ StmtPtr Parser::parseVarDeclaration() {
       std::vector<std::string> boundNames;
       collectBoundNames(*pattern, boundNames);
       for (auto& name : boundNames) {
-        if (name == "eval" || name == "arguments") {
+        if (isStrictModeRestrictedIdentifier(name)) {
           return nullptr;
         }
       }
@@ -659,6 +1300,9 @@ StmtPtr Parser::parseFunctionDeclaration() {
   const Token& startTok = current();
   bool isAsync = false;
   if (match(TokenType::Async)) {
+    if (current().escaped) {
+      return nullptr;
+    }
     isAsync = true;
     advance();
   }
@@ -679,6 +1323,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   advance();
 
   ++functionDepth_;
+  awaitContextStack_.push_back(isAsync);
   if (isAsync) {
     ++asyncFunctionDepth_;
   }
@@ -687,35 +1332,136 @@ StmtPtr Parser::parseFunctionDeclaration() {
 
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;
+  std::vector<StmtPtr> destructurePrologue;
+
+  bool hasNonSimpleParams = false;
+  std::vector<std::string> boundParamNames;
+  std::set<std::string> seenParamNames;
+  bool hasDuplicateParams = false;
+  bool hasSuperInParams = false;
+  bool hasRestrictedParamNames = false;
 
   while (!match(TokenType::RightParen)) {
-    if (!params.empty()) {
-      expect(TokenType::Comma);
-    }
-
-    // Check for rest parameter
     if (match(TokenType::DotDotDot)) {
+      // Rest parameter (identifier or binding pattern)
+      hasNonSimpleParams = true;
       advance();
       if (isIdentifierLikeToken(current().type)) {
         restParam = Identifier{current().value};
+        if (!seenParamNames.insert(restParam->name).second) {
+          hasDuplicateParams = true;
+        }
+        boundParamNames.push_back(restParam->name);
+        if (restParam->name == "eval" || restParam->name == "arguments") {
+          hasRestrictedParamNames = true;
+        }
         advance();
+      } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+        auto pattern = parsePattern();
+        if (!pattern) return nullptr;
+        // Rest parameters cannot have initializers.
+        if (std::get_if<AssignmentPattern>(&pattern->node)) return nullptr;
+
+        std::vector<std::string> names;
+        collectBoundNames(*pattern, names);
+        for (auto& name : names) {
+          boundParamNames.push_back(name);
+          if (!seenParamNames.insert(name).second) {
+            hasDuplicateParams = true;
+          }
+          if (name == "eval" || name == "arguments") {
+            hasRestrictedParamNames = true;
+          }
+        }
+
+        std::string tempName = "__rest_param_" + std::to_string(arrowDestructureTempCounter_++);
+        restParam = Identifier{tempName};
+        VarDeclaration destructDecl;
+        destructDecl.kind = VarDeclaration::Kind::Let;
+        VarDeclarator destructBinding;
+        destructBinding.pattern = std::move(pattern);
+        destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+        destructDecl.declarations.push_back(std::move(destructBinding));
+        destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+      } else {
+        return nullptr;
       }
-      // Rest parameter must be last
+      if (match(TokenType::Comma)) return nullptr;
       break;
-    } else if (isIdentifierLikeToken(current().type)) {
-      Parameter param;
+    }
+
+    Parameter param;
+    bool hasDestructurePattern = false;
+
+    if (isIdentifierLikeToken(current().type)) {
       param.name = Identifier{current().value};
+      boundParamNames.push_back(param.name.name);
+      if (!seenParamNames.insert(param.name.name).second) {
+        hasDuplicateParams = true;
+      }
+      if (param.name.name == "eval" || param.name.name == "arguments") {
+        hasRestrictedParamNames = true;
+      }
       advance();
 
-      // Check for default value
       if (match(TokenType::Equal)) {
+        hasNonSimpleParams = true;
         advance();
         param.defaultValue = parseAssignment();
+        if (!param.defaultValue) return nullptr;
+        if (expressionContainsSuper(*param.defaultValue)) {
+          hasSuperInParams = true;
+        }
+      }
+    } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+      hasNonSimpleParams = true;
+      hasDestructurePattern = true;
+      auto pattern = parsePattern();
+      if (!pattern) return nullptr;
+
+      // Unwrap top-level AssignmentPattern: it's a parameter default.
+      if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
+        param.defaultValue = std::move(assignPat->right);
+        if (!param.defaultValue) return nullptr;
+        if (expressionContainsSuper(*param.defaultValue)) {
+          hasSuperInParams = true;
+        }
+        pattern = std::move(assignPat->left);
+        if (!pattern) return nullptr;
       }
 
-      params.push_back(std::move(param));
+      std::vector<std::string> names;
+      collectBoundNames(*pattern, names);
+      for (auto& name : names) {
+        boundParamNames.push_back(name);
+        if (!seenParamNames.insert(name).second) {
+          hasDuplicateParams = true;
+        }
+        if (name == "eval" || name == "arguments") {
+          hasRestrictedParamNames = true;
+        }
+      }
+
+      std::string tempName = "__param_" + std::to_string(arrowDestructureTempCounter_++);
+      param.name = Identifier{tempName};
+
+      VarDeclaration destructDecl;
+      destructDecl.kind = VarDeclaration::Kind::Let;
+      VarDeclarator destructBinding;
+      destructBinding.pattern = std::move(pattern);
+      destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+      destructDecl.declarations.push_back(std::move(destructBinding));
+      destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
     } else {
-      // Unexpected token in parameter list
+      return nullptr;
+    }
+
+    params.push_back(std::move(param));
+
+    if (match(TokenType::Comma)) {
+      advance();
+      if (match(TokenType::RightParen)) break;  // trailing comma
+    } else {
       break;
     }
   }
@@ -732,6 +1478,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
     --asyncFunctionDepth_;
   }
   --functionDepth_;
+  awaitContextStack_.pop_back();
   if (!block) {
     return nullptr;
   }
@@ -739,6 +1486,44 @@ StmtPtr Parser::parseFunctionDeclaration() {
   auto blockStmt = std::get_if<BlockStmt>(&block->node);
   if (!blockStmt) {
     return nullptr;
+  }
+
+  // Destructuring parameters are implemented via a body prologue.
+  insertPrologueAfterDirectives(blockStmt->body, destructurePrologue);
+
+  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
+  bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
+  if (strictFunctionCode && (name == "eval" || name == "arguments")) {
+    return nullptr;
+  }
+  if (strictFunctionCode && hasRestrictedParamNames) {
+    return nullptr;
+  }
+  if (hasUseStrictDirective && hasNonSimpleParams) {
+    return nullptr;
+  }
+  if ((strictFunctionCode || hasNonSimpleParams) && hasDuplicateParams) {
+    return nullptr;
+  }
+  {
+    std::vector<std::string> lexicalNames;
+    collectTopLevelLexicallyDeclaredNames(blockStmt->body, lexicalNames);
+    std::set<std::string> paramNameSet(boundParamNames.begin(), boundParamNames.end());
+    for (const auto& lexName : lexicalNames) {
+      if (paramNameSet.count(lexName) != 0) {
+        return nullptr;
+      }
+    }
+  }
+  if (isAsync) {
+    if (hasSuperInParams) {
+      return nullptr;
+    }
+    for (const auto& stmt : blockStmt->body) {
+      if (stmt && statementContainsSuper(*stmt)) {
+        return nullptr;
+      }
+    }
   }
 
   FunctionDeclaration funcDecl;
@@ -765,11 +1550,64 @@ StmtPtr Parser::parseClassDeclaration() {
   if (match(TokenType::Extends)) {
     advance();
     superClass = parseCall();
+    if (!superClass) {
+      return nullptr;
+    }
+    // Class heritage is evaluated in the *outer* PrivateEnvironment.
+    // Any private name access here is invalid (unless coming from an already-validated nested class).
+    const std::set<std::string> kNoPrivateNames;
+    if (expressionHasUndeclaredPrivateName(*superClass, kNoPrivateNames)) {
+      return nullptr;
+    }
   }
 
   expect(TokenType::LeftBrace);
 
+  // Class bodies are always strict mode code (ES2015+).
+  struct StrictModeGuard {
+    Parser* parser;
+    bool saved;
+    explicit StrictModeGuard(Parser* p) : parser(p), saved(p->strictMode_) { parser->strictMode_ = true; }
+    ~StrictModeGuard() { parser->strictMode_ = saved; }
+  } strictGuard(this);
+
   std::vector<MethodDefinition> methods;
+  bool hasInstanceConstructor = false;
+  std::unordered_map<std::string, uint8_t> privateNameKinds;
+
+  auto recordPrivateName = [&](const MethodDefinition& m) -> bool {
+    // Private names share a single namespace within the class.
+    // Allow exactly one getter+setter pair; all other duplicates/conflicts are early errors.
+    constexpr uint8_t kField = 1;
+    constexpr uint8_t kMethod = 2;
+    constexpr uint8_t kGet = 4;
+    constexpr uint8_t kSet = 8;
+    uint8_t add = 0;
+    switch (m.kind) {
+      case MethodDefinition::Kind::Field: add = kField; break;
+      case MethodDefinition::Kind::Get: add = kGet; break;
+      case MethodDefinition::Kind::Set: add = kSet; break;
+      case MethodDefinition::Kind::Method: add = kMethod; break;
+      case MethodDefinition::Kind::Constructor: add = kMethod; break;  // shouldn't happen for private names
+    }
+    uint8_t& mask = privateNameKinds[m.key.name];
+    if (add == kField || add == kMethod) {
+      if (mask != 0) return false;
+      mask |= add;
+      return true;
+    }
+    if (add == kGet) {
+      if (mask & (kField | kMethod | kGet)) return false;
+      mask |= add;
+      return true;
+    }
+    if (add == kSet) {
+      if (mask & (kField | kMethod | kSet)) return false;
+      mask |= add;
+      return true;
+    }
+    return false;
+  };
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
     // Skip semicolons
     if (match(TokenType::Semicolon)) {
@@ -779,29 +1617,64 @@ StmtPtr Parser::parseClassDeclaration() {
 
     MethodDefinition method;
 
-    // Check for static
-    if (match(TokenType::Static)) {
+    // Escaped 'static' must not be treated as the static modifier.
+    if (match(TokenType::Static) &&
+        current().escaped &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Equal &&
+        peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::RightBrace) {
+      return nullptr;
+    }
+
+    // Check for static modifier.
+    if (match(TokenType::Static) &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Equal &&
+        peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::RightBrace) {
       method.isStatic = true;
       advance();
     }
 
-    // Check for async (only if followed by a method name + '(')
-    if (match(TokenType::Async) && peek().type != TokenType::Semicolon &&
+    // Check for async modifier (must be same line and not escaped).
+    if (match(TokenType::Async) &&
+        !current().escaped &&
+        current().line == peek().line &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Semicolon &&
         peek().type != TokenType::Equal && peek().type != TokenType::RightBrace) {
       method.isAsync = true;
       advance();
     }
 
+    // Check for generator method marker.
+    if (match(TokenType::Star)) {
+      method.isGenerator = true;
+      advance();
+    }
+
     // Check for getter/setter - only if followed by name + '('
     if ((match(TokenType::Get) || match(TokenType::Set)) &&
-        (isIdentifierNameToken(peek().type) || peek().type == TokenType::PrivateIdentifier)) {
+        (isIdentifierNameToken(peek().type) ||
+         peek().type == TokenType::PrivateIdentifier ||
+         peek().type == TokenType::LeftBracket)) {
       // Peek ahead: if the token after the name is '(', it's a getter/setter
       // Otherwise treat get/set as a field name
       size_t saved = pos_;
       TokenType savedType = current().type;
       advance(); // consume get/set
       bool isGetterSetter = false;
-      if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
+      if (match(TokenType::LeftBracket)) {
+        advance(); // [
+        auto keyExpr = parseAssignment();
+        if (keyExpr && match(TokenType::RightBracket)) {
+          advance(); // ]
+          if (match(TokenType::LeftParen)) {
+            isGetterSetter = true;
+          }
+        }
+      } else if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
         advance(); // consume name
         if (match(TokenType::LeftParen)) {
           isGetterSetter = true;
@@ -820,58 +1693,217 @@ StmtPtr Parser::parseClassDeclaration() {
       }
     }
 
-    // Member name (identifier or private identifier)
+    // Member name (identifier, private identifier, string/number/bigint literal)
     if (match(TokenType::PrivateIdentifier)) {
       method.isPrivate = true;
+      if (current().value == "#constructor") {
+        return nullptr;
+      }
       method.key.name = current().value; // includes '#' prefix
       advance();
+    } else if (match(TokenType::LeftBracket)) {
+      method.computed = true;
+      advance();
+      method.computedKey = parseAssignment();
+      if (!method.computedKey || !expect(TokenType::RightBracket)) {
+        return nullptr;
+      }
     } else if (isIdentifierNameToken(current().type)) {
       std::string memberName = current().value;
-      if (memberName == "constructor" && method.kind == MethodDefinition::Kind::Method) {
+      if (!method.isStatic &&
+          memberName == "constructor" &&
+          method.kind == MethodDefinition::Kind::Method) {
         method.kind = MethodDefinition::Kind::Constructor;
       }
       method.key.name = memberName;
+      advance();
+    } else if (match(TokenType::Number)) {
+      double numberValue = 0.0;
+      if (!parseNumberLiteral(current().value, numberValue)) {
+        return nullptr;
+      }
+      method.key.name = numberToPropertyKey(numberValue);
+      advance();
+    } else if (match(TokenType::BigInt)) {
+      bigint::BigIntValue bigintValue = 0;
+      if (!parseBigIntLiteral64(current().value, bigintValue)) {
+        return nullptr;
+      }
+      method.key.name = bigint::toString(bigintValue);
+      advance();
+    } else if (match(TokenType::String)) {
+      method.key.name = current().value;
       advance();
     } else {
       return nullptr;
     }
 
+    if (!method.computed &&
+        !method.isStatic &&
+        !method.isPrivate &&
+        method.kind == MethodDefinition::Kind::Method &&
+        method.key.name == "constructor") {
+      method.kind = MethodDefinition::Kind::Constructor;
+    }
+
     // Distinguish field vs method: if '(' follows, it's a method; otherwise a field
     if (match(TokenType::LeftParen)) {
       // Method/constructor/getter/setter
+      if (method.kind == MethodDefinition::Kind::Constructor &&
+          (method.isAsync || method.isGenerator)) {
+        return nullptr;
+      }
+      // Instance getters/setters named "constructor" are early errors.
+      if (!method.isStatic &&
+          !method.computed &&
+          !method.isPrivate &&
+          method.key.name == "constructor" &&
+          (method.kind == MethodDefinition::Kind::Get ||
+           method.kind == MethodDefinition::Kind::Set)) {
+        return nullptr;
+      }
+      // Static methods cannot be named "prototype".
+      if (method.isStatic &&
+          !method.computed &&
+          !method.isPrivate &&
+          method.key.name == "prototype") {
+        return nullptr;
+      }
+
       ++functionDepth_;
+      awaitContextStack_.push_back(method.isAsync);
       if (method.isAsync) {
         ++asyncFunctionDepth_;
       }
       advance(); // consume '('
+
+      std::vector<StmtPtr> destructurePrologue;
+      bool hasNonSimpleParams = false;
+      std::set<std::string> seenParamNames;
+      bool hasDuplicateParams = false;
+
       while (!match(TokenType::RightParen)) {
-        if (isIdentifierLikeToken(current().type)) {
-          method.params.push_back({current().value});
+        if (match(TokenType::DotDotDot)) {
+          hasNonSimpleParams = true;
           advance();
-          if (match(TokenType::Comma)) {
+          if (isIdentifierLikeToken(current().type)) {
+            method.restParam = Identifier{current().value};
+            if (method.restParam->name == "eval" || method.restParam->name == "arguments") {
+              return nullptr;
+            }
+            if (!seenParamNames.insert(method.restParam->name).second) {
+              hasDuplicateParams = true;
+            }
             advance();
+          } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+            auto pattern = parsePattern();
+            if (!pattern) return nullptr;
+            // Rest parameters cannot have initializers.
+            if (std::get_if<AssignmentPattern>(&pattern->node)) return nullptr;
+            if (hasDuplicateBoundNames(*pattern)) return nullptr;
+
+            std::vector<std::string> names;
+            collectBoundNames(*pattern, names);
+            for (auto& name : names) {
+              if (name == "eval" || name == "arguments") return nullptr;
+              if (!seenParamNames.insert(name).second) hasDuplicateParams = true;
+            }
+
+            std::string tempName = "__rest_param_" + std::to_string(arrowDestructureTempCounter_++);
+            method.restParam = Identifier{tempName};
+            VarDeclaration destructDecl;
+            destructDecl.kind = VarDeclaration::Kind::Let;
+            VarDeclarator destructBinding;
+            destructBinding.pattern = std::move(pattern);
+            destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+            destructDecl.declarations.push_back(std::move(destructBinding));
+            destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+          } else {
+            return nullptr;
           }
+          if (match(TokenType::Comma)) return nullptr;
+          break;  // rest must be last
+        }
+
+        Parameter param;
+        if (isIdentifierLikeToken(current().type)) {
+          param.name = Identifier{current().value};
+          if (param.name.name == "eval" || param.name.name == "arguments") {
+            return nullptr;
+          }
+          if (!seenParamNames.insert(param.name.name).second) {
+            hasDuplicateParams = true;
+          }
+          advance();
+          if (match(TokenType::Equal)) {
+            hasNonSimpleParams = true;
+            advance();
+            param.defaultValue = parseAssignment();
+            if (!param.defaultValue) return nullptr;
+          }
+        } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+          hasNonSimpleParams = true;
+          auto pattern = parsePattern();
+          if (!pattern) return nullptr;
+          if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
+            param.defaultValue = std::move(assignPat->right);
+            pattern = std::move(assignPat->left);
+            if (!pattern) return nullptr;
+          }
+          if (hasDuplicateBoundNames(*pattern)) return nullptr;
+
+          std::vector<std::string> names;
+          collectBoundNames(*pattern, names);
+          for (auto& name : names) {
+            if (name == "eval" || name == "arguments") return nullptr;
+            if (!seenParamNames.insert(name).second) hasDuplicateParams = true;
+          }
+
+          std::string tempName = "__param_" + std::to_string(arrowDestructureTempCounter_++);
+          param.name = Identifier{tempName};
+
+          VarDeclaration destructDecl;
+          destructDecl.kind = VarDeclaration::Kind::Let;
+          VarDeclarator destructBinding;
+          destructBinding.pattern = std::move(pattern);
+          destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+          destructDecl.declarations.push_back(std::move(destructBinding));
+          destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
         } else {
           break;
+        }
+        method.params.push_back(std::move(param));
+        if (match(TokenType::Comma)) {
+          advance();
+          if (match(TokenType::RightParen)) {
+            break;
+          }
         }
       }
       expect(TokenType::RightParen);
 
       // Method body
-      bool disallowSuperCall = !superClass && !method.isStatic &&
-                               method.kind == MethodDefinition::Kind::Constructor;
-      if (disallowSuperCall) {
+      bool allowSuperCall = superClass && !method.isStatic &&
+                            method.kind == MethodDefinition::Kind::Constructor;
+      if (!allowSuperCall) {
         ++superCallDisallowDepth_;
+      }
+      if (method.isGenerator) {
+        ++generatorFunctionDepth_;
       }
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          if (method.isGenerator) {
+            --generatorFunctionDepth_;
+          }
           if (method.isAsync) {
             --asyncFunctionDepth_;
           }
           --functionDepth_;
-          if (disallowSuperCall) {
+          awaitContextStack_.pop_back();
+          if (!allowSuperCall) {
             --superCallDisallowDepth_;
           }
           return nullptr;
@@ -879,12 +1911,31 @@ StmtPtr Parser::parseClassDeclaration() {
         method.body.push_back(std::move(stmt));
       }
       expect(TokenType::RightBrace);
+      if (method.isGenerator) {
+        --generatorFunctionDepth_;
+      }
       if (method.isAsync) {
         --asyncFunctionDepth_;
       }
       --functionDepth_;
-      if (disallowSuperCall) {
+      awaitContextStack_.pop_back();
+      if (!allowSuperCall) {
         --superCallDisallowDepth_;
+      }
+
+      insertPrologueAfterDirectives(method.body, destructurePrologue);
+      if (hasDuplicateParams) {
+        return nullptr;
+      }
+      if (hasUseStrictDirectiveInBody(method.body) && hasNonSimpleParams) {
+        return nullptr;
+      }
+
+      if (method.kind == MethodDefinition::Kind::Constructor) {
+        if (hasInstanceConstructor) {
+          return nullptr;
+        }
+        hasInstanceConstructor = true;
       }
     } else {
       // Field declaration
@@ -892,16 +1943,58 @@ StmtPtr Parser::parseClassDeclaration() {
       if (match(TokenType::Equal)) {
         advance(); // consume '='
         method.initializer = parseAssignment();
+        if (!method.initializer) {
+          return nullptr;
+        }
       }
+      uint32_t fieldEndLine = tokens_[pos_ - 1].line;
       // Consume optional semicolon
+      bool consumedSemicolon = false;
       if (match(TokenType::Semicolon)) {
         advance();
+        consumedSemicolon = true;
+      }
+      // ASI for class fields only inserts a semicolon at a LineTerminator.
+      // `x y` on the same line is not two fields.
+      if (!consumedSemicolon &&
+          !match(TokenType::RightBrace) &&
+          !match(TokenType::EndOfFile) &&
+          current().line == fieldEndLine) {
+        return nullptr;
       }
     }
 
+    if (method.isPrivate) {
+      if (!recordPrivateName(method)) {
+        return nullptr;
+      }
+    }
     methods.push_back(std::move(method));
   }
   expect(TokenType::RightBrace);
+
+  std::set<std::string> declaredPrivateNames;
+  for (const auto& kv : privateNameKinds) {
+    declaredPrivateNames.insert(kv.first);
+  }
+  for (const auto& m : methods) {
+    if (m.computedKey && expressionHasUndeclaredPrivateName(*m.computedKey, declaredPrivateNames)) {
+      return nullptr;
+    }
+    for (const auto& param : m.params) {
+      if (param.defaultValue && expressionHasUndeclaredPrivateName(*param.defaultValue, declaredPrivateNames)) {
+        return nullptr;
+      }
+    }
+    if (m.initializer && expressionHasUndeclaredPrivateName(*m.initializer, declaredPrivateNames)) {
+      return nullptr;
+    }
+    for (const auto& stmt : m.body) {
+      if (stmt && statementHasUndeclaredPrivateName(*stmt, declaredPrivateNames)) {
+        return nullptr;
+      }
+    }
+  }
 
   auto decl = std::make_unique<Statement>(ClassDeclaration{
     {className},
@@ -1676,10 +2769,13 @@ StmtPtr Parser::parseSwitchStatement() {
         if (match(TokenType::Default)) {
           break;
         }
-        if (error_) return nullptr;
+        if (error_) {
+          return nullptr;
+        }
         if (auto stmt = parseStatement()) {
           consequent.push_back(std::move(stmt));
-        } else if (error_) {
+        } else {
+          error_ = true;
           return nullptr;
         }
       }
@@ -1697,10 +2793,13 @@ StmtPtr Parser::parseSwitchStatement() {
       std::vector<StmtPtr> consequent;
       while (!match(TokenType::Case) && !match(TokenType::Default) &&
              !match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
-        if (error_) return nullptr;
+        if (error_) {
+          return nullptr;
+        }
         if (auto stmt = parseStatement()) {
           consequent.push_back(std::move(stmt));
-        } else if (error_) {
+        } else {
+          error_ = true;
           return nullptr;
         }
       }
@@ -1789,6 +2888,22 @@ StmtPtr Parser::parseBlockStatement() {
   }
 
   expect(TokenType::RightBrace);
+
+  // Early errors for Block StatementList:
+  // 1. No duplicate lexically declared names.
+  // 2. No overlap between lexical and var-declared names.
+  {
+    std::vector<std::string> lexicalNames;
+    if (!collectStatementListLexicalNames(body, lexicalNames)) {
+      return nullptr;
+    }
+    std::vector<std::string> varNames;
+    collectStatementListVarNames(body, varNames);
+    if (hasNameCollision(lexicalNames, varNames)) {
+      return nullptr;
+    }
+  }
+
   return std::make_unique<Statement>(BlockStmt{std::move(body)});
 }
 
@@ -1841,7 +2956,9 @@ StmtPtr Parser::parseExpressionStatement() {
     }
     expr = std::make_unique<Expression>(SequenceExpr{std::move(sequence)});
   }
-  consumeSemicolon();
+  if (!consumeSemicolonOrASI()) {
+    return nullptr;
+  }
   return std::make_unique<Statement>(ExpressionStmt{std::move(expr)});
 }
 
@@ -1988,6 +3105,10 @@ StmtPtr Parser::parseImportDeclaration() {
 
   // Check for default import: import foo from "module"
   if (match(TokenType::Identifier)) {
+    if (strictMode_ && isStrictModeRestrictedIdentifier(current().value)) {
+      error_ = true;
+      return nullptr;
+    }
     import.defaultImport = Identifier{current().value};
     advance();
 
@@ -2006,6 +3127,10 @@ StmtPtr Parser::parseImportDeclaration() {
     if (!isIdentifierLikeToken(current().type)) {
       return nullptr;
     }
+    if (strictMode_ && isStrictModeRestrictedIdentifier(current().value)) {
+      error_ = true;
+      return nullptr;
+    }
     import.namespaceImport = Identifier{current().value};
     advance();
   }
@@ -2018,25 +3143,47 @@ StmtPtr Parser::parseImportDeclaration() {
         if (!expect(TokenType::Comma)) {
           return nullptr;
         }
-      }
-
-      if (!isIdentifierNameToken(current().type)) {
-        return nullptr;
+        if (match(TokenType::RightBrace)) {
+          break;
+        }
       }
 
       ImportSpecifier spec;
-      spec.imported = Identifier{current().value};
-      spec.local = spec.imported;
-      advance();
-
-      // Check for renaming: foo as bar
-      if (match(TokenType::As)) {
+      if (match(TokenType::String)) {
+        if (!isWellFormedUnicodeString(current().value)) {
+          error_ = true;
+          return nullptr;
+        }
+        spec.imported = Identifier{current().value};
         advance();
+        if (!expect(TokenType::As)) {
+          return nullptr;
+        }
         if (!isIdentifierLikeToken(current().type)) {
           return nullptr;
         }
         spec.local = Identifier{current().value};
         advance();
+      } else if (isIdentifierNameToken(current().type)) {
+        spec.imported = Identifier{current().value};
+        spec.local = spec.imported;
+        advance();
+        // Check for renaming: foo as bar
+        if (match(TokenType::As)) {
+          advance();
+          if (!isIdentifierLikeToken(current().type)) {
+            return nullptr;
+          }
+          spec.local = Identifier{current().value};
+          advance();
+        }
+      } else {
+        return nullptr;
+      }
+
+      if (strictMode_ && isStrictModeRestrictedIdentifier(spec.local.name)) {
+        error_ = true;
+        return nullptr;
       }
 
       import.specifiers.push_back(spec);
@@ -2054,7 +3201,10 @@ StmtPtr Parser::parseImportDeclaration() {
     advance();
   }
 
-  consumeSemicolon();
+  if (!consumeSemicolonOrASI()) {
+    error_ = true;
+    return nullptr;
+  }
 
   return std::make_unique<Statement>(std::move(import));
 }
@@ -2070,12 +3220,42 @@ StmtPtr Parser::parseExportDeclaration() {
 
     // Can be expression or function/class declaration
     if (match(TokenType::Function) || match(TokenType::Async)) {
+      exportDefault.isHoistableDeclaration = true;
       exportDefault.declaration = parseFunctionExpression();
-    } else {
-      exportDefault.declaration = parseAssignment();
+      if (!exportDefault.declaration) {
+        error_ = true;
+        return nullptr;
+      }
+      consumeSemicolon();
+      return std::make_unique<Statement>(std::move(exportDefault));
     }
 
-    consumeSemicolon();
+    if (match(TokenType::Class)) {
+      exportDefault.declaration = parseClassExpression();
+      if (!exportDefault.declaration) {
+        error_ = true;
+        return nullptr;
+      }
+      consumeSemicolon();
+      return std::make_unique<Statement>(std::move(exportDefault));
+    }
+
+    if (match(TokenType::Const) || match(TokenType::Let) || match(TokenType::Var)) {
+      error_ = true;
+      return nullptr;
+    }
+
+    exportDefault.declaration = parseAssignment();
+    if (!exportDefault.declaration) {
+      error_ = true;
+      return nullptr;
+    }
+
+    if (!consumeSemicolonOrASI()) {
+      error_ = true;
+      return nullptr;
+    }
+
     return std::make_unique<Statement>(std::move(exportDefault));
   }
 
@@ -2087,21 +3267,35 @@ StmtPtr Parser::parseExportDeclaration() {
 
     if (match(TokenType::As)) {
       advance();
-      if (!isIdentifierNameToken(current().type)) {
+      if (!isIdentifierNameToken(current().type) && !match(TokenType::String)) {
+        error_ = true;
+        return nullptr;
+      }
+      if (match(TokenType::String) && !isWellFormedUnicodeString(current().value)) {
+        error_ = true;
         return nullptr;
       }
       exportAll.exported = Identifier{current().value};
       advance();
     }
 
-    expect(TokenType::From);
-
-    if (match(TokenType::String)) {
-      exportAll.source = current().value;
-      advance();
+    if (!expect(TokenType::From)) {
+      error_ = true;
+      return nullptr;
     }
 
-    consumeSemicolon();
+    if (!match(TokenType::String)) {
+      error_ = true;
+      return nullptr;
+    }
+    exportAll.source = current().value;
+    advance();
+
+    if (!consumeSemicolonOrASI()) {
+      error_ = true;
+      return nullptr;
+    }
+
     return std::make_unique<Statement>(std::move(exportAll));
   }
 
@@ -2113,22 +3307,40 @@ StmtPtr Parser::parseExportDeclaration() {
       match(TokenType::Var) || match(TokenType::Function) ||
       match(TokenType::Async) || match(TokenType::Class)) {
     exportNamed.declaration = parseStatement();
+    if (!exportNamed.declaration) {
+      error_ = true;
+      return nullptr;
+    }
     return std::make_unique<Statement>(std::move(exportNamed));
   }
 
   // Export list: export { foo, bar as baz }
   if (match(TokenType::LeftBrace)) {
     advance();
+    std::vector<bool> localIsString;
 
     while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
       if (!exportNamed.specifiers.empty()) {
         if (!expect(TokenType::Comma)) {
+          error_ = true;
           return nullptr;
+        }
+        if (match(TokenType::RightBrace)) {
+          break;
         }
       }
 
-      if (!isIdentifierNameToken(current().type)) {
+      bool specLocalIsString = false;
+      if (!isIdentifierNameToken(current().type) && !match(TokenType::String)) {
+        error_ = true;
         return nullptr;
+      }
+      if (match(TokenType::String)) {
+        specLocalIsString = true;
+        if (!isWellFormedUnicodeString(current().value)) {
+          error_ = true;
+          return nullptr;
+        }
       }
 
       ExportSpecifier spec;
@@ -2139,7 +3351,12 @@ StmtPtr Parser::parseExportDeclaration() {
       // Check for renaming: foo as bar
       if (match(TokenType::As)) {
         advance();
-        if (!isIdentifierNameToken(current().type)) {
+        if (!isIdentifierNameToken(current().type) && !match(TokenType::String)) {
+          error_ = true;
+          return nullptr;
+        }
+        if (match(TokenType::String) && !isWellFormedUnicodeString(current().value)) {
+          error_ = true;
           return nullptr;
         }
         spec.exported = Identifier{current().value};
@@ -2147,23 +3364,45 @@ StmtPtr Parser::parseExportDeclaration() {
       }
 
       exportNamed.specifiers.push_back(spec);
+      localIsString.push_back(specLocalIsString);
     }
 
-    expect(TokenType::RightBrace);
+    if (!expect(TokenType::RightBrace)) {
+      error_ = true;
+      return nullptr;
+    }
 
     // Check for re-export: export { foo } from "module"
+    bool hasSource = false;
     if (match(TokenType::From)) {
       advance();
-      if (match(TokenType::String)) {
-        exportNamed.source = current().value;
-        advance();
+      if (!match(TokenType::String)) {
+        error_ = true;
+        return nullptr;
+      }
+      exportNamed.source = current().value;
+      advance();
+      hasSource = true;
+    }
+
+    if (!hasSource) {
+      for (bool isStringLocal : localIsString) {
+        if (isStringLocal) {
+          error_ = true;
+          return nullptr;
+        }
       }
     }
 
-    consumeSemicolon();
+    if (!consumeSemicolonOrASI()) {
+      error_ = true;
+      return nullptr;
+    }
+    return std::make_unique<Statement>(std::move(exportNamed));
   }
 
-  return std::make_unique<Statement>(std::move(exportNamed));
+  error_ = true;
+  return nullptr;
 }
 
 ExprPtr Parser::parseExpression() {
@@ -2252,14 +3491,17 @@ ExprPtr Parser::parseAssignment() {
         param.name = Identifier{paramName};
         func.params.push_back(std::move(param));
         ++functionDepth_;
+        awaitContextStack_.push_back(true);
         ++asyncFunctionDepth_;
         if (!parseArrowBodyInto(func)) {
           --asyncFunctionDepth_;
           --functionDepth_;
+          awaitContextStack_.pop_back();
           return nullptr;
         }
         --asyncFunctionDepth_;
         --functionDepth_;
+        awaitContextStack_.pop_back();
         return std::make_unique<Expression>(std::move(func));
       }
       pos_ = savedPos;
@@ -2267,7 +3509,9 @@ ExprPtr Parser::parseAssignment() {
       // async (...) => ...
       int prevFunctionDepth = functionDepth_;
       int prevAsyncDepth = asyncFunctionDepth_;
+      size_t prevAwaitContextDepth = awaitContextStack_.size();
       ++functionDepth_;
+      awaitContextStack_.push_back(true);
       ++asyncFunctionDepth_;
       advance();
       std::vector<Parameter> params;
@@ -2325,6 +3569,7 @@ ExprPtr Parser::parseAssignment() {
             if (!param.defaultValue) {
               --asyncFunctionDepth_;
               --functionDepth_;
+              awaitContextStack_.pop_back();
               return nullptr;
             }
           }
@@ -2351,16 +3596,19 @@ ExprPtr Parser::parseAssignment() {
           if (!parseArrowBodyInto(func)) {
             --asyncFunctionDepth_;
             --functionDepth_;
+            awaitContextStack_.pop_back();
             return nullptr;
           }
           prependDestructurePrologue(func, destructurePrologue);
           --asyncFunctionDepth_;
           --functionDepth_;
+          awaitContextStack_.pop_back();
           return std::make_unique<Expression>(std::move(func));
         }
       }
       functionDepth_ = prevFunctionDepth;
       asyncFunctionDepth_ = prevAsyncDepth;
+      awaitContextStack_.resize(prevAwaitContextDepth);
       pos_ = savedPos;
     } else {
       pos_ = savedPos;
@@ -2384,11 +3632,14 @@ ExprPtr Parser::parseAssignment() {
       func.params.push_back(std::move(param));
 
       ++functionDepth_;
+      awaitContextStack_.push_back(false);
       if (!parseArrowBodyInto(func)) {
         --functionDepth_;
+        awaitContextStack_.pop_back();
         return nullptr;
       }
       --functionDepth_;
+      awaitContextStack_.pop_back();
 
       return std::make_unique<Expression>(std::move(func));
     }
@@ -2491,12 +3742,15 @@ ExprPtr Parser::parseAssignment() {
       func.restParam = restParam;
 
       ++functionDepth_;
+      awaitContextStack_.push_back(false);
       if (!parseArrowBodyInto(func)) {
         --functionDepth_;
+        awaitContextStack_.pop_back();
         return nullptr;
       }
       prependDestructurePrologue(func, destructurePrologue);
       --functionDepth_;
+      awaitContextStack_.pop_back();
 
       return std::make_unique<Expression>(std::move(func));
     }
@@ -2939,6 +4193,22 @@ ExprPtr Parser::parseUnary() {
     if (!argument) {
       return nullptr;
     }
+    if (op == UnaryExpr::Op::Delete && strictMode_) {
+      // ES strict-mode early errors: `delete IdentifierReference` and delete applied to private names.
+      // Class bodies are always strict, so this also handles Test262 class-element delete early errors.
+      if (std::holds_alternative<Identifier>(argument->node)) {
+        return nullptr;
+      }
+      if (auto* mem = std::get_if<MemberExpr>(&argument->node)) {
+        if (!mem->computed && mem->property &&
+            std::holds_alternative<Identifier>(mem->property->node)) {
+          const auto& id = std::get<Identifier>(mem->property->node);
+          if (!id.name.empty() && id.name[0] == '#') {
+            return nullptr;
+          }
+        }
+      }
+    }
     return std::make_unique<Expression>(UnaryExpr{op, std::move(argument)});
   }
 
@@ -3201,6 +4471,10 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr, bool inOptionalChain) {
       advance();
       // Accept identifiers, keywords, or private identifiers as property names
       if (match(TokenType::PrivateIdentifier)) {
+        // super.#x is always an early SyntaxError.
+        if (expr && std::holds_alternative<SuperExpr>(expr->node)) {
+          return nullptr;
+        }
         // Private field access: obj.#field → MemberExpr with #-prefixed name
         auto prop = std::make_unique<Expression>(Identifier{current().value});
         advance();
@@ -3269,7 +4543,7 @@ ExprPtr Parser::parsePrimary() {
 
   if (match(TokenType::BigInt)) {
     const Token& tok = current();
-    int64_t value = 0;
+    bigint::BigIntValue value = 0;
     if (!parseBigIntLiteral64(tok.value, value)) {
       return nullptr;
     }
@@ -3502,7 +4776,9 @@ ExprPtr Parser::parsePrimary() {
   }
 
   if (match(TokenType::Async)) {
-    if (!current().escaped && peek().type == TokenType::Function) {
+    if (!current().escaped &&
+        current().line == peek().line &&
+        peek().type == TokenType::Function) {
       return parseFunctionExpression();
     }
     // 'async' used as identifier (not followed by function, or escaped)
@@ -3711,16 +4987,19 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
           ++functionDepth_;
+          awaitContextStack_.push_back(false);
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
               --functionDepth_;
+              awaitContextStack_.pop_back();
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
           --functionDepth_;
+          awaitContextStack_.pop_back();
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -3741,10 +5020,29 @@ ExprPtr Parser::parseObjectExpression() {
           continue;
         } else if (isIdentifierNameToken(current().type) ||
                    match(TokenType::String) ||
-                   match(TokenType::Number)) {
+                   match(TokenType::Number) ||
+                   match(TokenType::BigInt)) {
           // Getter/setter syntax: get propName() or set propName(value)
-          std::string propName = current().value;
-          key = std::make_unique<Expression>(Identifier{propName});
+          std::string propName;
+          if (match(TokenType::Number)) {
+            double numberValue = 0.0;
+            if (!parseNumberLiteral(current().value, numberValue)) {
+              return nullptr;
+            }
+            propName = numberToPropertyKey(numberValue);
+            key = std::make_unique<Expression>(NumberLiteral{numberValue});
+          } else if (match(TokenType::BigInt)) {
+            propName = current().value;
+            bigint::BigIntValue value = 0;
+            if (!parseBigIntLiteral64(propName, value)) {
+              return nullptr;
+            }
+            propName = bigint::toString(value);
+            key = std::make_unique<Expression>(BigIntLiteral{value});
+          } else {
+            propName = current().value;
+            key = std::make_unique<Expression>(Identifier{propName});
+          }
           advance();
 
           // Expect '(' for the parameter list
@@ -3767,16 +5065,19 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
           ++functionDepth_;
+          awaitContextStack_.push_back(false);
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
               --functionDepth_;
+              awaitContextStack_.pop_back();
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
           --functionDepth_;
+          awaitContextStack_.pop_back();
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -3818,6 +5119,13 @@ ExprPtr Parser::parseObjectExpression() {
       } else if (match(TokenType::Number)) {
         key = std::make_unique<Expression>(NumberLiteral{std::stod(current().value)});
         advance();
+      } else if (match(TokenType::BigInt)) {
+        bigint::BigIntValue value = 0;
+        if (!parseBigIntLiteral64(current().value, value)) {
+          return nullptr;
+        }
+        key = std::make_unique<Expression>(BigIntLiteral{value});
+        advance();
       }
 
       if (!key) {
@@ -3855,6 +5163,7 @@ ExprPtr Parser::parseObjectExpression() {
 
         // Parse function body
         ++functionDepth_;
+        awaitContextStack_.push_back(isAsync);
         if (isAsync) {
           ++asyncFunctionDepth_;
         }
@@ -3869,6 +5178,7 @@ ExprPtr Parser::parseObjectExpression() {
             --asyncFunctionDepth_;
           }
           --functionDepth_;
+          awaitContextStack_.pop_back();
           return nullptr;
         }
         std::vector<StmtPtr> body;
@@ -3882,6 +5192,7 @@ ExprPtr Parser::parseObjectExpression() {
               --asyncFunctionDepth_;
             }
             --functionDepth_;
+            awaitContextStack_.pop_back();
             return nullptr;
           }
           body.push_back(std::move(stmt));
@@ -3894,6 +5205,7 @@ ExprPtr Parser::parseObjectExpression() {
             --asyncFunctionDepth_;
           }
           --functionDepth_;
+          awaitContextStack_.pop_back();
           return nullptr;
         }
         if (isGenerator) {
@@ -3903,6 +5215,7 @@ ExprPtr Parser::parseObjectExpression() {
           --asyncFunctionDepth_;
         }
         --functionDepth_;
+        awaitContextStack_.pop_back();
 
         // Create FunctionExpr for the method
         FunctionExpr funcExpr;
@@ -3944,6 +5257,9 @@ ExprPtr Parser::parseObjectExpression() {
 ExprPtr Parser::parseFunctionExpression() {
   bool isAsync = false;
   if (match(TokenType::Async)) {
+    if (current().escaped) {
+      return nullptr;
+    }
     isAsync = true;
     advance();
   }
@@ -3964,6 +5280,7 @@ ExprPtr Parser::parseFunctionExpression() {
   }
 
   ++functionDepth_;
+  awaitContextStack_.push_back(isAsync);
   if (isAsync) {
     ++asyncFunctionDepth_;
   }
@@ -3972,35 +5289,129 @@ ExprPtr Parser::parseFunctionExpression() {
 
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;
+  std::vector<StmtPtr> destructurePrologue;
+
+  bool hasNonSimpleParams = false;
+  std::vector<std::string> boundParamNames;
+  std::set<std::string> seenParamNames;
+  bool hasDuplicateParams = false;
+  bool hasSuperInParams = false;
+  bool hasRestrictedParamNames = false;
 
   while (!match(TokenType::RightParen)) {
-    if (!params.empty()) {
-      expect(TokenType::Comma);
-    }
-
-    // Check for rest parameter
     if (match(TokenType::DotDotDot)) {
+      hasNonSimpleParams = true;
       advance();
       if (isIdentifierLikeToken(current().type)) {
         restParam = Identifier{current().value};
+        if (!seenParamNames.insert(restParam->name).second) {
+          hasDuplicateParams = true;
+        }
+        boundParamNames.push_back(restParam->name);
+        if (restParam->name == "eval" || restParam->name == "arguments") {
+          hasRestrictedParamNames = true;
+        }
         advance();
+      } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+        auto pattern = parsePattern();
+        if (!pattern) return nullptr;
+        if (std::get_if<AssignmentPattern>(&pattern->node)) return nullptr;
+
+        std::vector<std::string> names;
+        collectBoundNames(*pattern, names);
+        for (auto& name : names) {
+          boundParamNames.push_back(name);
+          if (!seenParamNames.insert(name).second) {
+            hasDuplicateParams = true;
+          }
+          if (name == "eval" || name == "arguments") {
+            hasRestrictedParamNames = true;
+          }
+        }
+
+        std::string tempName = "__rest_param_" + std::to_string(arrowDestructureTempCounter_++);
+        restParam = Identifier{tempName};
+        VarDeclaration destructDecl;
+        destructDecl.kind = VarDeclaration::Kind::Let;
+        VarDeclarator destructBinding;
+        destructBinding.pattern = std::move(pattern);
+        destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+        destructDecl.declarations.push_back(std::move(destructBinding));
+        destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+      } else {
+        return nullptr;
       }
-      // Rest parameter must be last
+      if (match(TokenType::Comma)) return nullptr;
       break;
-    } else if (isIdentifierLikeToken(current().type)) {
-      Parameter param;
+    }
+
+    Parameter param;
+    if (isIdentifierLikeToken(current().type)) {
       param.name = Identifier{current().value};
+      boundParamNames.push_back(param.name.name);
+      if (!seenParamNames.insert(param.name.name).second) {
+        hasDuplicateParams = true;
+      }
+      if (param.name.name == "eval" || param.name.name == "arguments") {
+        hasRestrictedParamNames = true;
+      }
       advance();
 
-      // Check for default value
       if (match(TokenType::Equal)) {
+        hasNonSimpleParams = true;
         advance();
         param.defaultValue = parseAssignment();
+        if (!param.defaultValue) return nullptr;
+        if (expressionContainsSuper(*param.defaultValue)) {
+          hasSuperInParams = true;
+        }
+      }
+    } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+      hasNonSimpleParams = true;
+      auto pattern = parsePattern();
+      if (!pattern) return nullptr;
+      if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
+        param.defaultValue = std::move(assignPat->right);
+        if (!param.defaultValue) return nullptr;
+        if (expressionContainsSuper(*param.defaultValue)) {
+          hasSuperInParams = true;
+        }
+        pattern = std::move(assignPat->left);
+        if (!pattern) return nullptr;
       }
 
-      params.push_back(std::move(param));
+      std::vector<std::string> names;
+      collectBoundNames(*pattern, names);
+      for (auto& name2 : names) {
+        boundParamNames.push_back(name2);
+        if (!seenParamNames.insert(name2).second) {
+          hasDuplicateParams = true;
+        }
+        if (name2 == "eval" || name2 == "arguments") {
+          hasRestrictedParamNames = true;
+        }
+      }
+
+      std::string tempName = "__param_" + std::to_string(arrowDestructureTempCounter_++);
+      param.name = Identifier{tempName};
+
+      VarDeclaration destructDecl;
+      destructDecl.kind = VarDeclaration::Kind::Let;
+      VarDeclarator destructBinding;
+      destructBinding.pattern = std::move(pattern);
+      destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+      destructDecl.declarations.push_back(std::move(destructBinding));
+      destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
     } else {
-      // Unexpected token in parameter list
+      return nullptr;
+    }
+
+    params.push_back(std::move(param));
+
+    if (match(TokenType::Comma)) {
+      advance();
+      if (match(TokenType::RightParen)) break;
+    } else {
       break;
     }
   }
@@ -4018,12 +5429,50 @@ ExprPtr Parser::parseFunctionExpression() {
     --asyncFunctionDepth_;
   }
   --functionDepth_;
+  awaitContextStack_.pop_back();
   if (!block) {
     return nullptr;
   }
   auto blockStmt = std::get_if<BlockStmt>(&block->node);
   if (!blockStmt) {
     return nullptr;
+  }
+
+  insertPrologueAfterDirectives(blockStmt->body, destructurePrologue);
+
+  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
+  bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
+  if (strictFunctionCode && (!name.empty() && (name == "eval" || name == "arguments"))) {
+    return nullptr;
+  }
+  if (strictFunctionCode && hasRestrictedParamNames) {
+    return nullptr;
+  }
+  if (hasUseStrictDirective && hasNonSimpleParams) {
+    return nullptr;
+  }
+  if ((strictFunctionCode || hasNonSimpleParams) && hasDuplicateParams) {
+    return nullptr;
+  }
+  {
+    std::vector<std::string> lexicalNames;
+    collectTopLevelLexicallyDeclaredNames(blockStmt->body, lexicalNames);
+    std::set<std::string> paramNameSet(boundParamNames.begin(), boundParamNames.end());
+    for (const auto& lexName : lexicalNames) {
+      if (paramNameSet.count(lexName) != 0) {
+        return nullptr;
+      }
+    }
+  }
+  if (isAsync) {
+    if (hasSuperInParams) {
+      return nullptr;
+    }
+    for (const auto& stmt : blockStmt->body) {
+      if (stmt && statementContainsSuper(*stmt)) {
+        return nullptr;
+      }
+    }
   }
 
   FunctionExpr funcExpr;
@@ -4050,11 +5499,60 @@ ExprPtr Parser::parseClassExpression() {
   if (match(TokenType::Extends)) {
     advance();
     superClass = parseCall();
+    if (!superClass) {
+      return nullptr;
+    }
+    const std::set<std::string> kNoPrivateNames;
+    if (expressionHasUndeclaredPrivateName(*superClass, kNoPrivateNames)) {
+      return nullptr;
+    }
   }
 
   expect(TokenType::LeftBrace);
 
+  // Class bodies are always strict mode code (ES2015+).
+  struct StrictModeGuard {
+    Parser* parser;
+    bool saved;
+    explicit StrictModeGuard(Parser* p) : parser(p), saved(p->strictMode_) { parser->strictMode_ = true; }
+    ~StrictModeGuard() { parser->strictMode_ = saved; }
+  } strictGuard(this);
+
   std::vector<MethodDefinition> methods;
+  bool hasInstanceConstructor = false;
+  std::unordered_map<std::string, uint8_t> privateNameKinds;
+
+  auto recordPrivateName = [&](const MethodDefinition& m) -> bool {
+    constexpr uint8_t kField = 1;
+    constexpr uint8_t kMethod = 2;
+    constexpr uint8_t kGet = 4;
+    constexpr uint8_t kSet = 8;
+    uint8_t add = 0;
+    switch (m.kind) {
+      case MethodDefinition::Kind::Field: add = kField; break;
+      case MethodDefinition::Kind::Get: add = kGet; break;
+      case MethodDefinition::Kind::Set: add = kSet; break;
+      case MethodDefinition::Kind::Method: add = kMethod; break;
+      case MethodDefinition::Kind::Constructor: add = kMethod; break;
+    }
+    uint8_t& mask = privateNameKinds[m.key.name];
+    if (add == kField || add == kMethod) {
+      if (mask != 0) return false;
+      mask |= add;
+      return true;
+    }
+    if (add == kGet) {
+      if (mask & (kField | kMethod | kGet)) return false;
+      mask |= add;
+      return true;
+    }
+    if (add == kSet) {
+      if (mask & (kField | kMethod | kSet)) return false;
+      mask |= add;
+      return true;
+    }
+    return false;
+  };
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
     // Skip semicolons
     if (match(TokenType::Semicolon)) {
@@ -4064,27 +5562,62 @@ ExprPtr Parser::parseClassExpression() {
 
     MethodDefinition method;
 
-    // Check for static
-    if (match(TokenType::Static)) {
+    // Escaped 'static' must not be treated as the static modifier.
+    if (match(TokenType::Static) &&
+        current().escaped &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Equal &&
+        peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::RightBrace) {
+      return nullptr;
+    }
+
+    // Check for static modifier.
+    if (match(TokenType::Static) &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Equal &&
+        peek().type != TokenType::Semicolon &&
+        peek().type != TokenType::RightBrace) {
       method.isStatic = true;
       advance();
     }
 
-    // Check for async (only if followed by a method name + '(')
-    if (match(TokenType::Async) && peek().type != TokenType::Semicolon &&
+    // Check for async modifier (must be same line and not escaped).
+    if (match(TokenType::Async) &&
+        !current().escaped &&
+        current().line == peek().line &&
+        peek().type != TokenType::LeftParen &&
+        peek().type != TokenType::Semicolon &&
         peek().type != TokenType::Equal && peek().type != TokenType::RightBrace) {
       method.isAsync = true;
       advance();
     }
 
+    // Check for generator method marker.
+    if (match(TokenType::Star)) {
+      method.isGenerator = true;
+      advance();
+    }
+
     // Check for getter/setter - only if followed by name + '('
     if ((match(TokenType::Get) || match(TokenType::Set)) &&
-        (isIdentifierNameToken(peek().type) || peek().type == TokenType::PrivateIdentifier)) {
+        (isIdentifierNameToken(peek().type) ||
+         peek().type == TokenType::PrivateIdentifier ||
+         peek().type == TokenType::LeftBracket)) {
       size_t saved = pos_;
       TokenType savedType = current().type;
       advance();
       bool isGetterSetter = false;
-      if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
+      if (match(TokenType::LeftBracket)) {
+        advance(); // [
+        auto keyExpr = parseAssignment();
+        if (keyExpr && match(TokenType::RightBracket)) {
+          advance(); // ]
+          if (match(TokenType::LeftParen)) {
+            isGetterSetter = true;
+          }
+        }
+      } else if (isIdentifierNameToken(current().type) || match(TokenType::PrivateIdentifier)) {
         advance();
         if (match(TokenType::LeftParen)) {
           isGetterSetter = true;
@@ -4102,56 +5635,213 @@ ExprPtr Parser::parseClassExpression() {
       }
     }
 
-    // Member name (identifier or private identifier)
+    // Member name (identifier, private identifier, string/number/bigint literal)
     if (match(TokenType::PrivateIdentifier)) {
       method.isPrivate = true;
+      if (current().value == "#constructor") {
+        return nullptr;
+      }
       method.key.name = current().value;
       advance();
+    } else if (match(TokenType::LeftBracket)) {
+      method.computed = true;
+      advance();
+      method.computedKey = parseAssignment();
+      if (!method.computedKey || !expect(TokenType::RightBracket)) {
+        return nullptr;
+      }
     } else if (isIdentifierNameToken(current().type)) {
       std::string memberName = current().value;
-      if (memberName == "constructor" && method.kind == MethodDefinition::Kind::Method) {
+      if (!method.isStatic &&
+          memberName == "constructor" &&
+          method.kind == MethodDefinition::Kind::Method) {
         method.kind = MethodDefinition::Kind::Constructor;
       }
       method.key.name = memberName;
+      advance();
+    } else if (match(TokenType::Number)) {
+      double numberValue = 0.0;
+      if (!parseNumberLiteral(current().value, numberValue)) {
+        return nullptr;
+      }
+      method.key.name = numberToPropertyKey(numberValue);
+      advance();
+    } else if (match(TokenType::BigInt)) {
+      bigint::BigIntValue bigintValue = 0;
+      if (!parseBigIntLiteral64(current().value, bigintValue)) {
+        return nullptr;
+      }
+      method.key.name = bigint::toString(bigintValue);
+      advance();
+    } else if (match(TokenType::String)) {
+      method.key.name = current().value;
       advance();
     } else {
       return nullptr;
     }
 
+    if (!method.computed &&
+        !method.isStatic &&
+        !method.isPrivate &&
+        method.kind == MethodDefinition::Kind::Method &&
+        method.key.name == "constructor") {
+      method.kind = MethodDefinition::Kind::Constructor;
+    }
+
     // Distinguish field vs method
     if (match(TokenType::LeftParen)) {
+      if (method.kind == MethodDefinition::Kind::Constructor &&
+          (method.isAsync || method.isGenerator)) {
+        return nullptr;
+      }
+      // Instance getters/setters named "constructor" are early errors.
+      if (!method.isStatic &&
+          !method.computed &&
+          !method.isPrivate &&
+          method.key.name == "constructor" &&
+          (method.kind == MethodDefinition::Kind::Get ||
+           method.kind == MethodDefinition::Kind::Set)) {
+        return nullptr;
+      }
+      // Static methods cannot be named "prototype".
+      if (method.isStatic &&
+          !method.computed &&
+          !method.isPrivate &&
+          method.key.name == "prototype") {
+        return nullptr;
+      }
       ++functionDepth_;
+      awaitContextStack_.push_back(method.isAsync);
       if (method.isAsync) {
         ++asyncFunctionDepth_;
       }
       advance();
+
+      std::vector<StmtPtr> destructurePrologue;
+      bool hasNonSimpleParams = false;
+      std::set<std::string> seenParamNames;
+      bool hasDuplicateParams = false;
+
       while (!match(TokenType::RightParen)) {
-        if (isIdentifierLikeToken(current().type)) {
-          method.params.push_back({current().value});
+        if (match(TokenType::DotDotDot)) {
+          hasNonSimpleParams = true;
           advance();
-          if (match(TokenType::Comma)) {
+          if (isIdentifierLikeToken(current().type)) {
+            method.restParam = Identifier{current().value};
+            if (method.restParam->name == "eval" || method.restParam->name == "arguments") {
+              return nullptr;
+            }
+            if (!seenParamNames.insert(method.restParam->name).second) {
+              hasDuplicateParams = true;
+            }
             advance();
+          } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+            auto pattern = parsePattern();
+            if (!pattern) return nullptr;
+            if (std::get_if<AssignmentPattern>(&pattern->node)) return nullptr;
+            if (hasDuplicateBoundNames(*pattern)) return nullptr;
+
+            std::vector<std::string> names;
+            collectBoundNames(*pattern, names);
+            for (auto& name : names) {
+              if (name == "eval" || name == "arguments") return nullptr;
+              if (!seenParamNames.insert(name).second) hasDuplicateParams = true;
+            }
+
+            std::string tempName = "__rest_param_" + std::to_string(arrowDestructureTempCounter_++);
+            method.restParam = Identifier{tempName};
+            VarDeclaration destructDecl;
+            destructDecl.kind = VarDeclaration::Kind::Let;
+            VarDeclarator destructBinding;
+            destructBinding.pattern = std::move(pattern);
+            destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+            destructDecl.declarations.push_back(std::move(destructBinding));
+            destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
+          } else {
+            return nullptr;
           }
+          if (match(TokenType::Comma)) return nullptr;
+          break;
+        }
+
+        Parameter param;
+        if (isIdentifierLikeToken(current().type)) {
+          param.name = Identifier{current().value};
+          if (param.name.name == "eval" || param.name.name == "arguments") {
+            return nullptr;
+          }
+          if (!seenParamNames.insert(param.name.name).second) {
+            hasDuplicateParams = true;
+          }
+          advance();
+          if (match(TokenType::Equal)) {
+            hasNonSimpleParams = true;
+            advance();
+            param.defaultValue = parseAssignment();
+            if (!param.defaultValue) return nullptr;
+          }
+        } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
+          hasNonSimpleParams = true;
+          auto pattern = parsePattern();
+          if (!pattern) return nullptr;
+          if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
+            param.defaultValue = std::move(assignPat->right);
+            pattern = std::move(assignPat->left);
+            if (!pattern) return nullptr;
+          }
+          if (hasDuplicateBoundNames(*pattern)) return nullptr;
+
+          std::vector<std::string> names;
+          collectBoundNames(*pattern, names);
+          for (auto& name2 : names) {
+            if (name2 == "eval" || name2 == "arguments") return nullptr;
+            if (!seenParamNames.insert(name2).second) hasDuplicateParams = true;
+          }
+
+          std::string tempName = "__param_" + std::to_string(arrowDestructureTempCounter_++);
+          param.name = Identifier{tempName};
+
+          VarDeclaration destructDecl;
+          destructDecl.kind = VarDeclaration::Kind::Let;
+          VarDeclarator destructBinding;
+          destructBinding.pattern = std::move(pattern);
+          destructBinding.init = std::make_unique<Expression>(Identifier{tempName});
+          destructDecl.declarations.push_back(std::move(destructBinding));
+          destructurePrologue.push_back(std::make_unique<Statement>(std::move(destructDecl)));
         } else {
           break;
+        }
+        method.params.push_back(std::move(param));
+        if (match(TokenType::Comma)) {
+          advance();
+          if (match(TokenType::RightParen)) {
+            break;
+          }
         }
       }
       expect(TokenType::RightParen);
 
-      bool disallowSuperCall = !superClass && !method.isStatic &&
-                               method.kind == MethodDefinition::Kind::Constructor;
-      if (disallowSuperCall) {
+      bool allowSuperCall = superClass && !method.isStatic &&
+                            method.kind == MethodDefinition::Kind::Constructor;
+      if (!allowSuperCall) {
         ++superCallDisallowDepth_;
+      }
+      if (method.isGenerator) {
+        ++generatorFunctionDepth_;
       }
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          if (method.isGenerator) {
+            --generatorFunctionDepth_;
+          }
           if (method.isAsync) {
             --asyncFunctionDepth_;
           }
           --functionDepth_;
-          if (disallowSuperCall) {
+          awaitContextStack_.pop_back();
+          if (!allowSuperCall) {
             --superCallDisallowDepth_;
           }
           return nullptr;
@@ -4159,12 +5849,30 @@ ExprPtr Parser::parseClassExpression() {
         method.body.push_back(std::move(stmt));
       }
       expect(TokenType::RightBrace);
+      if (method.isGenerator) {
+        --generatorFunctionDepth_;
+      }
       if (method.isAsync) {
         --asyncFunctionDepth_;
       }
       --functionDepth_;
-      if (disallowSuperCall) {
+      awaitContextStack_.pop_back();
+      if (!allowSuperCall) {
         --superCallDisallowDepth_;
+      }
+
+      insertPrologueAfterDirectives(method.body, destructurePrologue);
+      if (hasDuplicateParams) {
+        return nullptr;
+      }
+      if (hasUseStrictDirectiveInBody(method.body) && hasNonSimpleParams) {
+        return nullptr;
+      }
+      if (method.kind == MethodDefinition::Kind::Constructor) {
+        if (hasInstanceConstructor) {
+          return nullptr;
+        }
+        hasInstanceConstructor = true;
       }
     } else {
       // Field declaration
@@ -4172,15 +5880,55 @@ ExprPtr Parser::parseClassExpression() {
       if (match(TokenType::Equal)) {
         advance();
         method.initializer = parseAssignment();
+        if (!method.initializer) {
+          return nullptr;
+        }
       }
+      uint32_t fieldEndLine = tokens_[pos_ - 1].line;
+      bool consumedSemicolon = false;
       if (match(TokenType::Semicolon)) {
         advance();
+        consumedSemicolon = true;
+      }
+      if (!consumedSemicolon &&
+          !match(TokenType::RightBrace) &&
+          !match(TokenType::EndOfFile) &&
+          current().line == fieldEndLine) {
+        return nullptr;
       }
     }
 
+    if (method.isPrivate) {
+      if (!recordPrivateName(method)) {
+        return nullptr;
+      }
+    }
     methods.push_back(std::move(method));
   }
   expect(TokenType::RightBrace);
+
+  std::set<std::string> declaredPrivateNames;
+  for (const auto& kv : privateNameKinds) {
+    declaredPrivateNames.insert(kv.first);
+  }
+  for (const auto& m : methods) {
+    if (m.computedKey && expressionHasUndeclaredPrivateName(*m.computedKey, declaredPrivateNames)) {
+      return nullptr;
+    }
+    for (const auto& param : m.params) {
+      if (param.defaultValue && expressionHasUndeclaredPrivateName(*param.defaultValue, declaredPrivateNames)) {
+        return nullptr;
+      }
+    }
+    if (m.initializer && expressionHasUndeclaredPrivateName(*m.initializer, declaredPrivateNames)) {
+      return nullptr;
+    }
+    for (const auto& stmt : m.body) {
+      if (stmt && statementHasUndeclaredPrivateName(*stmt, declaredPrivateNames)) {
+        return nullptr;
+      }
+    }
+  }
 
   ClassExpr classExpr;
   classExpr.name = className;
@@ -4440,6 +6188,14 @@ ExprPtr Parser::parseObjectPattern() {
       std::string numVal = current().value;
       advance();
       key = std::make_unique<Expression>(NumberLiteral{std::stod(numVal)});
+    } else if (match(TokenType::BigInt)) {
+      std::string bigintVal = current().value;
+      advance();
+      bigint::BigIntValue parsed = 0;
+      if (!parseBigIntLiteral64(bigintVal, parsed)) {
+        return nullptr;
+      }
+      key = std::make_unique<Expression>(BigIntLiteral{parsed});
     } else {
       return nullptr;
     }

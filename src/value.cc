@@ -6,6 +6,8 @@
 #include <sstream>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+#include <cctype>
 
 namespace lightjs {
 
@@ -92,21 +94,44 @@ double Value::toNumber() const {
     } else if constexpr (std::is_same_v<T, double>) {
       return arg;
     } else if constexpr (std::is_same_v<T, BigInt>) {
-      return static_cast<double>(arg.value);
+      return arg.value.template convert_to<double>();
     } else if constexpr (std::is_same_v<T, std::string>) {
-      try {
-        return std::stod(arg);
-      } catch (...) {
+      size_t start = 0;
+      while (start < arg.size() &&
+             std::isspace(static_cast<unsigned char>(arg[start]))) {
+        start++;
+      }
+      size_t end = arg.size();
+      while (end > start &&
+             std::isspace(static_cast<unsigned char>(arg[end - 1]))) {
+        end--;
+      }
+      std::string s = arg.substr(start, end - start);
+      if (s.empty()) {
+        return 0.0;
+      }
+
+      char* parseEnd = nullptr;
+      double parsed = std::strtod(s.c_str(), &parseEnd);
+      if (parseEnd == s.c_str()) {
         return std::nan("");
       }
+      while (*parseEnd != '\0' &&
+             std::isspace(static_cast<unsigned char>(*parseEnd))) {
+        parseEnd++;
+      }
+      if (*parseEnd != '\0') {
+        return std::nan("");
+      }
+      return parsed;
     } else {
       return std::nan("");
     }
   }, data);
 }
 
-int64_t Value::toBigInt() const {
-  return std::visit([](auto&& arg) -> int64_t {
+bigint::BigIntValue Value::toBigInt() const {
+  return std::visit([](auto&& arg) -> bigint::BigIntValue {
     using T = std::decay_t<decltype(arg)>;
     if constexpr (std::is_same_v<T, Undefined>) {
       return 0;
@@ -115,15 +140,16 @@ int64_t Value::toBigInt() const {
     } else if constexpr (std::is_same_v<T, bool>) {
       return arg ? 1 : 0;
     } else if constexpr (std::is_same_v<T, double>) {
+      bigint::BigIntValue out = 0;
+      if (bigint::fromIntegralDouble(arg, out)) return out;
+      if (!std::isfinite(arg)) return 0;
       return static_cast<int64_t>(arg);
     } else if constexpr (std::is_same_v<T, BigInt>) {
       return arg.value;
     } else if constexpr (std::is_same_v<T, std::string>) {
-      try {
-        return std::stoll(arg);
-      } catch (...) {
-        return 0;
-      }
+      bigint::BigIntValue parsed = 0;
+      if (bigint::parseBigIntString(arg, parsed)) return parsed;
+      return 0;
     } else {
       return 0;
     }
@@ -144,7 +170,7 @@ std::string Value::toString() const {
       oss << arg;
       return oss.str();
     } else if constexpr (std::is_same_v<T, BigInt>) {
-      return std::to_string(arg.value);
+      return bigint::toString(arg.value);
     } else if constexpr (std::is_same_v<T, Symbol>) {
       return "Symbol(" + arg.description + ")";
     } else if constexpr (std::is_same_v<T, ModuleBinding>) {
@@ -191,7 +217,7 @@ std::string Value::toString() const {
 
 std::string Value::toDisplayString() const {
   if (isBigInt()) {
-    return std::to_string(std::get<BigInt>(data).value) + "n";
+    return bigint::toString(std::get<BigInt>(data).value) + "n";
   }
   return toString();
 }
@@ -898,6 +924,20 @@ Value Object_keys(const std::vector<Value>& args) {
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
   auto result = std::make_shared<Array>();
 
+  if (obj->isModuleNamespace) {
+    for (const auto& key : obj->moduleExportNames) {
+      auto getterIt = obj->properties.find("__get_" + key);
+      if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+        auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+        if (getter && getter->isNative) {
+          getter->nativeFunc({});
+        }
+      }
+      result->elements.push_back(Value(key));
+    }
+    return Value(result);
+  }
+
   for (const auto& [key, value] : obj->properties) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
@@ -999,14 +1039,20 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
     // Internal properties are not own properties
     if (isInternalProperty(key)) return Value(false);
-    return Value(fn->properties.find(key) != fn->properties.end());
+    if (fn->properties.find(key) != fn->properties.end()) return Value(true);
+    if (fn->properties.find("__get_" + key) != fn->properties.end()) return Value(true);
+    if (fn->properties.find("__set_" + key) != fn->properties.end()) return Value(true);
+    return Value(false);
   }
 
   // Handle Class objects
   if (args[0].isClass()) {
     auto cls = std::get<std::shared_ptr<Class>>(args[0].data);
     if (isInternalProperty(key)) return Value(false);
-    return Value(cls->properties.find(key) != cls->properties.end());
+    if (cls->properties.find(key) != cls->properties.end()) return Value(true);
+    if (cls->properties.find("__get_" + key) != cls->properties.end()) return Value(true);
+    if (cls->properties.find("__set_" + key) != cls->properties.end()) return Value(true);
+    return Value(false);
   }
 
   if (!args[0].isObject()) {
@@ -1019,13 +1065,27 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     if (key == WellKnownSymbols::toStringTagKey()) {
       return Value(true);
     }
-    return Value(std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
-                 obj->moduleExportNames.end());
+    bool isExport = std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
+                    obj->moduleExportNames.end();
+    if (!isExport) {
+      return Value(false);
+    }
+    auto getterIt = obj->properties.find("__get_" + key);
+    if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+      auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+      if (getter && getter->isNative) {
+        getter->nativeFunc({});
+      }
+    }
+    return Value(true);
   }
 
   // Internal properties are not own properties
   if (isInternalProperty(key)) return Value(false);
-  return Value(obj->properties.find(key) != obj->properties.end());
+  if (obj->properties.find(key) != obj->properties.end()) return Value(true);
+  if (obj->properties.find("__get_" + key) != obj->properties.end()) return Value(true);
+  if (obj->properties.find("__set_" + key) != obj->properties.end()) return Value(true);
+  return Value(false);
 }
 
 static bool isInternalProperty(const std::string& key) {

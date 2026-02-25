@@ -35,6 +35,10 @@ private:
   std::optional<Token> readRegex();
   std::optional<Token> readOperator();
 
+  // Parse \uXXXX or \u{XXXXXX} after the leading '\u' has been consumed.
+  // Throws std::runtime_error with errMsg on any parse or validity error.
+  uint32_t readUnicodeEscape(const std::string& errMsg);
+
   static bool isDigit(char c);
   static bool isAlpha(char c);
   static bool isAlphaNumeric(char c);

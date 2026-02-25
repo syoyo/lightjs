@@ -17,7 +17,7 @@ std::optional<wasm::WasmValue> wasm_js::valueToWasm(const Value& val) {
         }
         return wasm::WasmValue(d);
     } else if (std::holds_alternative<BigInt>(val.data)) {
-        return wasm::WasmValue(std::get<BigInt>(val.data).value);
+        return wasm::WasmValue(bigint::toInt64Trunc(std::get<BigInt>(val.data).value));
     } else if (std::holds_alternative<bool>(val.data)) {
         return wasm::WasmValue(static_cast<int32_t>(std::get<bool>(val.data)));
     }

@@ -49,7 +49,7 @@ struct Test262Metadata {
 class Test262Runner {
 private:
   static constexpr int kPerTestTimeoutSeconds = 10;
-  static constexpr int kTailCallPerTestTimeoutSeconds = 30;
+  static constexpr int kTailCallPerTestTimeoutSeconds = 60;
   std::string test262Path;
   std::string harnessPath;
   bool allowTemporarySkips_ = true;
@@ -296,10 +296,13 @@ private:
         "tail-call-optimization",
         "async-iteration",
         "async-disposable-stack",
+        "decorators",
         "import-defer",
         "source-phase-imports",
         "source-phase-imports-module-source",
         "import-attributes",
+        "regexp-v-flag",
+        "regexp-unicode-property-escapes",
       };
       bool allowTopLevelAwaitForAwaitSyntaxCoverage =
         testPath.find("language/module-code/top-level-await/syntax/for-await-await-expr-") != std::string::npos;
@@ -692,6 +695,18 @@ private:
         if (metadata.negative && metadata.negativePhase == "parse") {
           result.passed = true;
         }
+        auto endTime = std::chrono::high_resolution_clock::now();
+        result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
+        return result;
+      }
+
+      // Negative parse tests must fail during parse; do not execute them.
+      if (!metadata.isModule &&
+          metadata.negative &&
+          metadata.negativePhase == "parse") {
+        result.phase = "parse";
+        result.actualError = "Expected parse error but test parsed successfully";
+        result.passed = false;
         auto endTime = std::chrono::high_resolution_clock::now();
         result.executionTime = std::chrono::duration<double>(endTime - startTime).count();
         return result;

@@ -56,60 +56,6 @@ int digitValue(char c) {
   return -1;
 }
 
-// Parse a JS integer string into int64_t. Supports optional sign and 0x/0o/0b prefixes.
-// Values are reduced modulo 2^64 to keep the runtime stable on very large inputs.
-bool parseBigIntString64(const std::string& raw, int64_t& out) {
-  std::string s = trimAsciiWhitespace(raw);
-  if (s.empty()) {
-    out = 0;
-    return true;
-  }
-
-  bool negative = false;
-  bool hadSign = false;
-  size_t i = 0;
-  if (s[i] == '+' || s[i] == '-') {
-    hadSign = true;
-    negative = (s[i] == '-');
-    i++;
-  }
-  if (i >= s.size()) return false;
-
-  int base = 10;
-  if (i + 1 < s.size() && s[i] == '0') {
-    if (s[i + 1] == 'x' || s[i + 1] == 'X') {
-      if (hadSign) return false;
-      base = 16;
-      i += 2;
-    } else if (s[i + 1] == 'o' || s[i + 1] == 'O') {
-      if (hadSign) return false;
-      base = 8;
-      i += 2;
-    } else if (s[i + 1] == 'b' || s[i + 1] == 'B') {
-      if (hadSign) return false;
-      base = 2;
-      i += 2;
-    }
-  }
-  if (i >= s.size()) return false;
-
-  uint64_t value = 0;
-  bool sawDigit = false;
-  for (; i < s.size(); i++) {
-    int d = digitValue(s[i]);
-    if (d < 0 || d >= base) return false;
-    sawDigit = true;
-    value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
-  }
-  if (!sawDigit) return false;
-
-  uint64_t signedBits = value;
-  if (negative) {
-    signedBits = uint64_t{0} - signedBits;
-  }
-  out = static_cast<int64_t>(signedBits);
-  return true;
-}
 
 bool isModuleNamespaceExportKey(const std::shared_ptr<Object>& obj, const std::string& key) {
   return std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
@@ -124,17 +70,50 @@ bool isVisibleWithIdentifier(const std::string& name) {
   return !name.empty() && name.rfind("__", 0) != 0;
 }
 
+bool isBlockedByUnscopables(const std::shared_ptr<Object>& bindings, const std::string& name) {
+  if (!bindings || !isVisibleWithIdentifier(name)) {
+    return false;
+  }
+
+  const auto& unscopablesKey = WellKnownSymbols::unscopablesKey();
+  auto unscopablesIt = bindings->properties.find(unscopablesKey);
+  if (unscopablesIt == bindings->properties.end() || !unscopablesIt->second.isObject()) {
+    return false;
+  }
+
+  std::unordered_set<Object*> visited;
+  auto current = std::get<std::shared_ptr<Object>>(unscopablesIt->second.data);
+  int depth = 0;
+  while (current && depth < 64 && visited.insert(current.get()).second) {
+    auto it = current->properties.find(name);
+    if (it != current->properties.end()) {
+      return it->second.toBool();
+    }
+    auto protoIt = current->properties.find("__proto__");
+    if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
+      break;
+    }
+    current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    depth++;
+  }
+  return false;
+}
+
 std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std::string& name) {
   if (!isVisibleWithIdentifier(name) || !scopeValue.isObject()) {
     return std::nullopt;
   }
 
   std::unordered_set<Object*> visited;
-  auto current = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  auto bindings = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  auto current = bindings;
   int depth = 0;
   while (current && depth < 64 && visited.insert(current.get()).second) {
     auto it = current->properties.find(name);
     if (it != current->properties.end()) {
+      if (isBlockedByUnscopables(bindings, name)) {
+        return std::nullopt;
+      }
       return it->second;
     }
     auto protoIt = current->properties.find("__proto__");
@@ -153,6 +132,9 @@ bool setWithScopeProperty(const Value& scopeValue, const std::string& name, cons
   }
 
   auto receiver = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  if (isBlockedByUnscopables(receiver, name)) {
+    return false;
+  }
   std::unordered_set<Object*> visited;
   auto current = receiver;
   int depth = 0;
@@ -170,6 +152,152 @@ bool setWithScopeProperty(const Value& scopeValue, const std::string& name, cons
     depth++;
   }
   return false;
+}
+
+void collectVarNamesFromPattern(const Expression& pattern, std::vector<std::string>& names) {
+  if (auto* id = std::get_if<Identifier>(&pattern.node)) {
+    names.push_back(id->name);
+    return;
+  }
+  if (auto* assign = std::get_if<AssignmentPattern>(&pattern.node)) {
+    if (assign->left) {
+      collectVarNamesFromPattern(*assign->left, names);
+    }
+    return;
+  }
+  if (auto* arr = std::get_if<ArrayPattern>(&pattern.node)) {
+    for (const auto& elem : arr->elements) {
+      if (elem) {
+        collectVarNamesFromPattern(*elem, names);
+      }
+    }
+    if (arr->rest) {
+      collectVarNamesFromPattern(*arr->rest, names);
+    }
+    return;
+  }
+  if (auto* obj = std::get_if<ObjectPattern>(&pattern.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.value) {
+        collectVarNamesFromPattern(*prop.value, names);
+      }
+    }
+    if (obj->rest) {
+      collectVarNamesFromPattern(*obj->rest, names);
+    }
+  }
+}
+
+void collectVarNamesFromStatement(const Statement& stmt, std::vector<std::string>& names) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    if (varDecl->kind == VarDeclaration::Kind::Var) {
+      for (const auto& declarator : varDecl->declarations) {
+        if (declarator.pattern) {
+          collectVarNamesFromPattern(*declarator.pattern, names);
+        }
+      }
+    }
+    return;
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& inner : block->body) {
+      if (inner) {
+        collectVarNamesFromStatement(*inner, names);
+      }
+    }
+    return;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->consequent) {
+      collectVarNamesFromStatement(*ifStmt->consequent, names);
+    }
+    if (ifStmt->alternate) {
+      collectVarNamesFromStatement(*ifStmt->alternate, names);
+    }
+    return;
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->body) {
+      collectVarNamesFromStatement(*whileStmt->body, names);
+    }
+    return;
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body) {
+      collectVarNamesFromStatement(*doWhileStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init) {
+      collectVarNamesFromStatement(*forStmt->init, names);
+    }
+    if (forStmt->body) {
+      collectVarNamesFromStatement(*forStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left) {
+      collectVarNamesFromStatement(*forInStmt->left, names);
+    }
+    if (forInStmt->body) {
+      collectVarNamesFromStatement(*forInStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left) {
+      collectVarNamesFromStatement(*forOfStmt->left, names);
+    }
+    if (forOfStmt->body) {
+      collectVarNamesFromStatement(*forOfStmt->body, names);
+    }
+    return;
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    for (const auto& caseClause : switchStmt->cases) {
+      for (const auto& cons : caseClause.consequent) {
+        if (cons) {
+          collectVarNamesFromStatement(*cons, names);
+        }
+      }
+    }
+    return;
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& inner : tryStmt->block) {
+      if (inner) {
+        collectVarNamesFromStatement(*inner, names);
+      }
+    }
+    if (tryStmt->hasHandler) {
+      for (const auto& inner : tryStmt->handler.body) {
+        if (inner) {
+          collectVarNamesFromStatement(*inner, names);
+        }
+      }
+    }
+    if (tryStmt->hasFinalizer) {
+      for (const auto& inner : tryStmt->finalizer) {
+        if (inner) {
+          collectVarNamesFromStatement(*inner, names);
+        }
+      }
+    }
+    return;
+  }
+  if (auto* labelled = std::get_if<LabelledStmt>(&stmt.node)) {
+    if (labelled->body) {
+      collectVarNamesFromStatement(*labelled->body, names);
+    }
+    return;
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->body) {
+      collectVarNamesFromStatement(*withStmt->body, names);
+    }
+  }
 }
 
 bool defineModuleNamespaceProperty(const std::shared_ptr<Object>& obj,
@@ -304,6 +432,14 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
   }
 }
 
+void Environment::defineLexical(const std::string& name, const Value& value, bool isConst) {
+  bindings_[name] = value;
+  tdzBindings_.erase(name);
+  if (isConst) {
+    constants_[name] = true;
+  }
+}
+
 void Environment::defineTDZ(const std::string& name) {
   bindings_[name] = Value(Undefined{});
   tdzBindings_[name] = true;
@@ -351,6 +487,16 @@ bool Environment::set(const std::string& name, const Value& value) {
       return false;
     }
     bindings_[name] = value;
+    // Keep existing global object properties in sync with root-scope bindings.
+    if (!parent_) {
+      auto globalIt = bindings_.find("globalThis");
+      if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+        auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+        if (globalObj->properties.find(name) != globalObj->properties.end()) {
+          globalObj->properties[name] = value;
+        }
+      }
+    }
     return true;
   }
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
@@ -377,6 +523,10 @@ bool Environment::has(const std::string& name) const {
     return parent_->has(name);
   }
   return false;
+}
+
+bool Environment::hasLocal(const std::string& name) const {
+  return bindings_.find(name) != bindings_.end();
 }
 
 bool Environment::isConst(const std::string& name) const {
@@ -549,6 +699,20 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("SyntaxError: Parse error");
     }
 
+    if (prevInterpreter->inDirectEvalInvocation()) {
+      std::vector<std::string> varNames;
+      for (const auto& stmt : program->body) {
+        if (stmt) {
+          collectVarNamesFromStatement(*stmt, varNames);
+        }
+      }
+      for (const auto& varName : varNames) {
+        if (evalEnv->isTDZ(varName)) {
+          throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
+        }
+      }
+    }
+
     Interpreter evalInterpreter(evalEnv);
     Value result = Value(Undefined{});
     try {
@@ -584,6 +748,20 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   symbolFn->properties["toStringTag"] = WellKnownSymbols::toStringTag();
   symbolFn->properties["toPrimitive"] = WellKnownSymbols::toPrimitive();
   symbolFn->properties["matchAll"] = WellKnownSymbols::matchAll();
+  symbolFn->properties["unscopables"] = WellKnownSymbols::unscopables();
+  // Well-known symbol properties on Symbol are non-writable and non-configurable.
+  symbolFn->properties["__non_writable_iterator"] = Value(true);
+  symbolFn->properties["__non_configurable_iterator"] = Value(true);
+  symbolFn->properties["__non_writable_asyncIterator"] = Value(true);
+  symbolFn->properties["__non_configurable_asyncIterator"] = Value(true);
+  symbolFn->properties["__non_writable_toStringTag"] = Value(true);
+  symbolFn->properties["__non_configurable_toStringTag"] = Value(true);
+  symbolFn->properties["__non_writable_toPrimitive"] = Value(true);
+  symbolFn->properties["__non_configurable_toPrimitive"] = Value(true);
+  symbolFn->properties["__non_writable_matchAll"] = Value(true);
+  symbolFn->properties["__non_configurable_matchAll"] = Value(true);
+  symbolFn->properties["__non_writable_unscopables"] = Value(true);
+  symbolFn->properties["__non_configurable_unscopables"] = Value(true);
   env->define("Symbol", Value(symbolFn));
 
   // BigInt constructor/function
@@ -759,7 +937,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     throw std::runtime_error("TypeError: Cannot convert object to primitive value");
   };
 
-  auto toBigIntFromPrimitive = [](const Value& v) -> int64_t {
+  auto toBigIntFromPrimitive = [](const Value& v) -> bigint::BigIntValue {
     if (v.isBigInt()) {
       return v.toBigInt();
     }
@@ -767,8 +945,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return v.toBool() ? 1 : 0;
     }
     if (v.isString()) {
-      int64_t parsed = 0;
-      if (!parseBigIntString64(std::get<std::string>(v.data), parsed)) {
+      bigint::BigIntValue parsed = 0;
+      if (!bigint::parseBigIntString(std::get<std::string>(v.data), parsed)) {
         throw std::runtime_error("SyntaxError: Cannot convert string to BigInt");
       }
       return parsed;
@@ -776,7 +954,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     throw std::runtime_error("TypeError: Cannot convert value to BigInt");
   };
 
-  auto toBigIntFromValue = [toPrimitive, toBigIntFromPrimitive](const Value& v) -> int64_t {
+  auto toBigIntFromValue = [toPrimitive, toBigIntFromPrimitive](const Value& v) -> bigint::BigIntValue {
     Value primitive = toPrimitive(v, false);
     return toBigIntFromPrimitive(primitive);
   };
@@ -798,7 +976,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return static_cast<uint64_t>(n);
   };
 
-  auto thisBigIntValue = [](const Value& thisValue) -> int64_t {
+  auto thisBigIntValue = [](const Value& thisValue) -> bigint::BigIntValue {
     if (thisValue.isBigInt()) {
       return thisValue.toBigInt();
     }
@@ -812,30 +990,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     throw std::runtime_error("TypeError: BigInt method called on incompatible receiver");
   };
 
-  auto formatBigInt = [](int64_t value, int radix) -> std::string {
-    if (radix == 10) {
-      return std::to_string(value);
-    }
-
-    bool negative = value < 0;
-    uint64_t magnitude = negative
-      ? static_cast<uint64_t>(-(value + 1)) + 1
-      : static_cast<uint64_t>(value);
-
-    if (magnitude == 0) {
-      return "0";
-    }
-
-    static const std::string digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    std::string out;
-    while (magnitude > 0) {
-      uint64_t digit = magnitude % static_cast<uint64_t>(radix);
-      out.push_back(digits[static_cast<size_t>(digit)]);
-      magnitude /= static_cast<uint64_t>(radix);
-    }
-    std::reverse(out.begin(), out.end());
-    if (negative) out.insert(out.begin(), '-');
-    return out;
+  auto formatBigInt = [](const bigint::BigIntValue& value, int radix) -> std::string {
+    return bigint::toString(value, radix);
   };
 
   bigIntFn->nativeFunc = [toPrimitive, toBigIntFromPrimitive](const std::vector<Value>& args) -> Value {
@@ -849,7 +1005,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (!std::isfinite(n) || std::floor(n) != n) {
         throw std::runtime_error("RangeError: Cannot convert Number to BigInt");
       }
-      return Value(BigInt(static_cast<int64_t>(n)));
+      bigint::BigIntValue converted = 0;
+      if (!bigint::fromIntegralDouble(n, converted)) {
+        throw std::runtime_error("RangeError: Cannot convert Number to BigInt");
+      }
+      return Value(BigInt(converted));
     }
 
     return Value(BigInt(toBigIntFromPrimitive(primitive)));
@@ -865,18 +1025,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   asUintN->properties["length"] = Value(2.0);
   asUintN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
     uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
-    int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
-
-    if (bits == 0) {
-      return Value(BigInt(0));
-    }
-
-    uint64_t u = static_cast<uint64_t>(n);
-    if (bits < 64) {
-      uint64_t mask = (uint64_t{1} << bits) - 1;
-      u &= mask;
-    }
-    return Value(BigInt(static_cast<int64_t>(u)));
+    auto n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
+    return Value(BigInt(bigint::asUintN(bits, n)));
   };
   bigIntFn->properties["asUintN"] = Value(asUintN);
 
@@ -887,22 +1037,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   asIntN->properties["length"] = Value(2.0);
   asIntN->nativeFunc = [toIndex, toBigIntFromValue](const std::vector<Value>& args) -> Value {
     uint64_t bits = toIndex(args.empty() ? Value(Undefined{}) : args[0]);
-    int64_t n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
-
-    if (bits == 0) {
-      return Value(BigInt(0));
-    }
-
-    uint64_t u = static_cast<uint64_t>(n);
-    if (bits < 64) {
-      uint64_t mask = (uint64_t{1} << bits) - 1;
-      u &= mask;
-      uint64_t signBit = uint64_t{1} << (bits - 1);
-      if (u & signBit) {
-        u |= ~mask;
-      }
-    }
-    return Value(BigInt(static_cast<int64_t>(u)));
+    auto n = toBigIntFromValue(args.size() > 1 ? args[1] : Value(Undefined{}));
+    return Value(BigInt(bigint::asIntN(bits, n)));
   };
   bigIntFn->properties["asIntN"] = Value(asIntN);
 
@@ -919,7 +1055,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: BigInt.prototype.toString requires BigInt");
     }
 
-    int64_t n = thisBigIntValue(args[0]);
+    auto n = thisBigIntValue(args[0]);
     int radix = 10;
     if (args.size() > 1 && !args[1].isUndefined()) {
       radix = static_cast<int>(std::trunc(args[1].toNumber()));
@@ -955,7 +1091,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty()) {
       throw std::runtime_error("TypeError: BigInt.prototype.toLocaleString requires BigInt");
     }
-    return Value(std::to_string(thisBigIntValue(args[0])));
+    return Value(bigint::toString(thisBigIntValue(args[0])));
   };
   bigIntProto->properties["toLocaleString"] = Value(bigIntProtoToLocaleString);
 
@@ -1849,6 +1985,34 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     bool global = regexPtr->flags.find('g') != std::string::npos;
     bool unicodeMode = regexPtr->flags.find('u') != std::string::npos ||
                        regexPtr->flags.find('v') != std::string::npos;
+    auto utf16IndexFromEngineOffset = [&input](size_t rawOffset) -> double {
+      auto accumulateUtf16ByCodePointCount = [&input](size_t codePointCountTarget) -> size_t {
+        size_t cursor = 0;
+        size_t codePointCount = 0;
+        size_t utf16Units = 0;
+        while (cursor < input.size() && codePointCount < codePointCountTarget) {
+          uint32_t codePoint = unicode::decodeUTF8(input, cursor);
+          utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+          codePointCount++;
+        }
+        return utf16Units;
+      };
+
+      // Some regex backends report byte offsets, others effectively report code point offsets.
+      // If the offset lands inside a UTF-8 sequence, treat it as a code point count.
+      if (rawOffset < input.size() &&
+          unicode::isContinuationByte(static_cast<uint8_t>(input[rawOffset]))) {
+        return static_cast<double>(accumulateUtf16ByCodePointCount(rawOffset));
+      }
+
+      size_t cursor = 0;
+      size_t utf16Units = 0;
+      while (cursor < rawOffset && cursor < input.size()) {
+        uint32_t codePoint = unicode::decodeUTF8(input, cursor);
+        utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+      }
+      return static_cast<double>(utf16Units);
+    };
 
     auto allMatches = std::make_shared<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
@@ -1859,16 +2023,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::vector<simple_regex::Regex::Match> matches;
     while (regexPtr->regex->search(remaining, matches)) {
       if (matches.empty()) break;
-      auto matchObj = std::make_shared<Object>();
-      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      auto matchArr = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = 0; i < matches.size(); ++i) {
-        matchObj->properties[std::to_string(i)] = Value(matches[i].str);
+        matchArr->elements.push_back(Value(matches[i].str));
       }
       size_t matchStartBytes = offsetBytes + matches[0].start;
-      double matchIndex = static_cast<double>(unicode::utf8Length(input.substr(0, matchStartBytes)));
-      matchObj->properties["index"] = Value(matchIndex);
-      matchObj->properties["input"] = Value(input);
-      allMatches->elements.push_back(Value(matchObj));
+      double matchIndex = utf16IndexFromEngineOffset(matchStartBytes);
+      matchArr->properties["index"] = Value(matchIndex);
+      matchArr->properties["input"] = Value(input);
+      allMatches->elements.push_back(Value(matchArr));
 
       if (!global) break;
 
@@ -1892,16 +2056,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string::const_iterator searchStart = input.cbegin();
     std::smatch match;
     while (std::regex_search(searchStart, input.cend(), match, regexPtr->regex)) {
-      auto matchObj = std::make_shared<Object>();
-      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      auto matchArr = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = 0; i < match.size(); ++i) {
-        matchObj->properties[std::to_string(i)] = Value(match[i].str());
+        matchArr->elements.push_back(Value(match[i].str()));
       }
       size_t matchStartBytes = static_cast<size_t>(match.position() + (searchStart - input.cbegin()));
-      double matchIndex = static_cast<double>(unicode::utf8Length(input.substr(0, matchStartBytes)));
-      matchObj->properties["index"] = Value(matchIndex);
-      matchObj->properties["input"] = Value(input);
-      allMatches->elements.push_back(Value(matchObj));
+      double matchIndex = utf16IndexFromEngineOffset(matchStartBytes);
+      matchArr->properties["index"] = Value(matchIndex);
+      matchArr->properties["input"] = Value(input);
+      allMatches->elements.push_back(Value(matchArr));
 
       if (!global) break;
       searchStart = match.suffix().first;
@@ -2745,6 +2909,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     auto arrayProtoIterator = std::make_shared<Function>();
     arrayProtoIterator->isNative = true;
     arrayProtoIterator->properties["__uses_this_arg__"] = Value(true);
+    arrayProtoIterator->properties["__builtin_array_iterator__"] = Value(true);
     arrayProtoIterator->nativeFunc = [](const std::vector<Value>& args) -> Value {
       if (args.empty() || !args[0].isArray()) {
         return Value(Undefined{});
@@ -4245,8 +4410,39 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       auto enumIt = fn->properties.find("__enum_" + key);
       return Value(enumIt != fn->properties.end());
     }
+    if (thisVal.isClass()) {
+      auto cls = std::get<std::shared_ptr<Class>>(thisVal.data);
+      // Internal properties
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") return Value(false);
+      if (key.size() > 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) return Value(false);
+      if (key.size() > 10 && key.substr(0, 10) == "__non_enum") return Value(false);
+      if (key.size() > 14 && key.substr(0, 14) == "__non_writable") return Value(false);
+      if (key.size() > 18 && key.substr(0, 18) == "__non_configurable") return Value(false);
+      auto it = cls->properties.find(key);
+      if (it == cls->properties.end()) return Value(false);
+      auto enumIt = cls->properties.find("__enum_" + key);
+      return Value(enumIt != cls->properties.end());
+    }
     if (thisVal.isObject()) {
       auto obj = std::get<std::shared_ptr<Object>>(thisVal.data);
+      if (obj->isModuleNamespace) {
+        if (key == WellKnownSymbols::toStringTagKey()) {
+          return Value(false);
+        }
+        bool isExport = isModuleNamespaceExportKey(obj, key);
+        if (!isExport) {
+          return Value(false);
+        }
+        auto getterIt = obj->properties.find("__get_" + key);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+          if (getter && getter->isNative) {
+            getter->nativeFunc({});
+          }
+        }
+        return Value(true);
+      }
       // Internal properties
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
           key.substr(key.size() - 2) == "__") return Value(false);
@@ -4308,6 +4504,42 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectGetOwnPropertyNames->nativeFunc = Object_getOwnPropertyNames;
   objectConstructor->properties["getOwnPropertyNames"] = Value(objectGetOwnPropertyNames);
 
+  auto objectGetOwnPropertySymbols = std::make_shared<Function>();
+  objectGetOwnPropertySymbols->isNative = true;
+  objectGetOwnPropertySymbols->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto result = std::make_shared<Array>();
+    if (args.empty() || !args[0].isObject()) {
+      return Value(result);
+    }
+    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto appendSymbolForKey = [&](const std::string& key) {
+      if (key == WellKnownSymbols::iteratorKey()) {
+        result->elements.push_back(WellKnownSymbols::iterator());
+      } else if (key == WellKnownSymbols::asyncIteratorKey()) {
+        result->elements.push_back(WellKnownSymbols::asyncIterator());
+      } else if (key == WellKnownSymbols::toStringTagKey()) {
+        result->elements.push_back(WellKnownSymbols::toStringTag());
+      } else if (key == WellKnownSymbols::toPrimitiveKey()) {
+        result->elements.push_back(WellKnownSymbols::toPrimitive());
+      } else if (key == WellKnownSymbols::matchAllKey()) {
+        result->elements.push_back(WellKnownSymbols::matchAll());
+      } else if (key.size() >= 8 && key.rfind("Symbol(", 0) == 0 && key.back() == ')') {
+        result->elements.push_back(Value(Symbol(key.substr(7, key.size() - 8))));
+      }
+    };
+
+    if (obj->isModuleNamespace) {
+      appendSymbolForKey(WellKnownSymbols::toStringTagKey());
+      return Value(result);
+    }
+
+    for (const auto& [key, _] : obj->properties) {
+      appendSymbolForKey(key);
+    }
+    return Value(result);
+  };
+  objectConstructor->properties["getOwnPropertySymbols"] = Value(objectGetOwnPropertySymbols);
+
   // Object.create
   auto objectCreate = std::make_shared<Function>();
   objectCreate->isNative = true;
@@ -4332,7 +4564,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         if (key == WellKnownSymbols::toStringTagKey()) {
           return Value(true);
         }
-        return Value(isModuleNamespaceExportKey(obj, key));
+        if (!isModuleNamespaceExportKey(obj, key)) {
+          return Value(false);
+        }
+        auto getterIt = obj->properties.find("__get_" + key);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+          if (getter && getter->isNative) {
+            getter->nativeFunc({});
+          }
+        }
+        return Value(true);
       }
       return Value(obj->properties.find(key) != obj->properties.end());
     }
@@ -4508,6 +4750,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
     auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    if (obj->isModuleNamespace) {
+      throw std::runtime_error("TypeError: Cannot freeze module namespace object");
+    }
     obj->frozen = true;
     obj->sealed = true;  // Frozen objects are also sealed
     return args[0];
@@ -4622,11 +4867,22 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           key.substr(key.size() - 2) == "__") {
         return Value(Undefined{});
       }
+      auto getterIt = cls->properties.find("__get_" + key);
+      if (getterIt != cls->properties.end() && getterIt->second.isFunction()) {
+        descriptor->properties["get"] = getterIt->second;
+      }
+      auto setterIt = cls->properties.find("__set_" + key);
+      if (setterIt != cls->properties.end() && setterIt->second.isFunction()) {
+        descriptor->properties["set"] = setterIt->second;
+      }
+
       auto it = cls->properties.find(key);
-      if (it == cls->properties.end()) {
+      if (it == cls->properties.end() && getterIt == cls->properties.end() && setterIt == cls->properties.end()) {
         return Value(Undefined{});
       }
-      descriptor->properties["value"] = it->second;
+      if (it != cls->properties.end()) {
+        descriptor->properties["value"] = it->second;
+      }
       // Check for per-property attribute markers
       if (key == "name" || key == "length") {
         // Default: non-writable, non-enumerable, configurable
@@ -4760,12 +5016,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       auto getterIt2 = obj->properties.find("__get_" + key);
+      auto setterIt2 = obj->properties.find("__set_" + key);
       auto it = obj->properties.find(key);
-      if (it == obj->properties.end() && getterIt2 == obj->properties.end()) {
+      if (it == obj->properties.end() && getterIt2 == obj->properties.end() && setterIt2 == obj->properties.end()) {
         return Value(Undefined{});
       }
       if (getterIt2 != obj->properties.end() && getterIt2->second.isFunction()) {
         descriptor->properties["get"] = getterIt2->second;
+      }
+      if (setterIt2 != obj->properties.end() && setterIt2->second.isFunction()) {
+        descriptor->properties["set"] = setterIt2->second;
       }
       if (it != obj->properties.end()) {
         descriptor->properties["value"] = it->second;
@@ -5570,6 +5830,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // AbortController and AbortSignal
   auto abortControllerCtor = std::make_shared<Function>();
   abortControllerCtor->isNative = true;
+  abortControllerCtor->isConstructor = true;
   abortControllerCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto controller = std::make_shared<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
@@ -5812,8 +6073,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["performance"] = Value(performanceObj);
 
   // structuredClone - deep clone objects, arrays, and primitives
-  std::function<Value(const Value&)> deepClone;
-  deepClone = [&deepClone](const Value& val) -> Value {
+  // Use heap-owned recursion so callable lifetime remains valid after this setup scope.
+  auto deepClone = std::make_shared<std::function<Value(const Value&)>>();
+  *deepClone = [deepClone](const Value& val) -> Value {
     // Primitives are returned as-is (they're already copies)
     if (val.isUndefined() || val.isNull() || val.isBool() ||
         val.isNumber() || val.isString() || val.isBigInt() || val.isSymbol()) {
@@ -5826,7 +6088,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       auto newArr = std::make_shared<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (const auto& elem : arr->elements) {
-        newArr->elements.push_back(deepClone(elem));
+        newArr->elements.push_back((*deepClone)(elem));
       }
       return Value(newArr);
     }
@@ -5837,7 +6099,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       auto newObj = std::make_shared<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       for (const auto& [key, value] : obj->properties) {
-        newObj->properties[key] = deepClone(value);
+        newObj->properties[key] = (*deepClone)(value);
       }
       return Value(newObj);
     }
@@ -5850,7 +6112,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   structuredCloneFn->isNative = true;
   structuredCloneFn->nativeFunc = [deepClone](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Undefined{});
-    return deepClone(args[0]);
+    return (*deepClone)(args[0]);
   };
   env->define("structuredClone", Value(structuredCloneFn));
   globalThisObj->properties["structuredClone"] = Value(structuredCloneFn);

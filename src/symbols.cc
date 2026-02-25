@@ -52,4 +52,14 @@ const std::string& WellKnownSymbols::matchAllKey() {
   return key;
 }
 
+const Value& WellKnownSymbols::unscopables() {
+  static Value symbolUnscopables(Symbol("Symbol.unscopables"));
+  return symbolUnscopables;
+}
+
+const std::string& WellKnownSymbols::unscopablesKey() {
+  static const std::string key = WellKnownSymbols::unscopables().toString();
+  return key;
+}
+
 }

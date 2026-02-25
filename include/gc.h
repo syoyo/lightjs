@@ -29,15 +29,15 @@ struct MemoryLimits {
 };
 
 // Forward declarations
-class Value;
-class Object;
-class Array;
-class Function;
-class TypedArray;
-class Promise;
-class Regex;
-class GCObject;
-class Module;
+struct Value;
+struct Object;
+struct Array;
+struct Function;
+struct TypedArray;
+struct Promise;
+struct Regex;
+struct GCObject;
+struct Module;
 
 // Garbage Collection Statistics
 struct GCStats {

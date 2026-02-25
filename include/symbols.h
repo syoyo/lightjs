@@ -16,6 +16,8 @@ public:
   static const std::string& toPrimitiveKey();
   static const Value& matchAll();
   static const std::string& matchAllKey();
+  static const Value& unscopables();
+  static const std::string& unscopablesKey();
 };
 
 }

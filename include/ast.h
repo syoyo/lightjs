@@ -6,6 +6,7 @@
 #include <variant>
 #include <optional>
 #include <cstdint>
+#include "bigint.h"
 #include "object_shape.h"
 
 namespace lightjs {
@@ -34,7 +35,7 @@ struct NumberLiteral {
 };
 
 struct BigIntLiteral {
-  int64_t value;
+  bigint::BigIntValue value;
 };
 
 struct StringLiteral {
@@ -179,13 +180,23 @@ struct MethodDefinition {
   enum class Kind { Constructor, Method, Get, Set, Field };
   Kind kind;
   Identifier key;
-  std::vector<Identifier> params;
+  ExprPtr computedKey;  // For computed property names in class elements ([expr])
+  std::vector<Parameter> params;
+  std::optional<Identifier> restParam;  // Rest parameter (...args)
   std::vector<StmtPtr> body;
   ExprPtr initializer;  // For field initializers (Kind::Field)
   bool isStatic;
   bool isAsync;
+  bool isGenerator;
   bool isPrivate;
-  MethodDefinition() : kind(Kind::Method), isStatic(false), isAsync(false), isPrivate(false) {}
+  bool computed;
+  MethodDefinition()
+      : kind(Kind::Method),
+        isStatic(false),
+        isAsync(false),
+        isGenerator(false),
+        isPrivate(false),
+        computed(false) {}
 
   // Add move constructor and assignment
   MethodDefinition(MethodDefinition&&) = default;
@@ -416,6 +427,7 @@ struct ExportNamedDeclaration {
 
 struct ExportDefaultDeclaration {
   ExprPtr declaration;  // can be expression or function/class
+  bool isHoistableDeclaration = false;
 };
 
 struct ExportAllDeclaration {

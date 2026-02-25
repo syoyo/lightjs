@@ -23,6 +23,7 @@ private:
   int functionDepth_ = 0;
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
+  std::vector<bool> awaitContextStack_;
   size_t arrowDestructureTempCounter_ = 0;
 
   const Token& current() const;
@@ -31,12 +32,13 @@ private:
   bool match(TokenType type) const;
   bool expect(TokenType type);
   void consumeSemicolon();
+  bool consumeSemicolonOrASI();
   bool canUseAwaitAsIdentifier() const;
   bool canParseAwaitExpression() const;
   bool canUseYieldAsIdentifier() const;
   bool isIdentifierLikeToken(TokenType type) const;
 
-  StmtPtr parseStatement();
+  StmtPtr parseStatement(bool allowModuleItem = false);
   StmtPtr parseVarDeclaration();
   StmtPtr parseFunctionDeclaration();
   StmtPtr parseClassDeclaration();

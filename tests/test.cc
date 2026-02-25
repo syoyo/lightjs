@@ -7,7 +7,14 @@
 
 using namespace lightjs;
 
-void runTest(const std::string& name, const std::string& code, const std::string& expected = "", bool isModule = false) {
+namespace {
+int gTotalTests = 0;
+int gFailedTests = 0;
+}
+
+void runTest(const std::string& name, const std::string& code, const std::string& expected = "",
+             bool isModule = false) {
+  gTotalTests++;
   std::cout << "Test: " << name << std::endl;
 
   try {
@@ -19,6 +26,7 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
     if (!program) {
       std::cout << "  Parse error!" << std::endl;
+      gFailedTests++;
       return;
     }
 
@@ -27,17 +35,19 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
     auto task = interpreter.evaluate(*program);
 
-        Value result;
+    Value result;
     LIGHTJS_RUN_TASK(task, result);
     std::cout << "  Result: " << result.toDisplayString() << std::endl;
 
     if (!expected.empty() && result.toDisplayString() != expected) {
       std::cout << "  FAILED! Expected: " << expected << std::endl;
+      gFailedTests++;
     } else {
       std::cout << "  PASSED" << std::endl;
     }
   } catch (const std::exception& e) {
     std::cout << "  Error: " << e.what() << std::endl;
+    gFailedTests++;
   }
 
   std::cout << std::endl;
@@ -1015,8 +1025,8 @@ int main() {
     modulePromise.toString()
   )", "[Promise]");
 
-  runTest("Dynamic import - without argument returns Promise", R"(
-    const p = import();
+  runTest("Dynamic import - undefined specifier returns Promise", R"(
+    const p = import(undefined);
     p.toString()
   )", "[Promise]");
 
@@ -1661,17 +1671,44 @@ int main() {
   // import.meta - ES2020
   runTest("import.meta exists", R"(
     typeof import.meta
-  )", "object");
+  )", "object", true);
 
   runTest("import.meta.url exists", R"(
     typeof import.meta.url
-  )", "string");
+  )", "string", true);
 
   runTest("import.meta.resolve exists", R"(
     typeof import.meta.resolve
-  )", "function");
+  )", "function", true);
+
+  // Generator methods: parameter destructuring errors occur at call time.
+  runTest("Generator Param Destructure Throws On Call", R"(
+    function* boom() { throw 1; }
+    class C { *g([, ...x]) {} }
+    try {
+      new C().g(boom());
+      "bad";
+    } catch (e) {
+      e === 1 ? "ok" : "bad";
+    }
+  )", "ok");
+
+  // Array destructuring must use Array.prototype[Symbol.iterator] (including overrides).
+  runTest("Array Destructure Uses Overridden Iterator", R"(
+    Array.prototype[Symbol.iterator] = function* () {
+      if (this.length > 0) yield this[0];
+      if (this.length > 1) yield this[1];
+      if (this.length > 2) yield 42;
+    };
+    class C {
+      m([x, y, z] = [1, 2, 3]) { return z; }
+    }
+    new C().m()
+  )", "42");
 
   std::cout << "=== All tests completed ===" << std::endl;
+  std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests
+            << " passed, " << gFailedTests << " failed" << std::endl;
 
-  return 0;
+  return gFailedTests == 0 ? 0 : 1;
 }

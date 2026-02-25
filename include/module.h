@@ -55,6 +55,10 @@ public:
   bool isAsyncModule() const { return isAsync_; }
 
 private:
+  bool hasExport(const std::string& name) const;
+  std::vector<std::string> getExportNames() const;
+  bool initializeDeclaredExports(Interpreter* interpreter);
+  bool rebuildIndirectExports();
   bool resumeEvaluation(Interpreter* interpreter);
   bool evaluateBody(Interpreter* interpreter);
   void scheduleResume(Interpreter* interpreter);

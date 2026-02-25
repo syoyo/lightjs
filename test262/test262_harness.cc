@@ -136,9 +136,13 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   auto Test262Error = std::make_shared<Function>();
   Test262Error->isNative = true;
   Test262Error->isConstructor = true;
-  Test262Error->properties["prototype"] = Value(std::make_shared<Object>());
-  Test262Error->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  auto test262ErrorProto = std::make_shared<Object>();
+  test262ErrorProto->properties["constructor"] = Value(Test262Error);
+  Test262Error->properties["prototype"] = Value(test262ErrorProto);
+  Test262Error->nativeFunc = [Test262Error, test262ErrorProto](const std::vector<Value>& args) -> Value {
     auto error = std::make_shared<Object>();
+    error->properties["__proto__"] = Value(test262ErrorProto);
+    error->properties["constructor"] = Value(Test262Error);
     error->properties["message"] = args.empty() ? Value(std::string("")) : args[0];
     error->properties["name"] = Value(std::string("Test262Error"));
     return Value(error);
@@ -377,32 +381,63 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   };
   assertCallable->properties["throws"] = Value(throws);
 
-  // compareArray helper
-  auto compareArray = std::make_shared<Function>();
-  compareArray->isNative = true;
-  compareArray->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2) return Value(false);
-
-    auto* arr1 = std::get_if<std::shared_ptr<Array>>(&args[0].data);
-    auto* arr2 = std::get_if<std::shared_ptr<Array>>(&args[1].data);
-
-    if (!arr1 || !arr2) return Value(false);
-    if ((*arr1)->elements.size() != (*arr2)->elements.size()) return Value(false);
-
+  auto arraysEqual = [](const Value& lhs, const Value& rhs) -> bool {
+    auto* arr1 = std::get_if<std::shared_ptr<Array>>(&lhs.data);
+    auto* arr2 = std::get_if<std::shared_ptr<Array>>(&rhs.data);
+    if (!arr1 || !arr2) return false;
+    if ((*arr1)->elements.size() != (*arr2)->elements.size()) return false;
     for (size_t i = 0; i < (*arr1)->elements.size(); i++) {
       if ((*arr1)->elements[i].toString() != (*arr2)->elements[i].toString()) {
-        return Value(false);
+        return false;
       }
     }
-
-    return Value(true);
+    return true;
   };
 
-  assertCallable->properties["compareArray"] = Value(compareArray);
+  // assert.compareArray(actual, expected[, message])
+  // Test262 expects this to return `undefined` on success and throw on mismatch.
+  auto assertCompareArray = std::make_shared<Function>();
+  assertCompareArray->isNative = true;
+  assertCompareArray->nativeFunc = [arraysEqual](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) {
+      throw std::runtime_error("assert.compareArray requires at least 2 arguments");
+    }
+    if (!arraysEqual(args[0], args[1])) {
+      std::string message = args.size() > 2 ? args[2].toString() : "Array comparison failed";
+      auto* arr1 = std::get_if<std::shared_ptr<Array>>(&args[0].data);
+      auto* arr2 = std::get_if<std::shared_ptr<Array>>(&args[1].data);
+      if (!arr1 || !arr2) {
+        throw std::runtime_error("AssertionError: " + message + " (non-array operand)");
+      }
+      size_t len1 = (*arr1)->elements.size();
+      size_t len2 = (*arr2)->elements.size();
+      size_t minLen = std::min(len1, len2);
+      for (size_t i = 0; i < minLen; i++) {
+        std::string lhs = (*arr1)->elements[i].toString();
+        std::string rhs = (*arr2)->elements[i].toString();
+        if (lhs != rhs) {
+          throw std::runtime_error(
+            "AssertionError: " + message + " (index " + std::to_string(i) +
+            ": got '" + lhs + "', expected '" + rhs + "')");
+        }
+      }
+      throw std::runtime_error(
+        "AssertionError: " + message + " (length " + std::to_string(len1) +
+        " !== " + std::to_string(len2) + ")");
+    }
+    return Value(Undefined{});
+  };
+  assertCallable->properties["compareArray"] = Value(assertCompareArray);
 
   env->define("assert", Value(assertCallable));
 
-  // compareArray global function
+  // Legacy global compareArray helper returns boolean.
+  auto compareArray = std::make_shared<Function>();
+  compareArray->isNative = true;
+  compareArray->nativeFunc = [arraysEqual](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(false);
+    return Value(arraysEqual(args[0], args[1]));
+  };
   env->define("compareArray", Value(compareArray));
 
   // $DONE function for async tests

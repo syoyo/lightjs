@@ -14,6 +14,53 @@ int hexDigitValue(char c) {
   return -1;
 }
 
+bool isSurrogateCodePoint(uint32_t codepoint) {
+  return codepoint >= 0xD800 && codepoint <= 0xDFFF;
+}
+
+bool isDisallowedIdentifierCodePoint(uint32_t codepoint) {
+  // Treat some code points as never-valid in identifiers. This matches existing
+  // non-escaped identifier scanning which breaks on these sequences.
+  return codepoint == 0x00A0 ||  // NO-BREAK SPACE
+         codepoint == 0x2028 ||  // LINE SEPARATOR
+         codepoint == 0x2029 ||  // PARAGRAPH SEPARATOR
+         codepoint == 0xFEFF;    // BOM
+}
+
+bool isIdentifierStartCodePoint(uint32_t codepoint) {
+  // Minimal IdentifierStart check for code points produced by \u escapes.
+  // This intentionally doesn't implement full Unicode ID_Start, but it does
+  // correctly handle ZWNJ/ZWJ positioning and common early errors in Test262.
+  if (codepoint > 0x10FFFF || isSurrogateCodePoint(codepoint) || isDisallowedIdentifierCodePoint(codepoint)) {
+    return false;
+  }
+  if (codepoint <= 0x7F) {
+    char c = static_cast<char>(codepoint);
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+  }
+  // ZWNJ/ZWJ are IdentifierPart only.
+  if (codepoint == 0x200C || codepoint == 0x200D) {
+    return false;
+  }
+  return true;
+}
+
+bool isIdentifierPartCodePoint(uint32_t codepoint) {
+  if (codepoint > 0x10FFFF || isSurrogateCodePoint(codepoint) || isDisallowedIdentifierCodePoint(codepoint)) {
+    return false;
+  }
+  if (codepoint <= 0x7F) {
+    char c = static_cast<char>(codepoint);
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '$';
+  }
+  // ZWNJ/ZWJ are explicitly allowed in IdentifierPart.
+  if (codepoint == 0x200C || codepoint == 0x200D) {
+    return true;
+  }
+  return true;
+}
+
 void appendUtf8(std::string& out, uint32_t codepoint) {
   if (codepoint <= 0x7F) {
     out.push_back(static_cast<char>(codepoint));
@@ -84,6 +131,34 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
 };
 
 Lexer::Lexer(std::string_view source) : source_(source) {}
+
+uint32_t Lexer::readUnicodeEscape(const std::string& errMsg) {
+  uint32_t codepoint = 0;
+  if (current() == '{') {
+    advance();  // '{'
+    bool sawDigit = false;
+    while (!isAtEnd() && current() != '}') {
+      int d = hexDigitValue(current());
+      if (d < 0) throw std::runtime_error(errMsg);
+      sawDigit = true;
+      if (codepoint > 0x10FFFF) throw std::runtime_error(errMsg);
+      codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+      advance();
+    }
+    if (!sawDigit || isAtEnd() || current() != '}') throw std::runtime_error(errMsg);
+    advance();  // '}'
+  } else {
+    for (int i = 0; i < 4; i++) {
+      if (isAtEnd()) throw std::runtime_error(errMsg);
+      int d = hexDigitValue(current());
+      if (d < 0) throw std::runtime_error(errMsg);
+      codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
+      advance();
+    }
+  }
+  if (codepoint > 0x10FFFF || isSurrogateCodePoint(codepoint)) throw std::runtime_error(errMsg);
+  return codepoint;
+}
 
 char Lexer::current() const {
   if (isAtEnd()) return '\0';
@@ -492,6 +567,8 @@ std::optional<Token> Lexer::readIdentifier() {
   bool first = true;
   bool hadEscape = false;
 
+  static const std::string kIdentEscErr = "Invalid unicode escape in identifier";
+
   while (!isAtEnd()) {
     unsigned char c = static_cast<unsigned char>(current());
     if (isIdentifierPart(c)) {
@@ -520,39 +597,9 @@ std::optional<Token> Lexer::readIdentifier() {
       advance();  // '\'
       advance();  // 'u'
 
-      uint32_t codepoint = 0;
-      if (current() == '{') {
-        advance();  // '{'
-        bool sawDigit = false;
-        while (!isAtEnd() && current() != '}') {
-          int d = hexDigitValue(current());
-          if (d < 0) {
-            throw std::runtime_error("Invalid unicode escape in identifier");
-          }
-          sawDigit = true;
-          codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
-          advance();
-        }
-        if (!sawDigit || isAtEnd() || current() != '}') {
-          throw std::runtime_error("Invalid unicode escape in identifier");
-        }
-        advance();  // '}'
-      } else {
-        for (int i = 0; i < 4; i++) {
-          if (isAtEnd()) {
-            throw std::runtime_error("Invalid unicode escape in identifier");
-          }
-          int d = hexDigitValue(current());
-          if (d < 0) {
-            throw std::runtime_error("Invalid unicode escape in identifier");
-          }
-          codepoint = (codepoint << 4) + static_cast<uint32_t>(d);
-          advance();
-        }
-      }
-
-      bool validStart = codepoint > 0x7f || isAlpha(static_cast<char>(codepoint));
-      bool validPart = codepoint > 0x7f || isAlphaNumeric(static_cast<char>(codepoint));
+      uint32_t codepoint = readUnicodeEscape(kIdentEscErr);
+      bool validStart = isIdentifierStartCodePoint(codepoint);
+      bool validPart = isIdentifierPartCodePoint(codepoint);
       if ((first && !validStart) || (!first && !validPart)) {
         throw std::runtime_error("Invalid identifier escape");
       }
@@ -996,15 +1043,48 @@ std::vector<Token> Lexer::tokenize() {
       case '#': {
         advance(); // consume '#'
         std::string privName = "#";
-        while (!isAtEnd() && isIdentifierPart(static_cast<unsigned char>(current()))) {
+        bool first = true;
+        bool hadEscape = false;
+
+        while (!isAtEnd()) {
+          unsigned char c = static_cast<unsigned char>(current());
+          if (current() == '\\' && peek() == 'u') {
+            hadEscape = true;
+            advance();  // '\'
+            advance();  // 'u'
+            std::string privEscErr = "SyntaxError: Invalid private field at line " +
+                                     std::to_string(startLine) + ", column " + std::to_string(startColumn);
+            uint32_t codepoint = readUnicodeEscape(privEscErr);
+            bool validStart = isIdentifierStartCodePoint(codepoint);
+            bool validPart = isIdentifierPartCodePoint(codepoint);
+            if ((first && !validStart) || (!first && !validPart)) {
+              throw std::runtime_error("SyntaxError: Invalid private field at line " +
+                                       std::to_string(startLine) + ", column " + std::to_string(startColumn));
+            }
+            appendUtf8(privName, codepoint);
+            first = false;
+            continue;
+          }
+
+          if (!isIdentifierPart(c)) {
+            break;
+          }
+          if (first && !isIdentifierStart(c)) {
+            break;
+          }
           privName.push_back(current());
           advance();
+          first = false;
         }
-        if (privName.size() == 1) {
+
+        if (privName.size() == 1 || first) {
           throw std::runtime_error("SyntaxError: Invalid private field at line " +
                                    std::to_string(startLine) + ", column " + std::to_string(startColumn));
         }
-        tokens.emplace_back(TokenType::PrivateIdentifier, privName, startLine, startColumn);
+
+        Token tok(TokenType::PrivateIdentifier, privName, startLine, startColumn);
+        tok.escaped = hadEscape;
+        tokens.push_back(tok);
         break;
       }
       default:

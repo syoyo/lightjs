@@ -37,6 +37,114 @@ int32_t toInt32(double value) {
   return static_cast<int32_t>(wrapped);
 }
 
+std::string trimAsciiWhitespace(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+    start++;
+  }
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+    end--;
+  }
+  return s.substr(start, end - start);
+}
+
+int digitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'z') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'Z') return 10 + (c - 'A');
+  return -1;
+}
+
+// Parse JS integer-like strings used in BigInt/string comparisons.
+bool parseBigIntString64(const std::string& raw, bigint::BigIntValue& out) {
+  return bigint::parseBigIntString(raw, out);
+}
+
+bigint::BigIntValue powBigInt(bigint::BigIntValue base, bigint::BigIntValue exp) {
+  bigint::BigIntValue result = 1;
+  while (exp > 0) {
+    if ((exp & 1) != 0) {
+      result *= base;
+    }
+    exp >>= 1;
+    if (exp != 0) {
+      base *= base;
+    }
+  }
+  return result;
+}
+
+bool toShiftCount(const bigint::BigIntValue& shift,
+                  bool* negative,
+                  size_t* outCount) {
+  *negative = shift < 0;
+  bigint::BigIntValue magnitude = *negative ? -shift : shift;
+  return bigint::toSizeT(magnitude, *outCount);
+}
+
+bigint::BigIntValue applyBigIntShiftLeft(const bigint::BigIntValue& lhs,
+                                         const bigint::BigIntValue& rhs,
+                                         bool* ok) {
+  bool negative = false;
+  size_t count = 0;
+  if (!toShiftCount(rhs, &negative, &count)) {
+    *ok = false;
+    return 0;
+  }
+  *ok = true;
+  if (negative) {
+    return bigint::BigIntValue(lhs >> count);
+  }
+  return bigint::BigIntValue(lhs << count);
+}
+
+bigint::BigIntValue applyBigIntShiftRight(const bigint::BigIntValue& lhs,
+                                          const bigint::BigIntValue& rhs,
+                                          bool* ok) {
+  bool negative = false;
+  size_t count = 0;
+  if (!toShiftCount(rhs, &negative, &count)) {
+    *ok = false;
+    return 0;
+  }
+  *ok = true;
+  if (negative) {
+    return bigint::BigIntValue(lhs << count);
+  }
+  return bigint::BigIntValue(lhs >> count);
+}
+
+enum class BigIntNumberOrder { Less, Equal, Greater, Undefined };
+
+BigIntNumberOrder compareBigIntAndNumber(const bigint::BigIntValue& bi, double n) {
+  if (std::isnan(n)) return BigIntNumberOrder::Undefined;
+  if (std::isinf(n)) {
+    return n > 0 ? BigIntNumberOrder::Less : BigIntNumberOrder::Greater;
+  }
+
+  bigint::BigIntValue nAsBigInt = 0;
+  if (bigint::fromIntegralDouble(n, nAsBigInt)) {
+    if (bi < nAsBigInt) return BigIntNumberOrder::Less;
+    if (bi > nAsBigInt) return BigIntNumberOrder::Greater;
+    return BigIntNumberOrder::Equal;
+  }
+
+  double biAsDouble = bi.convert_to<double>();
+  if (std::isinf(biAsDouble)) {
+    return bi > 0 ? BigIntNumberOrder::Greater : BigIntNumberOrder::Less;
+  }
+  if (biAsDouble < n) return BigIntNumberOrder::Less;
+  if (biAsDouble > n) return BigIntNumberOrder::Greater;
+
+  double floorN = std::floor(n);
+  bigint::BigIntValue floorAsBigInt = 0;
+  if (!bigint::fromIntegralDouble(floorN, floorAsBigInt)) {
+    return bi > 0 ? BigIntNumberOrder::Greater : BigIntNumberOrder::Less;
+  }
+  return (bi <= floorAsBigInt) ? BigIntNumberOrder::Less : BigIntNumberOrder::Greater;
+}
+
 // Helper: compute result of compound assignment (e.g., +=, -=, <<=, etc.)
 // Does NOT handle AddAssign (needs toPrimitiveValue which requires Interpreter context)
 // Does NOT handle AndAssign/OrAssign/NullishAssign (short-circuit semantics)
@@ -49,16 +157,25 @@ Value computeCompoundOp(AssignmentExpr::Op op, const Value& current, const Value
       if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() * right.toBigInt()));
       return Value(current.toNumber() * right.toNumber());
     case AssignmentExpr::Op::DivAssign:
-      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() / right.toBigInt()));
+      if (current.isBigInt() && right.isBigInt()) {
+        auto divisor = right.toBigInt();
+        if (divisor == 0) return Value(Undefined{});
+        return Value(BigInt(current.toBigInt() / divisor));
+      }
       return Value(current.toNumber() / right.toNumber());
     case AssignmentExpr::Op::ModAssign:
-      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() % right.toBigInt()));
+      if (current.isBigInt() && right.isBigInt()) {
+        auto divisor = right.toBigInt();
+        if (divisor == 0) return Value(Undefined{});
+        return Value(BigInt(current.toBigInt() % divisor));
+      }
       return Value(std::fmod(current.toNumber(), right.toNumber()));
     case AssignmentExpr::Op::ExpAssign:
       if (current.isBigInt() && right.isBigInt()) {
-        int64_t base = current.toBigInt(), exp = right.toBigInt(), r = 1;
-        for (int64_t i = 0; i < exp; ++i) r *= base;
-        return Value(BigInt(r));
+        auto base = current.toBigInt();
+        auto exp = right.toBigInt();
+        if (exp < 0) return Value(Undefined{});
+        return Value(BigInt(powBigInt(base, exp)));
       }
       return Value(std::pow(current.toNumber(), right.toNumber()));
     case AssignmentExpr::Op::BitwiseAndAssign:
@@ -71,10 +188,20 @@ Value computeCompoundOp(AssignmentExpr::Op op, const Value& current, const Value
       if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() ^ right.toBigInt()));
       return Value(static_cast<double>(toInt32(current.toNumber()) ^ toInt32(right.toNumber())));
     case AssignmentExpr::Op::LeftShiftAssign:
-      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() << (right.toBigInt() & 63)));
+      if (current.isBigInt() && right.isBigInt()) {
+        bool ok = false;
+        auto shifted = applyBigIntShiftLeft(current.toBigInt(), right.toBigInt(), &ok);
+        if (!ok) return Value(Undefined{});
+        return Value(BigInt(shifted));
+      }
       return Value(static_cast<double>(toInt32(current.toNumber()) << (toInt32(right.toNumber()) & 0x1f)));
     case AssignmentExpr::Op::RightShiftAssign:
-      if (current.isBigInt() && right.isBigInt()) return Value(BigInt(current.toBigInt() >> (right.toBigInt() & 63)));
+      if (current.isBigInt() && right.isBigInt()) {
+        bool ok = false;
+        auto shifted = applyBigIntShiftRight(current.toBigInt(), right.toBigInt(), &ok);
+        if (!ok) return Value(Undefined{});
+        return Value(BigInt(shifted));
+      }
       return Value(static_cast<double>(toInt32(current.toNumber()) >> (toInt32(right.toNumber()) & 0x1f)));
     case AssignmentExpr::Op::UnsignedRightShiftAssign:
       return Value(static_cast<double>(static_cast<uint32_t>(toInt32(current.toNumber())) >> (toInt32(right.toNumber()) & 0x1f)));
@@ -150,6 +277,45 @@ bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
     }
   }
   return false;
+}
+
+bool isSyntheticParamDestructureTemp(const std::string& name) {
+  return name.rfind("__param_", 0) == 0 || name.rfind("__rest_param_", 0) == 0;
+}
+
+size_t directivePrologueLength(const std::vector<StmtPtr>& body) {
+  size_t n = 0;
+  for (const auto& stmt : body) {
+    if (!stmt) break;
+    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+    if (!exprStmt || !exprStmt->expression) break;
+    if (!std::get_if<StringLiteral>(&exprStmt->expression->node)) break;
+    ++n;
+  }
+  return n;
+}
+
+bool isSyntheticParamDestructureDecl(const VarDeclaration& decl) {
+  if (decl.kind != VarDeclaration::Kind::Let) return false;
+  if (decl.declarations.size() != 1) return false;
+  const auto& d = decl.declarations[0];
+  if (!d.init) return false;
+  auto* initId = std::get_if<Identifier>(&d.init->node);
+  if (!initId) return false;
+  return isSyntheticParamDestructureTemp(initId->name);
+}
+
+std::pair<size_t, size_t> syntheticParamDestructurePrologueRange(const std::vector<StmtPtr>& body) {
+  size_t start = directivePrologueLength(body);
+  size_t len = 0;
+  for (size_t i = start; i < body.size(); ++i) {
+    if (!body[i]) break;
+    auto* varDecl = std::get_if<VarDeclaration>(&body[i]->node);
+    if (!varDecl) break;
+    if (!isSyntheticParamDestructureDecl(*varDecl)) break;
+    ++len;
+  }
+  return {start, len};
 }
 }  // namespace
 
@@ -476,33 +642,155 @@ Task Interpreter::evaluate(const Statement& stmt) {
       }
     }
 
+    auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> std::shared_ptr<Object> {
+      if (ctorValue.isFunction()) {
+        auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+        auto protoIt = fn->properties.find("prototype");
+        if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
+          return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        }
+      } else if (ctorValue.isClass()) {
+        auto superCls = std::get<std::shared_ptr<Class>>(ctorValue.data);
+        auto protoIt = superCls->properties.find("prototype");
+        if (protoIt != superCls->properties.end() && protoIt->second.isObject()) {
+          return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        }
+      }
+      return nullptr;
+    };
+
+    // Create Class.prototype object and wire prototype inheritance.
+    auto classPrototype = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    if (cls->superClass) {
+      auto superProtoIt = cls->superClass->properties.find("prototype");
+      if (superProtoIt != cls->superClass->properties.end() && superProtoIt->second.isObject()) {
+        classPrototype->properties["__proto__"] = superProtoIt->second;
+      }
+    } else if (auto superCtorIt = cls->properties.find("__super_constructor__");
+               superCtorIt != cls->properties.end()) {
+      if (auto superProto = getPrototypeFromConstructor(superCtorIt->second)) {
+        classPrototype->properties["__proto__"] = Value(superProto);
+      }
+    } else if (auto objectCtor = env_->get("Object")) {
+      if (auto objectProto = getPrototypeFromConstructor(*objectCtor)) {
+        classPrototype->properties["__proto__"] = Value(objectProto);
+      }
+    }
+    cls->properties["prototype"] = Value(classPrototype);
+    cls->properties["__non_writable_prototype"] = Value(true);
+    cls->properties["__non_enum_prototype"] = Value(true);
+
+    auto resolveSuperForMethod = [&](const MethodDefinition& method) -> Value {
+      if (method.kind == MethodDefinition::Kind::Constructor || method.isStatic) {
+        if (cls->superClass) {
+          return Value(cls->superClass);
+        }
+        auto superCtorIt = cls->properties.find("__super_constructor__");
+        if (superCtorIt != cls->properties.end()) {
+          return superCtorIt->second;
+        }
+        if (auto objectCtor = env_->get("Object")) {
+          return *objectCtor;
+        }
+        return Value(Undefined{});
+      }
+      if (cls->superClass) {
+        auto superProtoIt = cls->superClass->properties.find("prototype");
+        if (superProtoIt != cls->superClass->properties.end()) {
+          return superProtoIt->second;
+        }
+      }
+      auto superCtorIt = cls->properties.find("__super_constructor__");
+      if (superCtorIt != cls->properties.end()) {
+        if (auto superProto = getPrototypeFromConstructor(superCtorIt->second)) {
+          return Value(superProto);
+        }
+      }
+      if (auto objectCtor = env_->get("Object")) {
+        if (auto objectProto = getPrototypeFromConstructor(*objectCtor)) {
+          return Value(objectProto);
+        }
+      }
+      return Value(Undefined{});
+    };
+
     // Process methods and fields
     for (const auto& method : node->methods) {
+      std::string methodName = method.key.name;
+      if (method.computed) {
+        if (!method.computedKey) {
+          throwError(ErrorType::SyntaxError, "Invalid computed class element name");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        auto keyTask = evaluate(*method.computedKey);
+        Value keyValue;
+        LIGHTJS_RUN_TASK(keyTask, keyValue);
+        if (isObjectLike(keyValue)) {
+          keyValue = toPrimitiveValue(keyValue, true);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        }
+        methodName = toPropertyKeyString(keyValue);
+      }
+
       // Handle field declarations
       if (method.kind == MethodDefinition::Kind::Field) {
-        Class::FieldInit fi;
-        fi.name = method.key.name;
-        fi.isPrivate = method.isPrivate;
-        if (method.initializer) {
-          fi.initExpr = std::shared_ptr<void>(
-            const_cast<Expression*>(method.initializer.get()),
-            [](void*){} // No-op deleter
-          );
+        if (method.isStatic) {
+          // Minimal static public field support: install on the class object.
+          // (Static initializers are evaluated at class definition time.)
+          Value fieldVal(Undefined{});
+          if (method.initializer) {
+            auto initTask = evaluate(*method.initializer);
+            LIGHTJS_RUN_TASK(initTask, fieldVal);
+          }
+          if (method.isPrivate) {
+            // Private static fields not supported yet.
+            throwError(ErrorType::SyntaxError, "Private static fields are not supported");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          cls->properties[methodName] = fieldVal;
+          cls->properties["__enum_" + methodName] = Value(true);
+        } else {
+          Class::FieldInit fi;
+          fi.name = methodName;
+          fi.isPrivate = method.isPrivate;
+          if (method.initializer) {
+            fi.initExpr = std::shared_ptr<void>(
+              const_cast<Expression*>(method.initializer.get()),
+              [](void*){} // No-op deleter
+            );
+          }
+          cls->fieldInitializers.push_back(std::move(fi));
         }
-        cls->fieldInitializers.push_back(std::move(fi));
         continue;
       }
 
       auto func = std::make_shared<Function>();
       func->isNative = false;
       func->isAsync = method.isAsync;
+      func->isGenerator = method.isGenerator;
       func->isStrict = true;  // Class bodies are always strict.
       func->closure = env_;
 
+      size_t methodLength = 0;
+      bool sawDefault = false;
       for (const auto& param : method.params) {
         FunctionParam funcParam;
-        funcParam.name = param.name;
+        funcParam.name = param.name.name;
+        if (param.defaultValue) {
+          funcParam.defaultValue = std::shared_ptr<void>(
+              const_cast<Expression*>(param.defaultValue.get()),
+              [](void*) {});
+          sawDefault = true;
+        } else if (!sawDefault) {
+          methodLength++;
+        }
         func->params.push_back(funcParam);
+      }
+      if (method.restParam.has_value()) {
+        func->restParam = method.restParam->name;
       }
 
       // Store the body reference
@@ -510,35 +798,77 @@ Task Interpreter::evaluate(const Statement& stmt) {
         const_cast<std::vector<StmtPtr>*>(&method.body),
         [](void*){} // No-op deleter
       );
+      {
+        auto [start, len] = syntheticParamDestructurePrologueRange(method.body);
+        if (len > 0) {
+          func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
+          func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
+        }
+      }
+      func->properties["length"] = Value(static_cast<double>(methodLength));
       if (method.kind == MethodDefinition::Kind::Constructor) {
         func->properties["name"] = Value(std::string("constructor"));
       } else {
-        func->properties["name"] = Value(method.key.name);
+        func->properties["name"] = Value(methodName);
       }
-      if (cls->superClass) {
-        func->properties["__super_class__"] = Value(cls->superClass);
-      } else if (cls->properties.find("__super_constructor__") != cls->properties.end()) {
-        func->properties["__super_class__"] = cls->properties["__super_constructor__"];
-      } else if (auto objectCtor = env_->get("Object")) {
-        func->properties["__super_class__"] = *objectCtor;
+
+      Value superBase = resolveSuperForMethod(method);
+      if (!superBase.isUndefined()) {
+        func->properties["__super_class__"] = superBase;
       }
 
       if (method.kind == MethodDefinition::Kind::Constructor) {
         cls->constructor = func;
       } else if (method.isStatic) {
-        cls->staticMethods[method.key.name] = func;
-        cls->properties[method.key.name] = Value(func);
+        if (method.kind == MethodDefinition::Kind::Get) {
+          cls->properties["__get_" + methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        } else if (method.kind == MethodDefinition::Kind::Set) {
+          cls->properties["__set_" + methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        } else {
+          cls->staticMethods[methodName] = func;
+          cls->properties[methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        }
       } else if (method.kind == MethodDefinition::Kind::Get) {
-        cls->getters[method.key.name] = func;
+        cls->getters[methodName] = func;
+        classPrototype->properties["__get_" + methodName] = Value(func);
+        classPrototype->properties["__non_enum_" + methodName] = Value(true);
       } else if (method.kind == MethodDefinition::Kind::Set) {
-        cls->setters[method.key.name] = func;
+        cls->setters[methodName] = func;
+        classPrototype->properties["__set_" + methodName] = Value(func);
+        classPrototype->properties["__non_enum_" + methodName] = Value(true);
       } else {
-        cls->methods[method.key.name] = func;
+        cls->methods[methodName] = func;
+        classPrototype->properties[methodName] = Value(func);
+        classPrototype->properties["__non_enum_" + methodName] = Value(true);
       }
     }
 
+    if (!cls->name.empty()) {
+      cls->properties["name"] = Value(cls->name);
+      cls->properties["__non_writable_name"] = Value(true);
+      cls->properties["__non_enum_name"] = Value(true);
+    }
+    int ctorLen = cls->constructor ? static_cast<int>(cls->constructor->params.size()) : 0;
+    cls->properties["length"] = Value(static_cast<double>(ctorLen));
+    cls->properties["__non_writable_length"] = Value(true);
+    cls->properties["__non_enum_length"] = Value(true);
+
     Value classVal = Value(cls);
+    classPrototype->properties["constructor"] = classVal;
+    classPrototype->properties["__non_enum_constructor"] = Value(true);
     env_->define(node->id.name, classVal);
+
+    // Class objects behave like functions: inherit from Function.prototype.
+    if (auto funcVal = env_->get("Function"); funcVal && funcVal->isFunction()) {
+      auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+      auto protoIt = funcCtor->properties.find("prototype");
+      if (protoIt != funcCtor->properties.end() && protoIt->second.isObject()) {
+        cls->properties["__proto__"] = protoIt->second;
+      }
+    }
     LIGHTJS_RETURN(classVal);
   } else if (auto* node = std::get_if<ReturnStmt>(&stmt.node)) {
     LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateReturn(*node)));
@@ -868,6 +1198,16 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
     }
   }
 
+  auto toNumericOperand = [&](const Value& operand, Value& out) -> bool {
+    out = isObjectLike(operand) ? toPrimitiveValue(operand, false) : operand;
+    if (hasError()) return false;
+    if (out.isSymbol()) {
+      throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+      return false;
+    }
+    return true;
+  };
+
   switch (expr.op) {
     case BinaryExpr::Op::Add: {
       Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
@@ -924,7 +1264,12 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
 
       if (lhs.isBigInt() && rhs.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() / rhs.toBigInt())));
+        auto divisor = rhs.toBigInt();
+        if (divisor == 0) {
+          throwError(ErrorType::RangeError, "Division by zero");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() / divisor)));
       }
       if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
@@ -939,7 +1284,12 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
 
       if (lhs.isBigInt() && rhs.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() % rhs.toBigInt())));
+        auto divisor = rhs.toBigInt();
+        if (divisor == 0) {
+          throwError(ErrorType::RangeError, "Division by zero");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() % divisor)));
       }
       if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
@@ -947,61 +1297,105 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
       LIGHTJS_RETURN(Value(std::fmod(lhs.toNumber(), rhs.toNumber())));
     }
-    case BinaryExpr::Op::BitwiseAnd:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() & right.toBigInt())));
+    case BinaryExpr::Op::BitwiseAnd: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() & rhs.toBigInt())));
       }
-      if (left.isBigInt() != right.isBigInt()) {
+      if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) & toInt32(right.toNumber()))));
-    case BinaryExpr::Op::BitwiseOr:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() | right.toBigInt())));
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(lhs.toNumber()) & toInt32(rhs.toNumber()))));
+    }
+    case BinaryExpr::Op::BitwiseOr: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() | rhs.toBigInt())));
       }
-      if (left.isBigInt() != right.isBigInt()) {
+      if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) | toInt32(right.toNumber()))));
-    case BinaryExpr::Op::BitwiseXor:
-      if (left.isBigInt() && right.isBigInt()) {
-        LIGHTJS_RETURN(Value(BigInt(left.toBigInt() ^ right.toBigInt())));
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(lhs.toNumber()) | toInt32(rhs.toNumber()))));
+    }
+    case BinaryExpr::Op::BitwiseXor: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() ^ rhs.toBigInt())));
       }
-      if (left.isBigInt() != right.isBigInt()) {
+      if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) ^ toInt32(right.toNumber()))));
-    case BinaryExpr::Op::LeftShift:
-      if (left.isBigInt() && right.isBigInt()) {
-        int64_t lv = left.toBigInt();
-        int64_t rv = right.toBigInt();
-        LIGHTJS_RETURN(Value(BigInt(lv << (rv & 63))));
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(lhs.toNumber()) ^ toInt32(rhs.toNumber()))));
+    }
+    case BinaryExpr::Op::LeftShift: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        bool ok = false;
+        auto shifted = applyBigIntShiftLeft(lhs.toBigInt(), rhs.toBigInt(), &ok);
+        if (!ok) {
+          throwError(ErrorType::RangeError, "Invalid BigInt shift count");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(Value(BigInt(shifted)));
       }
-      if (left.isBigInt() != right.isBigInt()) {
+      if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) << (toInt32(right.toNumber()) & 0x1f))));
-    case BinaryExpr::Op::RightShift:
-      if (left.isBigInt() && right.isBigInt()) {
-        int64_t lv = left.toBigInt();
-        int64_t rv = right.toBigInt();
-        LIGHTJS_RETURN(Value(BigInt(lv >> (rv & 63))));
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(lhs.toNumber()) << (toInt32(rhs.toNumber()) & 0x1f))));
+    }
+    case BinaryExpr::Op::RightShift: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() && rhs.isBigInt()) {
+        bool ok = false;
+        auto shifted = applyBigIntShiftRight(lhs.toBigInt(), rhs.toBigInt(), &ok);
+        if (!ok) {
+          throwError(ErrorType::RangeError, "Invalid BigInt shift count");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(Value(BigInt(shifted)));
       }
-      if (left.isBigInt() != right.isBigInt()) {
+      if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types in bitwise operations");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(left.toNumber()) >> (toInt32(right.toNumber()) & 0x1f))));
-    case BinaryExpr::Op::UnsignedRightShift:
-      if (left.isBigInt() || right.isBigInt()) {
+      LIGHTJS_RETURN(Value(static_cast<double>(toInt32(lhs.toNumber()) >> (toInt32(rhs.toNumber()) & 0x1f))));
+    }
+    case BinaryExpr::Op::UnsignedRightShift: {
+      Value lhs;
+      if (!toNumericOperand(left, lhs)) LIGHTJS_RETURN(Value(Undefined{}));
+      Value rhs;
+      if (!toNumericOperand(right, rhs)) LIGHTJS_RETURN(Value(Undefined{}));
+
+      if (lhs.isBigInt() || rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot use unsigned right shift on BigInt");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      LIGHTJS_RETURN(Value(static_cast<double>(static_cast<uint32_t>(toInt32(left.toNumber())) >> (toInt32(right.toNumber()) & 0x1f))));
+      LIGHTJS_RETURN(Value(static_cast<double>(static_cast<uint32_t>(toInt32(lhs.toNumber())) >> (toInt32(rhs.toNumber()) & 0x1f))));
+    }
     case BinaryExpr::Op::Exp: {
       Value lhs = isObjectLike(left) ? toPrimitiveValue(left, false) : left;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
@@ -1009,17 +1403,13 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
 
       if (lhs.isBigInt() && rhs.isBigInt()) {
-        // BigInt exponentiation
-        int64_t base = lhs.toBigInt();
-        int64_t exp = rhs.toBigInt();
+        auto base = lhs.toBigInt();
+        auto exp = rhs.toBigInt();
         if (exp < 0) {
-          LIGHTJS_RETURN(Value(0.0));  // Negative exponents for BigInt return 0
+          throwError(ErrorType::RangeError, "BigInt negative exponent");
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
-        int64_t result = 1;
-        for (int64_t i = 0; i < exp; ++i) {
-          result *= base;
-        }
-        LIGHTJS_RETURN(Value(BigInt(result)));
+        LIGHTJS_RETURN(Value(BigInt(powBigInt(base, exp))));
       }
       if (lhs.isBigInt() != rhs.isBigInt()) {
         throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
@@ -1032,8 +1422,34 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isSymbol() || rhs.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() < rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() < parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(parsed < rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), rhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Less));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), lhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Greater));
       }
       LIGHTJS_RETURN(Value(lhs.toNumber() < rhs.toNumber()));
     }
@@ -1042,8 +1458,34 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isSymbol() || rhs.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() > rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() > parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(parsed > rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), rhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Greater));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), lhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Less));
       }
       LIGHTJS_RETURN(Value(lhs.toNumber() > rhs.toNumber()));
     }
@@ -1052,8 +1494,34 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isSymbol() || rhs.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() <= rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() <= parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(parsed <= rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), rhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Less || cmp == BigIntNumberOrder::Equal));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), lhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Greater || cmp == BigIntNumberOrder::Equal));
       }
       LIGHTJS_RETURN(Value(lhs.toNumber() <= rhs.toNumber()));
     }
@@ -1062,8 +1530,34 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
       Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
       if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (lhs.isSymbol() || rhs.isSymbol()) {
+        throwError(ErrorType::TypeError, "Cannot convert Symbol to number");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() >= rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() >= parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(parsed >= rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), rhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Greater || cmp == BigIntNumberOrder::Equal));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), lhs.toNumber());
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Less || cmp == BigIntNumberOrder::Equal));
       }
       LIGHTJS_RETURN(Value(lhs.toNumber() >= rhs.toNumber()));
     }
@@ -1090,6 +1584,36 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() == rhs.toBigInt()));
       }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() == parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        LIGHTJS_RETURN(Value(parsed == rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        double n = rhs.toNumber();
+        if (!std::isfinite(n) || std::trunc(n) != n) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), n);
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Equal));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        double n = lhs.toNumber();
+        if (!std::isfinite(n) || std::trunc(n) != n) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), n);
+        LIGHTJS_RETURN(Value(cmp == BigIntNumberOrder::Equal));
+      }
       // Different types: coerce to number
       LIGHTJS_RETURN(Value(lhs.toNumber() == rhs.toNumber()));
     }
@@ -1113,6 +1637,36 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(lhs.toBigInt() != rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isString()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(rhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(true));
+        }
+        LIGHTJS_RETURN(Value(lhs.toBigInt() != parsed));
+      }
+      if (lhs.isString() && rhs.isBigInt()) {
+        bigint::BigIntValue parsed = 0;
+        if (!parseBigIntString64(lhs.toString(), parsed)) {
+          LIGHTJS_RETURN(Value(true));
+        }
+        LIGHTJS_RETURN(Value(parsed != rhs.toBigInt()));
+      }
+      if (lhs.isBigInt() && rhs.isNumber()) {
+        double n = rhs.toNumber();
+        if (!std::isfinite(n) || std::trunc(n) != n) {
+          LIGHTJS_RETURN(Value(true));
+        }
+        auto cmp = compareBigIntAndNumber(lhs.toBigInt(), n);
+        LIGHTJS_RETURN(Value(cmp != BigIntNumberOrder::Equal));
+      }
+      if (lhs.isNumber() && rhs.isBigInt()) {
+        double n = lhs.toNumber();
+        if (!std::isfinite(n) || std::trunc(n) != n) {
+          LIGHTJS_RETURN(Value(true));
+        }
+        auto cmp = compareBigIntAndNumber(rhs.toBigInt(), n);
+        LIGHTJS_RETURN(Value(cmp != BigIntNumberOrder::Equal));
       }
       LIGHTJS_RETURN(Value(lhs.toNumber() != rhs.toNumber()));
     }
@@ -1725,6 +2279,25 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
         LIGHTJS_RETURN(Value(true));
       }
 
+      // Delete on class properties
+      if (obj.isClass()) {
+        auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+        if (propName == "prototype") {
+          LIGHTJS_RETURN(Value(false));
+        }
+        if (clsPtr->properties.count("__non_configurable_" + propName)) {
+          LIGHTJS_RETURN(Value(false));
+        }
+        clsPtr->properties.erase(propName);
+        clsPtr->properties.erase("__get_" + propName);
+        clsPtr->properties.erase("__set_" + propName);
+        clsPtr->properties.erase("__non_enum_" + propName);
+        clsPtr->properties.erase("__non_writable_" + propName);
+        clsPtr->properties.erase("__non_configurable_" + propName);
+        clsPtr->properties.erase("__enum_" + propName);
+        LIGHTJS_RETURN(Value(true));
+      }
+
       if (obj.isObject()) {
         auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
         if (objPtr->isModuleNamespace) {
@@ -1811,6 +2384,11 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
   // For typeof, handle undeclared identifiers specially (return "undefined" instead of throwing)
   if (expr.op == UnaryExpr::Op::Typeof) {
     if (auto* id = std::get_if<Identifier>(&expr.argument->node)) {
+      if (env_->isTDZ(id->name)) {
+        throwError(ErrorType::ReferenceError,
+                   formatError("Cannot access '" + id->name + "' before initialization", expr.argument->loc));
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       auto val = env_->get(id->name);
       if (!val) {
         // Unresolvable reference: typeof returns "undefined"
@@ -2118,10 +2696,15 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         }
       } else if (obj.isArray()) {
         auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        auto getterIt = arrPtr->properties.find("__get_" + propName);
+        if (getterIt != arrPtr->properties.end() && getterIt->second.isFunction()) {
+          current = callFunction(getterIt->second, {}, obj);
+          propExists = true;
+        }
         size_t idx = 0;
         bool isIdx = false;
         try { idx = std::stoull(propName); isIdx = true; } catch (...) {}
-        if (isIdx && idx < arrPtr->elements.size()) {
+        if (!propExists && isIdx && idx < arrPtr->elements.size()) {
           current = arrPtr->elements[idx];
           propExists = true;
         }
@@ -2182,9 +2765,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         fnPtr->properties[propName] = right2;
       } else if (obj.isArray()) {
         auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
-        size_t idx = 0;
-        try { idx = std::stoull(propName); } catch (...) {}
-        if (idx < arrPtr->elements.size()) arrPtr->elements[idx] = right2;
+        auto setterIt = arrPtr->properties.find("__set_" + propName);
+        if (setterIt != arrPtr->properties.end() && setterIt->second.isFunction()) {
+          callFunction(setterIt->second, {right2}, obj);
+        } else {
+          size_t idx = 0;
+          try { idx = std::stoull(propName); } catch (...) {}
+          if (idx < arrPtr->elements.size()) arrPtr->elements[idx] = right2;
+        }
       }
       LIGHTJS_RETURN(right2);
     }
@@ -2297,11 +2885,13 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           break;
         case AssignmentExpr::Op::ExpAssign:
           if (current->isBigInt() && right.isBigInt()) {
-            int64_t base = current->toBigInt();
-            int64_t exp = right.toBigInt();
-            int64_t r = 1;
-            for (int64_t i = 0; i < exp; ++i) r *= base;
-            result = Value(BigInt(r));
+            auto base = current->toBigInt();
+            auto exp = right.toBigInt();
+            if (exp < 0) {
+              throwError(ErrorType::RangeError, "BigInt negative exponent");
+              LIGHTJS_RETURN(Value(Undefined{}));
+            }
+            result = Value(BigInt(powBigInt(base, exp)));
           } else {
             result = Value(std::pow(current->toNumber(), right.toNumber()));
           }
@@ -2329,14 +2919,26 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           break;
         case AssignmentExpr::Op::LeftShiftAssign:
           if (current->isBigInt() && right.isBigInt()) {
-            result = Value(BigInt(current->toBigInt() << (right.toBigInt() & 63)));
+            bool ok = false;
+            auto shifted = applyBigIntShiftLeft(current->toBigInt(), right.toBigInt(), &ok);
+            if (!ok) {
+              throwError(ErrorType::RangeError, "Invalid BigInt shift count");
+              LIGHTJS_RETURN(Value(Undefined{}));
+            }
+            result = Value(BigInt(shifted));
           } else {
             result = Value(static_cast<double>(toInt32(current->toNumber()) << (toInt32(right.toNumber()) & 0x1f)));
           }
           break;
         case AssignmentExpr::Op::RightShiftAssign:
           if (current->isBigInt() && right.isBigInt()) {
-            result = Value(BigInt(current->toBigInt() >> (right.toBigInt() & 63)));
+            bool ok = false;
+            auto shifted = applyBigIntShiftRight(current->toBigInt(), right.toBigInt(), &ok);
+            if (!ok) {
+              throwError(ErrorType::RangeError, "Invalid BigInt shift count");
+              LIGHTJS_RETURN(Value(Undefined{}));
+            }
+            result = Value(BigInt(shifted));
           } else {
             result = Value(static_cast<double>(toInt32(current->toNumber()) >> (toInt32(right.toNumber()) & 0x1f)));
           }
@@ -2356,6 +2958,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     auto objTask = evaluate(*member->object);
   Value obj;
   LIGHTJS_RUN_TASK(objTask, obj);
+    bool isSuperTarget = member->object &&
+                         std::holds_alternative<SuperExpr>(member->object->node);
+    Value superReceiver = Value(Undefined{});
+    if (isSuperTarget) {
+      if (auto thisVal = env_->get("this")) {
+        superReceiver = *thisVal;
+      }
+    }
 
     std::string propName;
     if (member->computed) {
@@ -2405,6 +3015,10 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      auto writeObjPtr = objPtr;
+      if (isSuperTarget && superReceiver.isObject()) {
+        writeObjPtr = std::get<std::shared_ptr<Object>>(superReceiver.data);
+      }
 
       // Handle private field assignment (#name)
       if (!propName.empty() && propName[0] == '#') {
@@ -2441,7 +3055,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         LIGHTJS_RETURN(right);
       }
 
-      if (objPtr->isModuleNamespace) {
+      if (writeObjPtr->isModuleNamespace) {
         // Module namespace exotic objects reject writes.
         if (strictMode_) {
           throwError(ErrorType::TypeError, "Cannot assign to property '" + propName + "' of module namespace object");
@@ -2451,19 +3065,19 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
 
       // Check if object is frozen (can't modify any properties)
-      if (objPtr->frozen) {
+      if (writeObjPtr->frozen) {
         // In strict mode this would throw, but we'll silently fail
         LIGHTJS_RETURN(right);
       }
 
       // Check __non_writable_ marker
-      if (objPtr->properties.count("__non_writable_" + propName)) {
+      if (writeObjPtr->properties.count("__non_writable_" + propName)) {
         LIGHTJS_RETURN(right);
       }
 
       // Check if object is sealed (can't add new properties)
-      bool isNewProperty = objPtr->properties.find(propName) == objPtr->properties.end();
-      if (objPtr->sealed && isNewProperty) {
+      bool isNewProperty = writeObjPtr->properties.find(propName) == writeObjPtr->properties.end();
+      if (writeObjPtr->sealed && isNewProperty) {
         // Can't add new properties to sealed object
         LIGHTJS_RETURN(right);
       }
@@ -2481,9 +3095,9 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
 
       if (expr.op == AssignmentExpr::Op::Assign) {
-        objPtr->properties[propName] = right;
+        writeObjPtr->properties[propName] = right;
       } else {
-        Value current = objPtr->properties[propName];
+        Value current = writeObjPtr->properties[propName];
         switch (expr.op) {
           case AssignmentExpr::Op::AddAssign: {
             Value lhs = isObjectLike(current) ? toPrimitiveValue(current, false) : current;
@@ -2491,22 +3105,22 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
             Value rhs = isObjectLike(right) ? toPrimitiveValue(right, false) : right;
             if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
             if (lhs.isString() || rhs.isString()) {
-              objPtr->properties[propName] = Value(lhs.toString() + rhs.toString());
+              writeObjPtr->properties[propName] = Value(lhs.toString() + rhs.toString());
             } else if (lhs.isBigInt() && rhs.isBigInt()) {
-              objPtr->properties[propName] = Value(BigInt(lhs.toBigInt() + rhs.toBigInt()));
+              writeObjPtr->properties[propName] = Value(BigInt(lhs.toBigInt() + rhs.toBigInt()));
             } else if (lhs.isBigInt() != rhs.isBigInt()) {
               throwError(ErrorType::TypeError, "Cannot mix BigInt and other types");
               LIGHTJS_RETURN(Value(Undefined{}));
             } else {
-              objPtr->properties[propName] = Value(lhs.toNumber() + rhs.toNumber());
+              writeObjPtr->properties[propName] = Value(lhs.toNumber() + rhs.toNumber());
             }
             break;
           }
           default:
-            objPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
+            writeObjPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
         }
       }
-      LIGHTJS_RETURN(objPtr->properties[propName]);
+      LIGHTJS_RETURN(writeObjPtr->properties[propName]);
     }
 
     if (obj.isFunction()) {
@@ -2543,15 +3157,26 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
       size_t idx = 0;
       if (parseArrayIndex(propName, idx)) {
+        auto setterIt = arrPtr->properties.find("__set_" + propName);
+        auto getterIt = arrPtr->properties.find("__get_" + propName);
         if (expr.op == AssignmentExpr::Op::Assign) {
-          if (idx >= arrPtr->elements.size()) {
-            arrPtr->elements.resize(idx + 1, Value(Undefined{}));
+          if (setterIt != arrPtr->properties.end() && setterIt->second.isFunction()) {
+            callFunction(setterIt->second, {right}, obj);
+          } else {
+            if (idx >= arrPtr->elements.size()) {
+              arrPtr->elements.resize(idx + 1, Value(Undefined{}));
+            }
+            arrPtr->elements[idx] = right;
           }
-          arrPtr->elements[idx] = right;
           LIGHTJS_RETURN(right);
         }
         // Compound assignment: read current, compute, write back
-        Value current = (idx < arrPtr->elements.size()) ? arrPtr->elements[idx] : Value(Undefined{});
+        Value current = Value(Undefined{});
+        if (getterIt != arrPtr->properties.end() && getterIt->second.isFunction()) {
+          current = callFunction(getterIt->second, {}, obj);
+        } else if (idx < arrPtr->elements.size()) {
+          current = arrPtr->elements[idx];
+        }
         Value result;
         switch (expr.op) {
           case AssignmentExpr::Op::AddAssign: {
@@ -2577,7 +3202,9 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         // Only extend array if index is in bounds (compound assignment on
         // out-of-bounds index matches arguments object behavior where length
         // doesn't change)
-        if (idx < arrPtr->elements.size()) {
+        if (setterIt != arrPtr->properties.end() && setterIt->second.isFunction()) {
+          callFunction(setterIt->second, {result}, obj);
+        } else if (idx < arrPtr->elements.size()) {
           arrPtr->elements[idx] = result;
         }
         LIGHTJS_RETURN(result);
@@ -2611,7 +3238,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       size_t idx = 0;
       if (parseArrayIndex(propName, idx)) {
         if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
-          taPtr->setBigIntElement(idx, right.toBigInt());
+          taPtr->setBigIntElement(idx, bigint::toInt64Trunc(right.toBigInt()));
         } else {
           taPtr->setElement(idx, right.toNumber());
         }
@@ -2636,6 +3263,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       if (clsPtr->properties.count("__non_writable_" + propName)) {
         LIGHTJS_RETURN(right);
       }
+      auto setterIt = clsPtr->properties.find("__set_" + propName);
+      if (setterIt != clsPtr->properties.end() && setterIt->second.isFunction()) {
+        callFunction(setterIt->second, {right}, obj);
+        LIGHTJS_RETURN(right);
+      }
       if (expr.op == AssignmentExpr::Op::Assign) {
         clsPtr->properties[propName] = right;
       } else {
@@ -2658,8 +3290,13 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     }
     if (auto current = env_->get(id->name)) {
       if (current->isBigInt()) {
-        int64_t oldVal = current->toBigInt();
-        int64_t newVal = (expr.op == UpdateExpr::Op::Increment) ? oldVal + 1 : oldVal - 1;
+        auto oldVal = current->toBigInt();
+        bigint::BigIntValue newVal = oldVal;
+        if (expr.op == UpdateExpr::Op::Increment) {
+          newVal += 1;
+        } else {
+          newVal -= 1;
+        }
         env_->set(id->name, Value(BigInt(newVal)));
         LIGHTJS_RETURN(expr.prefix ? Value(BigInt(newVal)) : Value(BigInt(oldVal)));
       }
@@ -2696,8 +3333,13 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
 
     auto applyNumericUpdate = [&](const Value& currentValue) -> std::pair<Value, Value> {
       if (currentValue.isBigInt()) {
-        int64_t oldVal = currentValue.toBigInt();
-        int64_t newVal = (expr.op == UpdateExpr::Op::Increment) ? oldVal + 1 : oldVal - 1;
+        auto oldVal = currentValue.toBigInt();
+        bigint::BigIntValue newVal = oldVal;
+        if (expr.op == UpdateExpr::Op::Increment) {
+          newVal += 1;
+        } else {
+          newVal -= 1;
+        }
         return {Value(BigInt(oldVal)), Value(BigInt(newVal))};
       }
       double oldNum = currentValue.toNumber();
@@ -3003,7 +3645,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // BigInt primitive member access
   if (obj.isBigInt()) {
-    int64_t bigintValue = obj.toBigInt();
+    auto bigintValue = obj.toBigInt();
 
     if (propName == "constructor") {
       if (auto ctor = env_->get("BigInt")) {
@@ -3027,7 +3669,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       toLocaleStringFn->isNative = true;
       toLocaleStringFn->properties["__throw_on_new__"] = Value(true);
       toLocaleStringFn->nativeFunc = [bigintValue](const std::vector<Value>&) -> Value {
-        return Value(std::to_string(bigintValue));
+        return Value(bigint::toString(bigintValue));
       };
       LIGHTJS_RETURN(Value(toLocaleStringFn));
     }
@@ -3045,26 +3687,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           radix = r;
         }
-
-        bool negative = bigintValue < 0;
-        uint64_t magnitude = negative
-          ? static_cast<uint64_t>(-(bigintValue + 1)) + 1
-          : static_cast<uint64_t>(bigintValue);
-
-        if (magnitude == 0) {
-          return Value(std::string("0"));
-        }
-
-        std::string digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-        std::string out;
-        while (magnitude > 0) {
-          uint64_t digit = magnitude % static_cast<uint64_t>(radix);
-          out.push_back(digits[static_cast<size_t>(digit)]);
-          magnitude /= static_cast<uint64_t>(radix);
-        }
-        std::reverse(out.begin(), out.end());
-        if (negative) out.insert(out.begin(), '-');
-        return Value(out);
+        return Value(bigint::toString(bigintValue, radix));
       };
       LIGHTJS_RETURN(Value(toStringFn));
     }
@@ -3448,7 +4071,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getBigUint64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
-        return Value(BigInt(static_cast<int64_t>(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
+        return Value(BigInt(bigint::BigIntValue(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -3546,7 +4169,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigInt64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
-        viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), args[1].toBigInt(), littleEndian);
+        viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), bigint::toInt64Trunc(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
       };
       LIGHTJS_RETURN(Value(fn));
@@ -3557,7 +4180,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigUint64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
-        viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), static_cast<uint64_t>(args[1].toBigInt()), littleEndian);
+        viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), bigint::toUint64Trunc(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
       };
       LIGHTJS_RETURN(Value(fn));
@@ -3806,18 +4429,77 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   if (obj.isClass()) {
     auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+    // hasOwnProperty from Object.prototype / Function.prototype chain.
+    if (propName == "hasOwnProperty") {
+      auto hopFn = std::make_shared<Function>();
+      hopFn->isNative = true;
+      hopFn->nativeFunc = [clsPtr](const std::vector<Value>& args) -> Value {
+        if (args.empty()) return Value(false);
+        std::string key = args[0].toString();
+        // Internal properties are not visible
+        if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") return Value(false);
+        if (key.size() > 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) return Value(false);
+        if (key.size() > 10 && key.substr(0, 10) == "__non_enum") return Value(false);
+        if (key.size() > 14 && key.substr(0, 14) == "__non_writable") return Value(false);
+        if (key.size() > 18 && key.substr(0, 18) == "__non_configurable") return Value(false);
+        if (clsPtr->properties.count(key) > 0) return Value(true);
+        if (clsPtr->properties.count("__get_" + key) > 0) return Value(true);
+        if (clsPtr->properties.count("__set_" + key) > 0) return Value(true);
+        return Value(false);
+      };
+      LIGHTJS_RETURN(Value(hopFn));
+    }
+    auto getterIt = clsPtr->properties.find("__get_" + propName);
+    if (getterIt != clsPtr->properties.end() && getterIt->second.isFunction()) {
+      LIGHTJS_RETURN(callFunction(getterIt->second, {}, obj));
+    }
     // Check own properties first (name, length, static methods, etc.)
     auto propIt = clsPtr->properties.find(propName);
     if (propIt != clsPtr->properties.end()) {
       LIGHTJS_RETURN(propIt->second);
     }
-    auto methodIt = clsPtr->methods.find(propName);
-    if (methodIt != clsPtr->methods.end()) {
-      LIGHTJS_RETURN(Value(methodIt->second));
-    }
     auto staticIt = clsPtr->staticMethods.find(propName);
     if (staticIt != clsPtr->staticMethods.end()) {
       LIGHTJS_RETURN(Value(staticIt->second));
+    }
+    if (clsPtr->superClass) {
+      auto superGetterIt = clsPtr->superClass->properties.find("__get_" + propName);
+      if (superGetterIt != clsPtr->superClass->properties.end() &&
+          superGetterIt->second.isFunction()) {
+        LIGHTJS_RETURN(callFunction(superGetterIt->second, {}, obj));
+      }
+      auto superPropIt = clsPtr->superClass->properties.find(propName);
+      if (superPropIt != clsPtr->superClass->properties.end()) {
+        LIGHTJS_RETURN(superPropIt->second);
+      }
+      auto superStaticIt = clsPtr->superClass->staticMethods.find(propName);
+      if (superStaticIt != clsPtr->superClass->staticMethods.end()) {
+        LIGHTJS_RETURN(Value(superStaticIt->second));
+      }
+    }
+
+    // Walk prototype chain (__proto__) for classes (class objects behave like functions).
+    {
+      auto protoIt = clsPtr->properties.find("__proto__");
+      if (protoIt != clsPtr->properties.end() && protoIt->second.isObject()) {
+        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        int depth = 0;
+        while (proto && depth < 50) {
+          auto protoGetterIt = proto->properties.find("__get_" + propName);
+          if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
+            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+          }
+          auto found = proto->properties.find(propName);
+          if (found != proto->properties.end()) {
+            LIGHTJS_RETURN(found->second);
+          }
+          auto nextProto = proto->properties.find("__proto__");
+          if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          depth++;
+        }
+      }
     }
   }
 
@@ -5031,6 +5713,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
 
+    auto getterIt = arrPtr->properties.find("__get_" + propName);
+    if (getterIt != arrPtr->properties.end() && getterIt->second.isFunction()) {
+      LIGHTJS_RETURN(callFunction(getterIt->second, {}, obj));
+    }
     size_t idx = 0;
     if (parseArrayIndex(propName, idx) && idx < arrPtr->elements.size()) {
       LIGHTJS_RETURN(arrPtr->elements[idx]);
@@ -6288,6 +6974,17 @@ Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
       }
 
       size_t startIndex = genPtr->yieldIndex;
+      if (!wasSuspendedYield && genPtr->function) {
+        auto startIt = genPtr->function->properties.find("__param_dstr_prologue_start__");
+        auto lenIt = genPtr->function->properties.find("__param_dstr_prologue_len__");
+        if (startIt != genPtr->function->properties.end() &&
+            lenIt != genPtr->function->properties.end() &&
+            startIt->second.isNumber() && lenIt->second.isNumber()) {
+          size_t start = static_cast<size_t>(startIt->second.toNumber());
+          size_t len = static_cast<size_t>(lenIt->second.toNumber());
+          startIndex = std::max(startIndex, start + len);
+        }
+      }
       for (size_t i = startIndex; i < bodyPtr->size(); i++) {
         auto task = evaluate(*(*bodyPtr)[i]);
   LIGHTJS_RUN_TASK(task, result);
@@ -6737,41 +7434,66 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   } namedExprGuard{this, pushNamedExpr};
 
   auto bindParameters = [&](std::shared_ptr<Environment>& targetEnv) {
+    bool isArrowFunction = false;
+    auto arrowIt = func->properties.find("__is_arrow_function__");
+    if (arrowIt != func->properties.end() &&
+        arrowIt->second.isBool() &&
+        arrowIt->second.toBool()) {
+      isArrowFunction = true;
+    }
+
     Value boundThis = currentThis;
-    if (!func->isStrict && (boundThis.isUndefined() || boundThis.isNull())) {
+    if (!isArrowFunction &&
+        !func->isStrict &&
+        (boundThis.isUndefined() || boundThis.isNull())) {
       if (auto globalThisValue = targetEnv->get("globalThis")) {
         boundThis = *globalThisValue;
       }
     }
-    if (!boundThis.isUndefined()) {
+    if (!isArrowFunction && !boundThis.isUndefined()) {
       targetEnv->define("this", boundThis);
     }
-    auto superIt = func->properties.find("__super_class__");
-    if (superIt != func->properties.end()) {
-      targetEnv->define("__super__", superIt->second);
+    if (!isArrowFunction) {
+      auto superIt = func->properties.find("__super_class__");
+      if (superIt != func->properties.end()) {
+        targetEnv->define("__super__", superIt->second);
+      }
     }
 
-    auto argumentsArray = std::make_shared<Array>();
-    GarbageCollector::instance().reportAllocation(sizeof(Array));
-    argumentsArray->elements = currentArgs;
-    targetEnv->define("arguments", Value(argumentsArray));
+    std::shared_ptr<Array> argumentsArray;
+    if (!isArrowFunction) {
+      argumentsArray = std::make_shared<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      argumentsArray->elements = currentArgs;
+      targetEnv->define("arguments", Value(argumentsArray));
+    }
+
+    // Parameter bindings are created before evaluating default initializers.
+    for (const auto& param : func->params) {
+      targetEnv->defineTDZ(param.name);
+    }
+    if (func->restParam.has_value()) {
+      targetEnv->defineTDZ(*func->restParam);
+    }
 
     for (size_t i = 0; i < func->params.size(); ++i) {
-      if (i < currentArgs.size()) {
-        targetEnv->define(func->params[i].name, currentArgs[i]);
-      } else if (func->params[i].defaultValue) {
+      Value paramValue = (i < currentArgs.size()) ? currentArgs[i] : Value(Undefined{});
+
+      if (func->params[i].defaultValue && paramValue.isUndefined()) {
         auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
         auto defaultTask = evaluate(*defaultExpr);
-        LIGHTJS_RUN_TASK_VOID(defaultTask);
-        targetEnv->define(func->params[i].name, defaultTask.result());
-      } else {
-        targetEnv->define(func->params[i].name, Value(Undefined{}));
+        LIGHTJS_RUN_TASK(defaultTask, paramValue);
+        if (flow_.type == ControlFlow::Type::Throw || hasError()) {
+          return;
+        }
       }
+
+      targetEnv->define(func->params[i].name, paramValue);
     }
 
     // Mapped arguments: in sloppy mode with simple params, create getters
     // so formal param changes are reflected when iterating arguments
-    if (!func->isStrict && !func->restParam.has_value()) {
+    if (!isArrowFunction && !func->isStrict && !func->restParam.has_value()) {
       bool hasSimpleParams = true;
       for (const auto& p : func->params) {
         if (p.defaultValue || p.name.empty()) { hasSimpleParams = false; break; }
@@ -6807,6 +7529,30 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         restArr->elements.push_back(currentArgs[i]);
       }
       targetEnv->define(*func->restParam, Value(restArr));
+    }
+
+    // Our parser lowers destructuring parameters into synthetic `let` bindings at the
+    // top of the function body. Generators don't execute their body at call time, so
+    // we must run those bindings during call-time parameter initialization.
+    if (func->isGenerator) {
+      auto startIt = func->properties.find("__param_dstr_prologue_start__");
+      auto lenIt = func->properties.find("__param_dstr_prologue_len__");
+      if (startIt != func->properties.end() && lenIt != func->properties.end() &&
+          startIt->second.isNumber() && lenIt->second.isNumber()) {
+        size_t start = static_cast<size_t>(startIt->second.toNumber());
+        size_t len = static_cast<size_t>(lenIt->second.toNumber());
+        if (len > 0) {
+          auto bodyPtr2 = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
+          for (size_t i = 0; i < len && (start + i) < bodyPtr2->size(); ++i) {
+            auto stmtTask = evaluate(*(*bodyPtr2)[start + i]);
+            Value stmtResult = Value(Undefined{});
+            LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+            if (flow_.type == ControlFlow::Type::Throw || hasError()) {
+              return;
+            }
+          }
+        }
+      }
     }
   };
 
@@ -6897,7 +7643,16 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     GarbageCollector::instance().reportAllocation(sizeof(Generator));
     auto genEnv = std::static_pointer_cast<Environment>(func->closure);
     genEnv = genEnv->createChild();
+    auto prevEnv2 = env_;
+    bool prevStrict2 = strictMode_;
+    env_ = genEnv;
+    strictMode_ = func->isStrict;
     bindParameters(genEnv);
+    env_ = prevEnv2;
+    strictMode_ = prevStrict2;
+    if (flow_.type == ControlFlow::Type::Throw) {
+      return Value(Undefined{});
+    }
     generator->context = genEnv;
     return Value(generator);
   }
@@ -6907,16 +7662,36 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     auto stackFrame = pushStackFrame("<async>");
 
     auto promise = std::make_shared<Promise>();
+    if (auto promiseCtor = env_->getRoot()->get("Promise");
+        promiseCtor.has_value() && promiseCtor->isFunction()) {
+      promise->properties["__constructor__"] = *promiseCtor;
+    }
+    auto prevFlow = flow_;
     auto prevEnv = env_;
     env_ = std::static_pointer_cast<Environment>(func->closure);
     env_ = env_->createChild();
+
+    flow_.reset();
     bindParameters(env_);
+    if (flow_.type == ControlFlow::Type::Throw) {
+      promise->reject(flow_.value);
+      flow_ = prevFlow;
+      env_ = prevEnv;
+      return Value(promise);
+    }
+    if (hasError()) {
+      Value err = getError();
+      clearError();
+      promise->reject(err);
+      flow_ = prevFlow;
+      env_ = prevEnv;
+      return Value(promise);
+    }
+    flow_ = prevFlow;
 
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
     bool previousStrictMode = strictMode_;
     strictMode_ = func->isStrict;
-    Value result = Value(Undefined{});
-    bool returned = false;
 
     // Initialize TDZ for let/const declarations in async function body
     for (const auto& s : *bodyPtr) {
@@ -6943,43 +7718,157 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       }
     }
 
-    auto prevFlow = flow_;
-    flow_ = ControlFlow{};
-
-    try {
-      for (const auto& stmt : *bodyPtr) {
-        // Skip function declarations - already hoisted
-        if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
-          continue;
-        }
-        auto stmtTask = evaluate(*stmt);
-        Value stmtResult = Value(Undefined{});
-        LIGHTJS_RUN_TASK(stmtTask, stmtResult);
-
-        if (flow_.type == ControlFlow::Type::Return) {
-          result = flow_.value;
-          returned = true;
-          break;
-        }
-
-        // Preserve throw flow control (errors)
-        if (flow_.type == ControlFlow::Type::Throw) {
-          promise->reject(flow_.value);
-          break;
-        }
+    auto asyncEnv = env_;
+    auto executeAsyncBody = std::make_shared<std::function<void(size_t)>>();
+    *executeAsyncBody = [this, executeAsyncBody, promise, asyncEnv, bodyPtr, isStrict = func->isStrict](size_t startIndex) {
+      if (!promise || promise->state != PromiseState::Pending) {
+        return;
       }
-      if (flow_.type != ControlFlow::Type::Throw) {
-        if (!returned) {
-          result = Value(Undefined{});
-        }
-        promise->resolve(result);
-      }
-    } catch (const std::exception& e) {
-      promise->reject(Value(std::string(e.what())));
-    }
 
-    // Async functions convert abrupt completion into Promise rejection.
-    flow_ = prevFlow;
+      auto savedEnv = env_;
+      bool savedStrictMode = strictMode_;
+      auto savedFlow = flow_;
+
+      env_ = asyncEnv;
+      strictMode_ = isStrict;
+      flow_.reset();
+
+      auto restoreState = [&]() {
+        env_ = savedEnv;
+        strictMode_ = savedStrictMode;
+        flow_ = savedFlow;
+      };
+
+      try {
+        for (size_t i = startIndex; i < bodyPtr->size(); ++i) {
+          const auto& stmt = (*bodyPtr)[i];
+          if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+            continue;
+          }
+
+          if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node)) {
+            if (exprStmt->expression) {
+              if (auto* awaitExpr = std::get_if<AwaitExpr>(&exprStmt->expression->node)) {
+                auto awaitArgTask = evaluate(*awaitExpr->argument);
+                Value awaitedValue = Value(Undefined{});
+                LIGHTJS_RUN_TASK(awaitArgTask, awaitedValue);
+
+                if (flow_.type == ControlFlow::Type::Throw) {
+                  promise->reject(flow_.value);
+                  restoreState();
+                  return;
+                }
+                if (hasError()) {
+                  Value err = getError();
+                  clearError();
+                  promise->reject(err);
+                  restoreState();
+                  return;
+                }
+
+                if (!awaitedValue.isPromise() && isObjectLike(awaitedValue)) {
+                  auto [foundThen, thenValue] = getPropertyForPrimitive(awaitedValue, "then");
+                  if (hasError()) {
+                    Value err = getError();
+                    clearError();
+                    promise->reject(err);
+                    restoreState();
+                    return;
+                  }
+                  if (foundThen && thenValue.isFunction()) {
+                    auto thenablePromise = std::make_shared<Promise>();
+
+                    auto resolveFunc = std::make_shared<Function>();
+                    resolveFunc->isNative = true;
+                    resolveFunc->nativeFunc = [thenablePromise](const std::vector<Value>& args) -> Value {
+                      if (!args.empty()) {
+                        thenablePromise->resolve(args[0]);
+                      } else {
+                        thenablePromise->resolve(Value(Undefined{}));
+                      }
+                      return Value(Undefined{});
+                    };
+
+                    auto rejectFunc = std::make_shared<Function>();
+                    rejectFunc->isNative = true;
+                    rejectFunc->nativeFunc = [thenablePromise](const std::vector<Value>& args) -> Value {
+                      if (!args.empty()) {
+                        thenablePromise->reject(args[0]);
+                      } else {
+                        thenablePromise->reject(Value(Undefined{}));
+                      }
+                      return Value(Undefined{});
+                    };
+
+                    callFunction(thenValue, {Value(resolveFunc), Value(rejectFunc)}, awaitedValue);
+                    if (flow_.type == ControlFlow::Type::Throw) {
+                      thenablePromise->reject(flow_.value);
+                      flow_.reset();
+                    }
+                    if (hasError()) {
+                      Value err = getError();
+                      clearError();
+                      thenablePromise->reject(err);
+                    }
+
+                    awaitedValue = Value(thenablePromise);
+                  }
+                }
+
+                std::shared_ptr<Promise> awaitedPromise;
+                if (awaitedValue.isPromise()) {
+                  awaitedPromise = std::get<std::shared_ptr<Promise>>(awaitedValue.data);
+                } else {
+                  awaitedPromise = std::make_shared<Promise>();
+                  awaitedPromise->resolve(awaitedValue);
+                }
+
+                size_t nextIndex = i + 1;
+                awaitedPromise->then(
+                  [executeAsyncBody, nextIndex](Value v) -> Value {
+                    (*executeAsyncBody)(nextIndex);
+                    return v;
+                  },
+                  [promise](Value reason) -> Value {
+                    if (promise && promise->state == PromiseState::Pending) {
+                      promise->reject(reason);
+                    }
+                    return reason;
+                  }
+                );
+
+                restoreState();
+                return;
+              }
+            }
+          }
+
+          auto stmtTask = evaluate(*stmt);
+          Value stmtResult = Value(Undefined{});
+          LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+
+          if (flow_.type == ControlFlow::Type::Return) {
+            promise->resolve(flow_.value);
+            restoreState();
+            return;
+          }
+          if (flow_.type == ControlFlow::Type::Throw) {
+            promise->reject(flow_.value);
+            restoreState();
+            return;
+          }
+        }
+
+        promise->resolve(Value(Undefined{}));
+      } catch (const std::exception& e) {
+        promise->reject(Value(std::string(e.what())));
+      }
+
+      restoreState();
+    };
+
+    (*executeAsyncBody)(0);
+
     strictMode_ = previousStrictMode;
     env_ = prevEnv;
     return Value(promise);
@@ -7008,6 +7897,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     env_ = std::static_pointer_cast<Environment>(func->closure);
     env_ = env_->createChild();
     bindParameters(env_);
+    if (flow_.type == ControlFlow::Type::Throw) {
+      break;
+    }
 
     // Initialize TDZ for let/const declarations in function body
     for (const auto& s : *bodyPtr) {
@@ -7247,7 +8139,9 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
         } else if (auto* str = std::get_if<StringLiteral>(&prop.key->node)) {
           key = str->value;
         } else if (auto* num = std::get_if<NumberLiteral>(&prop.key->node)) {
-          key = std::to_string(static_cast<int>(num->value));
+          key = numberToPropertyKey(num->value);
+        } else if (auto* bigint = std::get_if<BigIntLiteral>(&prop.key->node)) {
+          key = bigint::toString(bigint->value);
         } else {
           // Fallback: evaluate as expression
           auto keyTask = evaluate(*prop.key);
@@ -7285,6 +8179,13 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
+  {
+    auto [start, len] = syntheticParamDestructurePrologueRange(expr.body);
+    if (len > 0) {
+      func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
+      func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
+    }
+  }
   func->closure = env_;
   // Compute length: number of params before first default parameter
   size_t funcLength = 0;
@@ -7294,6 +8195,9 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   }
   func->properties["length"] = Value(static_cast<double>(funcLength));
   func->properties["name"] = Value(expr.name);
+  if (expr.isArrow) {
+    func->properties["__is_arrow_function__"] = Value(true);
+  }
   if (!expr.name.empty()) {
     func->properties["__named_expression__"] = Value(true);
   }
@@ -7491,25 +8395,41 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
     }
   }
 
-  auto setConstructorTag = [&](Value& instanceVal) {
-    Value constructorTag = newTargetOverride.isUndefined() ? callee : effectiveNewTarget;
-    if (instanceVal.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(instanceVal.data);
-      obj->properties["__constructor__"] = constructorTag;
-    } else if (instanceVal.isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(instanceVal.data);
-      arr->properties["__constructor__"] = constructorTag;
-    } else if (instanceVal.isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(instanceVal.data);
-      fn->properties["__constructor__"] = constructorTag;
-    } else if (instanceVal.isRegex()) {
-      auto regex = std::get<std::shared_ptr<Regex>>(instanceVal.data);
-      regex->properties["__constructor__"] = constructorTag;
-    } else if (instanceVal.isPromise()) {
-      auto promise = std::get<std::shared_ptr<Promise>>(instanceVal.data);
-      promise->properties["__constructor__"] = constructorTag;
-    }
-  };
+    auto setConstructorTag = [&](Value& instanceVal) {
+      Value constructorTag = newTargetOverride.isUndefined() ? callee : effectiveNewTarget;
+      auto setTagOnObject = [&](auto& container) {
+        container->properties["__constructor__"] = constructorTag;
+      };
+      if (instanceVal.isObject()) {
+        setTagOnObject(std::get<std::shared_ptr<Object>>(instanceVal.data));
+      } else if (instanceVal.isArray()) {
+        setTagOnObject(std::get<std::shared_ptr<Array>>(instanceVal.data));
+      } else if (instanceVal.isFunction()) {
+        setTagOnObject(std::get<std::shared_ptr<Function>>(instanceVal.data));
+      } else if (instanceVal.isRegex()) {
+        setTagOnObject(std::get<std::shared_ptr<Regex>>(instanceVal.data));
+      } else if (instanceVal.isPromise()) {
+        setTagOnObject(std::get<std::shared_ptr<Promise>>(instanceVal.data));
+      }
+    };
+
+    auto setProtoOnValue = [&](Value& targetVal, const Value& protoVal) {
+      if (!protoVal.isObject()) return;
+      auto setProto = [&](auto& container) {
+        container->properties["__proto__"] = protoVal;
+      };
+      if (targetVal.isObject()) {
+        setProto(std::get<std::shared_ptr<Object>>(targetVal.data));
+      } else if (targetVal.isArray()) {
+        setProto(std::get<std::shared_ptr<Array>>(targetVal.data));
+      } else if (targetVal.isFunction()) {
+        setProto(std::get<std::shared_ptr<Function>>(targetVal.data));
+      } else if (targetVal.isRegex()) {
+        setProto(std::get<std::shared_ptr<Regex>>(targetVal.data));
+      } else if (targetVal.isPromise()) {
+        setProto(std::get<std::shared_ptr<Promise>>(targetVal.data));
+      }
+    };
 
   auto wrapPrimitiveValue = [&](const Value& primitive) -> Value {
     auto wrapper = std::make_shared<Object>();
@@ -7561,18 +8481,10 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
     auto instance = std::make_shared<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
-    // Set up prototype chain - copy methods to instance
-    for (const auto& [name, method] : cls->methods) {
-      instance->properties[name] = Value(method);
-    }
-
-    // If class has a superclass, inherit its methods
-    if (cls->superClass) {
-      for (const auto& [name, method] : cls->superClass->methods) {
-        if (instance->properties.find(name) == instance->properties.end()) {
-          instance->properties[name] = Value(method);
-        }
-      }
+    // Set up prototype chain from Class.prototype.
+    auto protoIt = cls->properties.find("prototype");
+    if (protoIt != cls->properties.end() && protoIt->second.isObject()) {
+      instance->properties["__proto__"] = protoIt->second;
     }
 
     // Execute constructor if it exists
@@ -7705,6 +8617,15 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
       Value result = LIGHTJS_AWAIT(constructValue(superVal, args, effectiveNewTarget));
       if (flow_.type != ControlFlow::Type::None) {
         LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (superVal.isFunction()) {
+        auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+        if (superFunc && superFunc->isNative) {
+          auto protoIt = cls->properties.find("prototype");
+          if (protoIt != cls->properties.end()) {
+            setProtoOnValue(result, protoIt->second);
+          }
+        }
       }
       setConstructorTag(result);
       if (result.isPromise()) {
@@ -7917,20 +8838,125 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
   }
 
+  auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> std::shared_ptr<Object> {
+    if (ctorValue.isFunction()) {
+      auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+      auto protoIt = fn->properties.find("prototype");
+      if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
+        return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      }
+    } else if (ctorValue.isClass()) {
+      auto superCls = std::get<std::shared_ptr<Class>>(ctorValue.data);
+      auto protoIt = superCls->properties.find("prototype");
+      if (protoIt != superCls->properties.end() && protoIt->second.isObject()) {
+        return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      }
+    }
+    return nullptr;
+  };
+
+  // Create Class.prototype object and wire prototype inheritance.
+  auto classPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  if (cls->superClass) {
+    auto superProtoIt = cls->superClass->properties.find("prototype");
+    if (superProtoIt != cls->superClass->properties.end() && superProtoIt->second.isObject()) {
+      classPrototype->properties["__proto__"] = superProtoIt->second;
+    }
+  } else if (auto superCtorIt = cls->properties.find("__super_constructor__");
+             superCtorIt != cls->properties.end()) {
+    if (auto superProto = getPrototypeFromConstructor(superCtorIt->second)) {
+      classPrototype->properties["__proto__"] = Value(superProto);
+    }
+  } else if (auto objectCtor = env_->get("Object")) {
+    if (auto objectProto = getPrototypeFromConstructor(*objectCtor)) {
+      classPrototype->properties["__proto__"] = Value(objectProto);
+    }
+  }
+  cls->properties["prototype"] = Value(classPrototype);
+  cls->properties["__non_writable_prototype"] = Value(true);
+  cls->properties["__non_enum_prototype"] = Value(true);
+
+  auto resolveSuperForMethod = [&](const MethodDefinition& method) -> Value {
+    if (method.kind == MethodDefinition::Kind::Constructor || method.isStatic) {
+      if (cls->superClass) {
+        return Value(cls->superClass);
+      }
+      auto superCtorIt = cls->properties.find("__super_constructor__");
+      if (superCtorIt != cls->properties.end()) {
+        return superCtorIt->second;
+      }
+      if (auto objectCtor = env_->get("Object")) {
+        return *objectCtor;
+      }
+      return Value(Undefined{});
+    }
+    if (cls->superClass) {
+      auto superProtoIt = cls->superClass->properties.find("prototype");
+      if (superProtoIt != cls->superClass->properties.end()) {
+        return superProtoIt->second;
+      }
+    }
+    auto superCtorIt = cls->properties.find("__super_constructor__");
+    if (superCtorIt != cls->properties.end()) {
+      if (auto superProto = getPrototypeFromConstructor(superCtorIt->second)) {
+        return Value(superProto);
+      }
+    }
+    if (auto objectCtor = env_->get("Object")) {
+      if (auto objectProto = getPrototypeFromConstructor(*objectCtor)) {
+        return Value(objectProto);
+      }
+    }
+    return Value(Undefined{});
+  };
+
   // Process methods and fields
   for (const auto& method : expr.methods) {
+    std::string methodName = method.key.name;
+    if (method.computed) {
+      if (!method.computedKey) {
+        throwError(ErrorType::SyntaxError, "Invalid computed class element name");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      auto keyTask = evaluate(*method.computedKey);
+      Value keyValue;
+      LIGHTJS_RUN_TASK(keyTask, keyValue);
+      if (isObjectLike(keyValue)) {
+        keyValue = toPrimitiveValue(keyValue, true);
+        if (hasError()) {
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+      }
+      methodName = toPropertyKeyString(keyValue);
+    }
+
     // Handle field declarations
     if (method.kind == MethodDefinition::Kind::Field) {
-      Class::FieldInit fi;
-      fi.name = method.key.name;
-      fi.isPrivate = method.isPrivate;
-      if (method.initializer) {
-        fi.initExpr = std::shared_ptr<void>(
-          const_cast<Expression*>(method.initializer.get()),
-          [](void*){} // No-op deleter
-        );
+      if (method.isStatic) {
+        Value fieldVal(Undefined{});
+        if (method.initializer) {
+          auto initTask = evaluate(*method.initializer);
+          LIGHTJS_RUN_TASK(initTask, fieldVal);
+        }
+        if (method.isPrivate) {
+          throwError(ErrorType::SyntaxError, "Private static fields are not supported");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        cls->properties[methodName] = fieldVal;
+        cls->properties["__enum_" + methodName] = Value(true);
+      } else {
+        Class::FieldInit fi;
+        fi.name = methodName;
+        fi.isPrivate = method.isPrivate;
+        if (method.initializer) {
+          fi.initExpr = std::shared_ptr<void>(
+            const_cast<Expression*>(method.initializer.get()),
+            [](void*){} // No-op deleter
+          );
+        }
+        cls->fieldInitializers.push_back(std::move(fi));
       }
-      cls->fieldInitializers.push_back(std::move(fi));
       continue;
     }
 
@@ -7938,13 +8964,27 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     auto func = std::make_shared<Function>();
     func->isNative = false;
     func->isAsync = method.isAsync;
+    func->isGenerator = method.isGenerator;
     func->isStrict = true;  // Class bodies are always strict.
     func->closure = env_;
 
+    size_t methodLength = 0;
+    bool sawDefault = false;
     for (const auto& param : method.params) {
       FunctionParam funcParam;
-      funcParam.name = param.name;
+      funcParam.name = param.name.name;
+      if (param.defaultValue) {
+        funcParam.defaultValue = std::shared_ptr<void>(
+            const_cast<Expression*>(param.defaultValue.get()),
+            [](void*) {});
+        sawDefault = true;
+      } else if (!sawDefault) {
+        methodLength++;
+      }
       func->params.push_back(funcParam);
+    }
+    if (method.restParam.has_value()) {
+      func->restParam = method.restParam->name;
     }
 
     // Store the body - we need to cast away const for the shared_ptr
@@ -7952,33 +8992,57 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       const_cast<std::vector<StmtPtr>*>(&method.body),
       [](void*){} // No-op deleter since we don't own the memory
     );
+    {
+      auto [start, len] = syntheticParamDestructurePrologueRange(method.body);
+      if (len > 0) {
+        func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
+        func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
+      }
+    }
+    func->properties["length"] = Value(static_cast<double>(methodLength));
     if (method.kind == MethodDefinition::Kind::Constructor) {
       func->properties["name"] = Value(std::string("constructor"));
     } else {
-      func->properties["name"] = Value(method.key.name);
+      func->properties["name"] = Value(methodName);
     }
-    if (cls->superClass) {
-      func->properties["__super_class__"] = Value(cls->superClass);
-    } else if (cls->properties.find("__super_constructor__") != cls->properties.end()) {
-      func->properties["__super_class__"] = cls->properties["__super_constructor__"];
-    } else if (auto objectCtor = env_->get("Object")) {
-      func->properties["__super_class__"] = *objectCtor;
+
+    Value superBase = resolveSuperForMethod(method);
+    if (!superBase.isUndefined()) {
+      func->properties["__super_class__"] = superBase;
     }
 
     if (method.kind == MethodDefinition::Kind::Constructor) {
       cls->constructor = func;
     } else if (method.isStatic) {
-      cls->staticMethods[method.key.name] = func;
-      // Static methods become own properties of the class
-      cls->properties[method.key.name] = Value(func);
+      if (method.kind == MethodDefinition::Kind::Get) {
+        cls->properties["__get_" + methodName] = Value(func);
+        cls->properties["__non_enum_" + methodName] = Value(true);
+      } else if (method.kind == MethodDefinition::Kind::Set) {
+        cls->properties["__set_" + methodName] = Value(func);
+        cls->properties["__non_enum_" + methodName] = Value(true);
+      } else {
+        cls->staticMethods[methodName] = func;
+        // Static methods become own properties of the class
+        cls->properties[methodName] = Value(func);
+        cls->properties["__non_enum_" + methodName] = Value(true);
+      }
     } else if (method.kind == MethodDefinition::Kind::Get) {
-      cls->getters[method.key.name] = func;
+      cls->getters[methodName] = func;
+      classPrototype->properties["__get_" + methodName] = Value(func);
+      classPrototype->properties["__non_enum_" + methodName] = Value(true);
     } else if (method.kind == MethodDefinition::Kind::Set) {
-      cls->setters[method.key.name] = func;
+      cls->setters[methodName] = func;
+      classPrototype->properties["__set_" + methodName] = Value(func);
+      classPrototype->properties["__non_enum_" + methodName] = Value(true);
     } else {
-      cls->methods[method.key.name] = func;
+      cls->methods[methodName] = func;
+      classPrototype->properties[methodName] = Value(func);
+      classPrototype->properties["__non_enum_" + methodName] = Value(true);
     }
   }
+
+  classPrototype->properties["constructor"] = Value(cls);
+  classPrototype->properties["__non_enum_constructor"] = Value(true);
 
   // Set name as own property (per spec: SetFunctionName)
   // Named classes always get a name property; anonymous classes don't (until named evaluation)
@@ -7993,6 +9057,15 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
   cls->properties["length"] = Value((double)ctorLen);
   cls->properties["__non_writable_length"] = Value(true);
   cls->properties["__non_enum_length"] = Value(true);
+
+  // Class objects behave like functions: inherit from Function.prototype.
+  if (auto funcVal = env_->get("Function"); funcVal && funcVal->isFunction()) {
+    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+    auto protoIt = funcCtor->properties.find("prototype");
+    if (protoIt != funcCtor->properties.end() && protoIt->second.isObject()) {
+      cls->properties["__proto__"] = protoIt->second;
+    }
+  }
 
   LIGHTJS_RETURN(Value(cls));
 }
@@ -8060,7 +9133,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         env_->getRoot()->define(id->name, value);
       }
     } else {
-      env_->define(id->name, value, isConst);
+      env_->defineLexical(id->name, value, isConst);
     }
   } else if (auto* member = std::get_if<MemberExpr>(&pattern.node)) {
     // MemberExpression target in assignment destructuring (e.g., x.y, obj['key'])
@@ -8105,21 +9178,106 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
     }
     std::shared_ptr<Array> arr;
     if (value.isArray()) {
-      // Check if Array.prototype[Symbol.iterator] has been deleted
-      bool iteratorDeleted = false;
+      // Array destructuring must respect Array.prototype[Symbol.iterator] overrides.
+      // Fast path: use direct indexing only when the builtin iterator is installed.
       auto arrayProtoOpt = env_->get("__array_prototype__");
-      if (arrayProtoOpt.has_value() && arrayProtoOpt->isObject()) {
+      if (!arrayProtoOpt.has_value() || !arrayProtoOpt->isObject()) {
+        // Fallback to the legacy behavior when the hidden prototype is missing.
+        arr = std::get<std::shared_ptr<Array>>(value.data);
+      } else {
         auto protoObj = std::get<std::shared_ptr<Object>>(arrayProtoOpt->data);
         const auto& iterKey = WellKnownSymbols::iteratorKey();
-        if (protoObj->properties.find(iterKey) == protoObj->properties.end()) {
-          iteratorDeleted = true;
+        auto iterIt = protoObj->properties.find(iterKey);
+        if (iterIt == protoObj->properties.end()) {
+          throwError(ErrorType::TypeError, value.toString() + " is not iterable");
+          return;
+        }
+        Value iteratorMethod = iterIt->second;
+        if (!iteratorMethod.isFunction()) {
+          throwError(ErrorType::TypeError, "Symbol.iterator is not a function");
+          return;
+        }
+        bool isBuiltinIterator = false;
+        if (iteratorMethod.isFunction()) {
+          auto fn = std::get<std::shared_ptr<Function>>(iteratorMethod.data);
+          auto builtinIt = fn->properties.find("__builtin_array_iterator__");
+          isBuiltinIterator = builtinIt != fn->properties.end() &&
+                              builtinIt->second.isBool() &&
+                              builtinIt->second.toBool();
+        }
+        if (isBuiltinIterator) {
+          arr = std::get<std::shared_ptr<Array>>(value.data);
+        } else {
+          // Use the overridden @@iterator to collect elements.
+          Value iterResult = callFunction(iteratorMethod, {}, value);
+          if (flow_.type == ControlFlow::Type::Throw) return;
+
+          IteratorRecord iterRec;
+          if (iterResult.isGenerator()) {
+            iterRec.kind = IteratorRecord::Kind::Generator;
+            iterRec.generator = std::get<std::shared_ptr<Generator>>(iterResult.data);
+          } else if (iterResult.isObject()) {
+            auto iterObj = std::get<std::shared_ptr<Object>>(iterResult.data);
+            // Cache next method (with getter support).
+            Value nextMethod;
+            auto getterIt = iterObj->properties.find("__get_next");
+            if (getterIt != iterObj->properties.end() && getterIt->second.isFunction()) {
+              nextMethod = callFunction(getterIt->second, {}, iterResult);
+              if (flow_.type == ControlFlow::Type::Throw) return;
+            } else {
+              auto nextIt = iterObj->properties.find("next");
+              if (nextIt != iterObj->properties.end()) nextMethod = nextIt->second;
+            }
+            if (!nextMethod.isFunction()) {
+              throwError(ErrorType::TypeError, "Iterator next is not a function");
+              return;
+            }
+            iterRec.kind = IteratorRecord::Kind::IteratorObject;
+            iterRec.iteratorObject = iterObj;
+            iterRec.nextMethod = nextMethod;
+          } else {
+            throwError(ErrorType::TypeError, "Iterator result is not an object");
+            return;
+          }
+
+          arr = std::make_shared<Array>();
+          GarbageCollector::instance().reportAllocation(sizeof(Array));
+          size_t needed = arrayPat->elements.size();
+          bool hasRest = (arrayPat->rest != nullptr);
+          for (size_t i = 0; i < needed || hasRest; ++i) {
+            Value stepResult = iteratorNext(iterRec);
+            if (flow_.type == ControlFlow::Type::Throw) return;
+            if (!stepResult.isObject()) {
+              throwError(ErrorType::TypeError, "Iterator result is not an object");
+              return;
+            }
+            auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+            bool done = false;
+            auto doneGetterIt = stepObj->properties.find("__get_done");
+            if (doneGetterIt != stepObj->properties.end() && doneGetterIt->second.isFunction()) {
+              Value doneVal = callFunction(doneGetterIt->second, {}, stepResult);
+              if (flow_.type == ControlFlow::Type::Throw) return;
+              done = doneVal.toBool();
+            } else {
+              auto doneIt = stepObj->properties.find("done");
+              done = (doneIt != stepObj->properties.end() && doneIt->second.toBool());
+            }
+            if (done) break;
+
+            Value elemVal;
+            auto valGetterIt = stepObj->properties.find("__get_value");
+            if (valGetterIt != stepObj->properties.end() && valGetterIt->second.isFunction()) {
+              elemVal = callFunction(valGetterIt->second, {}, stepResult);
+              if (flow_.type == ControlFlow::Type::Throw) return;
+            } else {
+              auto valIt = stepObj->properties.find("value");
+              elemVal = (valIt != stepObj->properties.end()) ? valIt->second : Value(Undefined{});
+            }
+            arr->elements.push_back(elemVal);
+            if (i >= needed && !hasRest) break;
+          }
         }
       }
-      if (iteratorDeleted) {
-        throwError(ErrorType::TypeError, value.toString() + " is not iterable");
-        return;
-      }
-      arr = std::get<std::shared_ptr<Array>>(value.data);
     } else if (value.isString()) {
       // Strings are iterable - convert to array of chars
       auto str = std::get<std::string>(value.data);
@@ -8449,7 +9607,9 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       } else if (auto* keyStr = std::get_if<StringLiteral>(&prop.key->node)) {
         keyName = keyStr->value;
       } else if (auto* keyNum = std::get_if<NumberLiteral>(&prop.key->node)) {
-        keyName = std::to_string(static_cast<int>(keyNum->value));
+        keyName = numberToPropertyKey(keyNum->value);
+      } else if (auto* keyBigInt = std::get_if<BigIntLiteral>(&prop.key->node)) {
+        keyName = bigint::toString(keyBigInt->value);
       } else {
         continue;
       }
@@ -8638,7 +9798,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     } else if (decl.kind == VarDeclaration::Kind::Var) {
       // var without initializer: don't overwrite existing binding
       if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
-        if (env_->has(id->name)) {
+        if (env_->hasLocal(id->name)) {
           continue;
         }
       }
@@ -8715,7 +9875,7 @@ void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
           collectVarHoistNames(*declarator.pattern, names);
         }
         for (const auto& name : names) {
-          if (!env_->has(name)) {
+          if (!env_->hasLocal(name)) {
             env_->define(name, Value(Undefined{}));
           }
         }
@@ -8787,6 +9947,13 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
+  {
+    auto [start, len] = syntheticParamDestructurePrologueRange(decl.body);
+    if (len > 0) {
+      func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
+      func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
+    }
+  }
   func->closure = env_;
   // Compute length: number of params before first default parameter
   size_t funcDeclLen = 0;
@@ -9005,7 +10172,8 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
   };
 
   if (scopeValue.isObject()) {
-    bindObjectChain(std::get<std::shared_ptr<Object>>(scopeValue.data));
+    // Keep with-object property resolution dynamic via __with_scope_object__.
+    // Copying properties into lexical bindings breaks unscopables semantics.
   } else if (scopeValue.isPromise()) {
     auto promisePtr = std::get<std::shared_ptr<Promise>>(scopeValue.data);
     for (const auto& [key, value] : promisePtr->properties) {

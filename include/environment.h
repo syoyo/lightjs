@@ -22,12 +22,14 @@ public:
   explicit Environment(std::shared_ptr<Environment> parent);
 
   void define(const std::string& name, const Value& value, bool isConst = false);
+  void defineLexical(const std::string& name, const Value& value, bool isConst = false);
   void defineTDZ(const std::string& name);  // Define name in temporal dead zone
   void removeTDZ(const std::string& name);  // Remove TDZ marker (initialize binding)
   bool isTDZ(const std::string& name) const;  // Check if name is in TDZ
   std::optional<Value> get(const std::string& name) const;
   bool set(const std::string& name, const Value& value);
   bool has(const std::string& name) const;
+  bool hasLocal(const std::string& name) const;
   bool isConst(const std::string& name) const;
 
   static std::shared_ptr<Environment> createGlobal();
