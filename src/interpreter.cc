@@ -535,7 +535,8 @@ bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
 
 Task Interpreter::evaluate(const Program& program) {
   bool previousStrictMode = strictMode_;
-  strictMode_ = hasUseStrictDirective(program.body) || program.isModule;
+  // Inherit strict mode if already set (e.g., from direct eval in strict context)
+  strictMode_ = strictMode_ || hasUseStrictDirective(program.body) || program.isModule;
 
   if (program.isModule) {
     for (const auto& stmt : program.body) {
@@ -1940,7 +1941,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
 
       // Helper lambda to walk prototype chain for 'in' operator
-      auto hasPropertyInChain = [&](const std::unordered_map<std::string, Value>& props) -> bool {
+      auto hasPropertyInChain = [&](const OrderedMap<std::string, Value>& props) -> bool {
         if (props.find(propName) != props.end()) return true;
         auto protoIt = props.find("__proto__");
         if (protoIt != props.end() && protoIt->second.isObject()) {
@@ -2088,7 +2089,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       // OrdinaryHasInstance: walk the prototype chain
       // Get the constructor's .prototype property
       auto getCtorPrototype = [&](const Value& ctor) -> std::shared_ptr<Object> {
-        std::unordered_map<std::string, Value>* props = nullptr;
+        OrderedMap<std::string, Value>* props = nullptr;
         if (ctor.isFunction()) {
           props = &std::get<std::shared_ptr<Function>>(ctor.data)->properties;
         } else if (ctor.isObject()) {
@@ -2113,7 +2114,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       auto ctorProto = getCtorPrototype(right);
       if (!ctorProto) {
         // Check if prototype property exists but is not an object → TypeError
-        std::unordered_map<std::string, Value>* checkProps = nullptr;
+        OrderedMap<std::string, Value>* checkProps = nullptr;
         if (right.isFunction()) {
           checkProps = &std::get<std::shared_ptr<Function>>(right.data)->properties;
         } else if (right.isObject()) {
@@ -2130,7 +2131,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       if (ctorProto) {
         // Get the instance's __proto__ chain
         auto getProto = [](const Value& val) -> std::shared_ptr<Object> {
-          std::unordered_map<std::string, Value>* props = nullptr;
+          OrderedMap<std::string, Value>* props = nullptr;
           if (val.isObject()) {
             props = &std::get<std::shared_ptr<Object>>(val.data)->properties;
           } else if (val.isArray()) {
@@ -2371,8 +2372,17 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       LIGHTJS_RETURN(Value(false));
     }
 
-    // delete on identifier (not allowed in strict mode, but we return true)
+    // delete on identifier
     if (std::holds_alternative<Identifier>(expr.argument->node)) {
+      auto& id = std::get<Identifier>(expr.argument->node);
+      // Check with-scope objects first (delete p3 inside with(myObj) deletes myObj.p3)
+      int withResult = env_->deleteFromWithScope(id.name);
+      if (withResult == 1) {
+        LIGHTJS_RETURN(Value(true));   // deleted from with-scope object
+      }
+      if (withResult == -1) {
+        LIGHTJS_RETURN(Value(false));  // non-configurable with-scope property
+      }
       // In non-strict mode, delete on variables returns false
       LIGHTJS_RETURN(Value(false));
     }
@@ -2824,8 +2834,8 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
           LIGHTJS_RETURN(Value(Undefined{}));
         }
-        // In sloppy mode, create global
-        env_->define(id->name, right);
+        // In sloppy mode, create global variable
+        env_->getRoot()->define(id->name, right);
       }
       LIGHTJS_RETURN(right);
     }
@@ -3118,6 +3128,17 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           }
           default:
             writeObjPtr->properties[propName] = computeCompoundOp(expr.op, current, right);
+        }
+      }
+      // Sync globalThis property changes back to root environment bindings.
+      // In JS, global variables ARE properties of the global object, so
+      // this['x'] = 5 must also update the variable binding for x.
+      auto rootEnv = env_->getRoot();
+      auto globalThisVal = rootEnv->get("globalThis");
+      if (globalThisVal && globalThisVal->isObject()) {
+        auto globalObj = std::get<std::shared_ptr<Object>>(globalThisVal->data);
+        if (globalObj.get() == writeObjPtr.get()) {
+          rootEnv->set(propName, writeObjPtr->properties[propName]);
         }
       }
       LIGHTJS_RETURN(writeObjPtr->properties[propName]);
@@ -4793,17 +4814,38 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "return") {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
+      fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
         Value returnValue = args.empty() ? Value(Undefined{}) : args[0];
-        genPtr->state = GeneratorState::Completed;
-        genPtr->currentValue = std::make_shared<Value>(returnValue);
-        Value step = makeIteratorResult(returnValue, true);
+
+        if (genPtr->state == GeneratorState::Completed) {
+          return makeIteratorResult(returnValue, true);
+        }
+        if (genPtr->state == GeneratorState::SuspendedStart) {
+          genPtr->state = GeneratorState::Completed;
+          genPtr->currentValue = std::make_shared<Value>(returnValue);
+          return makeIteratorResult(returnValue, true);
+        }
+
+        // SuspendedYield: resume execution to run finally blocks
+        Value step = this->runGeneratorNext(genPtr, ControlFlow::ResumeMode::Return, returnValue);
+
+        // If a finally block yielded, the generator is still suspended
+        if (genPtr->state == GeneratorState::SuspendedYield) {
+          return step;  // Return the yielded value with done:false
+        }
+
+        // Generator completed (normally or via finally return)
+        Value resultValue = returnValue;
+        if (genPtr->currentValue) {
+          resultValue = *genPtr->currentValue;
+        }
+
         if (genPtr->function && genPtr->function->isAsync) {
           auto promise = std::make_shared<Promise>();
-          promise->resolve(step);
+          promise->resolve(makeIteratorResult(resultValue, true));
           return Value(promise);
         }
-        return step;
+        return makeIteratorResult(resultValue, true);
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -4811,15 +4853,40 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "throw") {
       auto fn = std::make_shared<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [genPtr](const std::vector<Value>& args) -> Value {
-        genPtr->state = GeneratorState::Completed;
-        std::string msg = args.empty() ? "Generator error" : args[0].toString();
+      fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
+        Value throwValue = args.empty() ? Value(std::make_shared<Error>(ErrorType::Error, "Generator error")) : args[0];
+
+        if (genPtr->state == GeneratorState::Completed ||
+            genPtr->state == GeneratorState::SuspendedStart) {
+          genPtr->state = GeneratorState::Completed;
+          // Re-throw: set flow to Throw so caller sees it
+          this->flow_.type = ControlFlow::Type::Throw;
+          this->flow_.value = throwValue;
+          return Value(Undefined{});
+        }
+
+        // SuspendedYield: resume to let try/catch handle the error
+        Value step = this->runGeneratorNext(genPtr, ControlFlow::ResumeMode::Throw, throwValue);
+
+        // If the generator caught the error and yielded again
+        if (genPtr->state == GeneratorState::SuspendedYield) {
+          return step;
+        }
+
+        // If the throw was not caught, flow_ will have type Throw
         if (genPtr->function && genPtr->function->isAsync) {
+          if (this->flow_.type == ControlFlow::Type::Throw) {
+            auto promise = std::make_shared<Promise>();
+            Value rejection = this->flow_.value;
+            this->clearError();
+            promise->reject(rejection);
+            return Value(promise);
+          }
           auto promise = std::make_shared<Promise>();
-          promise->reject(Value(std::make_shared<Error>(ErrorType::Error, msg)));
+          promise->resolve(step);
           return Value(promise);
         }
-        return Value(std::make_shared<Error>(ErrorType::Error, msg));
+        return step;
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -8012,7 +8079,7 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
   // Set __proto__ to Array.prototype for prototype chain resolution
   auto arrCtor = env_->get("Array");
   if (arrCtor) {
-    std::unordered_map<std::string, Value>* ctorProps = nullptr;
+    OrderedMap<std::string, Value>* ctorProps = nullptr;
     if (arrCtor->isFunction()) {
       ctorProps = &std::get<std::shared_ptr<Function>>(arrCtor->data)->properties;
     } else if (arrCtor->isObject()) {
@@ -8095,7 +8162,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   // Set __proto__ to Object.prototype for prototype chain resolution
   auto objCtor = env_->get("Object");
   if (objCtor) {
-    std::unordered_map<std::string, Value>* ctorProps = nullptr;
+    OrderedMap<std::string, Value>* ctorProps = nullptr;
     if (objCtor->isFunction()) {
       ctorProps = &std::get<std::shared_ptr<Function>>(objCtor->data)->properties;
     } else if (objCtor->isObject()) {
@@ -8179,6 +8246,10 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
+  // If evaluating in an eval context, keep the AST alive
+  if (sourceKeepAlive_) {
+    func->astOwner = sourceKeepAlive_;
+  }
   {
     auto [start, len] = syntheticParamDestructurePrologueRange(expr.body);
     if (len > 0) {
@@ -8580,6 +8651,10 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         if (flow_.type == ControlFlow::Type::Return) {
           break;
         }
+        // Preserve throw flow control (errors)
+        if (flow_.type == ControlFlow::Type::Throw) {
+          break;
+        }
       }
 
       // Get the final `this` value (super() may have replaced it)
@@ -8588,7 +8663,13 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         finalThis = *currentThis;
       }
 
-      flow_ = prevFlow;
+      // Don't restore flow if an error was thrown - preserve the error
+      if (flow_.type != ControlFlow::Type::Throw) {
+        flow_ = prevFlow;
+      } else {
+        env_ = prevEnv;
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
       env_ = prevEnv;
 
       setConstructorTag(finalThis);
@@ -8753,11 +8834,24 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
       }
     }
 
+    // Hoist var and function declarations in constructor body
+    hoistVarDeclarations(*bodyPtr);
+    for (const auto& hoistStmt : *bodyPtr) {
+      if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
+        auto hoistTask = evaluate(*hoistStmt);
+        LIGHTJS_RUN_TASK_VOID(hoistTask);
+      }
+    }
+
     Value result = Value(Undefined{});
     auto prevFlow = flow_;
     flow_ = ControlFlow{};
 
     for (const auto& stmt : *bodyPtr) {
+      // Skip function declarations - already hoisted
+      if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+        continue;
+      }
       auto stmtTask = evaluate(*stmt);
   LIGHTJS_RUN_TASK(stmtTask, result);
 
@@ -8776,9 +8870,16 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
         }
         break;
       }
+      // Preserve throw flow control (errors)
+      if (flow_.type == ControlFlow::Type::Throw) {
+        break;
+      }
     }
 
-    flow_ = prevFlow;
+    // Don't restore flow if an error was thrown - preserve the error
+    if (flow_.type != ControlFlow::Type::Throw) {
+      flow_ = prevFlow;
+    }
     env_ = prevEnv;
 
     Value instanceVal(instance);
@@ -9294,16 +9395,23 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       genRecord.generator = gen;
       size_t needed = arrayPat->elements.size();
       bool hasRest = (arrayPat->rest != nullptr);
+      bool genExhausted = false;
       // Only pull as many elements as the pattern requires
       for (size_t i = 0; i < needed || hasRest; ++i) {
         Value stepResult = iteratorNext(genRecord);
-        if (!stepResult.isObject()) break;
+        if (!stepResult.isObject()) { genExhausted = true; break; }
         auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
         auto doneIt2 = stepObj->properties.find("done");
-        if (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool()) break;
+        if (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool()) { genExhausted = true; break; }
         auto valIt = stepObj->properties.find("value");
         arr->elements.push_back(valIt != stepObj->properties.end() ? valIt->second : Value(Undefined{}));
         if (i >= needed && !hasRest) break;
+      }
+      // Per spec: IteratorClose if iterator not exhausted after destructuring.
+      // Only when elements were consumed ([] = empty pattern doesn't get iterator per spec).
+      if (needed > 0 && !genExhausted && !hasRest &&
+          gen->state != GeneratorState::Completed) {
+        iteratorClose(genRecord);
       }
     } else if (value.isObject()) {
       // Check for Symbol.iterator on objects
@@ -9791,14 +9899,29 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
 
 Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
   for (const auto& declarator : decl.declarations) {
+    // Per spec (13.3.2.4): ResolveBinding BEFORE evaluating initializer.
+    // For var declarations in with-scope, capture the with-scope object first.
+    std::shared_ptr<Object> preResolvedWithObj;
+    std::string preResolvedName;
+    if (decl.kind == VarDeclaration::Kind::Var && declarator.init) {
+      if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
+        preResolvedWithObj = env_->resolveWithScopeObject(id->name);
+        if (preResolvedWithObj) {
+          preResolvedName = id->name;
+        }
+      }
+    }
+
     Value value = Value(Undefined{});
     if (declarator.init) {
       auto task = evaluate(*declarator.init);
   LIGHTJS_RUN_TASK(task, value);
     } else if (decl.kind == VarDeclaration::Kind::Var) {
       // var without initializer: don't overwrite existing binding
+      // Use has() (not hasLocal) to check entire scope chain, since the body
+      // block creates a child env and the var binding may be in a parent scope
       if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
-        if (env_->hasLocal(id->name)) {
+        if (env_->has(id->name)) {
           continue;
         }
       }
@@ -9834,6 +9957,12 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
           }
         }
       }
+    }
+
+    // If binding was pre-resolved to a with-scope object, write there directly (PutValue)
+    if (preResolvedWithObj && !preResolvedName.empty()) {
+      preResolvedWithObj->properties[preResolvedName] = value;
+      continue;
     }
 
     // Use the unified destructuring helper
@@ -9877,6 +10006,15 @@ void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
         for (const auto& name : names) {
           if (!env_->hasLocal(name)) {
             env_->define(name, Value(Undefined{}));
+            // At global scope, var declarations create non-configurable properties
+            // on the global object (can't be deleted)
+            if (!env_->getParent()) {
+              auto globalThisOpt = env_->get("globalThis");
+              if (globalThisOpt && globalThisOpt->isObject()) {
+                auto globalObj = std::get<std::shared_ptr<Object>>(globalThisOpt->data);
+                globalObj->properties["__non_configurable_" + name] = Value(true);
+              }
+            }
           }
         }
       }
@@ -9947,6 +10085,10 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
+  // If evaluating in an eval context, keep the AST alive
+  if (sourceKeepAlive_) {
+    func->astOwner = sourceKeepAlive_;
+  }
   {
     auto [start, len] = syntheticParamDestructurePrologueRange(decl.body);
     if (len > 0) {
@@ -10090,9 +10232,17 @@ Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
   LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
       break;
     } else if (flow_.type == ControlFlow::Type::Continue) {
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty() || (!myLabel.empty() && flow_.label == myLabel)) {
         flow_.type = ControlFlow::Type::None;
         flow_.label.clear();
@@ -10115,6 +10265,12 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
 
   Value scopeValue = LIGHTJS_AWAIT(evaluate(*stmt.object));
   if (flow_.type != ControlFlow::Type::None) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  // with(null) or with(undefined) throws TypeError per spec
+  if (scopeValue.isNull() || scopeValue.isUndefined()) {
+    throwError(ErrorType::TypeError, "Cannot convert undefined or null to object");
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
@@ -10216,6 +10372,16 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
   }
 
   Value result = LIGHTJS_AWAIT(evaluate(*stmt.body));
+
+  // Per spec: Return Completion(UpdateEmpty(C, undefined))
+  // When body completes with break/continue, carry the UpdateEmpty'd value
+  if (flow_.type == ControlFlow::Type::Break ||
+      flow_.type == ControlFlow::Type::Continue) {
+    // The result is the UpdateEmpty'd value from the body
+    // Propagate it through breakCompletionValue for the enclosing loop
+    flow_.breakCompletionValue = result;
+  }
+
   LIGHTJS_RETURN(result);
 }
 
@@ -10288,9 +10454,17 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
       break;
     } else if (flow_.type == ControlFlow::Type::Continue) {
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty() || (!myLabel.empty() && flow_.label == myLabel)) {
         flow_.type = ControlFlow::Type::None;
         flow_.label.clear();
@@ -10326,9 +10500,19 @@ Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
   LIGHTJS_RUN_TASK(bodyTask, result);
 
     if (flow_.type == ControlFlow::Type::Break) {
+      // Use try/finally completion value if available (spec UpdateEmpty)
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
       break;
     } else if (flow_.type == ControlFlow::Type::Continue) {
+      // Use try/finally completion value if available (spec UpdateEmpty)
+      if (flow_.breakCompletionValue.has_value()) {
+        result = *flow_.breakCompletionValue;
+        flow_.breakCompletionValue = std::nullopt;
+      }
       if (flow_.label.empty()) {
         flow_.type = ControlFlow::Type::None;
       } else if (!myLabel.empty() && flow_.label == myLabel) {
@@ -10512,17 +10696,27 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     }
   };
 
-  // Helper to sort keys per spec: integer indices ascending first, then string keys in insertion order
-  // Since we use unordered_map (no insertion order), we sort strings alphabetically as approximation
+  // Helper to sort keys per spec: integer indices ascending first, then string keys in insertion order.
+  // Uses orderedKeys() from OrderedMap for correct insertion-order enumeration.
   auto sortKeys = [](std::vector<std::string>& keys) {
-    std::stable_sort(keys.begin(), keys.end(), [](const std::string& a, const std::string& b) {
-      bool aIsNum = !a.empty() && std::all_of(a.begin(), a.end(), ::isdigit);
-      bool bIsNum = !b.empty() && std::all_of(b.begin(), b.end(), ::isdigit);
-      if (aIsNum && bIsNum) return std::stoul(a) < std::stoul(b);
-      if (aIsNum) return true;  // Numeric keys come first
-      if (bIsNum) return false;
-      return a < b;  // Alphabetical for string keys
+    // Partition into numeric indices and string keys (preserving relative order)
+    std::vector<std::string> numericKeys, stringKeys;
+    for (const auto& k : keys) {
+      bool isNum = !k.empty() && std::all_of(k.begin(), k.end(), ::isdigit);
+      if (isNum) {
+        numericKeys.push_back(k);
+      } else {
+        stringKeys.push_back(k);
+      }
+    }
+    // Sort numeric indices in ascending numeric order
+    std::sort(numericKeys.begin(), numericKeys.end(), [](const std::string& a, const std::string& b) {
+      return std::stoul(a) < std::stoul(b);
     });
+    // Reassemble: numeric first, then string keys in insertion order (already in order)
+    keys.clear();
+    keys.insert(keys.end(), numericKeys.begin(), numericKeys.end());
+    keys.insert(keys.end(), stringKeys.begin(), stringKeys.end());
   };
 
   // Helper to collect enumerable keys from an object (including prototype chain)
@@ -10533,9 +10727,9 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     auto current = objPtr;
     int depth = 0;
     while (current && depth < 50) {
-      // Collect keys at this level, sort them, then add
+      // Collect keys at this level using insertion order from OrderedMap
       std::vector<std::string> levelKeys;
-      for (const auto& [key, _] : current->properties) {
+      for (const auto& key : current->properties.orderedKeys()) {
         if (isInternalProp(key)) continue;
         if (isMetaProp(key)) continue;
         if (seen.count(key)) continue;
@@ -11113,8 +11307,19 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
     // Execute if we found a match or if we're in fall-through mode
     if (foundMatch) {
       for (const auto& consequentStmt : caseClause.consequent) {
+        Value stmtResult;
         auto stmtTask = evaluate(*consequentStmt);
-  LIGHTJS_RUN_TASK(stmtTask, result);
+  LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+
+        // UpdateEmpty semantics (ES spec 13.12.9):
+        // Update V when R.[[value]] is not empty.
+        // Normal completion always updates V.
+        // Abrupt completion only updates V if it carries a non-empty value.
+        if (flow_.type == ControlFlow::Type::None) {
+          result = stmtResult;
+        } else if (!stmtResult.isUndefined()) {
+          result = stmtResult;
+        }
 
         if (flow_.type == ControlFlow::Type::Break) {
           if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -11133,8 +11338,17 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
     for (size_t i = defaultIndex; i < stmt.cases.size(); ++i) {
       const auto& caseClause = stmt.cases[i];
       for (const auto& consequentStmt : caseClause.consequent) {
+        Value stmtResult;
         auto stmtTask = evaluate(*consequentStmt);
-  LIGHTJS_RUN_TASK(stmtTask, result);
+  LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+
+        // UpdateEmpty semantics (ES spec 13.12.9):
+        // Update V when R.[[value]] is not empty.
+        if (flow_.type == ControlFlow::Type::None) {
+          result = stmtResult;
+        } else if (!stmtResult.isUndefined()) {
+          result = stmtResult;
+        }
 
         if (flow_.type == ControlFlow::Type::Break) {
           if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -11161,9 +11375,10 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   LIGHTJS_RUN_TASK(task, result);
 
     if (flow_.type == ControlFlow::Type::Throw && stmt.hasHandler) {
-      auto catchEnv = env_->createChild();
+      // Per spec: create catch parameter environment
+      auto catchParamEnv = env_->createChild();
       auto prevEnv = env_;
-      env_ = catchEnv;
+      env_ = catchParamEnv;
 
       // Save thrown value and clear flow BEFORE binding - bindDestructuringPattern
       // checks flow_.type == Throw internally and would exit early otherwise
@@ -11175,6 +11390,11 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       } else if (!stmt.handler.param.name.empty()) {
         env_->define(stmt.handler.param.name, thrownValue);
       }
+
+      // Per spec: create separate block environment (child of param env)
+      // so closures in param initializers vs block body capture different scopes
+      auto catchBlockEnv = env_->createChild();
+      env_ = catchBlockEnv;
 
       for (const auto& catchStmt : stmt.handler.body) {
         auto catchTask = evaluate(*catchStmt);
@@ -11194,24 +11414,47 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   }
 
   if (stmt.hasFinalizer) {
+    // In generators, yield should NOT trigger finally — only run finally on
+    // return/throw/normal completion, not on yield suspension
+    if (flow_.type == ControlFlow::Type::Yield) {
+      LIGHTJS_RETURN(result);
+    }
+
     // Save current control flow state (from try/catch)
     auto savedFlow = flow_;
     flow_.type = ControlFlow::Type::None;
     flow_.label.clear();
 
+    Value finallyValue = Value(Undefined{});
     for (const auto& finalStmt : stmt.finalizer) {
       auto finalTask = evaluate(*finalStmt);
       Value finalResult;
       LIGHTJS_RUN_TASK(finalTask, finalResult);
+      // UpdateEmpty semantics: track last non-empty completion value
+      if (flow_.type == ControlFlow::Type::None) {
+        finallyValue = finalResult;
+      } else if (!finalResult.isUndefined()) {
+        finallyValue = finalResult;
+      }
       if (flow_.type != ControlFlow::Type::None) {
         break;
       }
     }
 
     // If finally block produced its own control flow, it overrides try/catch's
-    // If finally block completed normally, restore try/catch's control flow
+    // and its completion value replaces the try/catch result
     if (flow_.type == ControlFlow::Type::None) {
       flow_ = savedFlow;
+    } else {
+      // Per spec: Return Completion(UpdateEmpty(F, undefined))
+      // The finally block's abrupt completion overrides try/catch.
+      // Carry the completion value through breakCompletionValue so
+      // enclosing loops can use it (avoids the empty-vs-undefined problem).
+      if (flow_.type == ControlFlow::Type::Break ||
+          flow_.type == ControlFlow::Type::Continue) {
+        flow_.breakCompletionValue = finallyValue;
+      }
+      result = finallyValue;
     }
   }
 

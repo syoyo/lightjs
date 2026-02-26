@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "object_shape.h"
+#include "ordered_map.h"
 #include "value_core.h"
 
 #if USE_SIMPLE_REGEX
@@ -44,7 +45,7 @@ struct Function : public GCObject {
   bool isStrict;
   bool isConstructor = false;  // Can be called with 'new'
   NativeFunction nativeFunc;
-  std::unordered_map<std::string, Value> properties;
+  OrderedMap<std::string, Value> properties;
 
   Function() : isNative(false), isAsync(false), isGenerator(false), isStrict(false), isConstructor(false) {}
 
@@ -62,7 +63,7 @@ struct Class : public GCObject {
   std::unordered_map<std::string, std::shared_ptr<Function>> staticMethods;  // Static methods
   std::unordered_map<std::string, std::shared_ptr<Function>> getters;        // Getter methods
   std::unordered_map<std::string, std::shared_ptr<Function>> setters;        // Setter methods
-  std::unordered_map<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
+  OrderedMap<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
   std::shared_ptr<void> closure;  // Closure environment
 
   // Field initializers (public and private) - evaluated during construction
@@ -92,7 +93,7 @@ struct Class : public GCObject {
 
 struct Array : public GCObject {
   std::vector<Value> elements;
-  std::unordered_map<std::string, Value> properties;
+  OrderedMap<std::string, Value> properties;
 
   // GCObject interface
   const char* typeName() const override { return "Array"; }
@@ -100,7 +101,7 @@ struct Array : public GCObject {
 };
 
 struct Object : public GCObject {
-  std::unordered_map<std::string, Value> properties;  // Fallback for dynamic properties
+  OrderedMap<std::string, Value> properties;  // Fallback for dynamic properties
   std::vector<Value> slots;  // Fast slot-based storage for known properties
   std::shared_ptr<ObjectShape> shape;  // Shape for inline caching optimization
   bool isModuleNamespace = false;  // Special handling for ES module namespace objects.
@@ -190,7 +191,7 @@ struct Regex : public GCObject {
 #endif
   std::string pattern;
   std::string flags;
-  std::unordered_map<std::string, Value> properties;
+  OrderedMap<std::string, Value> properties;
 
   Regex(const std::string& p, const std::string& f = "")
     : pattern(p), flags(f) {
@@ -536,7 +537,7 @@ struct Promise : public GCObject {
   std::vector<std::function<Value(Value)>> fulfilledCallbacks;
   std::vector<std::function<Value(Value)>> rejectedCallbacks;
   std::vector<std::shared_ptr<Promise>> chainedPromises;
-  std::unordered_map<std::string, Value> properties;
+  OrderedMap<std::string, Value> properties;
 
   Promise() : state(PromiseState::Pending), result(Undefined{}) {}
 

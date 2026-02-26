@@ -198,6 +198,9 @@ public:
   void setSuppressMicrotasks(bool value) { suppressMicrotasks_ = value; }
   bool suppressMicrotasks() const { return suppressMicrotasks_; }
   bool inDirectEvalInvocation() const { return activeDirectEvalInvocation_; }
+  bool isStrictMode() const { return strictMode_; }
+  void setStrictMode(bool strict) { strictMode_ = strict; }
+  void setSourceKeepAlive(std::shared_ptr<void> keep) { sourceKeepAlive_ = std::move(keep); }
 
   // Stack depth limit for recursion protection
   // Keep this well below what would cause a C stack overflow (~3000-4000 on typical systems)
@@ -252,6 +255,9 @@ private:
     std::string label;
     ResumeMode resumeMode = ResumeMode::None;
     Value resumeValue = Value(Undefined{});
+    // Completion value from try/finally override for break/continue.
+    // Set when finally block produces break/continue to carry the UpdateEmpty'd value.
+    std::optional<Value> breakCompletionValue;
 
     void reset() {
       type = Type::None;
@@ -259,6 +265,7 @@ private:
       label.clear();
       resumeMode = ResumeMode::None;
       resumeValue = Value(Undefined{});
+      breakCompletionValue = std::nullopt;
     }
 
     void setYield(const Value& v) {
@@ -288,6 +295,7 @@ private:
   Value lastMemberBase_ = Value(Undefined{});
   bool hasLastMemberBase_ = false;
   bool strictMode_ = false;
+  bool varDeclBypassWith_ = false;  // Set during var declaration eval to bypass with scopes
   bool inTailPosition_ = false;
   std::shared_ptr<Function> activeFunction_ = nullptr;
   bool pendingSelfTailCall_ = false;
@@ -295,6 +303,7 @@ private:
   Value pendingSelfTailThis_ = Value(Undefined{});
   bool pendingDirectEvalCall_ = false;
   bool activeDirectEvalInvocation_ = false;
+  std::shared_ptr<void> sourceKeepAlive_;  // Keeps eval AST alive for function bodies
   std::vector<std::shared_ptr<Function>> activeNamedExpressionStack_;
   std::string pendingIterationLabel_;  // Label for next iteration statement (consumed once)
 

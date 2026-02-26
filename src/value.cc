@@ -938,7 +938,7 @@ Value Object_keys(const std::vector<Value>& args) {
     return Value(result);
   }
 
-  for (const auto& [key, value] : obj->properties) {
+  for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
     if (isSymbolKey(key)) continue;
@@ -958,12 +958,13 @@ Value Object_values(const std::vector<Value>& args) {
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
   auto result = std::make_shared<Array>();
 
-  for (const auto& [key, value] : obj->properties) {
+  for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
     if (isSymbolKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
-    result->elements.push_back(value);
+    auto it = obj->properties.find(key);
+    result->elements.push_back(it->second);
   }
 
   return Value(result);
@@ -978,14 +979,15 @@ Value Object_entries(const std::vector<Value>& args) {
   auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
   auto result = std::make_shared<Array>();
 
-  for (const auto& [key, value] : obj->properties) {
+  for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
     if (isSymbolKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
+    auto it = obj->properties.find(key);
     auto entry = std::make_shared<Array>();
     entry->elements.push_back(Value(key));
-    entry->elements.push_back(value);
+    entry->elements.push_back(it->second);
     result->elements.push_back(Value(entry));
   }
 
@@ -1118,7 +1120,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     if (fn->properties.count("name")) {
       result->elements.push_back(Value(std::string("name")));
     }
-    for (const auto& [key, value] : fn->properties) {
+    for (const auto& key : fn->properties.orderedKeys()) {
       if (isInternalProperty(key)) continue;
       if (key == "length" || key == "name") continue;
       result->elements.push_back(Value(key));
@@ -1139,7 +1141,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     return Value(result);
   }
 
-  for (const auto& [key, value] : obj->properties) {
+  for (const auto& key : obj->properties.orderedKeys()) {
     if (isInternalProperty(key)) continue;
     if (isSymbolKey(key)) continue;
     result->elements.push_back(Value(key));

@@ -1092,11 +1092,48 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
     advance();  // label identifier
     advance();  // :
     // let/const/class/async-function are not allowed as the body of a labeled statement
-    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    // But in non-strict mode, 'let' followed by a newline can be an identifier (ASI).
+    // The lookahead restriction for ExpressionStatement is 'let [', not 'let' in general.
+    if (match(TokenType::Let)) {
+      // In non-strict mode, 'let' followed by a newline is an identifier expression (ASI)
+      if (!strictMode_) {
+        auto nextType = peek().type;
+        auto nextLine = peek().line;
+        auto curLine = current().line;
+        // If 'let' is on a different line from the next token, it's an identifier via ASI
+        // EXCEPT: 'let [' is always a SyntaxError per ExpressionStatement lookahead
+        if (curLine != nextLine && nextType == TokenType::LeftBracket) {
+          error_ = true;
+          return nullptr;
+        } else if (curLine != nextLine) {
+          // Fall through to parseStatement() which will treat 'let' as identifier
+        } else if (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
+                   nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
+                   nextType != TokenType::Yield && nextType != TokenType::Async &&
+                   nextType != TokenType::Get && nextType != TokenType::Set &&
+                   nextType != TokenType::From && nextType != TokenType::As &&
+                   nextType != TokenType::Of && nextType != TokenType::Static &&
+                   nextType != TokenType::Let) {
+          // 'let' followed by something that can't start a binding - treat as identifier
+        } else {
+          // 'let' starts a LexicalDeclaration, which is not allowed in labeled body
+          error_ = true;
+          return nullptr;
+        }
+      } else {
+        error_ = true;
+        return nullptr;
+      }
+    } else if (match(TokenType::Const) || match(TokenType::Class)) {
       error_ = true;
       return nullptr;
     }
     if (match(TokenType::Async) && peek().type == TokenType::Function) {
+      error_ = true;
+      return nullptr;
+    }
+    // Generator declarations (function*) are not allowed in labeled statement position
+    if (match(TokenType::Function) && peek().type == TokenType::Star) {
       error_ = true;
       return nullptr;
     }
@@ -1105,7 +1142,35 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
       error_ = true;
       return nullptr;
     }
+    // Check if label wraps an iteration statement for continue validation.
+    // We need to look ahead: the body could be another label (chained), or an
+    // iteration statement (for/while/do-while), or something else.
+    // For chained labels like `L1: L2: for(...)`, both L1 and L2 are iteration labels.
+    bool isIterationLabel = false;
+    {
+      // Walk through potential chained labels to find the actual statement
+      size_t lookPos = pos_;
+      while (lookPos + 1 < tokens_.size() &&
+             isIdentifierLikeToken(tokens_[lookPos].type) &&
+             tokens_[lookPos + 1].type == TokenType::Colon) {
+        lookPos += 2;  // skip label :
+      }
+      if (lookPos < tokens_.size()) {
+        auto bodyType = tokens_[lookPos].type;
+        isIterationLabel = (bodyType == TokenType::For ||
+                           bodyType == TokenType::While ||
+                           bodyType == TokenType::Do);
+      }
+    }
+    if (isIterationLabel) {
+      iterationLabels_.insert(label);
+    }
+    activeLabels_.insert(label);
     auto body = parseStatement();
+    activeLabels_.erase(label);
+    if (isIterationLabel) {
+      iterationLabels_.erase(label);
+    }
     if (!body) return nullptr;
     return makeStmt(LabelledStmt{label, std::move(body)}, tok);
   }
@@ -1117,26 +1182,29 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
       return makeStmt(ExpressionStmt{makeExpr(NullLiteral{}, tok)}, tok);
     }
     case TokenType::Let:
-      // In non-strict mode, 'let' can be an identifier expression
+      // Escaped 'let' (e.g. l\u0065t) is always an identifier, never a keyword
+      if (current().escaped) {
+        return parseExpressionStatement();
+      }
+      // In non-strict mode, 'let' can be an identifier expression.
       if (!strictMode_) {
         auto nextType = peek().type;
-        bool nextOnSameLine = (peek().line == current().line);
-        // Inside async contexts, `let` followed by linebreak + `await` still
-        // starts a LexicalDeclaration (ASI does not apply here).
-        if (!(!nextOnSameLine &&
-              nextType == TokenType::Await &&
-              !canUseAwaitAsIdentifier())) {
-          // 'let' followed by binding pattern on same line → declaration
-          // 'let' followed by newline or non-pattern → identifier expression
-          if (!nextOnSameLine ||
-              (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
-               nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
-               nextType != TokenType::Yield && nextType != TokenType::Async &&
-               nextType != TokenType::Get && nextType != TokenType::Set &&
-               nextType != TokenType::From && nextType != TokenType::As &&
-               nextType != TokenType::Of && nextType != TokenType::Static)) {
-            return parseExpressionStatement();
-          }
+        // In single-statement positions (for/while/if body), LexicalDeclarations
+        // are not allowed, so 'let' is always an identifier.
+        if (inSingleStatementPosition_) {
+          return parseExpressionStatement();
+        }
+        // In block/module/top-level: 'let' followed by a valid BindingIdentifier
+        // or destructuring pattern is always a LexicalDeclaration
+        // (no [no LineTerminator here] restriction), regardless of line breaks.
+        if (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
+            nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
+            nextType != TokenType::Yield && nextType != TokenType::Async &&
+            nextType != TokenType::Get && nextType != TokenType::Set &&
+            nextType != TokenType::From && nextType != TokenType::As &&
+            nextType != TokenType::Of && nextType != TokenType::Static &&
+            nextType != TokenType::Let) {
+          return parseExpressionStatement();
         }
       }
       [[fallthrough]];
@@ -1176,6 +1244,11 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
         label = current().value;
         advance();
       }
+      // Validate: break with a label must target an existing label
+      if (!label.empty() && activeLabels_.find(label) == activeLabels_.end()) {
+        error_ = true;
+        return nullptr;
+      }
       consumeSemicolon();
       return makeStmt(BreakStmt{label}, tok);
     }
@@ -1186,6 +1259,11 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
       if (match(TokenType::Identifier) && current().line == tok.line) {
         label = current().value;
         advance();
+      }
+      // Validate: continue with a label must target an iteration statement
+      if (!label.empty() && iterationLabels_.find(label) == iterationLabels_.end()) {
+        error_ = true;
+        return nullptr;
       }
       consumeSemicolon();
       return makeStmt(ContinueStmt{label}, tok);
@@ -1255,8 +1333,22 @@ StmtPtr Parser::parseVarDeclaration() {
       return nullptr;
     }
 
-    // Strict mode: reject 'eval' and 'arguments' as binding names
-    if (strictMode_) {
+    // Reject 'let' as a BindingIdentifier in LexicalDeclarations (13.3.1.1)
+    if (kind == VarDeclaration::Kind::Let || kind == VarDeclaration::Kind::Const) {
+      std::vector<std::string> boundNames;
+      collectBoundNames(*pattern, boundNames);
+      for (auto& name : boundNames) {
+        if (name == "let") {
+          error_ = true;
+          return nullptr;
+        }
+        // Strict mode: also reject 'eval' and 'arguments'
+        if (strictMode_ && isStrictModeRestrictedIdentifier(name)) {
+          return nullptr;
+        }
+      }
+    } else if (strictMode_) {
+      // Strict mode: reject 'eval' and 'arguments' in var declarations
       std::vector<std::string> boundNames;
       collectBoundNames(*pattern, boundNames);
       for (auto& name : boundNames) {
@@ -1292,7 +1384,9 @@ StmtPtr Parser::parseVarDeclaration() {
     decl.declarations.push_back({std::move(pattern), std::move(init)});
   } while (match(TokenType::Comma));
 
-  consumeSemicolon();
+  if (!consumeSemicolonOrASI()) {
+    return nullptr;
+  }
   return makeStmt(std::move(decl), startTok);
 }
 
@@ -1470,7 +1564,25 @@ StmtPtr Parser::parseFunctionDeclaration() {
   if (isGenerator) {
     ++generatorFunctionDepth_;
   }
+  // Save and reset labels (labels don't cross function boundaries)
+  auto savedIterationLabels = std::move(iterationLabels_);
+  iterationLabels_.clear();
+  auto savedActiveLabels = std::move(activeLabels_);
+  activeLabels_.clear();
+  // Pre-scan for 'use strict' directive before parsing body
+  bool savedStrict = strictMode_;
+  if (!strictMode_ && match(TokenType::LeftBrace)) {
+    // Peek at first statement: check for "use strict" string literal (after the '{')
+    auto peekPos = pos_ + 1;
+    if (peekPos < tokens_.size() && tokens_[peekPos].type == TokenType::String &&
+        tokens_[peekPos].value == "use strict") {
+      strictMode_ = true;
+    }
+  }
   auto block = parseBlockStatement();
+  strictMode_ = savedStrict;
+  iterationLabels_ = std::move(savedIterationLabels);
+  activeLabels_ = std::move(savedActiveLabels);
   if (isGenerator) {
     --generatorFunctionDepth_;
   }
@@ -1891,10 +2003,14 @@ StmtPtr Parser::parseClassDeclaration() {
       if (method.isGenerator) {
         ++generatorFunctionDepth_;
       }
+      // Save and reset iteration labels (labels don't cross function boundaries)
+      auto savedIterLabelsMethod = std::move(iterationLabels_);
+      iterationLabels_.clear();
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          iterationLabels_ = std::move(savedIterLabelsMethod);
           if (method.isGenerator) {
             --generatorFunctionDepth_;
           }
@@ -1910,6 +2026,7 @@ StmtPtr Parser::parseClassDeclaration() {
         }
         method.body.push_back(std::move(stmt));
       }
+      iterationLabels_ = std::move(savedIterLabelsMethod);
       expect(TokenType::RightBrace);
       if (method.isGenerator) {
         --generatorFunctionDepth_;
@@ -2111,16 +2228,34 @@ StmtPtr Parser::parseWhileStatement() {
     return nullptr;
   }
   // let/const/class/async-function are not allowed as the body of a while statement
-  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+  if (match(TokenType::Const) || match(TokenType::Class)) {
     error_ = true;
     return nullptr;
+  }
+  if (match(TokenType::Let)) {
+    if (peek().type == TokenType::LeftBracket) {
+      error_ = true;
+      return nullptr;
+    }
+    if (strictMode_) {
+      error_ = true;
+      return nullptr;
+    }
+    if (peek().line == current().line &&
+        (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+      error_ = true;
+      return nullptr;
+    }
   }
   // async function declarations not allowed in single-statement position
   if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
+  bool prevSingleStmt = inSingleStatementPosition_;
+  inSingleStatementPosition_ = true;
   auto body = parseStatement();
+  inSingleStatementPosition_ = prevSingleStmt;
   if (!body) {
     return nullptr;
   }
@@ -2155,9 +2290,52 @@ StmtPtr Parser::parseWithStatement() {
     return nullptr;
   }
 
+  // Declarations are not allowed as the body of a with statement
+  if (match(TokenType::Const) || match(TokenType::Class)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Let)) {
+    if (peek().type == TokenType::LeftBracket) {
+      error_ = true;
+      return nullptr;
+    }
+    if (peek().line == current().line &&
+        (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+      error_ = true;
+      return nullptr;
+    }
+  }
+  if (match(TokenType::Function)) {
+    error_ = true;
+    return nullptr;
+  }
+  if (match(TokenType::Async) && peek().type == TokenType::Function) {
+    error_ = true;
+    return nullptr;
+  }
+  bool prevSingleStmt5 = inSingleStatementPosition_;
+  inSingleStatementPosition_ = true;
   auto body = parseStatement();
+  inSingleStatementPosition_ = prevSingleStmt5;
   if (!body) {
     return nullptr;
+  }
+
+  // Check IsLabelledFunction: with body cannot be a labeled function declaration
+  {
+    auto* check = body.get();
+    while (check) {
+      if (auto* labeled = std::get_if<LabelledStmt>(&check->node)) {
+        check = labeled->body.get();
+      } else {
+        break;
+      }
+    }
+    if (check && std::get_if<FunctionDeclaration>(&check->node)) {
+      error_ = true;
+      return nullptr;
+    }
   }
 
   return makeStmt(WithStmt{std::move(object), std::move(body)}, startTok);
@@ -2180,7 +2358,7 @@ StmtPtr Parser::parseForStatement() {
   bool isForOf = false;
 
   // Try to detect for...in or for...of pattern
-  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+  if ((match(TokenType::Let) && !current().escaped) || match(TokenType::Const) || match(TokenType::Var)) {
     auto declType = current().type;
     advance();
     // In non-strict mode, 'let' directly followed by 'in' means 'let' is an identifier
@@ -2349,9 +2527,9 @@ StmtPtr Parser::parseForStatement() {
     StmtPtr left = nullptr;
     // In non-strict mode, 'let' directly followed by 'in' is an identifier, not a declaration
     // Note: 'let' followed by 'of' was already rejected above (spec lookahead restriction)
-    bool letAsIdentifier = !strictMode_ && match(TokenType::Let) &&
-      peek().type == TokenType::In;
-    if (!letAsIdentifier && (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var))) {
+    bool letAsIdentifier = (!strictMode_ && match(TokenType::Let) &&
+      peek().type == TokenType::In) || (match(TokenType::Let) && current().escaped);
+    if (!letAsIdentifier && ((match(TokenType::Let) && !current().escaped) || match(TokenType::Const) || match(TokenType::Var))) {
       VarDeclaration::Kind kind;
       switch (current().type) {
         case TokenType::Let: kind = VarDeclaration::Kind::Let; break;
@@ -2528,7 +2706,10 @@ StmtPtr Parser::parseForStatement() {
       return nullptr;
     }
 
+    bool prevSingleStmt3 = inSingleStatementPosition_;
+    inSingleStatementPosition_ = true;
     auto body = parseStatement();
+    inSingleStatementPosition_ = prevSingleStmt3;
     if (!body) {
       return nullptr;
     }
@@ -2584,7 +2765,21 @@ StmtPtr Parser::parseForStatement() {
   // Regular for loop
   StmtPtr init = nullptr;
   if (!match(TokenType::Semicolon)) {
-    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Var)) {
+    bool isLetDecl = match(TokenType::Let) && !current().escaped;
+    // In non-strict mode, 'let' not followed by binding-start tokens is an identifier
+    if (isLetDecl && !strictMode_) {
+      auto nextType = peek().type;
+      if (nextType != TokenType::Identifier && nextType != TokenType::LeftBracket &&
+          nextType != TokenType::LeftBrace && nextType != TokenType::Await &&
+          nextType != TokenType::Yield && nextType != TokenType::Async &&
+          nextType != TokenType::Get && nextType != TokenType::Set &&
+          nextType != TokenType::From && nextType != TokenType::As &&
+          nextType != TokenType::Of && nextType != TokenType::Static &&
+          nextType != TokenType::Let) {
+        isLetDecl = false;
+      }
+    }
+    if (isLetDecl || match(TokenType::Const) || match(TokenType::Var)) {
       init = parseVarDeclaration();
       if (!init) {
         return nullptr;
@@ -2626,9 +2821,28 @@ StmtPtr Parser::parseForStatement() {
   }
 
   // Declarations are not allowed as the body of a for statement
-  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+  if (match(TokenType::Const) || match(TokenType::Class)) {
     error_ = true;
     return nullptr;
+  }
+  if (match(TokenType::Let)) {
+    // ExpressionStatement lookahead restriction: 'let [' is always forbidden
+    if (peek().type == TokenType::LeftBracket) {
+      error_ = true;
+      return nullptr;
+    }
+    if (strictMode_) {
+      // In strict mode, 'let' is always a declaration keyword - reject as body
+      error_ = true;
+      return nullptr;
+    }
+    // In non-strict mode, only reject 'let' followed by declaration pattern on same line
+    if (peek().line == current().line &&
+        (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+      error_ = true;
+      return nullptr;
+    }
+    // Otherwise: let as identifier expression (handled by parseStatement)
   }
   if (match(TokenType::Function)) {
     error_ = true;
@@ -2638,7 +2852,10 @@ StmtPtr Parser::parseForStatement() {
     error_ = true;
     return nullptr;
   }
+  bool prevSingleStmt2 = inSingleStatementPosition_;
+  inSingleStatementPosition_ = true;
   auto body = parseStatement();
+  inSingleStatementPosition_ = prevSingleStmt2;
   if (!body) {
     return nullptr;
   }
@@ -2686,15 +2903,33 @@ StmtPtr Parser::parseForStatement() {
 StmtPtr Parser::parseDoWhileStatement() {
   expect(TokenType::Do);
   // let/const/class/async-function are not allowed as the body of a do-while statement
-  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+  if (match(TokenType::Const) || match(TokenType::Class)) {
     error_ = true;
     return nullptr;
+  }
+  if (match(TokenType::Let)) {
+    if (peek().type == TokenType::LeftBracket) {
+      error_ = true;
+      return nullptr;
+    }
+    if (strictMode_) {
+      error_ = true;
+      return nullptr;
+    }
+    if (peek().line == current().line &&
+        (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+      error_ = true;
+      return nullptr;
+    }
   }
   if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
     return nullptr;
   }
+  bool prevSingleStmt4 = inSingleStatementPosition_;
+  inSingleStatementPosition_ = true;
   auto body = parseStatement();
+  inSingleStatementPosition_ = prevSingleStmt4;
   if (!body) {
     return nullptr;
   }
@@ -2878,14 +3113,20 @@ StmtPtr Parser::parseSwitchStatement() {
 StmtPtr Parser::parseBlockStatement() {
   expect(TokenType::LeftBrace);
 
+  // Declarations are allowed inside blocks, so clear single-statement flag
+  bool prevSingleStmt = inSingleStatementPosition_;
+  inSingleStatementPosition_ = false;
+
   std::vector<StmtPtr> body;
   while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
     auto stmt = parseStatement();
     if (!stmt) {
+      inSingleStatementPosition_ = prevSingleStmt;
       return nullptr;
     }
     body.push_back(std::move(stmt));
   }
+  inSingleStatementPosition_ = prevSingleStmt;
 
   expect(TokenType::RightBrace);
 
@@ -3003,6 +3244,16 @@ StmtPtr Parser::parseTryStatement() {
         std::set<std::string> seen;
         for (const auto& name : catchParamNames) {
           if (!seen.insert(name).second) {
+            error_ = true;
+            return nullptr;
+          }
+        }
+      }
+
+      // In strict mode, eval/arguments cannot be used as catch parameter names
+      if (strictMode_) {
+        for (const auto& name : catchParamNames) {
+          if (name == "eval" || name == "arguments") {
             error_ = true;
             return nullptr;
           }
@@ -3437,8 +3688,15 @@ ExprPtr Parser::parseExpression() {
 
 ExprPtr Parser::parseAssignment() {
   auto parseArrowBodyInto = [&](FunctionExpr& func) -> bool {
+    // Save and reset labels (labels don't cross function boundaries)
+    auto savedIterLabels = std::move(iterationLabels_);
+    iterationLabels_.clear();
+    auto savedActLabels = std::move(activeLabels_);
+    activeLabels_.clear();
     if (match(TokenType::LeftBrace)) {
       auto blockStmt = parseBlockStatement();
+      iterationLabels_ = std::move(savedIterLabels);
+      activeLabels_ = std::move(savedActLabels);
       if (!blockStmt) {
         return false;
       }
@@ -3450,6 +3708,8 @@ ExprPtr Parser::parseAssignment() {
     }
 
     auto expr = parseAssignment();
+    iterationLabels_ = std::move(savedIterLabels);
+    activeLabels_ = std::move(savedActLabels);
     if (!expr) {
       return false;
     }
@@ -5421,7 +5681,14 @@ ExprPtr Parser::parseFunctionExpression() {
   if (isGenerator) {
     ++generatorFunctionDepth_;
   }
+  // Save and reset labels (labels don't cross function boundaries)
+  auto savedIterationLabels2 = std::move(iterationLabels_);
+  iterationLabels_.clear();
+  auto savedActiveLabels2 = std::move(activeLabels_);
+  activeLabels_.clear();
   auto block = parseBlockStatement();
+  iterationLabels_ = std::move(savedIterationLabels2);
+  activeLabels_ = std::move(savedActiveLabels2);
   if (isGenerator) {
     --generatorFunctionDepth_;
   }
@@ -5829,10 +6096,14 @@ ExprPtr Parser::parseClassExpression() {
       if (method.isGenerator) {
         ++generatorFunctionDepth_;
       }
+      // Save and reset iteration labels (labels don't cross function boundaries)
+      auto savedIterLabelsMethod = std::move(iterationLabels_);
+      iterationLabels_.clear();
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          iterationLabels_ = std::move(savedIterLabelsMethod);
           if (method.isGenerator) {
             --generatorFunctionDepth_;
           }
@@ -5848,6 +6119,7 @@ ExprPtr Parser::parseClassExpression() {
         }
         method.body.push_back(std::move(stmt));
       }
+      iterationLabels_ = std::move(savedIterLabelsMethod);
       expect(TokenType::RightBrace);
       if (method.isGenerator) {
         --generatorFunctionDepth_;

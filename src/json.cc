@@ -333,12 +333,14 @@ private:
     void stringifyObject(const Object& obj) {
         out_ << '{';
         bool first = true;
-        for (const auto& [key, value] : obj.properties) {
+        for (const auto& key : obj.properties.orderedKeys()) {
+            auto it = obj.properties.find(key);
+            if (it == obj.properties.end()) continue;
             if (!first) out_ << ',';
             first = false;
             stringifyString(key);
             out_ << ':';
-            stringifyValue(value);
+            stringifyValue(it->second);
         }
         out_ << '}';
     }

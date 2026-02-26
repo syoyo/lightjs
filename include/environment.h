@@ -31,6 +31,12 @@ public:
   bool has(const std::string& name) const;
   bool hasLocal(const std::string& name) const;
   bool isConst(const std::string& name) const;
+  // Delete from with-scope object: 0=not found, 1=deleted, -1=non-configurable
+  int deleteFromWithScope(const std::string& name);
+  // Set a var binding, bypassing with-scope objects (for var declarations)
+  bool setVar(const std::string& name, const Value& value);
+  // Resolve where a name would be written (returns with-scope object if applicable)
+  std::shared_ptr<Object> resolveWithScopeObject(const std::string& name) const;
 
   static std::shared_ptr<Environment> createGlobal();
   std::shared_ptr<Environment> createChild();

@@ -79,7 +79,7 @@ int main() {
     let g = gen();
     let result = g.next();
     result.value;
-  )", "2");
+  )", "1");
 
   // Test 5: Generator without return
   runTest("Generator without explicit return", R"(

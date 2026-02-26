@@ -154,6 +154,28 @@ bool setWithScopeProperty(const Value& scopeValue, const std::string& name, cons
   return false;
 }
 
+bool deleteWithScopeProperty(const Value& scopeValue, const std::string& name) {
+  if (!isVisibleWithIdentifier(name) || !scopeValue.isObject()) {
+    return false;
+  }
+
+  auto receiver = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  // Check own properties only for delete (no prototype chain)
+  auto it = receiver->properties.find(name);
+  if (it != receiver->properties.end()) {
+    // Check non-configurable
+    if (receiver->properties.count("__non_configurable_" + name)) {
+      return false;  // Can't delete non-configurable properties
+    }
+    receiver->properties.erase(name);
+    receiver->properties.erase("__non_writable_" + name);
+    receiver->properties.erase("__non_enum_" + name);
+    receiver->properties.erase("__enum_" + name);
+    return true;
+  }
+  return false;
+}
+
 void collectVarNamesFromPattern(const Expression& pattern, std::vector<std::string>& names) {
   if (auto* id = std::get_if<Identifier>(&pattern.node)) {
     names.push_back(id->name);
@@ -477,6 +499,17 @@ std::optional<Value> Environment::get(const std::string& name) const {
   if (parent_) {
     return parent_->get(name);
   }
+  // At global scope, fall back to globalThis properties.
+  // In JavaScript, the global object acts as the variable environment
+  // for global code, so properties on globalThis are accessible as variables.
+  auto globalIt = bindings_.find("globalThis");
+  if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+    auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+    auto propIt = globalObj->properties.find(name);
+    if (propIt != globalObj->properties.end()) {
+      return propIt->second;
+    }
+  }
   return std::nullopt;
 }
 
@@ -507,6 +540,18 @@ bool Environment::set(const std::string& name, const Value& value) {
   if (parent_) {
     return parent_->set(name, value);
   }
+  // At global scope, also check/set globalThis properties
+  if (!parent_) {
+    auto globalIt = bindings_.find("globalThis");
+    if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+      auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+      auto propIt = globalObj->properties.find(name);
+      if (propIt != globalObj->properties.end()) {
+        propIt->second = value;
+        return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -522,11 +567,71 @@ bool Environment::has(const std::string& name) const {
   if (parent_) {
     return parent_->has(name);
   }
+  // At global scope, also check globalThis properties
+  auto globalIt = bindings_.find("globalThis");
+  if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+    auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+    if (globalObj->properties.find(name) != globalObj->properties.end()) {
+      return true;
+    }
+  }
   return false;
 }
 
 bool Environment::hasLocal(const std::string& name) const {
   return bindings_.find(name) != bindings_.end();
+}
+
+int Environment::deleteFromWithScope(const std::string& name) {
+  auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
+  if (withScopeIt != bindings_.end()) {
+    if (deleteWithScopeProperty(withScopeIt->second, name)) {
+      return 1;  // deleted
+    }
+    // Check if it exists but is non-configurable
+    if (lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
+      return -1;  // exists but non-configurable
+    }
+  }
+  if (parent_) {
+    return parent_->deleteFromWithScope(name);
+  }
+  return 0;  // not found in any with scope
+}
+
+bool Environment::setVar(const std::string& name, const Value& value) {
+  // For var declarations: walk the scope chain looking for bindings,
+  // but skip with-scope objects. This ensures var assignments go to the
+  // hoisted variable in the function/global scope, not to with-scope properties.
+  auto it = bindings_.find(name);
+  if (it != bindings_.end()) {
+    it->second = value;
+    return true;
+  }
+  if (parent_) {
+    return parent_->setVar(name, value);
+  }
+  return false;
+}
+
+std::shared_ptr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
+  // Check if this env has a local binding that shadows the name
+  auto it = bindings_.find(name);
+  if (it != bindings_.end()) {
+    return nullptr;  // Name is a local binding, not in with-scope
+  }
+  // Check with-scope object
+  auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
+  if (withScopeIt != bindings_.end() && withScopeIt->second.isObject()) {
+    auto obj = std::get<std::shared_ptr<Object>>(withScopeIt->second.data);
+    if (lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
+      return obj;
+    }
+  }
+  if (parent_) {
+    return parent_->resolveWithScopeObject(name);
+  }
+  return nullptr;
 }
 
 bool Environment::isConst(const std::string& name) const {
@@ -693,7 +798,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
     }
 
+    // Direct eval inherits strict mode from calling context (ES2020 18.2.1.1)
+    bool inheritStrict = false;
+    if (prevInterpreter->inDirectEvalInvocation() && prevInterpreter->isStrictMode()) {
+      inheritStrict = true;
+    }
+
     Parser parser(tokens);
+    if (inheritStrict) {
+      parser.setStrictMode(true);
+    }
     auto program = parser.parse();
     if (!program) {
       throw std::runtime_error("SyntaxError: Parse error");
@@ -713,11 +827,18 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
     }
 
+    // Move program to heap so functions created during eval can keep AST alive
+    auto programPtr = std::make_shared<Program>(std::move(*program));
+
     Interpreter evalInterpreter(evalEnv);
+    if (inheritStrict) {
+      evalInterpreter.setStrictMode(true);
+    }
+    evalInterpreter.setSourceKeepAlive(programPtr);
     Value result = Value(Undefined{});
     try {
       setGlobalInterpreter(&evalInterpreter);
-      auto task = evalInterpreter.evaluate(*program);
+      auto task = evalInterpreter.evaluate(*programPtr);
       LIGHTJS_RUN_TASK(task, result);
       if (evalInterpreter.hasError()) {
         Value err = evalInterpreter.getError();

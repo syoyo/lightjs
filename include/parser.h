@@ -4,6 +4,7 @@
 #include "ast.h"
 #include <vector>
 #include <optional>
+#include <set>
 
 namespace lightjs {
 
@@ -12,6 +13,7 @@ public:
   explicit Parser(std::vector<Token> tokens, bool isModule = false);
 
   std::optional<Program> parse();
+  void setStrictMode(bool strict) { strictMode_ = strict; }
 
 private:
   std::vector<Token> tokens_;
@@ -19,12 +21,15 @@ private:
   bool isModule_ = false;
   bool strictMode_ = false;
   bool error_ = false;  // Set on syntax errors to abort parsing
+  bool inSingleStatementPosition_ = false;  // True when parsing body of for/while/if/etc.
   int superCallDisallowDepth_ = 0;
   int functionDepth_ = 0;
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
   std::vector<bool> awaitContextStack_;
   size_t arrowDestructureTempCounter_ = 0;
+  std::set<std::string> iterationLabels_;  // Labels wrapping iteration statements (for continue validation)
+  std::set<std::string> activeLabels_;      // All active labels (for break validation)
 
   const Token& current() const;
   const Token& peek(size_t offset = 1) const;
