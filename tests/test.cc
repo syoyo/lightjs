@@ -1706,6 +1706,89 @@ int main() {
     new C().m()
   )", "42");
 
+  // === Class features ===
+
+  runTest("Class basic instantiation", R"(
+    class Animal {
+      constructor(name) { this.name = name; }
+      speak() { return this.name + " speaks"; }
+    }
+    let a = new Animal("Dog");
+    a.speak()
+  )", "Dog speaks");
+
+  runTest("Class inheritance", R"(
+    class Base {
+      constructor(x) { this.x = x; }
+    }
+    class Child extends Base {
+      constructor(x, y) { super(x); this.y = y; }
+    }
+    let c = new Child(10, 20);
+    c.x + c.y
+  )", "30");
+
+  runTest("Static methods", R"(
+    class MathHelper {
+      static add(a, b) { return a + b; }
+    }
+    MathHelper.add(3, 4)
+  )", "7");
+
+  runTest("Static fields", R"(
+    class Config {
+      static version = 42;
+    }
+    Config.version
+  )", "42");
+
+  runTest("Private instance fields", R"(
+    class Counter {
+      #count = 0;
+      increment() { this.#count++; return this.#count; }
+    }
+    let c = new Counter();
+    c.increment();
+    c.increment();
+    c.increment()
+  )", "3");
+
+  runTest("Private static fields", R"(
+    class IdGen {
+      static #nextId = 1;
+      static generate() { return IdGen.#nextId++; }
+    }
+    let a = IdGen.generate();
+    let b = IdGen.generate();
+    "" + a + "," + b
+  )", "1,2");
+
+  runTest("Getter and setter", R"(
+    class Temp {
+      #celsius = 0;
+      get fahrenheit() { return this.#celsius * 9 / 5 + 32; }
+      set fahrenheit(f) { this.#celsius = (f - 32) * 5 / 9; }
+    }
+    let t = new Temp();
+    t.fahrenheit = 212;
+    t.fahrenheit
+  )", "212");
+
+  runTest("Class valueOf", R"(
+    class Money {
+      constructor(amount) { this.amount = amount; }
+      valueOf() { return this.amount; }
+    }
+    let m = new Money(100);
+    m + 50
+  )", "150");
+
+  runTest("instanceof operator", R"(
+    class A {}
+    let a = new A();
+    "" + (a instanceof A)
+  )", "true");
+
   std::cout << "=== All tests completed ===" << std::endl;
   std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests
             << " passed, " << gFailedTests << " failed" << std::endl;

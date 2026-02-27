@@ -747,12 +747,13 @@ Task Interpreter::evaluate(const Statement& stmt) {
             LIGHTJS_RUN_TASK(initTask, fieldVal);
           }
           if (method.isPrivate) {
-            // Private static fields not supported yet.
-            throwError(ErrorType::SyntaxError, "Private static fields are not supported");
-            LIGHTJS_RETURN(Value(Undefined{}));
+            // Private static fields use name-mangled keys on the class object
+            std::string mangledName = "__private_" + methodName + "__";
+            cls->properties[mangledName] = fieldVal;
+          } else {
+            cls->properties[methodName] = fieldVal;
+            cls->properties["__enum_" + methodName] = Value(true);
           }
-          cls->properties[methodName] = fieldVal;
-          cls->properties["__enum_" + methodName] = Value(true);
         } else {
           Class::FieldInit fi;
           fi.name = methodName;
@@ -3280,6 +3281,17 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isClass()) {
       auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+      // Handle private static field assignment (#name)
+      if (!propName.empty() && propName[0] == '#') {
+        std::string mangledName = "__private_" + propName + "__";
+        if (expr.op == AssignmentExpr::Op::Assign) {
+          clsPtr->properties[mangledName] = right;
+        } else {
+          Value current = clsPtr->properties[mangledName];
+          clsPtr->properties[mangledName] = computeCompoundOp(expr.op, current, right);
+        }
+        LIGHTJS_RETURN(right);
+      }
       // Check __non_writable_ marker
       if (clsPtr->properties.count("__non_writable_" + propName)) {
         LIGHTJS_RETURN(right);
@@ -3370,13 +3382,34 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
 
     if (obj.isObject()) {
       auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      // Handle private field update (#name)
+      std::string lookupName = propName;
+      if (!propName.empty() && propName[0] == '#') {
+        lookupName = "__private_" + propName + "__";
+      }
       Value currentValue = Value(Undefined{});
-      auto it = objPtr->properties.find(propName);
+      auto it = objPtr->properties.find(lookupName);
       if (it != objPtr->properties.end()) {
         currentValue = it->second;
       }
       auto [oldValue, newValue] = applyNumericUpdate(currentValue);
-      objPtr->properties[propName] = newValue;
+      objPtr->properties[lookupName] = newValue;
+      LIGHTJS_RETURN(expr.prefix ? newValue : oldValue);
+    }
+
+    if (obj.isClass()) {
+      auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+      std::string lookupName = propName;
+      if (!propName.empty() && propName[0] == '#') {
+        lookupName = "__private_" + propName + "__";
+      }
+      Value currentValue = Value(Undefined{});
+      auto it = clsPtr->properties.find(lookupName);
+      if (it != clsPtr->properties.end()) {
+        currentValue = it->second;
+      }
+      auto [oldValue, newValue] = applyNumericUpdate(currentValue);
+      clsPtr->properties[lookupName] = newValue;
       LIGHTJS_RETURN(expr.prefix ? newValue : oldValue);
     }
 
@@ -4469,6 +4502,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         return Value(false);
       };
       LIGHTJS_RETURN(Value(hopFn));
+    }
+    // Handle private static field/method access (#name)
+    if (!propName.empty() && propName[0] == '#') {
+      std::string mangledName = "__private_" + propName + "__";
+      auto it = clsPtr->properties.find(mangledName);
+      if (it != clsPtr->properties.end()) {
+        LIGHTJS_RETURN(it->second);
+      }
+      throwError(ErrorType::TypeError, "Cannot read private member " + propName + " from an object whose class did not declare it");
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
     auto getterIt = clsPtr->properties.find("__get_" + propName);
     if (getterIt != clsPtr->properties.end() && getterIt->second.isFunction()) {
@@ -9041,11 +9084,12 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
           LIGHTJS_RUN_TASK(initTask, fieldVal);
         }
         if (method.isPrivate) {
-          throwError(ErrorType::SyntaxError, "Private static fields are not supported");
-          LIGHTJS_RETURN(Value(Undefined{}));
+          std::string mangledName = "__private_" + methodName + "__";
+          cls->properties[mangledName] = fieldVal;
+        } else {
+          cls->properties[methodName] = fieldVal;
+          cls->properties["__enum_" + methodName] = Value(true);
         }
-        cls->properties[methodName] = fieldVal;
-        cls->properties["__enum_" + methodName] = Value(true);
       } else {
         Class::FieldInit fi;
         fi.name = methodName;
