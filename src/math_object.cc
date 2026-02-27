@@ -385,4 +385,54 @@ Value Math_imul(const std::vector<Value>& args) {
     return Value(static_cast<double>(a * b));
 }
 
+Value Math_asin(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::asin(args[0].toNumber()));
+}
+
+Value Math_acos(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::acos(args[0].toNumber()));
+}
+
+Value Math_atan(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::atan(args[0].toNumber()));
+}
+
+Value Math_atan2(const std::vector<Value>& args) {
+    if (args.size() < 2) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::atan2(args[0].toNumber(), args[1].toNumber()));
+}
+
+Value Math_sinh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::sinh(args[0].toNumber()));
+}
+
+Value Math_cosh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::cosh(args[0].toNumber()));
+}
+
+Value Math_tanh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::tanh(args[0].toNumber()));
+}
+
+Value Math_asinh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::asinh(args[0].toNumber()));
+}
+
+Value Math_acosh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::acosh(args[0].toNumber()));
+}
+
+Value Math_atanh(const std::vector<Value>& args) {
+    if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
+    return Value(std::atanh(args[0].toNumber()));
+}
+
 } // namespace lightjs

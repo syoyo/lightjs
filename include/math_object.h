@@ -31,5 +31,15 @@ Value Math_log1p(const std::vector<Value>& args);
 Value Math_fround(const std::vector<Value>& args);
 Value Math_clz32(const std::vector<Value>& args);
 Value Math_imul(const std::vector<Value>& args);
+Value Math_asin(const std::vector<Value>& args);
+Value Math_acos(const std::vector<Value>& args);
+Value Math_atan(const std::vector<Value>& args);
+Value Math_atan2(const std::vector<Value>& args);
+Value Math_sinh(const std::vector<Value>& args);
+Value Math_cosh(const std::vector<Value>& args);
+Value Math_tanh(const std::vector<Value>& args);
+Value Math_asinh(const std::vector<Value>& args);
+Value Math_acosh(const std::vector<Value>& args);
+Value Math_atanh(const std::vector<Value>& args);
 
 } // namespace lightjs

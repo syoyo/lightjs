@@ -62,4 +62,67 @@ const std::string& WellKnownSymbols::unscopablesKey() {
   return key;
 }
 
+const Value& WellKnownSymbols::hasInstance() {
+  static Value s(Symbol("Symbol.hasInstance"));
+  return s;
+}
+const std::string& WellKnownSymbols::hasInstanceKey() {
+  static const std::string key = WellKnownSymbols::hasInstance().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::species() {
+  static Value s(Symbol("Symbol.species"));
+  return s;
+}
+const std::string& WellKnownSymbols::speciesKey() {
+  static const std::string key = WellKnownSymbols::species().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::isConcatSpreadable() {
+  static Value s(Symbol("Symbol.isConcatSpreadable"));
+  return s;
+}
+const std::string& WellKnownSymbols::isConcatSpreadableKey() {
+  static const std::string key = WellKnownSymbols::isConcatSpreadable().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::match() {
+  static Value s(Symbol("Symbol.match"));
+  return s;
+}
+const std::string& WellKnownSymbols::matchKey() {
+  static const std::string key = WellKnownSymbols::match().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::replace() {
+  static Value s(Symbol("Symbol.replace"));
+  return s;
+}
+const std::string& WellKnownSymbols::replaceKey() {
+  static const std::string key = WellKnownSymbols::replace().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::search() {
+  static Value s(Symbol("Symbol.search"));
+  return s;
+}
+const std::string& WellKnownSymbols::searchKey() {
+  static const std::string key = WellKnownSymbols::search().toString();
+  return key;
+}
+
+const Value& WellKnownSymbols::split() {
+  static Value s(Symbol("Symbol.split"));
+  return s;
+}
+const std::string& WellKnownSymbols::splitKey() {
+  static const std::string key = WellKnownSymbols::split().toString();
+  return key;
+}
+
 }

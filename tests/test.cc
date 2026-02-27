@@ -1785,9 +1785,64 @@ int main() {
 
   runTest("instanceof operator", R"(
     class A {}
-    let a = new A();
-    "" + (a instanceof A)
+    class B extends A {}
+    let b = new B();
+    "" + (b instanceof B) + "," + (b instanceof A)
+  )", "true,true");
+
+  runTest("Private static methods", R"(
+    class C {
+      static #x(value) { return value / 2; }
+      static x() { return this.#x(84); }
+    }
+    C.x()
+  )", "42");
+
+  // === Math trig/hyperbolic functions ===
+  runTest("Math.asin", R"(Math.asin(1) === Math.PI / 2)", "true");
+  runTest("Math.acos", R"(Math.acos(1) === 0)", "true");
+  runTest("Math.atan", R"(Math.atan(0) === 0)", "true");
+  runTest("Math.atan2", R"(Math.atan2(1, 1) === Math.PI / 4)", "true");
+  runTest("Math.sinh", R"(Math.sinh(0) === 0)", "true");
+  runTest("Math.cosh", R"(Math.cosh(0) === 1)", "true");
+  runTest("Math.tanh", R"(Math.tanh(0) === 0)", "true");
+  runTest("Math.asinh", R"(Math.asinh(0) === 0)", "true");
+  runTest("Math.acosh", R"(Math.acosh(1) === 0)", "true");
+  runTest("Math.atanh", R"(Math.atanh(0) === 0)", "true");
+
+  // === Symbol.for / Symbol.keyFor ===
+  runTest("Symbol.for returns same symbol", R"(
+    Symbol.for("test") === Symbol.for("test")
   )", "true");
+  runTest("Symbol.keyFor", R"(
+    let s = Symbol.for("hello");
+    Symbol.keyFor(s)
+  )", "hello");
+  runTest("Symbol.keyFor returns undefined for non-registered", R"(
+    let s = Symbol("local");
+    typeof Symbol.keyFor(s)
+  )", "undefined");
+
+  // === Well-known symbols exist ===
+  runTest("Symbol.hasInstance exists", R"(typeof Symbol.hasInstance)", "symbol");
+  runTest("Symbol.species exists", R"(typeof Symbol.species)", "symbol");
+  runTest("Symbol.isConcatSpreadable exists", R"(typeof Symbol.isConcatSpreadable)", "symbol");
+  runTest("Symbol.match exists", R"(typeof Symbol.match)", "symbol");
+  runTest("Symbol.replace exists", R"(typeof Symbol.replace)", "symbol");
+  runTest("Symbol.search exists", R"(typeof Symbol.search)", "symbol");
+  runTest("Symbol.split exists", R"(typeof Symbol.split)", "symbol");
+
+  // === Object.getOwnPropertyDescriptors ===
+  runTest("Object.getOwnPropertyDescriptors", R"(
+    let obj = { a: 1, b: 2 };
+    let descs = Object.getOwnPropertyDescriptors(obj);
+    descs.a.value + descs.b.value
+  )", "3");
+
+  // === String.raw ===
+  runTest("String.raw basic", R"(
+    String.raw({raw: ["a", "b", "c"]}, 1, 2)
+  )", "a1b2c");
 
   std::cout << "=== All tests completed ===" << std::endl;
   std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests

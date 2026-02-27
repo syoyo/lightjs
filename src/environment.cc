@@ -870,19 +870,60 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   symbolFn->properties["toPrimitive"] = WellKnownSymbols::toPrimitive();
   symbolFn->properties["matchAll"] = WellKnownSymbols::matchAll();
   symbolFn->properties["unscopables"] = WellKnownSymbols::unscopables();
+  symbolFn->properties["hasInstance"] = WellKnownSymbols::hasInstance();
+  symbolFn->properties["species"] = WellKnownSymbols::species();
+  symbolFn->properties["isConcatSpreadable"] = WellKnownSymbols::isConcatSpreadable();
+  symbolFn->properties["match"] = WellKnownSymbols::match();
+  symbolFn->properties["replace"] = WellKnownSymbols::replace();
+  symbolFn->properties["search"] = WellKnownSymbols::search();
+  symbolFn->properties["split"] = WellKnownSymbols::split();
   // Well-known symbol properties on Symbol are non-writable and non-configurable.
-  symbolFn->properties["__non_writable_iterator"] = Value(true);
-  symbolFn->properties["__non_configurable_iterator"] = Value(true);
-  symbolFn->properties["__non_writable_asyncIterator"] = Value(true);
-  symbolFn->properties["__non_configurable_asyncIterator"] = Value(true);
-  symbolFn->properties["__non_writable_toStringTag"] = Value(true);
-  symbolFn->properties["__non_configurable_toStringTag"] = Value(true);
-  symbolFn->properties["__non_writable_toPrimitive"] = Value(true);
-  symbolFn->properties["__non_configurable_toPrimitive"] = Value(true);
-  symbolFn->properties["__non_writable_matchAll"] = Value(true);
-  symbolFn->properties["__non_configurable_matchAll"] = Value(true);
-  symbolFn->properties["__non_writable_unscopables"] = Value(true);
-  symbolFn->properties["__non_configurable_unscopables"] = Value(true);
+  const char* wellKnownNames[] = {
+    "iterator", "asyncIterator", "toStringTag", "toPrimitive",
+    "matchAll", "unscopables", "hasInstance", "species",
+    "isConcatSpreadable", "match", "replace", "search", "split"
+  };
+  for (const char* name : wellKnownNames) {
+    symbolFn->properties[std::string("__non_writable_") + name] = Value(true);
+    symbolFn->properties[std::string("__non_configurable_") + name] = Value(true);
+  }
+
+  // Symbol.for() - global symbol registry
+  static std::unordered_map<std::string, Value> globalSymbolRegistry;
+  auto symbolFor = std::make_shared<Function>();
+  symbolFor->isNative = true;
+  symbolFor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    std::string key = args.empty() ? "undefined" : args[0].toString();
+    auto it = globalSymbolRegistry.find(key);
+    if (it != globalSymbolRegistry.end()) {
+      return it->second;
+    }
+    Symbol s(key);
+    Value sym;
+    sym.data = s;
+    globalSymbolRegistry[key] = sym;
+    return sym;
+  };
+  symbolFn->properties["for"] = Value(symbolFor);
+
+  // Symbol.keyFor() - reverse lookup in global registry
+  auto symbolKeyFor = std::make_shared<Function>();
+  symbolKeyFor->isNative = true;
+  symbolKeyFor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isSymbol()) {
+      return Value(Undefined{});
+    }
+    const auto& sym = std::get<Symbol>(args[0].data);
+    for (const auto& [key, val] : globalSymbolRegistry) {
+      const auto& regSym = std::get<Symbol>(val.data);
+      if (sym.id == regSym.id) {
+        return Value(key);
+      }
+    }
+    return Value(Undefined{});
+  };
+  symbolFn->properties["keyFor"] = Value(symbolKeyFor);
+
   env->define("Symbol", Value(symbolFn));
 
   // BigInt constructor/function
@@ -5192,6 +5233,43 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectConstructor->properties["getOwnPropertyDescriptor"] = Value(objectGetOwnPropertyDescriptor);
 
+  // Object.getOwnPropertyDescriptors (plural)
+  auto objectGetOwnPropertyDescriptors = std::make_shared<Function>();
+  objectGetOwnPropertyDescriptors->isNative = true;
+  objectGetOwnPropertyDescriptors->nativeFunc = [objectGetOwnPropertyDescriptor](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(Undefined{});
+    auto result = std::make_shared<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    // Collect keys from the target object
+    OrderedMap<std::string, Value>* props = nullptr;
+    if (args[0].isObject()) {
+      props = &std::get<std::shared_ptr<Object>>(args[0].data)->properties;
+    } else if (args[0].isFunction()) {
+      props = &std::get<std::shared_ptr<Function>>(args[0].data)->properties;
+    } else if (args[0].isClass()) {
+      props = &std::get<std::shared_ptr<Class>>(args[0].data)->properties;
+    } else if (args[0].isArray()) {
+      props = &std::get<std::shared_ptr<Array>>(args[0].data)->properties;
+    }
+    if (props) {
+      for (const auto& key : props->orderedKeys()) {
+        // Skip internal properties
+        if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") continue;
+        if (key.size() > 6 && (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_")) continue;
+        if (key.size() > 10 && key.substr(0, 10) == "__non_enum") continue;
+        if (key.size() > 14 && key.substr(0, 14) == "__non_writable") continue;
+        if (key.size() > 18 && key.substr(0, 18) == "__non_configurable") continue;
+        if (key.size() > 7 && key.substr(0, 7) == "__enum_") continue;
+        Value desc = objectGetOwnPropertyDescriptor->nativeFunc({args[0], Value(key)});
+        if (!desc.isUndefined()) {
+          result->properties[key] = desc;
+        }
+      }
+    }
+    return Value(result);
+  };
+  objectConstructor->properties["getOwnPropertyDescriptors"] = Value(objectGetOwnPropertyDescriptors);
+
   // Object.defineProperty - define property with descriptor
   auto objectDefineProperty = std::make_shared<Function>();
   objectDefineProperty->isNative = true;
@@ -5557,6 +5635,23 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   mathImul->nativeFunc = Math_imul;
   mathObj->properties["imul"] = Value(mathImul);
 
+  auto registerMathFn = [&](const std::string& name, std::function<Value(const std::vector<Value>&)> fn) {
+    auto f = std::make_shared<Function>();
+    f->isNative = true;
+    f->nativeFunc = fn;
+    mathObj->properties[name] = Value(f);
+  };
+  registerMathFn("asin", Math_asin);
+  registerMathFn("acos", Math_acos);
+  registerMathFn("atan", Math_atan);
+  registerMathFn("atan2", Math_atan2);
+  registerMathFn("sinh", Math_sinh);
+  registerMathFn("cosh", Math_cosh);
+  registerMathFn("tanh", Math_tanh);
+  registerMathFn("asinh", Math_asinh);
+  registerMathFn("acosh", Math_acosh);
+  registerMathFn("atanh", Math_atanh);
+
   env->define("Math", Value(mathObj));
 
   // Date constructor
@@ -5625,6 +5720,36 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   fromCodePoint->isNative = true;
   fromCodePoint->nativeFunc = String_fromCodePoint;
   stringConstructorObj->properties["fromCodePoint"] = Value(fromCodePoint);
+
+  // String.raw
+  auto stringRaw = std::make_shared<Function>();
+  stringRaw->isNative = true;
+  stringRaw->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || (!args[0].isObject() && !args[0].isArray())) {
+      return Value(std::string(""));
+    }
+    // Get the template object's raw property
+    std::shared_ptr<Array> rawArr;
+    if (args[0].isObject()) {
+      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto rawIt = obj->properties.find("raw");
+      if (rawIt != obj->properties.end() && rawIt->second.isArray()) {
+        rawArr = std::get<std::shared_ptr<Array>>(rawIt->second.data);
+      }
+    }
+    if (!rawArr) return Value(std::string(""));
+
+    std::string result;
+    size_t literalCount = rawArr->elements.size();
+    for (size_t i = 0; i < literalCount; i++) {
+      result += rawArr->elements[i].toString();
+      if (i + 1 < literalCount && i + 1 < args.size()) {
+        result += args[i + 1].toString();
+      }
+    }
+    return Value(result);
+  };
+  stringConstructorObj->properties["raw"] = Value(stringRaw);
 
   auto stringPrototype = std::make_shared<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));

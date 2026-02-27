@@ -822,16 +822,29 @@ Task Interpreter::evaluate(const Statement& stmt) {
       if (method.kind == MethodDefinition::Kind::Constructor) {
         cls->constructor = func;
       } else if (method.isStatic) {
-        if (method.kind == MethodDefinition::Kind::Get) {
-          cls->properties["__get_" + methodName] = Value(func);
-          cls->properties["__non_enum_" + methodName] = Value(true);
-        } else if (method.kind == MethodDefinition::Kind::Set) {
-          cls->properties["__set_" + methodName] = Value(func);
-          cls->properties["__non_enum_" + methodName] = Value(true);
+        if (method.isPrivate) {
+          // Private static methods/getters/setters use mangled keys
+          std::string mangledName = "__private_" + methodName + "__";
+          if (method.kind == MethodDefinition::Kind::Get) {
+            cls->properties["__get_" + mangledName] = Value(func);
+          } else if (method.kind == MethodDefinition::Kind::Set) {
+            cls->properties["__set_" + mangledName] = Value(func);
+          } else {
+            cls->staticMethods[mangledName] = func;
+            cls->properties[mangledName] = Value(func);
+          }
         } else {
-          cls->staticMethods[methodName] = func;
-          cls->properties[methodName] = Value(func);
-          cls->properties["__non_enum_" + methodName] = Value(true);
+          if (method.kind == MethodDefinition::Kind::Get) {
+            cls->properties["__get_" + methodName] = Value(func);
+            cls->properties["__non_enum_" + methodName] = Value(true);
+          } else if (method.kind == MethodDefinition::Kind::Set) {
+            cls->properties["__set_" + methodName] = Value(func);
+            cls->properties["__non_enum_" + methodName] = Value(true);
+          } else {
+            cls->staticMethods[methodName] = func;
+            cls->properties[methodName] = Value(func);
+            cls->properties["__non_enum_" + methodName] = Value(true);
+          }
         }
       } else if (method.kind == MethodDefinition::Kind::Get) {
         cls->getters[methodName] = func;
@@ -2001,6 +2014,16 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           LIGHTJS_RETURN(Value(false));
         }
       }
+      // Check Symbol.hasInstance on the constructor first
+      {
+        const std::string& hasInstanceKey = WellKnownSymbols::hasInstanceKey();
+        auto [found, hasInstanceFn] = getPropertyForPrimitive(right, hasInstanceKey);
+        if (found && hasInstanceFn.isFunction()) {
+          Value result = callFunction(hasInstanceFn, {left}, right);
+          LIGHTJS_RETURN(Value(result.toBool()));
+        }
+      }
+
       // Per spec: if LHS is a primitive (not object-like), return false
       if (!left.isObject() && !left.isArray() && !left.isFunction() &&
           !left.isRegex() && !left.isPromise() && !left.isError() &&
@@ -2097,9 +2120,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           props = &std::get<std::shared_ptr<Object>>(ctor.data)->properties;
         } else if (ctor.isClass()) {
           auto cls = std::get<std::shared_ptr<Class>>(ctor.data);
-          if (cls->constructor) {
-            props = &cls->constructor->properties;
-          }
+          props = &cls->properties;
         }
         if (props) {
           auto protoIt = props->find("prototype");
@@ -9159,17 +9180,28 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     if (method.kind == MethodDefinition::Kind::Constructor) {
       cls->constructor = func;
     } else if (method.isStatic) {
-      if (method.kind == MethodDefinition::Kind::Get) {
-        cls->properties["__get_" + methodName] = Value(func);
-        cls->properties["__non_enum_" + methodName] = Value(true);
-      } else if (method.kind == MethodDefinition::Kind::Set) {
-        cls->properties["__set_" + methodName] = Value(func);
-        cls->properties["__non_enum_" + methodName] = Value(true);
+      if (method.isPrivate) {
+        std::string mangledName = "__private_" + methodName + "__";
+        if (method.kind == MethodDefinition::Kind::Get) {
+          cls->properties["__get_" + mangledName] = Value(func);
+        } else if (method.kind == MethodDefinition::Kind::Set) {
+          cls->properties["__set_" + mangledName] = Value(func);
+        } else {
+          cls->staticMethods[mangledName] = func;
+          cls->properties[mangledName] = Value(func);
+        }
       } else {
-        cls->staticMethods[methodName] = func;
-        // Static methods become own properties of the class
-        cls->properties[methodName] = Value(func);
-        cls->properties["__non_enum_" + methodName] = Value(true);
+        if (method.kind == MethodDefinition::Kind::Get) {
+          cls->properties["__get_" + methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        } else if (method.kind == MethodDefinition::Kind::Set) {
+          cls->properties["__set_" + methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        } else {
+          cls->staticMethods[methodName] = func;
+          cls->properties[methodName] = Value(func);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        }
       }
     } else if (method.kind == MethodDefinition::Kind::Get) {
       cls->getters[methodName] = func;
