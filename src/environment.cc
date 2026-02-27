@@ -2897,7 +2897,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     double num = std::get<double>(args[0].data);
     return Value(std::isnan(num));
   };
+  isNaNFn->properties["name"] = Value(std::string("isNaN"));
+  isNaNFn->properties["length"] = Value(1.0);
   numberObj->properties["isNaN"] = Value(isNaNFn);
+  numberObj->properties["__non_enum_isNaN"] = Value(true);
 
   // Number.isFinite
   auto isFiniteFn = std::make_shared<Function>();
@@ -2907,7 +2910,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     double num = std::get<double>(args[0].data);
     return Value(std::isfinite(num));
   };
+  isFiniteFn->properties["name"] = Value(std::string("isFinite"));
+  isFiniteFn->properties["length"] = Value(1.0);
   numberObj->properties["isFinite"] = Value(isFiniteFn);
+  numberObj->properties["__non_enum_isFinite"] = Value(true);
 
   // Number.isInteger
   auto isIntegerFn = std::make_shared<Function>();
@@ -2917,7 +2923,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     double num = std::get<double>(args[0].data);
     return Value(std::isfinite(num) && std::floor(num) == num);
   };
+  isIntegerFn->properties["name"] = Value(std::string("isInteger"));
+  isIntegerFn->properties["length"] = Value(1.0);
   numberObj->properties["isInteger"] = Value(isIntegerFn);
+  numberObj->properties["__non_enum_isInteger"] = Value(true);
 
   // Number.isSafeInteger
   auto isSafeIntegerFn = std::make_shared<Function>();
@@ -2925,22 +2934,30 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   isSafeIntegerFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isNumber()) return Value(false);
     double num = std::get<double>(args[0].data);
-    // Safe integers are integers in range [-(2^53-1), 2^53-1]
-    const double MAX_SAFE_INTEGER = 9007199254740991.0;  // 2^53 - 1
+    const double MAX_SAFE_INTEGER = 9007199254740991.0;
     return Value(std::isfinite(num) && std::floor(num) == num &&
                  num >= -MAX_SAFE_INTEGER && num <= MAX_SAFE_INTEGER);
   };
+  isSafeIntegerFn->properties["name"] = Value(std::string("isSafeInteger"));
+  isSafeIntegerFn->properties["length"] = Value(1.0);
   numberObj->properties["isSafeInteger"] = Value(isSafeIntegerFn);
+  numberObj->properties["__non_enum_isSafeInteger"] = Value(true);
 
-  // Number constants
-  numberObj->properties["MAX_VALUE"] = Value(std::numeric_limits<double>::max());
-  numberObj->properties["MIN_VALUE"] = Value(std::numeric_limits<double>::min());
-  numberObj->properties["POSITIVE_INFINITY"] = Value(std::numeric_limits<double>::infinity());
-  numberObj->properties["NEGATIVE_INFINITY"] = Value(-std::numeric_limits<double>::infinity());
-  numberObj->properties["NaN"] = Value(std::numeric_limits<double>::quiet_NaN());
-  numberObj->properties["MAX_SAFE_INTEGER"] = Value(9007199254740991.0);  // 2^53 - 1
-  numberObj->properties["MIN_SAFE_INTEGER"] = Value(-9007199254740991.0);  // -(2^53 - 1)
-  numberObj->properties["EPSILON"] = Value(2.220446049250313e-16);  // 2^-52
+  // Number constants (non-writable, non-enumerable, non-configurable per spec)
+  auto defineNumberConst = [&](const std::string& name, Value val) {
+    numberObj->properties[name] = val;
+    numberObj->properties["__non_writable_" + name] = Value(true);
+    numberObj->properties["__non_enum_" + name] = Value(true);
+    numberObj->properties["__non_configurable_" + name] = Value(true);
+  };
+  defineNumberConst("MAX_VALUE", Value(std::numeric_limits<double>::max()));
+  defineNumberConst("MIN_VALUE", Value(std::numeric_limits<double>::denorm_min()));
+  defineNumberConst("POSITIVE_INFINITY", Value(std::numeric_limits<double>::infinity()));
+  defineNumberConst("NEGATIVE_INFINITY", Value(-std::numeric_limits<double>::infinity()));
+  defineNumberConst("NaN", Value(std::numeric_limits<double>::quiet_NaN()));
+  defineNumberConst("MAX_SAFE_INTEGER", Value(9007199254740991.0));
+  defineNumberConst("MIN_SAFE_INTEGER", Value(-9007199254740991.0));
+  defineNumberConst("EPSILON", Value(2.220446049250313e-16));
 
   env->define("Number", Value(numberObj));
 
@@ -5635,16 +5652,23 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   mathImul->nativeFunc = Math_imul;
   mathObj->properties["imul"] = Value(mathImul);
 
-  auto registerMathFn = [&](const std::string& name, std::function<Value(const std::vector<Value>&)> fn) {
+  auto registerMathFn = [&](const std::string& name, std::function<Value(const std::vector<Value>&)> fn, int length = 1) {
     auto f = std::make_shared<Function>();
     f->isNative = true;
     f->nativeFunc = fn;
+    f->properties["name"] = Value(name);
+    f->properties["length"] = Value(static_cast<double>(length));
+    f->properties["__non_writable_name"] = Value(true);
+    f->properties["__non_configurable_name"] = Value(true);
+    f->properties["__non_writable_length"] = Value(true);
+    f->properties["__non_configurable_length"] = Value(true);
     mathObj->properties[name] = Value(f);
+    mathObj->properties["__non_enum_" + name] = Value(true);
   };
   registerMathFn("asin", Math_asin);
   registerMathFn("acos", Math_acos);
   registerMathFn("atan", Math_atan);
-  registerMathFn("atan2", Math_atan2);
+  registerMathFn("atan2", Math_atan2, 2);
   registerMathFn("sinh", Math_sinh);
   registerMathFn("cosh", Math_cosh);
   registerMathFn("tanh", Math_tanh);
