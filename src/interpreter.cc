@@ -3098,19 +3098,29 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
       // Check if object is frozen (can't modify any properties)
       if (writeObjPtr->frozen) {
-        // In strict mode this would throw, but we'll silently fail
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "' of object");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
 
       // Check __non_writable_ marker
       if (writeObjPtr->properties.count("__non_writable_" + propName)) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "'");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
 
       // Check if object is sealed (can't add new properties)
       bool isNewProperty = writeObjPtr->properties.find(propName) == writeObjPtr->properties.end();
       if (writeObjPtr->sealed && isNewProperty) {
-        // Can't add new properties to sealed object
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot add property " + propName + ", object is not extensible");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
 
@@ -3168,12 +3178,20 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isFunction()) {
       auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
-      // name and length are non-writable on functions - silently ignore assignment
+      // name and length are non-writable on functions
       if (propName == "name" || propName == "length") {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "'");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
       // Check __non_writable_ marker
       if (funcPtr->properties.count("__non_writable_" + propName)) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "'");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
       if (expr.op == AssignmentExpr::Op::Assign) {
@@ -3315,6 +3333,10 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
       // Check __non_writable_ marker
       if (clsPtr->properties.count("__non_writable_" + propName)) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to read only property '" + propName + "'");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
         LIGHTJS_RETURN(right);
       }
       auto setterIt = clsPtr->properties.find("__set_" + propName);
