@@ -1,6 +1,7 @@
 #include "value.h"
 #include "gc.h"
 #include "streams.h"
+#include "interpreter.h"
 
 namespace lightjs {
 
@@ -39,6 +40,10 @@ static void addValueReferences(const Value& value, std::vector<GCObject*>& refs)
     } else if (auto* transform = std::get_if<std::shared_ptr<TransformStream>>(&value.data)) {
         if (*transform) refs.push_back(transform->get());
     }
+}
+
+void Value::getReferences(std::vector<GCObject*>& refs) const {
+    addValueReferences(*this, refs);
 }
 
 void Function::getReferences(std::vector<GCObject*>& refs) const {
@@ -115,6 +120,17 @@ void Map::getReferences(std::vector<GCObject*>& refs) const {
 void Set::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& value : values) {
         addValueReferences(value, refs);
+    }
+}
+
+void Generator::getReferences(std::vector<GCObject*>& refs) const {
+    if (function) refs.push_back(function.get());
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+    if (suspendedTask) {
+        static_cast<Task*>(suspendedTask.get())->getReferences(refs);
     }
 }
 

@@ -311,16 +311,20 @@ struct Generator : public GCObject {
   GeneratorState state;
   std::shared_ptr<Value> currentValue;  // Last yielded or returned value
   size_t yieldIndex;   // Index of last yield point (for resumption)
+  std::shared_ptr<void> suspendedTask;  // Suspended C++ coroutine (Task)
+  OrderedMap<std::string, Value> properties;
 
   Generator(std::shared_ptr<Function> func, std::shared_ptr<void> ctx)
     : function(func), context(ctx), state(GeneratorState::SuspendedStart),
-      currentValue(std::make_shared<Value>(Undefined{})), yieldIndex(0) {}
+      currentValue(std::make_shared<Value>(Undefined{})), yieldIndex(0),
+      suspendedTask(nullptr, [](void* p) { 
+        // This deleter will be called when suspendedTask shared_ptr is reset or destroyed.
+        // We will set this up in runGeneratorNext.
+      }) {}
 
   // GCObject interface
   const char* typeName() const override { return "Generator"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {
-    if (function) refs.push_back(function.get());
-  }
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 // Proxy for intercept operations on objects

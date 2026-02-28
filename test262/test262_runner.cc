@@ -943,23 +943,23 @@ public:
 
     std::regex filterRegex(filter.empty() ? ".*" : filter);
 
-    for (const auto& entry : fs::recursive_directory_iterator(fullPath)) {
-      if (entry.path().extension() == ".js") {
-        std::string testPath = fs::relative(entry.path(), test262Path).string();
+    auto runTest = [&](const fs::path& path) {
+      if (path.extension() == ".js") {
+        std::string testPath = fs::relative(path, test262Path).string();
 
         // Test262 fixture modules are support files, not standalone test cases.
         if (testPath.find("_FIXTURE.js") != std::string::npos) {
-          continue;
+          return;
         }
 
         if (!std::regex_search(testPath, filterRegex)) {
-          continue;
+          return;
         }
 
-        std::ifstream file(entry.path());
+        std::ifstream file(path);
         if (!file.is_open()) {
           std::cerr << "Could not open test file: " << testPath << std::endl;
-          continue;
+          return;
         }
 
         std::stringstream buffer;
@@ -986,6 +986,14 @@ public:
           failedTests++;
         }
       }
+    };
+
+    if (fs::is_directory(fullPath)) {
+      for (const auto& entry : fs::recursive_directory_iterator(fullPath)) {
+        runTest(entry.path());
+      }
+    } else {
+      runTest(fullPath);
     }
   }
 

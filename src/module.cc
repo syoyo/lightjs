@@ -1803,7 +1803,9 @@ bool Module::initializeDeclaredExports(Interpreter* interpreter) {
 
   for (const auto* functionDecl : hoistedFunctionDeclarations) {
     auto task = interpreter->evaluateFuncDecl(*functionDecl);
-    LIGHTJS_RUN_TASK_VOID(task);
+    while (!task.done()) {
+      task.resume();
+    }
     if (interpreter->hasError()) {
       lastError_ = interpreter->getError();
       interpreter->clearError();
@@ -1814,7 +1816,10 @@ bool Module::initializeDeclaredExports(Interpreter* interpreter) {
   for (const auto& defaultFunction : hoistedDefaultFunctions) {
     auto task = interpreter->evaluate(*defaultFunction.expression);
     Value functionValue = Value(Undefined{});
-    LIGHTJS_RUN_TASK(task, functionValue);
+    while (!task.done()) {
+      task.resume();
+    }
+    functionValue = task.result();
     if (interpreter->hasError()) {
       lastError_ = interpreter->getError();
       interpreter->clearError();
@@ -2161,7 +2166,10 @@ bool Module::evaluateBody(Interpreter* interpreter) {
         Value argValue = Value(Undefined{});
         if (awaitExpr && awaitExpr->argument) {
           auto argTask = interpreter->evaluate(*awaitExpr->argument);
-          LIGHTJS_RUN_TASK(argTask, argValue);
+          while (!argTask.done()) {
+            argTask.resume();
+          }
+          argValue = argTask.result();
           if (interpreter->hasError()) {
             lastError_ = interpreter->getError();
             interpreter->clearError();
@@ -2215,7 +2223,10 @@ bool Module::evaluateBody(Interpreter* interpreter) {
         Value argValue = Value(Undefined{});
         if (awaitExpr && awaitExpr->argument) {
           auto argTask = interpreter->evaluate(*awaitExpr->argument);
-          LIGHTJS_RUN_TASK(argTask, argValue);
+          while (!argTask.done()) {
+            argTask.resume();
+          }
+          argValue = argTask.result();
           if (interpreter->hasError()) {
             lastError_ = interpreter->getError();
             interpreter->clearError();
@@ -2280,7 +2291,9 @@ bool Module::evaluateBody(Interpreter* interpreter) {
       if (auto* exportNamed = std::get_if<ExportNamedDeclaration>(&stmt.node)) {
         if (exportNamed->declaration) {
           auto task = interpreter->evaluate(*exportNamed->declaration);
-          LIGHTJS_RUN_TASK_VOID(task);
+          while (!task.done()) {
+            task.resume();
+          }
           if (interpreter->hasError()) {
             lastError_ = interpreter->getError();
             interpreter->clearError();
@@ -2295,7 +2308,10 @@ bool Module::evaluateBody(Interpreter* interpreter) {
       } else if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
         auto task = interpreter->evaluate(*exportDefault->declaration);
         Value result;
-        LIGHTJS_RUN_TASK(task, result);
+        while (!task.done()) {
+          task.resume();
+        }
+        result = task.result();
         if (interpreter->hasError()) {
           lastError_ = interpreter->getError();
           interpreter->clearError();
@@ -2320,7 +2336,9 @@ bool Module::evaluateBody(Interpreter* interpreter) {
         // Imports are handled before executing statements.
       } else {
         auto task = interpreter->evaluate(stmt);
-        LIGHTJS_RUN_TASK_VOID(task);
+        while (!task.done()) {
+          task.resume();
+        }
         if (interpreter->hasError()) {
           lastError_ = interpreter->getError();
           interpreter->clearError();

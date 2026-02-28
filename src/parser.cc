@@ -7,6 +7,7 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <iostream>
 
 namespace lightjs {
 
@@ -3124,6 +3125,21 @@ StmtPtr Parser::parseBlockStatement() {
       inSingleStatementPosition_ = prevSingleStmt;
       return nullptr;
     }
+
+    // Optimization/Fix for generators: split top-level comma expressions (SequenceExpr)
+    // into separate statements. This allows generators to yield between comma-separated
+    // expressions without re-evaluating the preceding ones upon resumption.
+    if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node)) {
+      if (auto* seqExpr = std::get_if<SequenceExpr>(&exprStmt->expression->node)) {
+        for (auto& childExpr : seqExpr->expressions) {
+          auto newStmt = std::make_unique<Statement>(ExpressionStmt{std::move(childExpr)});
+          newStmt->loc = stmt->loc; // Preserve location
+          body.push_back(std::move(newStmt));
+        }
+        continue;
+      }
+    }
+
     body.push_back(std::move(stmt));
   }
   inSingleStatementPosition_ = prevSingleStmt;
@@ -4399,7 +4415,14 @@ ExprPtr Parser::parseUnary() {
     if (current().escaped) {
       return nullptr;
     }
+    uint32_t awaitLine = current().line;
     advance();
+    // await [no LineTerminator here] UnaryExpression
+    if (current().line != awaitLine) {
+      // In ES, if await is followed by newline, it might be an error or just await without arg
+      // But await always requires an argument in async functions.
+      return nullptr;
+    }
     auto argument = parseUnary();
     if (!argument) {
       return nullptr;
@@ -4412,18 +4435,20 @@ ExprPtr Parser::parseUnary() {
     if (generatorFunctionDepth_ == 0) {
       return nullptr;
     }
+    uint32_t yieldLine = current().line;
     advance();
     bool delegate = false;
 
     // Check for yield* (delegate to another iterator)
-    if (match(TokenType::Star)) {
+    if (match(TokenType::Star) && current().line == yieldLine) {
       delegate = true;
       advance();
     }
 
-    // yield can be used without an argument
+    // yield can be used without an argument if followed by newline or certain tokens
     ExprPtr argument = nullptr;
-    if (!match(TokenType::Semicolon) && !match(TokenType::RightBrace) &&
+    if (current().line == yieldLine &&
+        !match(TokenType::Semicolon) && !match(TokenType::RightBrace) &&
         !match(TokenType::RightParen) && !match(TokenType::Comma)) {
       argument = parseAssignment();
     }

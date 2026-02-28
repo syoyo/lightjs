@@ -178,6 +178,8 @@ struct Value {
   std::string toString() const;
   // Display string for REPL/debugging - BigInt shows "42n" suffix
   std::string toDisplayString() const;
+
+  void getReferences(std::vector<GCObject*>& refs) const;
 };
 
 using ValuePtr = std::shared_ptr<Value>;

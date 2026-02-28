@@ -839,7 +839,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     try {
       setGlobalInterpreter(&evalInterpreter);
       auto task = evalInterpreter.evaluate(*programPtr);
-      LIGHTJS_RUN_TASK(task, result);
+      while (!task.done()) {
+        task.resume();
+      }
+      Value result = task.result();
       if (evalInterpreter.hasError()) {
         Value err = evalInterpreter.getError();
         evalInterpreter.clearError();
@@ -923,7 +926,6 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   };
   symbolFn->properties["keyFor"] = Value(symbolKeyFor);
-
   env->define("Symbol", Value(symbolFn));
 
   // BigInt constructor/function
@@ -4856,6 +4858,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
       return Value(Null{});
     }
+    if (args[0].isGenerator()) {
+      auto gen = std::get<std::shared_ptr<Generator>>(args[0].data);
+      auto it = gen->properties.find("__proto__");
+      if (it != gen->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
     if (!args[0].isObject()) {
       return Value(Null{});
     }
@@ -6800,6 +6810,31 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   functionConstructor->properties["__proto__"] = Value(functionPrototype);
   env->define("Function", Value(functionConstructor));
   globalThisObj->properties["Function"] = Value(functionConstructor);
+
+  // Generator function intrinsics setup
+  auto generatorFunctionPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  auto generatorPrototype = std::make_shared<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  
+  // %GeneratorFunction.prototype% inherits from Function.prototype
+  generatorFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
+  // %GeneratorFunction.prototype.prototype% is %GeneratorPrototype%
+  generatorFunctionPrototype->properties["prototype"] = Value(generatorPrototype);
+  // %GeneratorPrototype% inherits from Object.prototype
+  if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+    auto fn = std::get<std::shared_ptr<Function>>(objCtor->data);
+    auto protoIt = fn->properties.find("prototype");
+    if (protoIt != fn->properties.end()) {
+      generatorPrototype->properties["__proto__"] = protoIt->second;
+    }
+  }
+  // %GeneratorPrototype%.constructor is %GeneratorFunction.prototype%
+  generatorPrototype->properties["constructor"] = Value(generatorFunctionPrototype);
+  
+  // Store these in environment for internal use
+  env->define("__generator_function_prototype__", Value(generatorFunctionPrototype));
+  env->define("__generator_prototype__", Value(generatorPrototype));
 
   // ===== Deferred prototype chain setup =====
   // These must happen after all constructors are defined.

@@ -1,4 +1,18 @@
+#define LIGHTJS_INTERPRETER_INTERNAL
 #include "interpreter.h"
+
+#if LIGHTJS_HAS_COROUTINES
+namespace lightjs {
+void TaskAwaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
+  while (!task.done()) {
+    task.resume();
+    if (interp.flow_.type == Interpreter::ControlFlow::Type::Yield) return;
+  }
+  awaiting.resume();
+}
+}
+#endif
+
 #include "module.h"
 #include "array_methods.h"
 #include "string_methods.h"
@@ -349,7 +363,7 @@ Value Interpreter::constructFromNative(const Value& constructor,
                                        const std::vector<Value>& args) {
   auto task = constructValue(constructor, args);
   Value result;
-  LIGHTJS_RUN_TASK(task, result);
+  LIGHTJS_RUN_TASK_SYNC(task, result);
   return result;
 }
 
@@ -533,6 +547,18 @@ bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
   return true;
 }
 
+Task Interpreter::evaluateGeneratorBody(const std::vector<StmtPtr>& body) {
+  Value result = Value(Undefined{});
+  for (const auto& stmt : body) {
+    { auto _t = evaluate(*stmt); LIGHTJS_RUN_TASK(_t, result); }
+    if (flow_.type == ControlFlow::Type::Return ||
+        flow_.type == ControlFlow::Type::Throw) {
+      break;
+    }
+  }
+  LIGHTJS_RETURN(result);
+}
+
 Task Interpreter::evaluate(const Program& program) {
   bool previousStrictMode = strictMode_;
   // Inherit strict mode if already set (e.g., from direct eval in strict context)
@@ -612,9 +638,9 @@ Task Interpreter::evaluate(const Statement& stmt) {
   }
 
   if (auto* node = std::get_if<VarDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateVarDecl(*node)));
+    { auto _t = evaluateVarDecl(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<FunctionDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFuncDecl(*node)));
+    { auto _t = evaluateFuncDecl(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ClassDeclaration>(&stmt.node)) {
     // Create the class directly
     auto cls = std::make_shared<Class>(node->id.name);
@@ -886,27 +912,27 @@ Task Interpreter::evaluate(const Statement& stmt) {
     }
     LIGHTJS_RETURN(classVal);
   } else if (auto* node = std::get_if<ReturnStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateReturn(*node)));
+    { auto _t = evaluateReturn(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ExpressionStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExprStmt(*node)));
+    { auto _t = evaluateExprStmt(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<BlockStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateBlock(*node)));
+    { auto _t = evaluateBlock(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<IfStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateIf(*node)));
+    { auto _t = evaluateIf(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<WhileStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateWhile(*node)));
+    { auto _t = evaluateWhile(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<WithStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateWith(*node)));
+    { auto _t = evaluateWith(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<DoWhileStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateDoWhile(*node)));
+    { auto _t = evaluateDoWhile(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ForStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFor(*node)));
+    { auto _t = evaluateFor(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ForInStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateForIn(*node)));
+    { auto _t = evaluateForIn(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ForOfStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateForOf(*node)));
+    { auto _t = evaluateForOf(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<SwitchStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateSwitch(*node)));
+    { auto _t = evaluateSwitch(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<BreakStmt>(&stmt.node)) {
     flow_.type = ControlFlow::Type::Break;
     flow_.label = node->label;
@@ -939,15 +965,15 @@ Task Interpreter::evaluate(const Statement& stmt) {
     flow_.value = task.result();
     LIGHTJS_RETURN(Value(Undefined{}));
   } else if (auto* node = std::get_if<TryStmt>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateTry(*node)));
+    { auto _t = evaluateTry(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ImportDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateImport(*node)));
+    { auto _t = evaluateImport(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ExportNamedDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportNamed(*node)));
+    { auto _t = evaluateExportNamed(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportDefault(*node)));
+    { auto _t = evaluateExportDefault(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ExportAllDeclaration>(&stmt.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateExportAll(*node)));
+    { auto _t = evaluateExportAll(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   }
   LIGHTJS_RETURN(Value(Undefined{}));
 }
@@ -1037,45 +1063,45 @@ Task Interpreter::evaluate(const Expression& expr) {
   } else if (std::holds_alternative<NullLiteral>(expr.node)) {
     LIGHTJS_RETURN(Value(Null{}));
   } else if (auto* node = std::get_if<BinaryExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateBinary(*node)));
+    { auto _t = evaluateBinary(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<UnaryExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateUnary(*node)));
+    { auto _t = evaluateUnary(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<AssignmentExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateAssignment(*node)));
+    { auto _t = evaluateAssignment(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<UpdateExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateUpdate(*node)));
+    { auto _t = evaluateUpdate(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<CallExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateCall(*node)));
+    { auto _t = evaluateCall(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<MemberExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateMember(*node)));
+    { auto _t = evaluateMember(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ConditionalExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateConditional(*node)));
+    { auto _t = evaluateConditional(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<SequenceExpr>(&expr.node)) {
     Value last = Value(Undefined{});
     for (const auto& sequenceExpr : node->expressions) {
       if (!sequenceExpr) {
         continue;
       }
-      last = LIGHTJS_AWAIT(evaluate(*sequenceExpr));
+      { auto _t = evaluate(*sequenceExpr); LIGHTJS_RUN_TASK(_t, last); }
       if (flow_.type != ControlFlow::Type::None) {
         break;
       }
     }
     LIGHTJS_RETURN(last);
   } else if (auto* node = std::get_if<ArrayExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateArray(*node)));
+    { auto _t = evaluateArray(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ObjectExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateObject(*node)));
+    { auto _t = evaluateObject(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<FunctionExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateFunction(*node)));
+    { auto _t = evaluateFunction(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<AwaitExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateAwait(*node)));
+    { auto _t = evaluateAwait(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<YieldExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateYield(*node)));
+    { auto _t = evaluateYield(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<NewExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateNew(*node)));
+    { auto _t = evaluateNew(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ClassExpr>(&expr.node)) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluateClass(*node)));
+    { auto _t = evaluateClass(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (std::holds_alternative<ThisExpr>(expr.node)) {
     // Look up 'this' in the current environment
     if (auto thisVal = env_->get("this")) {
@@ -2027,7 +2053,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       // Per spec: if LHS is a primitive (not object-like), return false
       if (!left.isObject() && !left.isArray() && !left.isFunction() &&
           !left.isRegex() && !left.isPromise() && !left.isError() &&
-          !left.isClass() && !left.isProxy()) {
+          !left.isClass() && !left.isProxy() && !left.isGenerator()) {
         LIGHTJS_RETURN(Value(false));
       }
       auto unwrapConstructor = [&](const Value& ctor) -> Value {
@@ -2066,6 +2092,11 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           auto obj = std::get<std::shared_ptr<Object>>(instance.data);
           auto it = obj->properties.find("__constructor__");
           return it != obj->properties.end() && sameCtor(it->second, ctor);
+        }
+        if (instance.isGenerator()) {
+          auto gen = std::get<std::shared_ptr<Generator>>(instance.data);
+          auto it = gen->properties.find("__constructor__");
+          return it != gen->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isArray()) {
           auto arr = std::get<std::shared_ptr<Array>>(instance.data);
@@ -3385,14 +3416,16 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
   }
 
   if (auto* member = std::get_if<MemberExpr>(&expr.argument->node)) {
-    Value obj = LIGHTJS_AWAIT(evaluate(*member->object));
+    Value obj;
+    { auto _t = evaluate(*member->object); LIGHTJS_RUN_TASK(_t, obj); }
     if (hasError()) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     std::string propName;
     if (member->computed) {
-      Value prop = LIGHTJS_AWAIT(evaluate(*member->property));
+      Value prop;
+      { auto _t = evaluate(*member->property); LIGHTJS_RUN_TASK(_t, prop); }
       if (hasError()) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
@@ -3400,7 +3433,8 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     } else if (auto* idProp = std::get_if<Identifier>(&member->property->node)) {
       propName = idProp->name;
     } else {
-      Value prop = LIGHTJS_AWAIT(evaluate(*member->property));
+      Value prop;
+      { auto _t = evaluate(*member->property); LIGHTJS_RUN_TASK(_t, prop); }
       if (hasError()) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
@@ -3532,7 +3566,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   if (std::holds_alternative<MemberExpr>(expr.callee->node)) {
     // Evaluate the member expression once and capture the base object from evaluateMember.
     hasLastMemberBase_ = false;
-    callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
+    { auto _t = evaluate(*expr.callee); LIGHTJS_RUN_TASK(_t, callee); }
     if (flow_.type != ControlFlow::Type::None) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
@@ -3540,7 +3574,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       thisValue = lastMemberBase_;
     }
   } else {
-    callee = LIGHTJS_AWAIT(evaluate(*expr.callee));
+    { auto _t = evaluate(*expr.callee); LIGHTJS_RUN_TASK(_t, callee); }
     if (flow_.type != ControlFlow::Type::None) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
@@ -3557,7 +3591,8 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     // Check if this is a spread element
     if (auto* spread = std::get_if<SpreadElement>(&arg->node)) {
       // Evaluate the argument
-      Value val = LIGHTJS_AWAIT(evaluate(*spread->argument));
+      Value val;
+      { auto _t = evaluate(*spread->argument); LIGHTJS_RUN_TASK(_t, val); }
       if (flow_.type != ControlFlow::Type::None) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
@@ -3572,7 +3607,8 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
         args.push_back(val);
       }
     } else {
-      Value argVal = LIGHTJS_AWAIT(evaluate(*arg));
+      Value argVal;
+      { auto _t = evaluate(*arg); LIGHTJS_RUN_TASK(_t, argVal); }
       if (flow_.type != ControlFlow::Type::None) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
@@ -3586,7 +3622,8 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
     if (auto nt = env_->get("__new_target__")) {
       newTarget = *nt;
     }
-    Value result = LIGHTJS_AWAIT(constructValue(callee, args, newTarget));
+    Value result;
+    { auto _t = constructValue(callee, args, newTarget); LIGHTJS_RUN_TASK(_t, result); }
     if (flow_.type != ControlFlow::Type::None) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
@@ -3836,7 +3873,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // Compute property name
     std::string propName;
     if (expr.computed) {
-      Value propVal = LIGHTJS_AWAIT(evaluate(*expr.property));
+      Value propVal;
+      { auto _t = evaluate(*expr.property); LIGHTJS_RUN_TASK(_t, propVal); }
       propName = toPropertyKeyString(propVal);
     } else {
       if (auto* id = std::get_if<Identifier>(&expr.property->node)) {
@@ -7106,86 +7144,75 @@ Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
     return makeIteratorResult(Value(Undefined{}), true);
   }
 
-  if (genPtr->state == GeneratorState::SuspendedStart ||
-      genPtr->state == GeneratorState::SuspendedYield) {
-    bool wasSuspendedYield = (genPtr->state == GeneratorState::SuspendedYield);
-    genPtr->state = GeneratorState::Executing;
+  if (genPtr->state == GeneratorState::Executing) {
+    throwError(ErrorType::TypeError, "Generator is already executing");
+    return Value(Undefined{});
+  }
 
-    if (genPtr->function && genPtr->context) {
-      auto prevEnv = env_;
-      env_ = std::static_pointer_cast<Environment>(genPtr->context);
+  bool wasSuspendedYield = (genPtr->state == GeneratorState::SuspendedYield);
+  genPtr->state = GeneratorState::Executing;
 
-      auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
-      Value result = Value(Undefined{});
-      bool hadThrow = false;
-      Value thrownValue = Value(Undefined{});
+  if (genPtr->function && genPtr->context) {
+    auto prevEnv = env_;
+    env_ = std::static_pointer_cast<Environment>(genPtr->context);
 
-      auto prevFlow = flow_;
-      flow_.reset();
-      if (mode != ControlFlow::ResumeMode::None && wasSuspendedYield) {
-        flow_.prepareResume(mode, resumeValue);
-      }
+    auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
+    
+    // Resume or start the generator coroutine
+    auto prevFlow = flow_;
+    flow_.reset();
+    if (mode != ControlFlow::ResumeMode::None && wasSuspendedYield) {
+      flow_.prepareResume(mode, resumeValue);
+    }
 
-      size_t startIndex = genPtr->yieldIndex;
-      if (!wasSuspendedYield && genPtr->function) {
-        auto startIt = genPtr->function->properties.find("__param_dstr_prologue_start__");
-        auto lenIt = genPtr->function->properties.find("__param_dstr_prologue_len__");
-        if (startIt != genPtr->function->properties.end() &&
-            lenIt != genPtr->function->properties.end() &&
-            startIt->second.isNumber() && lenIt->second.isNumber()) {
-          size_t start = static_cast<size_t>(startIt->second.toNumber());
-          size_t len = static_cast<size_t>(lenIt->second.toNumber());
-          startIndex = std::max(startIndex, start + len);
-        }
-      }
-      for (size_t i = startIndex; i < bodyPtr->size(); i++) {
-        auto task = evaluate(*(*bodyPtr)[i]);
-  LIGHTJS_RUN_TASK(task, result);
+    Value result = Value(Undefined{});
+    
+    if (!genPtr->suspendedTask) {
+      // First time starting the generator - evaluate the whole body
+      auto task = evaluateGeneratorBody(*bodyPtr);
+      
+      // Store the task in genPtr->suspendedTask for future resumptions
+      // We must store it as a pointer to Task to avoid slicing and preserve coroutine handle
+      Task* heapTask = new Task(std::move(task));
+      genPtr->suspendedTask = std::shared_ptr<void>(heapTask, [](void* p) {
+        delete static_cast<Task*>(p);
+      });
+    }
 
-        if (flow_.type == ControlFlow::Type::Throw) {
-          hadThrow = true;
-          thrownValue = flow_.value;
-          genPtr->state = GeneratorState::Completed;
-          break;
-        }
+    // Resume the stored task
+    Task& task = *static_cast<Task*>(genPtr->suspendedTask.get());
+    
+    // Execute until it yields or completes
+    LIGHTJS_RUN_TASK_SYNC(task, result);
 
-        if (flow_.type == ControlFlow::Type::Yield) {
-          genPtr->state = GeneratorState::SuspendedYield;
-          genPtr->currentValue = std::make_shared<Value>(flow_.value);
-          genPtr->yieldIndex = i;
-
-          flow_ = prevFlow;
-          env_ = prevEnv;
-
-          return makeIteratorResult(*genPtr->currentValue, false);
-        }
-
-        if (flow_.type == ControlFlow::Type::Return) {
-          genPtr->state = GeneratorState::Completed;
-          genPtr->currentValue = std::make_shared<Value>(flow_.value);
-          result = flow_.value;
-          break;
-        }
-      }
-
+    if (flow_.type == ControlFlow::Type::Yield) {
+      genPtr->state = GeneratorState::SuspendedYield;
+      genPtr->currentValue = std::make_shared<Value>(flow_.value);
+      
       flow_ = prevFlow;
       env_ = prevEnv;
-
-      if (hadThrow) {
-        flow_.type = ControlFlow::Type::Throw;
-        flow_.value = thrownValue;
-        return Value(Undefined{});
-      }
-
-      if (genPtr->state != GeneratorState::Completed &&
-          genPtr->state != GeneratorState::SuspendedYield) {
-        genPtr->state = GeneratorState::Completed;
-        genPtr->currentValue = std::make_shared<Value>(result);
-      }
-
-      return makeIteratorResult(*genPtr->currentValue,
-                                genPtr->state == GeneratorState::Completed);
+      return makeIteratorResult(*genPtr->currentValue, false);
     }
+
+    // Generator completed (returned or finished body)
+    genPtr->state = GeneratorState::Completed;
+    if (flow_.type == ControlFlow::Type::Return) {
+      genPtr->currentValue = std::make_shared<Value>(flow_.value);
+    } else if (flow_.type == ControlFlow::Type::Throw) {
+      // Re-throw the error to the caller
+      Value thrownValue = flow_.value;
+      flow_ = prevFlow;
+      env_ = prevEnv;
+      flow_.type = ControlFlow::Type::Throw;
+      flow_.value = thrownValue;
+      return Value(Undefined{});
+    } else {
+      genPtr->currentValue = std::make_shared<Value>(Undefined{});
+    }
+
+    flow_ = prevFlow;
+    env_ = prevEnv;
+    return makeIteratorResult(*genPtr->currentValue, true);
   }
 
   genPtr->state = GeneratorState::Completed;
@@ -7635,7 +7662,8 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       if (func->params[i].defaultValue && paramValue.isUndefined()) {
         auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
         auto defaultTask = evaluate(*defaultExpr);
-        LIGHTJS_RUN_TASK(defaultTask, paramValue);
+        LIGHTJS_RUN_TASK_SYNC(defaultTask, paramValue);
+        if (flow_.type == ControlFlow::Type::Yield) return;
         if (flow_.type == ControlFlow::Type::Throw || hasError()) {
           return;
         }
@@ -7699,7 +7727,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
           for (size_t i = 0; i < len && (start + i) < bodyPtr2->size(); ++i) {
             auto stmtTask = evaluate(*(*bodyPtr2)[start + i]);
             Value stmtResult = Value(Undefined{});
-            LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+            LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
             if (flow_.type == ControlFlow::Type::Throw || hasError()) {
               return;
             }
@@ -7734,7 +7762,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       Value newTarget = (args.size() >= 3) ? args[2] : target;
       auto constructTask = constructValue(target, constructArgs, newTarget);
       Value constructed;
-      LIGHTJS_RUN_TASK(constructTask, constructed);
+      LIGHTJS_RUN_TASK_SYNC(constructTask, constructed);
       return constructed;
     }
 
@@ -7793,6 +7821,19 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
 
   if (func->isGenerator) {
     auto generator = std::make_shared<Generator>(func, func->closure);
+    generator->properties["__constructor__"] = callee;
+    
+    // Set prototype: g() returns an object that inherits from g.prototype
+    auto protoIt = func->properties.find("prototype");
+    if (protoIt != func->properties.end() && (protoIt->second.isObject() || protoIt->second.isArray() || protoIt->second.isFunction() || protoIt->second.isGenerator() || protoIt->second.isProxy())) {
+      generator->properties["__proto__"] = protoIt->second;
+    } else {
+      // Fallback to intrinsic %GeneratorPrototype% if g.prototype is not an object
+      if (auto genProto = env_->getRoot()->get("__generator_prototype__"); genProto && genProto->isObject()) {
+        generator->properties["__proto__"] = *genProto;
+      }
+    }
+    
     GarbageCollector::instance().reportAllocation(sizeof(Generator));
     auto genEnv = std::static_pointer_cast<Environment>(func->closure);
     genEnv = genEnv->createChild();
@@ -7867,7 +7908,8 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     for (const auto& stmt : *bodyPtr) {
       if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
         auto task = evaluate(*stmt);
-        LIGHTJS_RUN_TASK_VOID(task);
+        LIGHTJS_RUN_TASK_VOID_SYNC(task);
+        if (flow_.type == ControlFlow::Type::Yield) return Value(Undefined{});
       }
     }
 
@@ -7904,7 +7946,8 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
               if (auto* awaitExpr = std::get_if<AwaitExpr>(&exprStmt->expression->node)) {
                 auto awaitArgTask = evaluate(*awaitExpr->argument);
                 Value awaitedValue = Value(Undefined{});
-                LIGHTJS_RUN_TASK(awaitArgTask, awaitedValue);
+                LIGHTJS_RUN_TASK_SYNC(awaitArgTask, awaitedValue);
+                if (flow_.type == ControlFlow::Type::Yield) return;
 
                 if (flow_.type == ControlFlow::Type::Throw) {
                   promise->reject(flow_.value);
@@ -7998,8 +8041,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
 
           auto stmtTask = evaluate(*stmt);
           Value stmtResult = Value(Undefined{});
-          LIGHTJS_RUN_TASK(stmtTask, stmtResult);
-
+          LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
           if (flow_.type == ControlFlow::Type::Return) {
             promise->resolve(flow_.value);
             restoreState();
@@ -8075,7 +8117,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     for (const auto& hoistStmt : *bodyPtr) {
       if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
         auto hoistTask = evaluate(*hoistStmt);
-        LIGHTJS_RUN_TASK_VOID(hoistTask);
+        LIGHTJS_RUN_TASK_VOID_SYNC(hoistTask);
       }
     }
 
@@ -8093,10 +8135,10 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       }
       auto stmtTask = evaluate(*stmt);
       Value stmtResult = Value(Undefined{});
-      LIGHTJS_RUN_TASK(stmtTask, stmtResult);
+      LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
+      if (flow_.type == ControlFlow::Type::Yield) return Value(Undefined{});
 
-      if (flow_.type == ControlFlow::Type::Return) {
-        if (strictMode_ && pendingSelfTailCall_) {
+      if (flow_.type == ControlFlow::Type::Return) {        if (strictMode_ && pendingSelfTailCall_) {
           currentArgs = std::move(pendingSelfTailArgs_);
           currentThis = pendingSelfTailThis_;
           pendingSelfTailCall_ = false;
@@ -8366,16 +8408,29 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     proto->properties["constructor"] = Value(func);
     proto->properties["__non_enum_constructor"] = Value(true);
+    
+    // If it's a generator, the default prototype should inherit from %GeneratorPrototype%
+    if (func->isGenerator) {
+      if (auto genProto = env_->get("__generator_prototype__"); genProto && genProto->isObject()) {
+        proto->properties["__proto__"] = *genProto;
+      }
+    }
+    
     func->properties["prototype"] = Value(proto);
   }
 
-  // Set __proto__ to Function.prototype for proper prototype chain
-  auto funcVal = env_->getRoot()->get("Function");
-  if (funcVal.has_value() && funcVal->isFunction()) {
-    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
-    auto protoIt = funcCtor->properties.find("prototype");
-    if (protoIt != funcCtor->properties.end()) {
-      func->properties["__proto__"] = protoIt->second;
+  // Set __proto__ to Function.prototype or GeneratorFunction.prototype for proper prototype chain
+  std::string protoName = func->isGenerator ? "__generator_function_prototype__" : "Function";
+  auto protoVal = env_->getRoot()->get(protoName);
+  if (protoVal.has_value()) {
+    if (func->isGenerator && protoVal->isObject()) {
+      func->properties["__proto__"] = *protoVal;
+    } else if (protoVal->isFunction()) {
+      auto protoCtor = std::get<std::shared_ptr<Function>>(protoVal->data);
+      auto protoIt = protoCtor->properties.find("prototype");
+      if (protoIt != protoCtor->properties.end()) {
+        func->properties["__proto__"] = protoIt->second;
+      }
     }
   }
 
@@ -8465,34 +8520,43 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
 }
 
 Task Interpreter::evaluateYield(const YieldExpr& expr) {
-  auto resumeMode = flow_.takeResumeMode();
-  Value resumeValue = flow_.takeResumeValue();
-
-  if (resumeMode == ControlFlow::ResumeMode::Return) {
-    flow_.type = ControlFlow::Type::Return;
-    flow_.value = resumeValue;
-    LIGHTJS_RETURN(Value(Undefined{}));
-  }
-  if (resumeMode == ControlFlow::ResumeMode::Throw) {
-    flow_.type = ControlFlow::Type::Throw;
-    flow_.value = resumeValue;
-    LIGHTJS_RETURN(Value(Undefined{}));
-  }
-  if (resumeMode == ControlFlow::ResumeMode::Next) {
-    LIGHTJS_RETURN(resumeValue);
-  }
-
   // Evaluate the yielded value
   Value yieldedValue = Value(Undefined{});
   if (expr.argument) {
     auto task = evaluate(*expr.argument);
-  LIGHTJS_RUN_TASK(task, yieldedValue);
+    LIGHTJS_RUN_TASK(task, yieldedValue);
+    if (flow_.type == ControlFlow::Type::Yield) {
+      // Nested yield? ES spec doesn't allow yield in operand of yield without parentheses
+      // but if it happens, we just pass it up.
+      LIGHTJS_RETURN(yieldedValue);
+    }
   }
 
-  // Set the Yield control flow to suspend execution
+  // Set the Yield control flow to signal suspension to LIGHTJS_RUN_TASK
   flow_.setYield(yieldedValue);
 
-  LIGHTJS_RETURN(yieldedValue);
+  // Suspend this task coroutine. 
+  // When resumed, LIGHTJS_RUN_TASK will continue from here.
+  co_await YieldAwaiter{yieldedValue};
+
+  // When we reach here, we've been resumed. 
+  // Handle the resume mode (Next, Return, Throw)
+  auto mode = flow_.takeResumeMode();
+  Value resumeValue = flow_.takeResumeValue();
+
+  if (mode == ControlFlow::ResumeMode::Return) {
+    flow_.type = ControlFlow::Type::Return;
+    flow_.value = resumeValue;
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+  if (mode == ControlFlow::ResumeMode::Throw) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = resumeValue;
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
+
+  // Next mode: return the value passed to .next()
+  LIGHTJS_RETURN(resumeValue);
 }
 
 Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, const Value& newTargetOverride) {
@@ -8781,7 +8845,8 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
     auto superCtorIt = cls->properties.find("__super_constructor__");
     if (superCtorIt != cls->properties.end()) {
       Value superVal = superCtorIt->second;
-      Value result = LIGHTJS_AWAIT(constructValue(superVal, args, effectiveNewTarget));
+      Value result;
+      { auto _t = constructValue(superVal, args, effectiveNewTarget); LIGHTJS_RUN_TASK(_t, result); }
       if (flow_.type != ControlFlow::Type::None) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
@@ -8838,6 +8903,11 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
   // Handle Function constructor (regular constructor function)
   if (callee.isFunction()) {
     auto func = std::get<std::shared_ptr<Function>>(callee.data);
+
+    if (func->isGenerator || func->isAsync) {
+      throwError(ErrorType::TypeError, "Function is not a constructor");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
 
     if (func->isNative) {
       if (!func->isConstructor) {
@@ -8925,7 +8995,7 @@ Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, c
     for (const auto& hoistStmt : *bodyPtr) {
       if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
         auto hoistTask = evaluate(*hoistStmt);
-        LIGHTJS_RUN_TASK_VOID(hoistTask);
+        LIGHTJS_RUN_TASK_VOID_SYNC(hoistTask);
       }
     }
 
@@ -8996,7 +9066,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
     args.push_back(argTask.result());
   }
 
-  LIGHTJS_RETURN(LIGHTJS_AWAIT(constructValue(callee, args, Value(Undefined{}))));
+  { auto _t = constructValue(callee, args, Value(Undefined{})); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
 }
 
 Task Interpreter::evaluateClass(const ClassExpr& expr) {
@@ -9270,7 +9340,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
 }
 
 // Helper for recursively binding destructuring patterns
-void Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet) {
+Task Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet) {
   if (auto* assign = std::get_if<AssignmentPattern>(&pattern.node)) {
     Value boundValue = value;
     if (boundValue.isUndefined()) {
@@ -9304,8 +9374,8 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         }
       }
     }
-    bindDestructuringPattern(*assign->left, boundValue, isConst, useSet);
-    return;
+    { auto t = bindDestructuringPattern(*assign->left, boundValue, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+    LIGHTJS_RETURN(Value(Undefined{}));
   }
 
   if (auto* id = std::get_if<Identifier>(&pattern.node)) {
@@ -9313,7 +9383,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
     if (useSet && env_->isTDZ(id->name)) {
       throwError(ErrorType::ReferenceError,
                  "Cannot access '" + id->name + "' before initialization");
-      return;
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
     // Simple identifier
     if (useSet) {
@@ -9321,12 +9391,12 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         // Check if this is a const binding being reassigned
         if (env_->isConst(id->name)) {
           throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
-          return;
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
         if (strictMode_) {
           // In strict mode, assignment to undeclared variable is a ReferenceError
           throwError(ErrorType::ReferenceError, id->name + " is not defined");
-          return;
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
         // In non-strict mode, assignment to undeclared variable creates global
         env_->getRoot()->define(id->name, value);
@@ -9373,7 +9443,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
     // Array destructuring - null/undefined are not iterable
     if (value.isNull() || value.isUndefined()) {
       throwError(ErrorType::TypeError, "Cannot destructure " + value.toString() + " as it is not iterable");
-      return;
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
     std::shared_ptr<Array> arr;
     if (value.isArray()) {
@@ -9389,12 +9459,12 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         auto iterIt = protoObj->properties.find(iterKey);
         if (iterIt == protoObj->properties.end()) {
           throwError(ErrorType::TypeError, value.toString() + " is not iterable");
-          return;
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
         Value iteratorMethod = iterIt->second;
         if (!iteratorMethod.isFunction()) {
           throwError(ErrorType::TypeError, "Symbol.iterator is not a function");
-          return;
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
         bool isBuiltinIterator = false;
         if (iteratorMethod.isFunction()) {
@@ -9409,7 +9479,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         } else {
           // Use the overridden @@iterator to collect elements.
           Value iterResult = callFunction(iteratorMethod, {}, value);
-          if (flow_.type == ControlFlow::Type::Throw) return;
+          if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
 
           IteratorRecord iterRec;
           if (iterResult.isGenerator()) {
@@ -9422,21 +9492,21 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
             auto getterIt = iterObj->properties.find("__get_next");
             if (getterIt != iterObj->properties.end() && getterIt->second.isFunction()) {
               nextMethod = callFunction(getterIt->second, {}, iterResult);
-              if (flow_.type == ControlFlow::Type::Throw) return;
+              if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
             } else {
               auto nextIt = iterObj->properties.find("next");
               if (nextIt != iterObj->properties.end()) nextMethod = nextIt->second;
             }
             if (!nextMethod.isFunction()) {
               throwError(ErrorType::TypeError, "Iterator next is not a function");
-              return;
+              LIGHTJS_RETURN(Value(Undefined{}));
             }
             iterRec.kind = IteratorRecord::Kind::IteratorObject;
             iterRec.iteratorObject = iterObj;
             iterRec.nextMethod = nextMethod;
           } else {
             throwError(ErrorType::TypeError, "Iterator result is not an object");
-            return;
+            LIGHTJS_RETURN(Value(Undefined{}));
           }
 
           arr = std::make_shared<Array>();
@@ -9445,17 +9515,17 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
           bool hasRest = (arrayPat->rest != nullptr);
           for (size_t i = 0; i < needed || hasRest; ++i) {
             Value stepResult = iteratorNext(iterRec);
-            if (flow_.type == ControlFlow::Type::Throw) return;
+            if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
             if (!stepResult.isObject()) {
               throwError(ErrorType::TypeError, "Iterator result is not an object");
-              return;
+              LIGHTJS_RETURN(Value(Undefined{}));
             }
             auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
             bool done = false;
             auto doneGetterIt = stepObj->properties.find("__get_done");
             if (doneGetterIt != stepObj->properties.end() && doneGetterIt->second.isFunction()) {
               Value doneVal = callFunction(doneGetterIt->second, {}, stepResult);
-              if (flow_.type == ControlFlow::Type::Throw) return;
+              if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
               done = doneVal.toBool();
             } else {
               auto doneIt = stepObj->properties.find("done");
@@ -9467,7 +9537,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
             auto valGetterIt = stepObj->properties.find("__get_value");
             if (valGetterIt != stepObj->properties.end() && valGetterIt->second.isFunction()) {
               elemVal = callFunction(valGetterIt->second, {}, stepResult);
-              if (flow_.type == ControlFlow::Type::Throw) return;
+              if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
             } else {
               auto valIt = stepObj->properties.find("value");
               elemVal = (valIt != stepObj->properties.end()) ? valIt->second : Value(Undefined{});
@@ -9578,7 +9648,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
               if (!arrayPat->elements[i]) {
                 // Hole/elision: advance iterator to consume slot
                 advanceIterator();
-                if (flow_.type == ControlFlow::Type::Throw) return;
+                if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
                 continue;
               }
 
@@ -9597,14 +9667,14 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
                 auto objTask = evaluate(*memberTarget->object);
                 Value objVal = Value(Undefined{});
                 LIGHTJS_RUN_TASK(objTask, objVal);
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
 
                 std::string prop;
                 if (memberTarget->computed) {
                   auto propTask = evaluate(*memberTarget->property);
                   Value propVal = Value(Undefined{});
                   LIGHTJS_RUN_TASK(propTask, propVal);
-                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
                   prop = propVal.toString();
                 } else if (auto* propId = std::get_if<Identifier>(&memberTarget->property->node)) {
                   prop = propId->name;
@@ -9612,13 +9682,13 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
 
                 // THEN advance iterator to get value
                 Value elemValue = advanceIterator();
-                if (flow_.type == ControlFlow::Type::Throw) return; // next() threw, no close
+                if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{})); // next() threw, no close
 
                 // Handle default value if undefined
                 if (elemValue.isUndefined() && defaultExpr) {
                   auto defaultTask = evaluate(*defaultExpr);
                   LIGHTJS_RUN_TASK(defaultTask, elemValue);
-                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
                 }
 
                 // Bind value to pre-evaluated reference
@@ -9639,21 +9709,21 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
                     }
                   }
                 }
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
               } else {
                 // Identifier or nested pattern: advance iterator first, then bind
                 Value elemValue = advanceIterator();
-                if (flow_.type == ControlFlow::Type::Throw) return; // next() threw, no close
+                if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{})); // next() threw, no close
 
                 // Handle default value if undefined
                 if (elemValue.isUndefined() && defaultExpr) {
                   auto defaultTask = evaluate(*defaultExpr);
                   LIGHTJS_RUN_TASK(defaultTask, elemValue);
-                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
                 }
 
-                bindDestructuringPattern(*target, elemValue, isConst, useSet);
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                { auto t = bindDestructuringPattern(*target, elemValue, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
               }
             }
 
@@ -9672,14 +9742,14 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
                 auto objTask = evaluate(*memberTarget->object);
                 Value objVal = Value(Undefined{});
                 LIGHTJS_RUN_TASK(objTask, objVal);
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
 
                 std::string prop;
                 if (memberTarget->computed) {
                   auto propTask = evaluate(*memberTarget->property);
                   Value propVal = Value(Undefined{});
                   LIGHTJS_RUN_TASK(propTask, propVal);
-                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                  if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
                   prop = propVal.toString();
                 } else if (auto* propId = std::get_if<Identifier>(&memberTarget->property->node)) {
                   prop = propId->name;
@@ -9689,7 +9759,7 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
                 auto restArr = std::make_shared<Array>();
                 while (!iteratorDone) {
                   Value v = advanceIterator();
-                  if (flow_.type == ControlFlow::Type::Throw) return;
+                  if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
                   if (iteratorDone) break;
                   restArr->elements.push_back(v);
                 }
@@ -9712,28 +9782,28 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
                     }
                   }
                 }
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
               } else {
                 // Identifier or nested pattern rest: collect remaining, then bind
                 auto restArr = std::make_shared<Array>();
                 while (!iteratorDone) {
                   Value v = advanceIterator();
-                  if (flow_.type == ControlFlow::Type::Throw) return;
+                  if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
                   if (iteratorDone) break;
                   restArr->elements.push_back(v);
                 }
-                bindDestructuringPattern(*restActualTarget, Value(restArr), isConst, useSet);
-                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); return; }
+                { auto t = bindDestructuringPattern(*restActualTarget, Value(restArr), isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+                if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
               }
             }
 
             // Final IteratorClose if iterator not exhausted
             if (!iteratorDone) {
               iteratorClose(iterRec);
-              if (flow_.type == ControlFlow::Type::Throw) return;
+              if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
             }
             // Done - skip the default binding loop below
-            return;
+            LIGHTJS_RETURN(Value(Undefined{}));
           }
           // next method not found - treat as empty iterable
           arr = std::make_shared<Array>();
@@ -9742,12 +9812,12 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
         }
       } else {
         throwError(ErrorType::TypeError, value.toString() + " is not iterable");
-        return;
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
     } else {
       // Primitives (bool, number, bigint) are not iterable
       throwError(ErrorType::TypeError, value.toString() + " is not iterable");
-      return;
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     for (size_t i = 0; i < arrayPat->elements.size(); ++i) {
@@ -9756,8 +9826,8 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       Value elemValue = (i < arr->elements.size()) ? arr->elements[i] : Value(Undefined{});
 
       // Recursively bind (handles nested patterns)
-      bindDestructuringPattern(*arrayPat->elements[i], elemValue, isConst, useSet);
-      if (flow_.type == ControlFlow::Type::Throw) return;
+      { auto t = bindDestructuringPattern(*arrayPat->elements[i], elemValue, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+      if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     // Handle rest element
@@ -9766,13 +9836,13 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
         restArr->elements.push_back(arr->elements[i]);
       }
-      bindDestructuringPattern(*arrayPat->rest, Value(restArr), isConst, useSet);
+      { auto t = bindDestructuringPattern(*arrayPat->rest, Value(restArr), isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
     }
   } else if (auto* objPat = std::get_if<ObjectPattern>(&pattern.node)) {
     // Object destructuring - null/undefined cannot be destructured
     if (value.isNull() || value.isUndefined()) {
       throwError(ErrorType::TypeError, "Cannot destructure " + value.toString() + " as it is not an object");
-      return;
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
     std::shared_ptr<Object> obj;
     if (value.isObject()) {
@@ -9826,14 +9896,14 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
       auto getterIt = obj->properties.find("__get_" + keyName);
       if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
         propValue = callFunction(getterIt->second, {}, value);
-        if (flow_.type == ControlFlow::Type::Throw) return;
+        if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
       } else if (obj->properties.count(keyName)) {
         propValue = obj->properties[keyName];
       }
 
       // Recursively bind (handles nested patterns)
-      bindDestructuringPattern(*prop.value, propValue, isConst, useSet);
-      if (flow_.type == ControlFlow::Type::Throw) return;
+      { auto t = bindDestructuringPattern(*prop.value, propValue, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+      if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     // Handle rest properties
@@ -9874,11 +9944,12 @@ void Interpreter::bindDestructuringPattern(const Expression& pattern, const Valu
           restObj->properties[propName] = callFunction(getterIt->second, {}, value);
         }
       }
-      bindDestructuringPattern(*objPat->rest, Value(restObj), isConst, useSet);
+      { auto t = bindDestructuringPattern(*objPat->rest, Value(restObj), isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
     }
   }
   // Other node types are ignored (error case in real JS)
-}
+
+  LIGHTJS_RETURN(Value(Undefined{}));}
 
 // Helper to invoke a JavaScript function synchronously (used by native array methods for callbacks)
 Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue) {
@@ -9925,7 +9996,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
     } else if (func->params[i].defaultValue) {
       auto defaultExpr = std::static_pointer_cast<Expression>(func->params[i].defaultValue);
       auto defaultTask = evaluate(*defaultExpr);
-      LIGHTJS_RUN_TASK_VOID(defaultTask);
+      LIGHTJS_RUN_TASK_VOID_SYNC(defaultTask);
       env_->define(func->params[i].name, defaultTask.result());
     } else {
       env_->define(func->params[i].name, Value(Undefined{}));
@@ -9972,8 +10043,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
     Value stmtResult = Value(Undefined{});
-    LIGHTJS_RUN_TASK(stmtTask, stmtResult);
-
+    LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
     if (flow_.type == ControlFlow::Type::Return) {
       result = flow_.value;
       returned = true;
@@ -10068,7 +10138,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     // For var declarations, use set() to update the hoisted binding in function scope
     // rather than define() which would create a new binding in the current block scope
     bool useSet = (decl.kind == VarDeclaration::Kind::Var);
-    bindDestructuringPattern(*declarator.pattern, value, isConst, useSet);
+    { auto t = bindDestructuringPattern(*declarator.pattern, value, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
   }
   LIGHTJS_RETURN(Value(Undefined{}));
 }
@@ -10361,7 +10431,9 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  Value scopeValue = LIGHTJS_AWAIT(evaluate(*stmt.object));
+  Value scopeValue;
+
+  { auto _t = evaluate(*stmt.object); LIGHTJS_RUN_TASK(_t, scopeValue); }
   if (flow_.type != ControlFlow::Type::None) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
@@ -10469,7 +10541,9 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
     }
   }
 
-  Value result = LIGHTJS_AWAIT(evaluate(*stmt.body));
+  Value result;
+
+  { auto _t = evaluate(*stmt.body); LIGHTJS_RUN_TASK(_t, result); }
 
   // Per spec: Return Completion(UpdateEmpty(C, undefined))
   // When body completes with break/continue, carry the UpdateEmpty'd value
@@ -10755,7 +10829,8 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
         auto iterEnv = env_->createChild();
         env_ = iterEnv;
       }
-      bindDestructuringPattern(*dstrPattern, Value(key), isConst, !dstrIsDecl);
+      { auto t = bindDestructuringPattern(*dstrPattern, Value(key), isConst, !dstrIsDecl); LIGHTJS_RUN_TASK_VOID_SYNC(t); }
+      if (this->flow_.type == ControlFlow::Type::Yield) return;
       return;
     }
     if (isLetOrConst && !varName.empty()) {
@@ -10769,14 +10844,16 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       if (auto* member = std::get_if<MemberExpr>(&memberExpr->node)) {
         auto objTask = evaluate(*member->object);
         Value objVal;
-        LIGHTJS_RUN_TASK_VOID(objTask);
+        LIGHTJS_RUN_TASK_VOID_SYNC(objTask);
+        if (this->flow_.type == ControlFlow::Type::Yield) return;
         objVal = objTask.result();
         if (objVal.isObject()) {
           auto mObj = std::get<std::shared_ptr<Object>>(objVal.data);
           std::string prop;
           if (member->computed) {
             auto propTask = evaluate(*member->property);
-            LIGHTJS_RUN_TASK_VOID(propTask);
+            LIGHTJS_RUN_TASK_VOID_SYNC(propTask);
+            if (this->flow_.type == ControlFlow::Type::Yield) return;
             prop = propTask.result().toString();
           } else if (auto* propId = std::get_if<Identifier>(&member->property->node)) {
             prop = propId->name;
@@ -11238,7 +11315,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         }
       }
     } else if (lhsType == ForOfLHS::DestructuringVar) {
-      bindDestructuringPattern(*lhsPattern, currentValue, isConst);
+      { auto t = bindDestructuringPattern(*lhsPattern, currentValue, isConst); LIGHTJS_RUN_TASK_VOID(t); }
       if (flow_.type == ControlFlow::Type::Throw) {
         // Per spec IteratorClose step 5: original throw completion always wins
         auto savedFlow = flow_;
@@ -11252,7 +11329,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       // Bare destructuring assignment or member expression target
       if (std::get_if<ArrayPattern>(&lhsExpr->node) || std::get_if<ObjectPattern>(&lhsExpr->node)) {
         // Destructuring assignment (for ({a, b} of ...) or for ([a, b] of ...))
-        bindDestructuringPattern(*lhsExpr, currentValue, false, true);
+        { auto t = bindDestructuringPattern(*lhsExpr, currentValue, false, true); LIGHTJS_RUN_TASK_VOID(t); }
         if (flow_.type == ControlFlow::Type::Throw) {
           // Per spec IteratorClose step 5: original throw completion always wins
           auto savedFlow = flow_;
@@ -11484,7 +11561,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       flow_.type = ControlFlow::Type::None;
 
       if (stmt.handler.paramPattern) {
-        bindDestructuringPattern(*stmt.handler.paramPattern, thrownValue, false);
+        { auto t = bindDestructuringPattern(*stmt.handler.paramPattern, thrownValue, false); LIGHTJS_RUN_TASK_VOID(t); }
       } else if (!stmt.handler.param.name.empty()) {
         env_->define(stmt.handler.param.name, thrownValue);
       }
@@ -11643,7 +11720,7 @@ Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
 Task Interpreter::evaluateExportNamed(const ExportNamedDeclaration& stmt) {
   // If there's a declaration, evaluate it
   if (stmt.declaration) {
-    LIGHTJS_RETURN(LIGHTJS_AWAIT(evaluate(*stmt.declaration)));
+    { auto _t = evaluate(*stmt.declaration); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   }
 
   // Export bindings are handled at the module level

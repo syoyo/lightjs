@@ -32,7 +32,7 @@ struct Task {
       return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
     }
 
-    std::suspend_never initial_suspend() { return {}; }
+    std::suspend_always initial_suspend() { return {}; }
     std::suspend_always final_suspend() noexcept { return {}; }
 
     void return_value(Value v) {
@@ -78,47 +78,115 @@ struct Task {
     return Value(Undefined{});
   }
 
-  bool done() const {
-    return handle && handle.done();
-  }
-
-  bool await_ready() const noexcept {
-    return handle.done();
-  }
-
-  void await_suspend(std::coroutine_handle<> awaiting) noexcept {
-    // Run this task to completion, then resume the awaiting coroutine
-    while (!handle.done()) {
+  void resume() {
+    if (handle && !handle.done()) {
       handle.resume();
     }
-    awaiting.resume();
   }
 
-  Value await_resume() {
-    return result();
+  void getReferences(std::vector<GCObject*>& refs) const {
+    if (handle) {
+      handle.promise().result.getReferences(refs);
+    }
+  }
+
+  bool done() const {
+    return handle && handle.done();
   }
 };
 
 // C++20 macros for coroutine operations
 #define LIGHTJS_RETURN(val) co_return (val)
-#define LIGHTJS_AWAIT(task) co_await (task)
 
-// Run a task to completion and store result
-#define LIGHTJS_RUN_TASK(taskvar, outvar) \
+struct YieldAwaiter {
+  Value yieldedValue;
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<>) const noexcept {}
+  void await_resume() const noexcept {}
+};
+
+// Forward declaration
+class Interpreter;
+
+/**
+ * TaskAwaiter - Handles co_await for Task objects within the Interpreter.
+ * Correctly propagates yields by suspending the parent coroutine.
+ */
+struct TaskAwaiter {
+  Task task;
+  Interpreter& interp;
+
+  bool await_ready() const noexcept { return task.done(); }
+  void await_suspend(std::coroutine_handle<> awaiting) noexcept;
+  Value await_resume() { return task.result(); }
+};
+
+#define LIGHTJS_AWAIT(task) co_await TaskAwaiter{(task), *this}
+
+// Internal macro for coroutine contexts (propagates yield via suspension)
+#define LIGHTJS_RUN_TASK_CORO(taskvar, outvar) \
   do { \
     while (!(taskvar).done()) { \
-      std::coroutine_handle<>::from_address((taskvar).handle.address()).resume(); \
+      (taskvar).resume(); \
+      if (this->flow_.type == ControlFlow::Type::Yield) co_await YieldAwaiter{Value(Undefined{})}; \
     } \
     (outvar) = (taskvar).result(); \
   } while (0)
 
-// Run a task to completion without storing result
-#define LIGHTJS_RUN_TASK_VOID(task) \
+#define LIGHTJS_RUN_TASK_VOID_CORO(task) \
   do { \
     while (!(task).done()) { \
-      std::coroutine_handle<>::from_address((task).handle.address()).resume(); \
+      (task).resume(); \
+      if (this->flow_.type == ControlFlow::Type::Yield) co_await YieldAwaiter{Value(Undefined{})}; \
     } \
   } while (0)
+
+// Internal synchronous macro (bails out on yield, but cannot co_await)
+#define LIGHTJS_RUN_TASK_SYNC_INTERNAL(taskvar, outvar) \
+  do { \
+    while (!(taskvar).done()) { \
+      (taskvar).resume(); \
+      if (this->flow_.type == ControlFlow::Type::Yield) break; \
+    } \
+    if ((taskvar).done()) (outvar) = (taskvar).result(); \
+  } while (0)
+
+#define LIGHTJS_RUN_TASK_VOID_SYNC_INTERNAL(task) \
+  do { \
+    while (!(task).done()) { \
+      (task).resume(); \
+      if (this->flow_.type == ControlFlow::Type::Yield) break; \
+    } \
+  } while (0)
+
+// External synchronous macro (runs to completion, safe for non-Interpreter contexts)
+#define LIGHTJS_RUN_TASK_SYNC_EXTERNAL(taskvar, outvar) \
+  do { \
+    while (!(taskvar).done()) { \
+      (taskvar).resume(); \
+    } \
+    (outvar) = (taskvar).result(); \
+  } while (0)
+
+#define LIGHTJS_RUN_TASK_VOID_SYNC_EXTERNAL(task) \
+  do { \
+    while (!(task).done()) { \
+      (task).resume(); \
+    } \
+  } while (0)
+
+// Map standard macros based on context
+#ifdef LIGHTJS_INTERPRETER_INTERNAL
+#define LIGHTJS_RUN_TASK LIGHTJS_RUN_TASK_CORO
+#define LIGHTJS_RUN_TASK_VOID LIGHTJS_RUN_TASK_VOID_CORO
+#define LIGHTJS_RUN_TASK_SYNC LIGHTJS_RUN_TASK_SYNC_INTERNAL
+#define LIGHTJS_RUN_TASK_VOID_SYNC LIGHTJS_RUN_TASK_VOID_SYNC_INTERNAL
+#else
+#define LIGHTJS_RUN_TASK LIGHTJS_RUN_TASK_SYNC_EXTERNAL
+#define LIGHTJS_RUN_TASK_VOID LIGHTJS_RUN_TASK_VOID_SYNC_EXTERNAL
+#define LIGHTJS_RUN_TASK_SYNC LIGHTJS_RUN_TASK_SYNC_EXTERNAL
+#define LIGHTJS_RUN_TASK_VOID_SYNC LIGHTJS_RUN_TASK_VOID_SYNC_EXTERNAL
+#endif
 
 #else
 
@@ -181,10 +249,14 @@ inline Value runTask(Task&& t) {
 #define LIGHTJS_RUN_TASK(taskvar, outvar) (outvar) = (taskvar).result()
 #define LIGHTJS_RUN_TASK_VOID(taskvar) ((void)(taskvar))
 
+#define LIGHTJS_RUN_TASK_SYNC(taskvar, outvar) (outvar) = (taskvar).result()
+#define LIGHTJS_RUN_TASK_VOID_SYNC(taskvar) ((void)(taskvar))
+
 #endif // LIGHTJS_HAS_COROUTINES
 
 class Interpreter {
   friend class Module;
+  friend struct TaskAwaiter;
 public:
   explicit Interpreter(std::shared_ptr<Environment> env);
 
@@ -370,8 +442,11 @@ private:
   Task evaluateExportDefault(const ExportDefaultDeclaration& stmt);
   Task evaluateExportAll(const ExportAllDeclaration& stmt);
 
+  Task evaluateProgram(const Program& program);
+  Task evaluateGeneratorBody(const std::vector<StmtPtr>& body);
+
   // Helper for destructuring bindings
-  void bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet = false);
+  Task bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet = false);
 
   // Helper to invoke a JavaScript function (used by native functions to call JS callbacks)
   Value invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
