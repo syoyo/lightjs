@@ -293,44 +293,6 @@ bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
   return false;
 }
 
-bool isSyntheticParamDestructureTemp(const std::string& name) {
-  return name.rfind("__param_", 0) == 0 || name.rfind("__rest_param_", 0) == 0;
-}
-
-size_t directivePrologueLength(const std::vector<StmtPtr>& body) {
-  size_t n = 0;
-  for (const auto& stmt : body) {
-    if (!stmt) break;
-    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
-    if (!exprStmt || !exprStmt->expression) break;
-    if (!std::get_if<StringLiteral>(&exprStmt->expression->node)) break;
-    ++n;
-  }
-  return n;
-}
-
-bool isSyntheticParamDestructureDecl(const VarDeclaration& decl) {
-  if (decl.kind != VarDeclaration::Kind::Let) return false;
-  if (decl.declarations.size() != 1) return false;
-  const auto& d = decl.declarations[0];
-  if (!d.init) return false;
-  auto* initId = std::get_if<Identifier>(&d.init->node);
-  if (!initId) return false;
-  return isSyntheticParamDestructureTemp(initId->name);
-}
-
-std::pair<size_t, size_t> syntheticParamDestructurePrologueRange(const std::vector<StmtPtr>& body) {
-  size_t start = directivePrologueLength(body);
-  size_t len = 0;
-  for (size_t i = start; i < body.size(); ++i) {
-    if (!body[i]) break;
-    auto* varDecl = std::get_if<VarDeclaration>(&body[i]->node);
-    if (!varDecl) break;
-    if (!isSyntheticParamDestructureDecl(*varDecl)) break;
-    ++len;
-  }
-  return {start, len};
-}
 }  // namespace
 
 // Forward declaration for TDZ initialization
@@ -826,13 +788,10 @@ Task Interpreter::evaluate(const Statement& stmt) {
         const_cast<std::vector<StmtPtr>*>(&method.body),
         [](void*){} // No-op deleter
       );
-      {
-        auto [start, len] = syntheticParamDestructurePrologueRange(method.body);
-        if (len > 0) {
-          func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
-          func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
-        }
-      }
+      func->destructurePrologue = std::shared_ptr<void>(
+        const_cast<std::vector<StmtPtr>*>(&method.destructurePrologue),
+        [](void*){} // No-op deleter
+      );
       func->properties["length"] = Value(static_cast<double>(methodLength));
       if (method.kind == MethodDefinition::Kind::Constructor) {
         func->properties["name"] = Value(std::string("constructor"));
@@ -7712,26 +7671,15 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       targetEnv->define(*func->restParam, Value(restArr));
     }
 
-    // Our parser lowers destructuring parameters into synthetic `let` bindings at the
-    // top of the function body. Generators don't execute their body at call time, so
-    // we must run those bindings during call-time parameter initialization.
-    if (func->isGenerator) {
-      auto startIt = func->properties.find("__param_dstr_prologue_start__");
-      auto lenIt = func->properties.find("__param_dstr_prologue_len__");
-      if (startIt != func->properties.end() && lenIt != func->properties.end() &&
-          startIt->second.isNumber() && lenIt->second.isNumber()) {
-        size_t start = static_cast<size_t>(startIt->second.toNumber());
-        size_t len = static_cast<size_t>(lenIt->second.toNumber());
-        if (len > 0) {
-          auto bodyPtr2 = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
-          for (size_t i = 0; i < len && (start + i) < bodyPtr2->size(); ++i) {
-            auto stmtTask = evaluate(*(*bodyPtr2)[start + i]);
-            Value stmtResult = Value(Undefined{});
-            LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
-            if (flow_.type == ControlFlow::Type::Throw || hasError()) {
-              return;
-            }
-          }
+    // Execute destructuring prologue if present
+    if (func->destructurePrologue) {
+      auto prologuePtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->destructurePrologue);
+      for (const auto& stmt : *prologuePtr) {
+        auto stmtTask = evaluate(*stmt);
+        Value stmtResult = Value(Undefined{});
+        LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
+        if (flow_.type == ControlFlow::Type::Throw || hasError()) {
+          return;
         }
       }
     }
@@ -7766,37 +7714,37 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       return constructed;
     }
 
-	    bool isIntrinsicEval = false;
-	    auto intrinsicEvalIt = func->properties.find("__is_intrinsic_eval__");
-	    if (intrinsicEvalIt != func->properties.end() &&
-	        intrinsicEvalIt->second.isBool() &&
-	        intrinsicEvalIt->second.toBool()) {
-	      isIntrinsicEval = true;
-	    }
-	    bool prevActiveDirectEvalInvocation = activeDirectEvalInvocation_;
-	    if (isIntrinsicEval) {
-	      activeDirectEvalInvocation_ = pendingDirectEvalCall_;
-	      pendingDirectEvalCall_ = false;
-	    }
+    bool isIntrinsicEval = false;
+    auto intrinsicEvalIt = func->properties.find("__is_intrinsic_eval__");
+    if (intrinsicEvalIt != func->properties.end() &&
+        intrinsicEvalIt->second.isBool() &&
+        intrinsicEvalIt->second.toBool()) {
+      isIntrinsicEval = true;
+    }
+    bool prevActiveDirectEvalInvocation = activeDirectEvalInvocation_;
+    if (isIntrinsicEval) {
+      activeDirectEvalInvocation_ = pendingDirectEvalCall_;
+      pendingDirectEvalCall_ = false;
+    }
 
-	    try {
-	      auto itUsesThis = func->properties.find("__uses_this_arg__");
-	      Value nativeResult = Value(Undefined{});
-	      if (itUsesThis != func->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
-	        std::vector<Value> nativeArgs;
-	        nativeArgs.reserve(args.size() + 1);
-	        nativeArgs.push_back(thisValue);
-	        nativeArgs.insert(nativeArgs.end(), args.begin(), args.end());
-	        nativeResult = func->nativeFunc(nativeArgs);
-	      } else {
-	        nativeResult = func->nativeFunc(args);
-	      }
-	      activeDirectEvalInvocation_ = prevActiveDirectEvalInvocation;
-	      return nativeResult;
-	    } catch (const std::exception& e) {
-	      activeDirectEvalInvocation_ = prevActiveDirectEvalInvocation;
-	      std::string message = e.what();
-	      ErrorType errorType = ErrorType::Error;
+    try {
+      auto itUsesThis = func->properties.find("__uses_this_arg__");
+      Value nativeResult = Value(Undefined{});
+      if (itUsesThis != func->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+        std::vector<Value> nativeArgs;
+        nativeArgs.reserve(args.size() + 1);
+        nativeArgs.push_back(thisValue);
+        nativeArgs.insert(nativeArgs.end(), args.begin(), args.end());
+        nativeResult = func->nativeFunc(nativeArgs);
+      } else {
+        nativeResult = func->nativeFunc(args);
+      }
+      activeDirectEvalInvocation_ = prevActiveDirectEvalInvocation;
+      return nativeResult;
+    } catch (const std::exception& e) {
+      activeDirectEvalInvocation_ = prevActiveDirectEvalInvocation;
+      std::string message = e.what();
+      ErrorType errorType = ErrorType::Error;
       auto consumePrefix = [&](const std::string& prefix, ErrorType type) {
         if (message.rfind(prefix, 0) == 0) {
           errorType = type;
@@ -8374,16 +8322,10 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.body), [](void*){});
+  func->destructurePrologue = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&expr.destructurePrologue), [](void*){});
   // If evaluating in an eval context, keep the AST alive
   if (sourceKeepAlive_) {
     func->astOwner = sourceKeepAlive_;
-  }
-  {
-    auto [start, len] = syntheticParamDestructurePrologueRange(expr.body);
-    if (len > 0) {
-      func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
-      func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
-    }
   }
   func->closure = env_;
   // Compute length: number of params before first default parameter
@@ -8526,21 +8468,83 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
     auto task = evaluate(*expr.argument);
     LIGHTJS_RUN_TASK(task, yieldedValue);
     if (flow_.type == ControlFlow::Type::Yield) {
-      // Nested yield? ES spec doesn't allow yield in operand of yield without parentheses
-      // but if it happens, we just pass it up.
+      // Nested yield propagation
       LIGHTJS_RETURN(yieldedValue);
     }
   }
 
-  // Set the Yield control flow to signal suspension to LIGHTJS_RUN_TASK
-  flow_.setYield(yieldedValue);
+  if (expr.delegate) {
+    auto iterRecOpt = getIterator(yieldedValue);
+    if (!iterRecOpt) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    auto& iterRec = *iterRecOpt;
 
-  // Suspend this task coroutine. 
-  // When resumed, LIGHTJS_RUN_TASK will continue from here.
+    Value received = Value(Undefined{});
+    ControlFlow::ResumeMode mode = ControlFlow::ResumeMode::None;
+
+    while (true) {
+      Value innerResult;
+      if (mode == ControlFlow::ResumeMode::Throw) {
+        // Spec 15.4.3.4 step 3.b: call .throw()
+        // Simplification: if it's a generator, we can call runGeneratorNext directly
+        if (iterRec.kind == IteratorRecord::Kind::Generator) {
+          innerResult = runGeneratorNext(iterRec.generator, ControlFlow::ResumeMode::Throw, received);
+        } else {
+          // Generic iterator .throw() call (not fully implemented for all types here)
+          throwError(ErrorType::TypeError, "yield* delegation to non-generator .throw() not fully supported");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+      } else if (mode == ControlFlow::ResumeMode::Return) {
+        // Spec 15.4.3.4 step 3.c: call .return()
+        if (iterRec.kind == IteratorRecord::Kind::Generator) {
+          innerResult = runGeneratorNext(iterRec.generator, ControlFlow::ResumeMode::Return, received);
+        } else {
+          throwError(ErrorType::TypeError, "yield* delegation to non-generator .return() not fully supported");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+      } else {
+        // mode == None or Next
+        if (iterRec.kind == IteratorRecord::Kind::Generator) {
+          innerResult = runGeneratorNext(iterRec.generator, ControlFlow::ResumeMode::Next, received);
+        } else {
+          innerResult = iteratorNext(iterRec);
+        }
+      }
+
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+
+      // innerResult is {value, done}
+      bool done = false;
+      Value val = Value(Undefined{});
+      if (innerResult.isObject()) {
+        auto obj = std::get<std::shared_ptr<Object>>(innerResult.data);
+        if (auto doneVal = obj->properties.find("done"); doneVal != obj->properties.end()) {
+          done = doneVal->second.toBool();
+        }
+        if (auto valueVal = obj->properties.find("value"); valueVal != obj->properties.end()) {
+          val = valueVal->second;
+        }
+      }
+
+      if (done) {
+        LIGHTJS_RETURN(val);
+      }
+
+      // Yield the value and wait for next resumption
+      flow_.setYield(val);
+      co_await YieldAwaiter{val};
+
+      // Resumed!
+      mode = flow_.takeResumeMode();
+      received = flow_.takeResumeValue();
+    }
+  }
+
+  // Normal yield
+  flow_.setYield(yieldedValue);
   co_await YieldAwaiter{yieldedValue};
 
-  // When we reach here, we've been resumed. 
-  // Handle the resume mode (Next, Return, Throw)
   auto mode = flow_.takeResumeMode();
   Value resumeValue = flow_.takeResumeValue();
 
@@ -8555,11 +8559,10 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  // Next mode: return the value passed to .next()
   LIGHTJS_RETURN(resumeValue);
 }
 
-Task Interpreter::constructValue(Value callee, const std::vector<Value>& args, const Value& newTargetOverride) {
+Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value newTargetOverride) {
   // Check memory limit before potential allocation
   if (!checkMemoryLimit(sizeof(Object))) {
     LIGHTJS_RETURN(Value(Undefined{}));
@@ -9250,13 +9253,10 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       const_cast<std::vector<StmtPtr>*>(&method.body),
       [](void*){} // No-op deleter since we don't own the memory
     );
-    {
-      auto [start, len] = syntheticParamDestructurePrologueRange(method.body);
-      if (len > 0) {
-        func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
-        func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
-      }
-    }
+    func->destructurePrologue = std::shared_ptr<void>(
+      const_cast<std::vector<StmtPtr>*>(&method.destructurePrologue),
+      [](void*){} // No-op deleter
+    );
     func->properties["length"] = Value(static_cast<double>(methodLength));
     if (method.kind == MethodDefinition::Kind::Constructor) {
       func->properties["name"] = Value(std::string("constructor"));
@@ -9340,7 +9340,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
 }
 
 // Helper for recursively binding destructuring patterns
-Task Interpreter::bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet) {
+Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value value, bool isConst, bool useSet) {
   if (auto* assign = std::get_if<AssignmentPattern>(&pattern.node)) {
     Value boundValue = value;
     if (boundValue.isUndefined()) {
@@ -10253,16 +10253,10 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   }
 
   func->body = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.body), [](void*){});
+  func->destructurePrologue = std::shared_ptr<void>(const_cast<std::vector<StmtPtr>*>(&decl.destructurePrologue), [](void*){});
   // If evaluating in an eval context, keep the AST alive
   if (sourceKeepAlive_) {
     func->astOwner = sourceKeepAlive_;
-  }
-  {
-    auto [start, len] = syntheticParamDestructurePrologueRange(decl.body);
-    if (len > 0) {
-      func->properties["__param_dstr_prologue_start__"] = Value(static_cast<double>(start));
-      func->properties["__param_dstr_prologue_len__"] = Value(static_cast<double>(len));
-    }
   }
   func->closure = env_;
   // Compute length: number of params before first default parameter

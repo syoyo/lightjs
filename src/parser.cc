@@ -306,35 +306,6 @@ bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body) {
   return false;
 }
 
-size_t directivePrologueLength(const std::vector<StmtPtr>& body) {
-  size_t n = 0;
-  for (const auto& stmt : body) {
-    if (!stmt) break;
-    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
-    if (!exprStmt || !exprStmt->expression) break;
-    if (!std::get_if<StringLiteral>(&exprStmt->expression->node)) break;
-    ++n;
-  }
-  return n;
-}
-
-void insertPrologueAfterDirectives(std::vector<StmtPtr>& body, std::vector<StmtPtr>& prologue) {
-  if (prologue.empty()) return;
-  size_t insertAt = directivePrologueLength(body);
-  std::vector<StmtPtr> newBody;
-  newBody.reserve(body.size() + prologue.size());
-  for (size_t i = 0; i < insertAt && i < body.size(); ++i) {
-    newBody.push_back(std::move(body[i]));
-  }
-  for (auto& stmt : prologue) {
-    newBody.push_back(std::move(stmt));
-  }
-  for (size_t i = insertAt; i < body.size(); ++i) {
-    newBody.push_back(std::move(body[i]));
-  }
-  body = std::move(newBody);
-}
-
 bool expressionContainsSuper(const Expression& expr);
 bool statementContainsSuper(const Statement& stmt);
 
@@ -1009,6 +980,9 @@ bool Parser::canParseAwaitExpression() const {
 }
 
 bool Parser::canUseYieldAsIdentifier() const {
+  if (!yieldContextStack_.empty() && yieldContextStack_.back()) {
+    return false;
+  }
   return generatorFunctionDepth_ == 0 && !strictMode_;
 }
 
@@ -1419,11 +1393,14 @@ StmtPtr Parser::parseFunctionDeclaration() {
 
   ++functionDepth_;
   awaitContextStack_.push_back(isAsync);
+  yieldContextStack_.push_back(isGenerator);
   if (isAsync) {
     ++asyncFunctionDepth_;
   }
 
-  expect(TokenType::LeftParen);
+  if (!expect(TokenType::LeftParen)) {
+    return nullptr;
+  }
 
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;
@@ -1453,7 +1430,9 @@ StmtPtr Parser::parseFunctionDeclaration() {
         advance();
       } else if (match(TokenType::LeftBracket) || match(TokenType::LeftBrace)) {
         auto pattern = parsePattern();
-        if (!pattern) return nullptr;
+        if (!pattern) {
+          return nullptr;
+        }
         // Rest parameters cannot have initializers.
         if (std::get_if<AssignmentPattern>(&pattern->node)) return nullptr;
 
@@ -1503,7 +1482,9 @@ StmtPtr Parser::parseFunctionDeclaration() {
         hasNonSimpleParams = true;
         advance();
         param.defaultValue = parseAssignment();
-        if (!param.defaultValue) return nullptr;
+        if (!param.defaultValue) {
+          return nullptr;
+        }
         if (expressionContainsSuper(*param.defaultValue)) {
           hasSuperInParams = true;
         }
@@ -1512,7 +1493,9 @@ StmtPtr Parser::parseFunctionDeclaration() {
       hasNonSimpleParams = true;
       hasDestructurePattern = true;
       auto pattern = parsePattern();
-      if (!pattern) return nullptr;
+      if (!pattern) {
+        return nullptr;
+      }
 
       // Unwrap top-level AssignmentPattern: it's a parameter default.
       if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
@@ -1592,6 +1575,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   }
   --functionDepth_;
   awaitContextStack_.pop_back();
+  yieldContextStack_.pop_back();
   if (!block) {
     return nullptr;
   }
@@ -1600,9 +1584,6 @@ StmtPtr Parser::parseFunctionDeclaration() {
   if (!blockStmt) {
     return nullptr;
   }
-
-  // Destructuring parameters are implemented via a body prologue.
-  insertPrologueAfterDirectives(blockStmt->body, destructurePrologue);
 
   bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
   bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
@@ -1644,6 +1625,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.params = std::move(params);
   funcDecl.restParam = restParam;
   funcDecl.body = std::move(blockStmt->body);
+  funcDecl.destructurePrologue = std::move(destructurePrologue);
   funcDecl.isAsync = isAsync;
   funcDecl.isGenerator = isGenerator;
 
@@ -1885,6 +1867,7 @@ StmtPtr Parser::parseClassDeclaration() {
 
       ++functionDepth_;
       awaitContextStack_.push_back(method.isAsync);
+      yieldContextStack_.push_back(method.isGenerator);
       if (method.isAsync) {
         ++asyncFunctionDepth_;
       }
@@ -2020,6 +2003,7 @@ StmtPtr Parser::parseClassDeclaration() {
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           if (!allowSuperCall) {
             --superCallDisallowDepth_;
           }
@@ -2037,17 +2021,18 @@ StmtPtr Parser::parseClassDeclaration() {
       }
       --functionDepth_;
       awaitContextStack_.pop_back();
+      yieldContextStack_.pop_back();
       if (!allowSuperCall) {
         --superCallDisallowDepth_;
       }
 
-      insertPrologueAfterDirectives(method.body, destructurePrologue);
       if (hasDuplicateParams) {
         return nullptr;
       }
       if (hasUseStrictDirectiveInBody(method.body) && hasNonSimpleParams) {
         return nullptr;
       }
+      method.destructurePrologue = std::move(destructurePrologue);
 
       if (method.kind == MethodDefinition::Kind::Constructor) {
         if (hasInstanceConstructor) {
@@ -4446,10 +4431,11 @@ ExprPtr Parser::parseUnary() {
     }
 
     // yield can be used without an argument if followed by newline or certain tokens
+    // BUT yield* ALWAYS requires an argument and allows it on a new line
     ExprPtr argument = nullptr;
-    if (current().line == yieldLine &&
+    if (delegate || (current().line == yieldLine &&
         !match(TokenType::Semicolon) && !match(TokenType::RightBrace) &&
-        !match(TokenType::RightParen) && !match(TokenType::Comma)) {
+        !match(TokenType::RightParen) && !match(TokenType::Comma))) {
       argument = parseAssignment();
     }
 
@@ -5273,18 +5259,21 @@ ExprPtr Parser::parseObjectExpression() {
           }
           ++functionDepth_;
           awaitContextStack_.push_back(false);
+          yieldContextStack_.push_back(false);
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
               --functionDepth_;
               awaitContextStack_.pop_back();
+              yieldContextStack_.pop_back();
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -5351,18 +5340,21 @@ ExprPtr Parser::parseObjectExpression() {
           }
           ++functionDepth_;
           awaitContextStack_.push_back(false);
+          yieldContextStack_.push_back(false);
           std::vector<StmtPtr> body;
           while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
             auto stmt = parseStatement();
             if (!stmt) {
               --functionDepth_;
               awaitContextStack_.pop_back();
+              yieldContextStack_.pop_back();
               return nullptr;
             }
             body.push_back(std::move(stmt));
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           if (!expect(TokenType::RightBrace)) {
             return nullptr;
           }
@@ -5449,6 +5441,7 @@ ExprPtr Parser::parseObjectExpression() {
         // Parse function body
         ++functionDepth_;
         awaitContextStack_.push_back(isAsync);
+        yieldContextStack_.push_back(isGenerator);
         if (isAsync) {
           ++asyncFunctionDepth_;
         }
@@ -5464,6 +5457,7 @@ ExprPtr Parser::parseObjectExpression() {
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           return nullptr;
         }
         std::vector<StmtPtr> body;
@@ -5478,6 +5472,7 @@ ExprPtr Parser::parseObjectExpression() {
             }
             --functionDepth_;
             awaitContextStack_.pop_back();
+            yieldContextStack_.pop_back();
             return nullptr;
           }
           body.push_back(std::move(stmt));
@@ -5491,6 +5486,7 @@ ExprPtr Parser::parseObjectExpression() {
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           return nullptr;
         }
         if (isGenerator) {
@@ -5501,6 +5497,7 @@ ExprPtr Parser::parseObjectExpression() {
         }
         --functionDepth_;
         awaitContextStack_.pop_back();
+        yieldContextStack_.pop_back();
 
         // Create FunctionExpr for the method
         FunctionExpr funcExpr;
@@ -5566,6 +5563,7 @@ ExprPtr Parser::parseFunctionExpression() {
 
   ++functionDepth_;
   awaitContextStack_.push_back(isAsync);
+  yieldContextStack_.push_back(isGenerator);
   if (isAsync) {
     ++asyncFunctionDepth_;
   }
@@ -5722,6 +5720,7 @@ ExprPtr Parser::parseFunctionExpression() {
   }
   --functionDepth_;
   awaitContextStack_.pop_back();
+  yieldContextStack_.pop_back();
   if (!block) {
     return nullptr;
   }
@@ -5729,8 +5728,6 @@ ExprPtr Parser::parseFunctionExpression() {
   if (!blockStmt) {
     return nullptr;
   }
-
-  insertPrologueAfterDirectives(blockStmt->body, destructurePrologue);
 
   bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
   bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
@@ -5774,6 +5771,7 @@ ExprPtr Parser::parseFunctionExpression() {
   funcExpr.isAsync = isAsync;
   funcExpr.isGenerator = isGenerator;
   funcExpr.body = std::move(blockStmt->body);
+  funcExpr.destructurePrologue = std::move(destructurePrologue);
 
   return std::make_unique<Expression>(std::move(funcExpr));
 }
@@ -6004,6 +6002,7 @@ ExprPtr Parser::parseClassExpression() {
       }
       ++functionDepth_;
       awaitContextStack_.push_back(method.isAsync);
+      yieldContextStack_.push_back(method.isGenerator);
       if (method.isAsync) {
         ++asyncFunctionDepth_;
       }
@@ -6137,6 +6136,7 @@ ExprPtr Parser::parseClassExpression() {
           }
           --functionDepth_;
           awaitContextStack_.pop_back();
+          yieldContextStack_.pop_back();
           if (!allowSuperCall) {
             --superCallDisallowDepth_;
           }
@@ -6154,17 +6154,19 @@ ExprPtr Parser::parseClassExpression() {
       }
       --functionDepth_;
       awaitContextStack_.pop_back();
+      yieldContextStack_.pop_back();
       if (!allowSuperCall) {
         --superCallDisallowDepth_;
       }
 
-      insertPrologueAfterDirectives(method.body, destructurePrologue);
       if (hasDuplicateParams) {
         return nullptr;
       }
       if (hasUseStrictDirectiveInBody(method.body) && hasNonSimpleParams) {
         return nullptr;
       }
+      method.destructurePrologue = std::move(destructurePrologue);
+
       if (method.kind == MethodDefinition::Kind::Constructor) {
         if (hasInstanceConstructor) {
           return nullptr;

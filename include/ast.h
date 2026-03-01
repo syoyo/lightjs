@@ -156,6 +156,7 @@ struct FunctionExpr {
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
+  std::vector<StmtPtr> destructurePrologue;  // Synthetic bindings for destructuring params
   std::string name;
   bool isAsync;
   bool isGenerator;  // Generator function (function*)
@@ -184,6 +185,7 @@ struct MethodDefinition {
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;  // Rest parameter (...args)
   std::vector<StmtPtr> body;
+  std::vector<StmtPtr> destructurePrologue;  // Synthetic bindings for destructuring params
   ExprPtr initializer;  // For field initializers (Kind::Field)
   bool isStatic;
   bool isAsync;
@@ -297,6 +299,7 @@ struct FunctionDeclaration {
   std::vector<Parameter> params;
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
+  std::vector<StmtPtr> destructurePrologue;  // Synthetic bindings for destructuring params
   bool isAsync;
   bool isGenerator;  // Generator function (function*)
   FunctionDeclaration() : isAsync(false), isGenerator(false) {}

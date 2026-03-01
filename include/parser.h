@@ -27,6 +27,7 @@ private:
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
   std::vector<bool> awaitContextStack_;
+  std::vector<bool> yieldContextStack_;
   size_t arrowDestructureTempCounter_ = 0;
   std::set<std::string> iterationLabels_;  // Labels wrapping iteration statements (for continue validation)
   std::set<std::string> activeLabels_;      // All active labels (for break validation)

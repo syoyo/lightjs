@@ -416,8 +416,8 @@ private:
   Task evaluateFunction(const FunctionExpr& expr);
   Task evaluateAwait(const AwaitExpr& expr);
   Task evaluateYield(const YieldExpr& expr);
-  Task constructValue(Value callee, const std::vector<Value>& args,
-                      const Value& newTargetOverride = Value(Undefined{}));
+  Task constructValue(Value callee, std::vector<Value> args,
+                      Value newTargetOverride = Value(Undefined{}));
   Task evaluateNew(const NewExpr& expr);
   Task evaluateClass(const ClassExpr& expr);
 
@@ -446,7 +446,7 @@ private:
   Task evaluateGeneratorBody(const std::vector<StmtPtr>& body);
 
   // Helper for destructuring bindings
-  Task bindDestructuringPattern(const Expression& pattern, const Value& value, bool isConst, bool useSet = false);
+  Task bindDestructuringPattern(const Expression& pattern, Value value, bool isConst, bool useSet = false);
 
   // Helper to invoke a JavaScript function (used by native functions to call JS callbacks)
   Value invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
