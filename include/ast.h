@@ -132,6 +132,8 @@ struct ObjectProperty {
   ExprPtr value;
   bool isSpread = false;  // For spread properties (...obj)
   bool isComputed = false;  // For computed property names ([expr])
+  bool isGetter = false;
+  bool isSetter = false;
 };
 
 struct ObjectExpr {

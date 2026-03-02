@@ -402,7 +402,7 @@ private:
   Value callFunction(const Value& callee, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
   bool isObjectLike(const Value& value) const;
   std::pair<bool, Value> getPropertyForPrimitive(const Value& receiver, const std::string& key);
-  Value toPrimitiveValue(const Value& input, bool preferString);
+  Value toPrimitiveValue(const Value& input, bool preferString, bool useDefaultHint = false);
 
   Task evaluateBinary(const BinaryExpr& expr);
   Task evaluateUnary(const UnaryExpr& expr);

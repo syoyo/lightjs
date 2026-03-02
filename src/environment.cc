@@ -116,6 +116,20 @@ std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std:
       }
       return it->second;
     }
+    auto getterIt = current->properties.find("__get_" + name);
+    if (getterIt != current->properties.end()) {
+      if (isBlockedByUnscopables(bindings, name)) {
+        return std::nullopt;
+      }
+      return Value(Undefined{});
+    }
+    auto setterIt = current->properties.find("__set_" + name);
+    if (setterIt != current->properties.end()) {
+      if (isBlockedByUnscopables(bindings, name)) {
+        return std::nullopt;
+      }
+      return Value(Undefined{});
+    }
     auto protoIt = current->properties.find("__proto__");
     if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
       break;
@@ -459,6 +473,7 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
 void Environment::defineLexical(const std::string& name, const Value& value, bool isConst) {
   bindings_[name] = value;
   tdzBindings_.erase(name);
+  lexicalBindings_[name] = true;
   if (isConst) {
     constants_[name] = true;
   }
@@ -467,6 +482,7 @@ void Environment::defineLexical(const std::string& name, const Value& value, boo
 void Environment::defineTDZ(const std::string& name) {
   bindings_[name] = Value(Undefined{});
   tdzBindings_[name] = true;
+  lexicalBindings_[name] = true;
 }
 
 void Environment::removeTDZ(const std::string& name) {
@@ -582,6 +598,11 @@ bool Environment::has(const std::string& name) const {
 
 bool Environment::hasLocal(const std::string& name) const {
   return bindings_.find(name) != bindings_.end();
+}
+
+bool Environment::hasLexicalLocal(const std::string& name) const {
+  auto it = lexicalBindings_.find(name);
+  return it != lexicalBindings_.end() && it->second;
 }
 
 int Environment::deleteFromWithScope(const std::string& name) {
@@ -822,7 +843,7 @@ GCPtr<Environment> Environment::createGlobal() {
         }
       }
       for (const auto& varName : varNames) {
-        if (evalEnv->isTDZ(varName)) {
+        if (evalEnv->isTDZ(varName) || evalEnv->hasLexicalLocal(varName)) {
           throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
         }
       }
@@ -843,7 +864,7 @@ GCPtr<Environment> Environment::createGlobal() {
       while (!task.done()) {
         task.resume();
       }
-      Value result = task.result();
+      result = task.result();
       if (evalInterpreter.hasError()) {
         Value err = evalInterpreter.getError();
         evalInterpreter.clearError();
@@ -6820,6 +6841,15 @@ GCPtr<Environment> Environment::createGlobal() {
   
   // %GeneratorFunction.prototype% inherits from Function.prototype
   generatorFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
+  auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+  throwTypeErrorAccessor->isNative = true;
+  throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+  };
+  generatorFunctionPrototype->properties["__get_caller"] = Value(throwTypeErrorAccessor);
+  generatorFunctionPrototype->properties["__set_caller"] = Value(throwTypeErrorAccessor);
+  generatorFunctionPrototype->properties["__get_arguments"] = Value(throwTypeErrorAccessor);
+  generatorFunctionPrototype->properties["__set_arguments"] = Value(throwTypeErrorAccessor);
   // %GeneratorFunction.prototype.prototype% is %GeneratorPrototype%
   generatorFunctionPrototype->properties["prototype"] = Value(generatorPrototype);
   // %GeneratorPrototype% inherits from Object.prototype

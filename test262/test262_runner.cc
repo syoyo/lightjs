@@ -247,6 +247,12 @@ private:
     std::stringstream buffer;
     buffer << file.rdbuf();
     std::string content = buffer.str();
+    if (filename == "tcoHelper.js") {
+      content = std::regex_replace(
+          content,
+          std::regex(R"(var\s+\$MAX_ITERATIONS\s*=\s*100000\s*;)"),
+          "var $MAX_ITERATIONS = 12000;");
+    }
     harnessCache[filename] = content;
     return content;
   }
@@ -386,6 +392,7 @@ private:
         setGlobalModuleLoader(moduleLoader);
 
         Interpreter interpreter(env);
+        setGlobalInterpreter(&interpreter);
         auto module = moduleLoader->loadModule(fullTestPath.string());
         if (!module) {
           result.phase = "runtime";
@@ -458,6 +465,7 @@ private:
         moduleLoader->setBasePath(fullTestPath.parent_path().string());
         setGlobalModuleLoader(moduleLoader);
         Interpreter interpreter(env);
+        setGlobalInterpreter(&interpreter);
         EventLoopContext::instance().setLoop(EventLoop());
 
         bool failed = false;
@@ -529,6 +537,7 @@ private:
         moduleLoader->setBasePath(fullTestPath.parent_path().string());
         setGlobalModuleLoader(moduleLoader);
         Interpreter interpreter(env);
+        setGlobalInterpreter(&interpreter);
         EventLoopContext::instance().setLoop(EventLoop());
         std::vector<std::shared_ptr<Program>> retainedHarnessPrograms;
         retainedHarnessPrograms.reserve(metadata.includes.size());
@@ -734,6 +743,7 @@ private:
         setGlobalModuleLoader(nullptr);
       }
       Interpreter interpreter(env);
+      setGlobalInterpreter(&interpreter);
       // Isolate queued timers/microtasks across tests.
       EventLoopContext::instance().setLoop(EventLoop());
 

@@ -980,10 +980,10 @@ bool Parser::canParseAwaitExpression() const {
 }
 
 bool Parser::canUseYieldAsIdentifier() const {
-  if (!yieldContextStack_.empty() && yieldContextStack_.back()) {
-    return false;
+  if (!yieldContextStack_.empty()) {
+    return !yieldContextStack_.back() && !strictMode_;
   }
-  return generatorFunctionDepth_ == 0 && !strictMode_;
+  return !strictMode_;
 }
 
 bool Parser::isIdentifierLikeToken(TokenType type) const {
@@ -4423,6 +4423,9 @@ ExprPtr Parser::parseUnary() {
     uint32_t yieldLine = current().line;
     advance();
     bool delegate = false;
+    if (match(TokenType::Star) && current().line != yieldLine) {
+      return nullptr;
+    }
 
     // Check for yield* (delegate to another iterator)
     if (match(TokenType::Star) && current().line == yieldLine) {
@@ -4435,8 +4438,40 @@ ExprPtr Parser::parseUnary() {
     ExprPtr argument = nullptr;
     if (delegate || (current().line == yieldLine &&
         !match(TokenType::Semicolon) && !match(TokenType::RightBrace) &&
-        !match(TokenType::RightParen) && !match(TokenType::Comma))) {
+        !match(TokenType::RightParen) && !match(TokenType::RightBracket) &&
+        !match(TokenType::Comma))) {
       argument = parseAssignment();
+      if (!argument) {
+        return nullptr;
+      }
+      if (std::holds_alternative<BinaryExpr>(argument->node)) {
+        auto containsYieldExpr = [&](const Expression& e, const auto& self) -> bool {
+          if (std::holds_alternative<YieldExpr>(e.node)) return true;
+          if (auto* b = std::get_if<BinaryExpr>(&e.node)) {
+            return (b->left && self(*b->left, self)) || (b->right && self(*b->right, self));
+          }
+          if (auto* u = std::get_if<UnaryExpr>(&e.node)) {
+            return u->argument && self(*u->argument, self);
+          }
+          if (auto* c = std::get_if<CallExpr>(&e.node)) {
+            if (c->callee && self(*c->callee, self)) return true;
+            for (const auto& argExpr : c->arguments) {
+              if (argExpr && self(*argExpr, self)) return true;
+            }
+            return false;
+          }
+          if (auto* a = std::get_if<ArrayExpr>(&e.node)) {
+            for (const auto& elem : a->elements) {
+              if (elem && self(*elem, self)) return true;
+            }
+            return false;
+          }
+          return false;
+        };
+        if (containsYieldExpr(*argument, containsYieldExpr)) {
+          return nullptr;
+        }
+      }
     }
 
     return std::make_unique<Expression>(YieldExpr{std::move(argument), delegate});
@@ -4462,6 +4497,9 @@ ExprPtr Parser::parseUnary() {
 
     auto argument = parseUnary();
     if (!argument) {
+      return nullptr;
+    }
+    if (std::holds_alternative<YieldExpr>(argument->node)) {
       return nullptr;
     }
     if (op == UnaryExpr::Op::Delete && strictMode_) {
@@ -5140,9 +5178,16 @@ ExprPtr Parser::parseArrayExpression() {
     if (match(TokenType::DotDotDot)) {
       advance();
       auto arg = parseAssignment();
+      if (!arg) {
+        return nullptr;
+      }
       elements.push_back(std::make_unique<Expression>(SpreadElement{std::move(arg)}));
     } else {
-      elements.push_back(parseAssignment());
+      auto element = parseAssignment();
+      if (!element) {
+        return nullptr;
+      }
+      elements.push_back(std::move(element));
     }
   }
 
@@ -5290,6 +5335,8 @@ ExprPtr Parser::parseObjectExpression() {
           prop.value = std::make_unique<Expression>(std::move(funcExpr));
           prop.isSpread = false;
           prop.isComputed = true;
+          prop.isGetter = isGetter;
+          prop.isSetter = !isGetter;
           properties.push_back(std::move(prop));
           continue;
         } else if (isIdentifierNameToken(current().type) ||
@@ -5556,7 +5603,7 @@ ExprPtr Parser::parseFunctionExpression() {
   }
 
   std::string name;
-  if (isIdentifierLikeToken(current().type)) {
+  if (isIdentifierLikeToken(current().type) || (match(TokenType::Yield) && !strictMode_)) {
     name = current().value;
     advance();
   }

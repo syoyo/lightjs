@@ -29,6 +29,7 @@ public:
   bool set(const std::string& name, const Value& value);
   bool has(const std::string& name) const;
   bool hasLocal(const std::string& name) const;
+  bool hasLexicalLocal(const std::string& name) const;
   bool isConst(const std::string& name) const;
   // Delete from with-scope object: 0=not found, 1=deleted, -1=non-configurable
   int deleteFromWithScope(const std::string& name);
@@ -52,6 +53,7 @@ private:
   std::unordered_map<std::string, Value> bindings_;
   std::unordered_map<std::string, bool> constants_;
   std::unordered_map<std::string, bool> tdzBindings_;  // temporal dead zone
+  std::unordered_map<std::string, bool> lexicalBindings_;
 };
 
 }

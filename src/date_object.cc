@@ -94,8 +94,7 @@ struct Date : public Object {
 
 // Date constructor
 Value Date_constructor(const std::vector<Value>& args) {
-    auto date = std::make_shared<Date>();
-    GarbageCollector::instance().reportAllocation(sizeof(Date));
+    auto date = GarbageCollector::makeGC<Date>();
 
     if (args.size() == 1 && args[0].isNumber()) {
         // Date(milliseconds)
@@ -111,11 +110,17 @@ Value Date_constructor(const std::vector<Value>& args) {
         int second = args.size() > 5 && args[5].isNumber() ? static_cast<int>(std::get<double>(args[5].data)) : 0;
         int ms = args.size() > 6 && args[6].isNumber() ? static_cast<int>(std::get<double>(args[6].data)) : 0;
 
-        date = std::make_shared<Date>(year, month, day, hour, minute, second, ms);
-        GarbageCollector::instance().reportAllocation(sizeof(Date));
+        date = GarbageCollector::makeGC<Date>(year, month, day, hour, minute, second, ms);
     }
 
-    return Value(date);
+    auto toStringFn = GarbageCollector::makeGC<Function>();
+    toStringFn->isNative = true;
+    toStringFn->nativeFunc = [](const std::vector<Value>&) -> Value {
+        return Value(std::string("[object Date]"));
+    };
+    date->properties["toString"] = Value(toStringFn);
+    date->properties["__is_date__"] = Value(true);
+    return Value(GCPtr<Object>(static_cast<Object*>(date.get())));
 }
 
 // Date.now
