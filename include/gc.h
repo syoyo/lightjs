@@ -90,12 +90,12 @@ class GCPtr {
 public:
     GCPtr() : ptr_(nullptr) {}
 
-    explicit GCPtr(T* ptr) : ptr_(ptr) {
-        if (ptr_) ptr_->addRef();
+    GCPtr(T* ptr) : ptr_(ptr) {
+        if (ptr_) reinterpret_cast<GCObject*>(ptr_)->addRef();
     }
 
     GCPtr(const GCPtr& other) : ptr_(other.ptr_) {
-        if (ptr_) ptr_->addRef();
+        if (ptr_) reinterpret_cast<GCObject*>(ptr_)->addRef();
     }
 
     GCPtr(GCPtr&& other) noexcept : ptr_(other.ptr_) {
@@ -103,23 +103,40 @@ public:
     }
 
     ~GCPtr() {
-        if (ptr_) ptr_->release();
+        if (ptr_) reinterpret_cast<GCObject*>(ptr_)->release();
     }
 
     GCPtr& operator=(const GCPtr& other) {
         if (this != &other) {
-            if (ptr_) ptr_->release();
+            if (ptr_) reinterpret_cast<GCObject*>(ptr_)->release();
             ptr_ = other.ptr_;
-            if (ptr_) ptr_->addRef();
+            if (ptr_) reinterpret_cast<GCObject*>(ptr_)->addRef();
         }
         return *this;
     }
 
     GCPtr& operator=(GCPtr&& other) noexcept {
         if (this != &other) {
-            if (ptr_) ptr_->release();
+            if (ptr_) reinterpret_cast<GCObject*>(ptr_)->release();
             ptr_ = other.ptr_;
             other.ptr_ = nullptr;
+        }
+        return *this;
+    }
+
+    void reset() {
+        if (ptr_) {
+            reinterpret_cast<GCObject*>(ptr_)->release();
+            ptr_ = nullptr;
+        }
+    }
+
+    template<typename U>
+    GCPtr& operator=(U* ptr) {
+        if (ptr_ != static_cast<T*>(ptr)) {
+            if (ptr_) reinterpret_cast<GCObject*>(ptr_)->release();
+            ptr_ = static_cast<T*>(ptr);
+            if (ptr_) reinterpret_cast<GCObject*>(ptr_)->addRef();
         }
         return *this;
     }
@@ -128,9 +145,23 @@ public:
     T* operator->() const { return ptr_; }
     T& operator*() const { return *ptr_; }
     explicit operator bool() const { return ptr_ != nullptr; }
+    operator T*() const { return ptr_; }
 
     bool operator==(const GCPtr& other) const { return ptr_ == other.ptr_; }
     bool operator!=(const GCPtr& other) const { return ptr_ != other.ptr_; }
+
+    template<typename U>
+    bool operator==(const GCPtr<U>& other) const { return ptr_ == other.get(); }
+    template<typename U>
+    bool operator!=(const GCPtr<U>& other) const { return ptr_ != other.get(); }
+
+    // Adopt an existing T* that already has a refcount (e.g. from makeGC).
+    // Does NOT call addRef – used internally by makeGC to avoid double-counting.
+    static GCPtr adopt(T* ptr) {
+        GCPtr g;
+        g.ptr_ = ptr;
+        return g;
+    }
 
 private:
     T* ptr_;
@@ -171,6 +202,13 @@ public:
     size_t getCurrentMemoryUsage() const;
     void reportAllocation(size_t bytes);
     void reportDeallocation(size_t bytes);
+
+    template<typename T, typename... Args>
+    static GCPtr<T> makeGC(Args&&... args) {
+        T* obj = new T(std::forward<Args>(args)...);
+        instance().reportAllocation(sizeof(T));
+        return GCPtr<T>::adopt(obj);
+    }
 
     // Check if heap limit would be exceeded by an allocation
     // Returns true if allocation is OK, false if limit exceeded

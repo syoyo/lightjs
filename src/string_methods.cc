@@ -1,4 +1,6 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "gc.h"
 #include "unicode.h"
 #include <stdexcept>
@@ -224,7 +226,7 @@ Value String_split(const std::vector<Value>& args) {
     }
 
     std::string str = std::get<std::string>(args[0].data);
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     if (args.size() < 2) {

@@ -27,7 +27,7 @@ int main() {
         std::cout << "Object_keys returned type: " << (int)result.data.index() << std::endl;
 
         if (result.isArray()) {
-            auto arr = std::get<std::shared_ptr<Array>>(result.data);
+            auto arr = std::get<GCPtr<Array>>(result.data);
             std::cout << "Array size: " << arr->elements.size() << std::endl;
 
             for (size_t i = 0; i < arr->elements.size(); ++i) {

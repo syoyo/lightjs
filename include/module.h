@@ -45,13 +45,13 @@ public:
   std::unordered_map<std::string, Value> getAllExports() const;
 
   // Get (and refresh) the module namespace object for this module.
-  std::shared_ptr<Object> getNamespaceObject();
+  GCPtr<Object> getNamespaceObject();
 
   // Module metadata
   std::string getPath() const { return path_; }
   State getState() const { return state_; }
   std::optional<Value> getLastError() const { return lastError_; }
-  std::shared_ptr<Promise> getEvaluationPromise() const { return topLevelPromise_; }
+  GCPtr<Promise> getEvaluationPromise() const { return topLevelPromise_; }
   bool isAsyncModule() const { return isAsync_; }
 
 private:
@@ -74,7 +74,7 @@ private:
   std::optional<Program> ast_;
 
   // Module environment
-  std::shared_ptr<Environment> environment_;
+  GCPtr<Environment> environment_;
 
   // Exported bindings
   std::unordered_map<std::string, Value> exports_;
@@ -87,7 +87,7 @@ private:
   std::unordered_map<std::string, std::shared_ptr<Module>> sourceDependencies_;
   std::unordered_set<std::string> ambiguousReExports_;
   std::unordered_map<std::string, std::string> exportBindings_;
-  std::weak_ptr<Object> namespaceObject_;
+  GCPtr<Object> namespaceObject_;
 
   // Most recent module-level failure reason.
   std::optional<Value> lastError_;
@@ -100,7 +100,7 @@ private:
   bool resumeScheduled_ = false;
   size_t nextStatementIndex_ = 0;
   size_t pendingAsyncDeps_ = 0;
-  std::shared_ptr<Promise> topLevelPromise_;
+  GCPtr<Promise> topLevelPromise_;
   std::vector<std::weak_ptr<Module>> asyncParents_;
   std::weak_ptr<Module> cycleRoot_;
   std::function<void(const Value&)> pendingAwaitFulfilled_;

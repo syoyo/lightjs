@@ -108,6 +108,6 @@ Value appendFile(const std::string& path, const Value& data);
 /**
  * Create fs module object with all methods
  */
-std::shared_ptr<Object> createFSModule();
+GCPtr<Object> createFSModule();
 
 } // namespace lightjs

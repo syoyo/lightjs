@@ -27,7 +27,7 @@ struct TextEncoder : public GCObject {
    * Encode into an existing Uint8Array
    * Returns object with 'read' and 'written' properties
    */
-  Value encodeInto(const std::string& source, std::shared_ptr<TypedArray> dest);
+  Value encodeInto(const std::string& source, GCPtr<TypedArray> dest);
 
   // GCObject interface
   const char* typeName() const override { return "TextEncoder"; }
@@ -68,11 +68,11 @@ struct TextDecoder : public GCObject {
 /**
  * Create TextEncoder constructor for JavaScript
  */
-std::shared_ptr<Function> createTextEncoderConstructor();
+GCPtr<Function> createTextEncoderConstructor();
 
 /**
  * Create TextDecoder constructor for JavaScript
  */
-std::shared_ptr<Function> createTextDecoderConstructor();
+GCPtr<Function> createTextDecoderConstructor();
 
 } // namespace lightjs

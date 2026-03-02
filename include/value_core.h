@@ -5,6 +5,7 @@
 #endif
 
 #include <variant>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -29,6 +30,7 @@ struct Class;
 struct Array;
 struct Object;
 struct Function;
+struct Environment;
 struct Promise;
 struct Regex;
 struct Error;
@@ -73,6 +75,7 @@ struct ModuleBinding {
 };
 
 struct TypedArray; // forward for variant
+struct Date;
 
 struct Value {
   std::variant<
@@ -84,27 +87,29 @@ struct Value {
     Symbol,
     ModuleBinding,
     std::string,
-    std::shared_ptr<Function>,
-    std::shared_ptr<Array>,
-    std::shared_ptr<Object>,
-    std::shared_ptr<TypedArray>,
-    std::shared_ptr<Promise>,
-    std::shared_ptr<Regex>,
-    std::shared_ptr<Map>,
-    std::shared_ptr<Set>,
-    std::shared_ptr<Error>,
-    std::shared_ptr<Generator>,
-    std::shared_ptr<Proxy>,
-    std::shared_ptr<WeakMap>,
-    std::shared_ptr<WeakSet>,
-    std::shared_ptr<ArrayBuffer>,
-    std::shared_ptr<DataView>,
-    std::shared_ptr<Class>,
-    std::shared_ptr<WasmInstanceJS>,
-    std::shared_ptr<WasmMemoryJS>,
-    std::shared_ptr<ReadableStream>,
-    std::shared_ptr<WritableStream>,
-    std::shared_ptr<TransformStream>
+    GCPtr<Function>,
+    GCPtr<Array>,
+    GCPtr<Object>,
+    GCPtr<TypedArray>,
+    GCPtr<Promise>,
+    GCPtr<Regex>,
+    GCPtr<Map>,
+    GCPtr<Set>,
+    GCPtr<Error>,
+    GCPtr<Generator>,
+    GCPtr<Proxy>,
+    GCPtr<WeakMap>,
+    GCPtr<WeakSet>,
+    GCPtr<ArrayBuffer>,
+    GCPtr<DataView>,
+    GCPtr<Class>,
+    GCPtr<WasmInstanceJS>,
+    GCPtr<WasmMemoryJS>,
+    GCPtr<ReadableStream>,
+    GCPtr<WritableStream>,
+    GCPtr<TransformStream>,
+    GCPtr<Environment>,
+    std::shared_ptr<void>
   > data;
 
   Value() : data(Undefined{}) {}
@@ -120,27 +125,31 @@ struct Value {
   Value(ModuleBinding binding) : data(std::move(binding)) {}
   Value(const std::string& s) : data(s) {}
   Value(const char* s) : data(std::string(s)) {}
-  Value(std::shared_ptr<Function> f) : data(f) {}
-  Value(std::shared_ptr<Array> a) : data(a) {}
-  Value(std::shared_ptr<Object> o) : data(o) {}
-  Value(std::shared_ptr<TypedArray> ta) : data(ta) {}
-  Value(std::shared_ptr<Promise> p) : data(p) {}
-  Value(std::shared_ptr<Regex> r) : data(r) {}
-  Value(std::shared_ptr<Map> m) : data(m) {}
-  Value(std::shared_ptr<Set> s) : data(s) {}
-  Value(std::shared_ptr<Error> e) : data(e) {}
-  Value(std::shared_ptr<Generator> g) : data(g) {}
-  Value(std::shared_ptr<Proxy> p) : data(p) {}
-  Value(std::shared_ptr<WeakMap> wm) : data(wm) {}
-  Value(std::shared_ptr<WeakSet> ws) : data(ws) {}
-  Value(std::shared_ptr<ArrayBuffer> ab) : data(ab) {}
-  Value(std::shared_ptr<DataView> dv) : data(dv) {}
-  Value(std::shared_ptr<Class> c) : data(c) {}
-  Value(std::shared_ptr<WasmInstanceJS> wi) : data(wi) {}
-  Value(std::shared_ptr<WasmMemoryJS> wm) : data(wm) {}
-  Value(std::shared_ptr<ReadableStream> rs) : data(rs) {}
-  Value(std::shared_ptr<WritableStream> ws) : data(ws) {}
-  Value(std::shared_ptr<TransformStream> ts) : data(ts) {}
+
+  // Backwards compatibility constructors (temporary)
+  Value(GCPtr<Function> f) : data(f) {}
+  Value(GCPtr<Array> a) : data(a) {}
+  Value(GCPtr<Object> o) : data(o) {}
+  Value(GCPtr<TypedArray> ta) : data(ta) {}
+  Value(GCPtr<Promise> p) : data(p) {}
+  Value(GCPtr<Regex> r) : data(r) {}
+  Value(GCPtr<Map> m) : data(m) {}
+  Value(GCPtr<Set> s) : data(s) {}
+  Value(GCPtr<Error> e) : data(e) {}
+  Value(GCPtr<Generator> g) : data(g) {}
+  Value(GCPtr<Proxy> p) : data(p) {}
+  Value(GCPtr<WeakMap> wm) : data(wm) {}
+  Value(GCPtr<WeakSet> ws) : data(ws) {}
+  Value(GCPtr<ArrayBuffer> ab) : data(ab) {}
+  Value(GCPtr<DataView> dv) : data(dv) {}
+  Value(GCPtr<Class> c) : data(c) {}
+  Value(GCPtr<Environment> e) : data(e) {}
+  Value(GCPtr<WasmInstanceJS> w) : data(w) {}
+  Value(GCPtr<WasmMemoryJS> w) : data(w) {}
+  Value(GCPtr<ReadableStream> rs) : data(rs) {}
+  Value(GCPtr<WritableStream> ws) : data(ws) {}
+  Value(GCPtr<TransformStream> ts) : data(ts) {}
+  Value(std::shared_ptr<void> d) : data(d) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
@@ -150,27 +159,35 @@ struct Value {
   bool isSymbol() const { return std::holds_alternative<Symbol>(data); }
   bool isModuleBinding() const { return std::holds_alternative<ModuleBinding>(data); }
   bool isString() const { return std::holds_alternative<std::string>(data); }
-  bool isFunction() const { return std::holds_alternative<std::shared_ptr<Function>>(data); }
-  bool isArray() const { return std::holds_alternative<std::shared_ptr<Array>>(data); }
-  bool isObject() const { return std::holds_alternative<std::shared_ptr<Object>>(data); }
-  bool isTypedArray() const { return std::holds_alternative<std::shared_ptr<TypedArray>>(data); }
-  bool isPromise() const { return std::holds_alternative<std::shared_ptr<Promise>>(data); }
-  bool isRegex() const { return std::holds_alternative<std::shared_ptr<Regex>>(data); }
-  bool isMap() const { return std::holds_alternative<std::shared_ptr<Map>>(data); }
-  bool isSet() const { return std::holds_alternative<std::shared_ptr<Set>>(data); }
-  bool isError() const { return std::holds_alternative<std::shared_ptr<Error>>(data); }
-  bool isGenerator() const { return std::holds_alternative<std::shared_ptr<Generator>>(data); }
-  bool isProxy() const { return std::holds_alternative<std::shared_ptr<Proxy>>(data); }
-  bool isWeakMap() const { return std::holds_alternative<std::shared_ptr<WeakMap>>(data); }
-  bool isWeakSet() const { return std::holds_alternative<std::shared_ptr<WeakSet>>(data); }
-  bool isArrayBuffer() const { return std::holds_alternative<std::shared_ptr<ArrayBuffer>>(data); }
-  bool isDataView() const { return std::holds_alternative<std::shared_ptr<DataView>>(data); }
-  bool isClass() const { return std::holds_alternative<std::shared_ptr<Class>>(data); }
-  bool isWasmInstance() const { return std::holds_alternative<std::shared_ptr<WasmInstanceJS>>(data); }
-  bool isWasmMemory() const { return std::holds_alternative<std::shared_ptr<WasmMemoryJS>>(data); }
-  bool isReadableStream() const { return std::holds_alternative<std::shared_ptr<ReadableStream>>(data); }
-  bool isWritableStream() const { return std::holds_alternative<std::shared_ptr<WritableStream>>(data); }
-  bool isTransformStream() const { return std::holds_alternative<std::shared_ptr<TransformStream>>(data); }
+  bool isFunction() const { return std::holds_alternative<GCPtr<Function>>(data); }
+  bool isArray() const { return std::holds_alternative<GCPtr<Array>>(data); }
+  bool isObject() const { return std::holds_alternative<GCPtr<Object>>(data); }
+  bool isTypedArray() const { return std::holds_alternative<GCPtr<TypedArray>>(data); }
+  bool isPromise() const { return std::holds_alternative<GCPtr<Promise>>(data); }
+  bool isRegex() const { return std::holds_alternative<GCPtr<Regex>>(data); }
+  bool isMap() const { return std::holds_alternative<GCPtr<Map>>(data); }
+  bool isSet() const { return std::holds_alternative<GCPtr<Set>>(data); }
+  bool isError() const { return std::holds_alternative<GCPtr<Error>>(data); }
+  bool isGenerator() const { return std::holds_alternative<GCPtr<Generator>>(data); }
+  bool isProxy() const { return std::holds_alternative<GCPtr<Proxy>>(data); }
+  bool isWeakMap() const { return std::holds_alternative<GCPtr<WeakMap>>(data); }
+  bool isWeakSet() const { return std::holds_alternative<GCPtr<WeakSet>>(data); }
+  bool isArrayBuffer() const { return std::holds_alternative<GCPtr<ArrayBuffer>>(data); }
+  bool isDataView() const { return std::holds_alternative<GCPtr<DataView>>(data); }
+  bool isClass() const { return std::holds_alternative<GCPtr<Class>>(data); }
+  bool isWasmInstance() const { return std::holds_alternative<GCPtr<WasmInstanceJS>>(data); }
+  bool isWasmMemory() const { return std::holds_alternative<GCPtr<WasmMemoryJS>>(data); }
+  bool isReadableStream() const { return std::holds_alternative<GCPtr<ReadableStream>>(data); }
+  bool isWritableStream() const { return std::holds_alternative<GCPtr<WritableStream>>(data); }
+  bool isTransformStream() const { return std::holds_alternative<GCPtr<TransformStream>>(data); }
+
+  template<typename T>
+  GCPtr<T> getGC() const {
+    if (auto* ptr = std::get_if<GCPtr<T>>(&data)) {
+      return *ptr;
+    }
+    return GCPtr<T>{};
+  }
 
   bool toBool() const;
   double toNumber() const;

@@ -57,7 +57,7 @@ int digitValue(char c) {
 }
 
 
-bool isModuleNamespaceExportKey(const std::shared_ptr<Object>& obj, const std::string& key) {
+bool isModuleNamespaceExportKey(const GCPtr<Object>& obj, const std::string& key) {
   return std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
          obj->moduleExportNames.end();
 }
@@ -70,7 +70,7 @@ bool isVisibleWithIdentifier(const std::string& name) {
   return !name.empty() && name.rfind("__", 0) != 0;
 }
 
-bool isBlockedByUnscopables(const std::shared_ptr<Object>& bindings, const std::string& name) {
+bool isBlockedByUnscopables(const GCPtr<Object>& bindings, const std::string& name) {
   if (!bindings || !isVisibleWithIdentifier(name)) {
     return false;
   }
@@ -82,7 +82,7 @@ bool isBlockedByUnscopables(const std::shared_ptr<Object>& bindings, const std::
   }
 
   std::unordered_set<Object*> visited;
-  auto current = std::get<std::shared_ptr<Object>>(unscopablesIt->second.data);
+  auto current = unscopablesIt->second.getGC<Object>();
   int depth = 0;
   while (current && depth < 64 && visited.insert(current.get()).second) {
     auto it = current->properties.find(name);
@@ -93,7 +93,7 @@ bool isBlockedByUnscopables(const std::shared_ptr<Object>& bindings, const std::
     if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
       break;
     }
-    current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    current = protoIt->second.getGC<Object>();
     depth++;
   }
   return false;
@@ -105,7 +105,7 @@ std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std:
   }
 
   std::unordered_set<Object*> visited;
-  auto bindings = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  auto bindings = scopeValue.getGC<Object>();
   auto current = bindings;
   int depth = 0;
   while (current && depth < 64 && visited.insert(current.get()).second) {
@@ -120,7 +120,7 @@ std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std:
     if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
       break;
     }
-    current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    current = protoIt->second.getGC<Object>();
     depth++;
   }
   return std::nullopt;
@@ -131,7 +131,7 @@ bool setWithScopeProperty(const Value& scopeValue, const std::string& name, cons
     return false;
   }
 
-  auto receiver = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  auto receiver = scopeValue.getGC<Object>();
   if (isBlockedByUnscopables(receiver, name)) {
     return false;
   }
@@ -148,7 +148,7 @@ bool setWithScopeProperty(const Value& scopeValue, const std::string& name, cons
     if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
       break;
     }
-    current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    current = protoIt->second.getGC<Object>();
     depth++;
   }
   return false;
@@ -159,7 +159,7 @@ bool deleteWithScopeProperty(const Value& scopeValue, const std::string& name) {
     return false;
   }
 
-  auto receiver = std::get<std::shared_ptr<Object>>(scopeValue.data);
+  auto receiver = scopeValue.getGC<Object>();
   // Check own properties only for delete (no prototype chain)
   auto it = receiver->properties.find(name);
   if (it != receiver->properties.end()) {
@@ -322,9 +322,9 @@ void collectVarNamesFromStatement(const Statement& stmt, std::vector<std::string
   }
 }
 
-bool defineModuleNamespaceProperty(const std::shared_ptr<Object>& obj,
+bool defineModuleNamespaceProperty(const GCPtr<Object>& obj,
                                    const std::string& key,
-                                   const std::shared_ptr<Object>& descriptor) {
+                                   const GCPtr<Object>& descriptor) {
   const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
   const bool isExport = isModuleNamespaceExportKey(obj, key);
   const bool isToStringTag = (key == toStringTagKey);
@@ -436,8 +436,10 @@ Interpreter* getGlobalInterpreter() {
   return g_interpreter;
 }
 
-Environment::Environment(std::shared_ptr<Environment> parent)
-  : parent_(parent) {}
+Environment::Environment(Environment* parent)
+  : parent_(parent) {
+  GarbageCollector::instance().reportAllocation(sizeof(Environment));
+}
 
 void Environment::define(const std::string& name, const Value& value, bool isConst) {
   bindings_[name] = value;
@@ -448,7 +450,7 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
   if (!parent_) {
     auto it = bindings_.find("globalThis");
     if (it != bindings_.end() && it->second.isObject()) {
-      auto globalObj = std::get<std::shared_ptr<Object>>(it->second.data);
+      auto globalObj = it->second.getGC<Object>();
       globalObj->properties[name] = value;
     }
   }
@@ -504,7 +506,7 @@ std::optional<Value> Environment::get(const std::string& name) const {
   // for global code, so properties on globalThis are accessible as variables.
   auto globalIt = bindings_.find("globalThis");
   if (globalIt != bindings_.end() && globalIt->second.isObject()) {
-    auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+    auto globalObj = globalIt->second.getGC<Object>();
     auto propIt = globalObj->properties.find(name);
     if (propIt != globalObj->properties.end()) {
       return propIt->second;
@@ -524,7 +526,7 @@ bool Environment::set(const std::string& name, const Value& value) {
     if (!parent_) {
       auto globalIt = bindings_.find("globalThis");
       if (globalIt != bindings_.end() && globalIt->second.isObject()) {
-        auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+        auto globalObj = globalIt->second.getGC<Object>();
         if (globalObj->properties.find(name) != globalObj->properties.end()) {
           globalObj->properties[name] = value;
         }
@@ -544,7 +546,7 @@ bool Environment::set(const std::string& name, const Value& value) {
   if (!parent_) {
     auto globalIt = bindings_.find("globalThis");
     if (globalIt != bindings_.end() && globalIt->second.isObject()) {
-      auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+      auto globalObj = globalIt->second.getGC<Object>();
       auto propIt = globalObj->properties.find(name);
       if (propIt != globalObj->properties.end()) {
         propIt->second = value;
@@ -570,7 +572,7 @@ bool Environment::has(const std::string& name) const {
   // At global scope, also check globalThis properties
   auto globalIt = bindings_.find("globalThis");
   if (globalIt != bindings_.end() && globalIt->second.isObject()) {
-    auto globalObj = std::get<std::shared_ptr<Object>>(globalIt->second.data);
+    auto globalObj = globalIt->second.getGC<Object>();
     if (globalObj->properties.find(name) != globalObj->properties.end()) {
       return true;
     }
@@ -614,7 +616,7 @@ bool Environment::setVar(const std::string& name, const Value& value) {
   return false;
 }
 
-std::shared_ptr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
+GCPtr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
   // Check if this env has a local binding that shadows the name
   auto it = bindings_.find(name);
   if (it != bindings_.end()) {
@@ -623,7 +625,7 @@ std::shared_ptr<Object> Environment::resolveWithScopeObject(const std::string& n
   // Check with-scope object
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
   if (withScopeIt != bindings_.end() && withScopeIt->second.isObject()) {
-    auto obj = std::get<std::shared_ptr<Object>>(withScopeIt->second.data);
+    auto obj = withScopeIt->second.getGC<Object>();
     if (lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
       return obj;
     }
@@ -644,14 +646,14 @@ bool Environment::isConst(const std::string& name) const {
   return false;
 }
 
-std::shared_ptr<Environment> Environment::createChild() {
-  return std::make_shared<Environment>(shared_from_this());
+GCPtr<Environment> Environment::createChild() {
+  return GarbageCollector::makeGC<Environment>(this);
 }
 
-std::shared_ptr<Environment> Environment::createGlobal() {
-  auto env = std::make_shared<Environment>();
+GCPtr<Environment> Environment::createGlobal() {
+  auto env = GarbageCollector::makeGC<Environment>();
 
-  auto consoleFn = std::make_shared<Function>();
+  auto consoleFn = GarbageCollector::makeGC<Function>();
   consoleFn->isNative = true;
   consoleFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     for (const auto& arg : args) {
@@ -662,7 +664,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // console.error - writes to stderr
-  auto consoleErrorFn = std::make_shared<Function>();
+  auto consoleErrorFn = GarbageCollector::makeGC<Function>();
   consoleErrorFn->isNative = true;
   consoleErrorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     for (const auto& arg : args) {
@@ -673,7 +675,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // console.warn - writes to stderr
-  auto consoleWarnFn = std::make_shared<Function>();
+  auto consoleWarnFn = GarbageCollector::makeGC<Function>();
   consoleWarnFn->isNative = true;
   consoleWarnFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     for (const auto& arg : args) {
@@ -684,7 +686,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // console.info - same as log
-  auto consoleInfoFn = std::make_shared<Function>();
+  auto consoleInfoFn = GarbageCollector::makeGC<Function>();
   consoleInfoFn->isNative = true;
   consoleInfoFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     for (const auto& arg : args) {
@@ -695,7 +697,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // console.debug - same as log
-  auto consoleDebugFn = std::make_shared<Function>();
+  auto consoleDebugFn = GarbageCollector::makeGC<Function>();
   consoleDebugFn->isNative = true;
   consoleDebugFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     for (const auto& arg : args) {
@@ -708,7 +710,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // console.time/timeEnd - simple timing
   static std::unordered_map<std::string, std::chrono::steady_clock::time_point> consoleTimers;
 
-  auto consoleTimeFn = std::make_shared<Function>();
+  auto consoleTimeFn = GarbageCollector::makeGC<Function>();
   consoleTimeFn->isNative = true;
   consoleTimeFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string label = args.empty() ? "default" : args[0].toString();
@@ -716,7 +718,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   };
 
-  auto consoleTimeEndFn = std::make_shared<Function>();
+  auto consoleTimeEndFn = GarbageCollector::makeGC<Function>();
   consoleTimeEndFn->isNative = true;
   consoleTimeEndFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string label = args.empty() ? "default" : args[0].toString();
@@ -731,7 +733,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // console.assert
-  auto consoleAssertFn = std::make_shared<Function>();
+  auto consoleAssertFn = GarbageCollector::makeGC<Function>();
   consoleAssertFn->isNative = true;
   consoleAssertFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     bool condition = args.empty() ? false : args[0].toBool();
@@ -745,8 +747,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   };
 
-  auto consoleObj = std::make_shared<Object>();
-  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  auto consoleObj = GarbageCollector::makeGC<Object>();
   consoleObj->properties["log"] = Value(consoleFn);
   consoleObj->properties["error"] = Value(consoleErrorFn);
   consoleObj->properties["warn"] = Value(consoleWarnFn);
@@ -761,7 +762,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Infinity", Value(std::numeric_limits<double>::infinity()), true);
   env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()), true);
 
-  auto evalFn = std::make_shared<Function>();
+  auto evalFn = GarbageCollector::makeGC<Function>();
   evalFn->isNative = true;
   evalFn->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -861,7 +862,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("eval", Value(evalFn));
 
   // Symbol constructor
-  auto symbolFn = std::make_shared<Function>();
+  auto symbolFn = GarbageCollector::makeGC<Function>();
   symbolFn->isNative = true;
   symbolFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string description = args.empty() ? "" : args[0].toString();
@@ -893,7 +894,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Symbol.for() - global symbol registry
   static std::unordered_map<std::string, Value> globalSymbolRegistry;
-  auto symbolFor = std::make_shared<Function>();
+  auto symbolFor = GarbageCollector::makeGC<Function>();
   symbolFor->isNative = true;
   symbolFor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string key = args.empty() ? "undefined" : args[0].toString();
@@ -910,7 +911,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   symbolFn->properties["for"] = Value(symbolFor);
 
   // Symbol.keyFor() - reverse lookup in global registry
-  auto symbolKeyFor = std::make_shared<Function>();
+  auto symbolKeyFor = GarbageCollector::makeGC<Function>();
   symbolKeyFor->isNative = true;
   symbolKeyFor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isSymbol()) {
@@ -929,11 +930,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Symbol", Value(symbolFn));
 
   // BigInt constructor/function
-  auto bigIntFn = std::make_shared<Function>();
+  auto bigIntFn = GarbageCollector::makeGC<Function>();
   bigIntFn->isNative = true;
   bigIntFn->isConstructor = true;
 
-  auto arrayToString = [](const std::shared_ptr<Array>& arr) -> std::string {
+  auto arrayToString = [](const GCPtr<Array>& arr) -> std::string {
     std::string out;
     for (size_t i = 0; i < arr->elements.size(); i++) {
       if (i > 0) out += ",";
@@ -953,7 +954,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     }
 
-    auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+    auto fn = callee.getGC<Function>();
     if (fn->isNative) {
       auto itUsesThis = fn->properties.find("__uses_this_arg__");
       if (itUsesThis != fn->properties.end() &&
@@ -982,7 +983,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return result;
   };
 
-  auto getObjectProperty = [callChecked](const std::shared_ptr<Object>& obj,
+  auto getObjectProperty = [callChecked](const GCPtr<Object>& obj,
                                          const Value& receiver,
                                          const std::string& key) -> std::pair<bool, Value> {
     auto current = obj;
@@ -1008,7 +1009,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
         break;
       }
-      current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      current = protoIt->second.getGC<Object>();
     }
 
     return {false, Value(Undefined{})};
@@ -1017,10 +1018,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   auto getProperty = [getObjectProperty, callChecked](const Value& receiver,
                                                        const std::string& key) -> std::pair<bool, Value> {
     if (receiver.isObject()) {
-      return getObjectProperty(std::get<std::shared_ptr<Object>>(receiver.data), receiver, key);
+      return getObjectProperty(receiver.getGC<Object>(), receiver, key);
     }
     if (receiver.isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+      auto fn = receiver.getGC<Function>();
       auto it = fn->properties.find(key);
       if (it != fn->properties.end()) {
         return {true, it->second};
@@ -1028,7 +1029,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return {false, Value(Undefined{})};
     }
     if (receiver.isRegex()) {
-      auto regex = std::get<std::shared_ptr<Regex>>(receiver.data);
+      auto regex = receiver.getGC<Regex>();
       std::string getterKey = "__get_" + key;
       auto getterIt = regex->properties.find(getterKey);
       if (getterIt != regex->properties.end()) {
@@ -1084,7 +1085,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
       if (methodName == "toString") {
         if (input.isArray()) {
-          return Value(arrayToString(std::get<std::shared_ptr<Array>>(input.data)));
+          return Value(arrayToString(input.getGC<Array>()));
         }
         if (input.isObject()) {
           return Value(std::string("[object Object]"));
@@ -1145,7 +1146,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return thisValue.toBigInt();
     }
     if (thisValue.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(thisValue.data);
+      auto obj = thisValue.getGC<Object>();
       auto primitiveIt = obj->properties.find("__primitive_value__");
       if (primitiveIt != obj->properties.end() && primitiveIt->second.isBigInt()) {
         return primitiveIt->second.toBigInt();
@@ -1182,7 +1183,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   bigIntFn->properties["length"] = Value(1.0);
   bigIntFn->properties["__throw_on_new__"] = Value(true);
 
-  auto asUintN = std::make_shared<Function>();
+  auto asUintN = GarbageCollector::makeGC<Function>();
   asUintN->isNative = true;
   asUintN->properties["__throw_on_new__"] = Value(true);
   asUintN->properties["name"] = Value(std::string("asUintN"));
@@ -1194,7 +1195,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   bigIntFn->properties["asUintN"] = Value(asUintN);
 
-  auto asIntN = std::make_shared<Function>();
+  auto asIntN = GarbageCollector::makeGC<Function>();
   asIntN->isNative = true;
   asIntN->properties["__throw_on_new__"] = Value(true);
   asIntN->properties["name"] = Value(std::string("asIntN"));
@@ -1206,9 +1207,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   bigIntFn->properties["asIntN"] = Value(asIntN);
 
-  auto bigIntProto = std::make_shared<Object>();
+  auto bigIntProto = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
-  auto bigIntProtoToString = std::make_shared<Function>();
+  auto bigIntProtoToString = GarbageCollector::makeGC<Function>();
   bigIntProtoToString->isNative = true;
   bigIntProtoToString->properties["__throw_on_new__"] = Value(true);
   bigIntProtoToString->properties["__uses_this_arg__"] = Value(true);
@@ -1231,7 +1232,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   bigIntProto->properties["toString"] = Value(bigIntProtoToString);
 
-  auto bigIntProtoValueOf = std::make_shared<Function>();
+  auto bigIntProtoValueOf = GarbageCollector::makeGC<Function>();
   bigIntProtoValueOf->isNative = true;
   bigIntProtoValueOf->properties["__throw_on_new__"] = Value(true);
   bigIntProtoValueOf->properties["__uses_this_arg__"] = Value(true);
@@ -1245,7 +1246,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   bigIntProto->properties["valueOf"] = Value(bigIntProtoValueOf);
 
-  auto bigIntProtoToLocaleString = std::make_shared<Function>();
+  auto bigIntProtoToLocaleString = GarbageCollector::makeGC<Function>();
   bigIntProtoToLocaleString->isNative = true;
   bigIntProtoToLocaleString->properties["__throw_on_new__"] = Value(true);
   bigIntProtoToLocaleString->properties["__uses_this_arg__"] = Value(true);
@@ -1280,18 +1281,18 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("BigInt", Value(bigIntFn));
 
   auto createTypedArrayConstructor = [](TypedArrayType type) {
-    auto func = std::make_shared<Function>();
+    auto func = GarbageCollector::makeGC<Function>();
     func->isNative = true;
     func->isConstructor = true;
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
-        return Value(std::make_shared<TypedArray>(type, 0));
+        return Value(GarbageCollector::makeGC<TypedArray>(type, 0));
       }
 
       // Check if first argument is an array
-      if (std::holds_alternative<std::shared_ptr<Array>>(args[0].data)) {
-        auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-        auto typedArray = std::make_shared<TypedArray>(type, arr->elements.size());
+      if (std::holds_alternative<GCPtr<Array>>(args[0].data)) {
+        auto arr = args[0].getGC<Array>();
+        auto typedArray = GarbageCollector::makeGC<TypedArray>(type, arr->elements.size());
 
         // Fill the typed array with values from the regular array
         for (size_t i = 0; i < arr->elements.size(); ++i) {
@@ -1306,16 +1307,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       double lengthNum = args[0].toNumber();
       if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
         // Invalid length, return empty array
-        return Value(std::make_shared<TypedArray>(type, 0));
+        return Value(GarbageCollector::makeGC<TypedArray>(type, 0));
       }
 
       size_t length = static_cast<size_t>(lengthNum);
       // Sanity check: prevent allocating huge arrays
       if (length > 1000000000) { // 1GB limit
-        return Value(std::make_shared<TypedArray>(type, 0));
+        return Value(GarbageCollector::makeGC<TypedArray>(type, 0));
       }
 
-      return Value(std::make_shared<TypedArray>(type, length));
+      return Value(GarbageCollector::makeGC<TypedArray>(type, length));
     };
     return Value(func);
   };
@@ -1334,28 +1335,28 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64));
 
   // ArrayBuffer constructor
-  auto arrayBufferConstructor = std::make_shared<Function>();
+  auto arrayBufferConstructor = GarbageCollector::makeGC<Function>();
   arrayBufferConstructor->isNative = true;
   arrayBufferConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     size_t length = 0;
     if (!args.empty()) {
       length = static_cast<size_t>(args[0].toNumber());
     }
-    auto buffer = std::make_shared<ArrayBuffer>(length);
+    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length);
     GarbageCollector::instance().reportAllocation(length);
     return Value(buffer);
   };
   env->define("ArrayBuffer", Value(arrayBufferConstructor));
 
   // DataView constructor
-  auto dataViewConstructor = std::make_shared<Function>();
+  auto dataViewConstructor = GarbageCollector::makeGC<Function>();
   dataViewConstructor->isNative = true;
   dataViewConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArrayBuffer()) {
       throw std::runtime_error("TypeError: DataView requires an ArrayBuffer");
     }
 
-    auto buffer = std::get<std::shared_ptr<ArrayBuffer>>(args[0].data);
+    auto buffer = args[0].getGC<ArrayBuffer>();
     size_t byteOffset = 0;
     size_t byteLength = 0;
 
@@ -1366,16 +1367,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       byteLength = static_cast<size_t>(args[2].toNumber());
     }
 
-    auto dataView = std::make_shared<DataView>(buffer, byteOffset, byteLength);
+    auto dataView = GarbageCollector::makeGC<DataView>(buffer, byteOffset, byteLength);
     GarbageCollector::instance().reportAllocation(sizeof(DataView));
     return Value(dataView);
   };
   env->define("DataView", Value(dataViewConstructor));
 
-  auto cryptoObj = std::make_shared<Object>();
+  auto cryptoObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
-  auto sha256Fn = std::make_shared<Function>();
+  auto sha256Fn = GarbageCollector::makeGC<Function>();
   sha256Fn->isNative = true;
   sha256Fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string(""));
@@ -1387,7 +1388,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   cryptoObj->properties["sha256"] = Value(sha256Fn);
 
-  auto hmacFn = std::make_shared<Function>();
+  auto hmacFn = GarbageCollector::makeGC<Function>();
   hmacFn->isNative = true;
   hmacFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(std::string(""));
@@ -1401,7 +1402,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   cryptoObj->properties["hmac"] = Value(hmacFn);
 
-  auto toHexFn = std::make_shared<Function>();
+  auto toHexFn = GarbageCollector::makeGC<Function>();
   toHexFn->isNative = true;
   toHexFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string(""));
@@ -1414,7 +1415,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   cryptoObj->properties["toHex"] = Value(toHexFn);
 
   // crypto.randomUUID - generate RFC 4122 version 4 UUID
-  auto randomUUIDFn = std::make_shared<Function>();
+  auto randomUUIDFn = GarbageCollector::makeGC<Function>();
   randomUUIDFn->isNative = true;
   randomUUIDFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Generate 16 random bytes
@@ -1444,14 +1445,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   cryptoObj->properties["randomUUID"] = Value(randomUUIDFn);
 
   // crypto.getRandomValues - fill typed array with random values
-  auto getRandomValuesFn = std::make_shared<Function>();
+  auto getRandomValuesFn = GarbageCollector::makeGC<Function>();
   getRandomValuesFn->isNative = true;
   getRandomValuesFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isTypedArray()) {
-      return Value(std::make_shared<Error>(ErrorType::TypeError, "getRandomValues requires a TypedArray"));
+      return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getRandomValues requires a TypedArray"));
     }
 
-    auto typedArray = std::get<std::shared_ptr<TypedArray>>(args[0].data);
+    auto typedArray = args[0].getGC<TypedArray>();
     std::random_device rd;
     std::mt19937 gen(rd());
 
@@ -1467,7 +1468,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   env->define("crypto", Value(cryptoObj));
 
-  auto fetchFn = std::make_shared<Function>();
+  auto fetchFn = GarbageCollector::makeGC<Function>();
   fetchFn->isNative = true;
   fetchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -1476,19 +1477,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     std::string url = args[0].toString();
 
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     http::HTTPClient client;
 
     try {
       http::Response httpResp = client.get(url);
 
-      auto respObj = std::make_shared<Object>();
+      auto respObj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       respObj->properties["status"] = Value(static_cast<double>(httpResp.statusCode));
       respObj->properties["statusText"] = Value(httpResp.statusText);
       respObj->properties["ok"] = Value(httpResp.statusCode >= 200 && httpResp.statusCode < 300);
 
-      auto textFn = std::make_shared<Function>();
+      auto textFn = GarbageCollector::makeGC<Function>();
       textFn->isNative = true;
       std::string bodyText = httpResp.bodyAsString();
       textFn->nativeFunc = [bodyText](const std::vector<Value>&) -> Value {
@@ -1496,7 +1497,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       };
       respObj->properties["text"] = Value(textFn);
 
-      auto headersObj = std::make_shared<Object>();
+      auto headersObj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       for (const auto& [key, value] : httpResp.headers) {
         headersObj->properties[key] = Value(value);
@@ -1513,17 +1514,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("fetch", Value(fetchFn));
 
   // Dynamic import() function - returns a Promise
-  auto importFn = std::make_shared<Function>();
+  auto importFn = GarbageCollector::makeGC<Function>();
   importFn->isNative = true;
   importFn->nativeFunc = [arrayToString](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
-      auto promise = std::make_shared<Promise>();
-      auto err = std::make_shared<Error>(ErrorType::TypeError, "import() requires a module specifier");
+      auto promise = GarbageCollector::makeGC<Promise>();
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "import() requires a module specifier");
       promise->reject(Value(err));
       return Value(promise);
     }
 
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     std::string specifier;
     enum class ImportPhase {
       Normal,
@@ -1552,7 +1553,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (candidate.has_value()) {
         promise->reject(*candidate);
       } else {
-        auto err = std::make_shared<Error>(fallbackType, fallbackMessage);
+        auto err = GarbageCollector::makeGC<Error>(fallbackType, fallbackMessage);
         promise->reject(Value(err));
       }
     };
@@ -1580,11 +1581,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           !consumePrefix("Error: ", ErrorType::Error)) {
         return Value(message);
       }
-      return Value(std::make_shared<Error>(errorType, message));
+      return Value(GarbageCollector::makeGC<Error>(errorType, message));
     };
 
     auto makeError = [](ErrorType type, const std::string& message) -> Value {
-      return Value(std::make_shared<Error>(type, message));
+      return Value(GarbageCollector::makeGC<Error>(type, message));
     };
 
     auto callImportCallable = [&](const Value& callee,
@@ -1597,7 +1598,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return true;
       }
 
-      auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+      auto fn = callee.getGC<Function>();
       if (fn->isNative) {
         try {
           auto itUsesThis = fn->properties.find("__uses_this_arg__");
@@ -1641,9 +1642,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     getImportProperty =
       [&](const Value& receiver, const std::string& key, bool& found, Value& out, Value& abrupt) -> bool {
       if (receiver.isProxy()) {
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(receiver.data);
+        auto proxyPtr = receiver.getGC<Proxy>();
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto getTrapIt = handlerObj->properties.find("get");
           if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
             Value trapOut = Value(Undefined{});
@@ -1664,7 +1665,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (receiver.isObject()) {
-        auto current = std::get<std::shared_ptr<Object>>(receiver.data);
+        auto current = receiver.getGC<Object>();
         int depth = 0;
         while (current && depth <= 16) {
           depth++;
@@ -1696,7 +1697,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
             break;
           }
-          current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          current = protoIt->second.getGC<Object>();
         }
         found = false;
         out = Value(Undefined{});
@@ -1704,7 +1705,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (receiver.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+        auto fn = receiver.getGC<Function>();
         auto it = fn->properties.find(key);
         if (it != fn->properties.end()) {
           found = true;
@@ -1717,7 +1718,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (receiver.isRegex()) {
-        auto regex = std::get<std::shared_ptr<Regex>>(receiver.data);
+        auto regex = receiver.getGC<Regex>();
         std::string getterKey = "__get_" + key;
         auto getterIt = regex->properties.find(getterKey);
         if (getterIt != regex->properties.end()) {
@@ -1799,7 +1800,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (input.isArray()) {
-        out = Value(arrayToString(std::get<std::shared_ptr<Array>>(input.data)));
+        out = Value(arrayToString(input.getGC<Array>()));
         return true;
       }
       if (input.isObject() || input.isFunction() || input.isProxy()) {
@@ -1826,9 +1827,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       };
 
       if (source.isProxy()) {
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(source.data);
+        auto proxyPtr = source.getGC<Proxy>();
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto ownKeysIt = handlerObj->properties.find("ownKeys");
           if (ownKeysIt != handlerObj->properties.end() && ownKeysIt->second.isFunction()) {
             Value ownKeysResult = Value(Undefined{});
@@ -1838,7 +1839,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
             std::vector<std::string> candidateKeys;
             if (ownKeysResult.isArray()) {
-              auto arr = std::get<std::shared_ptr<Array>>(ownKeysResult.data);
+              auto arr = ownKeysResult.getGC<Array>();
               for (const auto& entry : arr->elements) {
                 if (entry.isString()) {
                   candidateKeys.push_back(std::get<std::string>(entry.data));
@@ -1880,7 +1881,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (source.isObject()) {
-        auto withObj = std::get<std::shared_ptr<Object>>(source.data);
+        auto withObj = source.getGC<Object>();
         for (const auto& [key, _] : withObj->properties) {
           if (key.rfind("__get_", 0) == 0) {
             pushKey(key.substr(6));
@@ -1892,12 +1893,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           pushKey(key);
         }
       } else if (source.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(source.data);
+        auto arr = source.getGC<Array>();
         for (size_t i = 0; i < arr->elements.size(); ++i) {
           pushKey(std::to_string(i));
         }
       } else if (source.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(source.data);
+        auto fn = source.getGC<Function>();
         for (const auto& [key, _] : fn->properties) {
           if (key.rfind("__", 0) == 0) {
             continue;
@@ -1912,12 +1913,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     try {
       if (args[0].isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+        auto obj = args[0].getGC<Object>();
         auto importMetaIt = obj->properties.find("__import_meta__");
         if (importMetaIt != obj->properties.end() &&
             importMetaIt->second.isBool() &&
             importMetaIt->second.toBool()) {
-          auto err = std::make_shared<Error>(ErrorType::TypeError, "Cannot convert object to primitive value");
+          auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Cannot convert object to primitive value");
           promise->reject(Value(err));
           return Value(promise);
         }
@@ -1929,21 +1930,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return Value(promise);
       }
       if (primitiveSpecifier.isSymbol()) {
-        auto err = std::make_shared<Error>(ErrorType::TypeError, "Cannot convert a Symbol value to a string");
+        auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Cannot convert a Symbol value to a string");
         promise->reject(Value(err));
         return Value(promise);
       }
       specifier = primitiveSpecifier.toString();
 
       if (importPhase == ImportPhase::Source) {
-        auto err = std::make_shared<Error>(ErrorType::SyntaxError, "Source phase import is not available");
+        auto err = GarbageCollector::makeGC<Error>(ErrorType::SyntaxError, "Source phase import is not available");
         promise->reject(Value(err));
         return Value(promise);
       }
 
       if (hasImportOptions && !importOptions.isUndefined()) {
         if (!isObjectLikeImport(importOptions)) {
-          auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options must be an object");
+          auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "import() options must be an object");
           promise->reject(Value(err));
           return Value(promise);
         }
@@ -1958,7 +1959,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
         if (hasWith && !withValue.isUndefined()) {
           if (!isObjectLikeImport(withValue)) {
-            auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options.with must be an object");
+            auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "import() options.with must be an object");
             promise->reject(Value(err));
             return Value(promise);
           }
@@ -1977,7 +1978,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
               return Value(promise);
             }
             if (!attrValue.isString()) {
-              auto err = std::make_shared<Error>(ErrorType::TypeError, "import() options.with values must be strings");
+              auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "import() options.with values must be strings");
               promise->reject(Value(err));
               return Value(promise);
             }
@@ -2065,7 +2066,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
         auto moduleNamespace = module->getNamespaceObject();
         if (deferEvaluationUntilNamespaceAccess) {
-          auto deferredEvalFn = std::make_shared<Function>();
+          auto deferredEvalFn = GarbageCollector::makeGC<Function>();
           deferredEvalFn->isNative = true;
           deferredEvalFn->properties["__throw_on_new__"] = Value(true);
           auto deferredModule = module;
@@ -2092,7 +2093,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         promise->resolve(Value(moduleNamespace));
       } else {
         // Fallback: create a placeholder namespace (for cases where module loader isn't set up)
-        auto moduleNamespace = std::make_shared<Object>();
+        auto moduleNamespace = GarbageCollector::makeGC<Object>();
         GarbageCollector::instance().reportAllocation(sizeof(Object));
         moduleNamespace->properties["__esModule"] = Value(true);
         moduleNamespace->properties["__moduleSpecifier"] = Value(specifier);
@@ -2120,10 +2121,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         promise->reject(Value(message));
         return Value(promise);
       }
-      auto err = std::make_shared<Error>(errorType, message);
+      auto err = GarbageCollector::makeGC<Error>(errorType, message);
       promise->reject(Value(err));
     } catch (...) {
-      auto err = std::make_shared<Error>(ErrorType::Error, "Failed to load module: " + specifier);
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, "Failed to load module: " + specifier);
       promise->reject(Value(err));
     }
 
@@ -2131,10 +2132,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   env->define("import", Value(importFn));
 
-  auto regExpPrototype = std::make_shared<Object>();
+  auto regExpPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
-  auto regExpMatchAll = std::make_shared<Function>();
+  auto regExpMatchAll = GarbageCollector::makeGC<Function>();
   regExpMatchAll->isNative = true;
   regExpMatchAll->isConstructor = false;
   regExpMatchAll->properties["__uses_this_arg__"] = Value(true);
@@ -2144,7 +2145,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: RegExp.prototype[@@matchAll] called on non-RegExp");
     }
 
-    auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+    auto regexPtr = args[0].getGC<Regex>();
     std::string input = args.size() > 1 ? args[1].toString() : "";
     bool global = regexPtr->flags.find('g') != std::string::npos;
     bool unicodeMode = regexPtr->flags.find('u') != std::string::npos ||
@@ -2178,7 +2179,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return static_cast<double>(utf16Units);
     };
 
-    auto allMatches = std::make_shared<Array>();
+    auto allMatches = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
 #if USE_SIMPLE_REGEX
@@ -2187,7 +2188,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::vector<simple_regex::Regex::Match> matches;
     while (regexPtr->regex->search(remaining, matches)) {
       if (matches.empty()) break;
-      auto matchArr = std::make_shared<Array>();
+      auto matchArr = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = 0; i < matches.size(); ++i) {
         matchArr->elements.push_back(Value(matches[i].str));
@@ -2220,7 +2221,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string::const_iterator searchStart = input.cbegin();
     std::smatch match;
     while (std::regex_search(searchStart, input.cend(), match, regexPtr->regex)) {
-      auto matchArr = std::make_shared<Array>();
+      auto matchArr = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = 0; i < match.size(); ++i) {
         matchArr->elements.push_back(Value(match[i].str()));
@@ -2250,13 +2251,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 #endif
 
     // Return a RegExpStringIterator (object with .next() method)
-    auto iterObj = std::make_shared<Object>();
+    auto iterObj = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     auto idx = std::make_shared<size_t>(0);
-    auto nextFn = std::make_shared<Function>();
+    auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
     nextFn->nativeFunc = [allMatches, idx](const std::vector<Value>& /*args*/) -> Value {
-      auto result = std::make_shared<Object>();
+      auto result = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       if (*idx < allMatches->elements.size()) {
         result->properties["value"] = allMatches->elements[*idx];
@@ -2273,27 +2274,27 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   regExpPrototype->properties[WellKnownSymbols::matchAllKey()] = Value(regExpMatchAll);
 
-  auto regExpConstructor = std::make_shared<Function>();
+  auto regExpConstructor = GarbageCollector::makeGC<Function>();
   regExpConstructor->isNative = true;
   regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Undefined{});
     std::string pattern = args[0].toString();
     std::string flags = args.size() > 1 ? args[1].toString() : "";
-    return Value(std::make_shared<Regex>(pattern, flags));
+    return Value(GarbageCollector::makeGC<Regex>(pattern, flags));
   };
   regExpConstructor->properties["prototype"] = Value(regExpPrototype);
   env->define("RegExp", Value(regExpConstructor));
 
   // Error constructors
   auto createErrorConstructor = [](ErrorType type, const std::string& name) {
-    auto prototype = std::make_shared<Object>();
+    auto prototype = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
-    auto func = std::make_shared<Function>();
+    auto func = GarbageCollector::makeGC<Function>();
     func->isNative = true;
     func->isConstructor = true;
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       std::string message = args.empty() ? "" : args[0].toString();
-      return Value(std::make_shared<Error>(type, message));
+      return Value(GarbageCollector::makeGC<Error>(type, message));
     };
     func->properties["__error_type__"] = Value(static_cast<double>(static_cast<int>(type)));
     func->properties["prototype"] = Value(prototype);
@@ -2319,21 +2320,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("EvalError", Value(evalErrorCtor));
 
   // Map constructor
-  auto mapConstructor = std::make_shared<Function>();
+  auto mapConstructor = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   mapConstructor->isNative = true;
   mapConstructor->isConstructor = true;
   mapConstructor->properties["name"] = Value(std::string("Map"));
   mapConstructor->properties["length"] = Value(0.0);
   mapConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto mapObj = std::make_shared<Map>();
+    auto mapObj = GarbageCollector::makeGC<Map>();
     GarbageCollector::instance().reportAllocation(sizeof(Map));
 
     if (!args.empty() && args[0].isArray()) {
-      auto entriesArr = std::get<std::shared_ptr<Array>>(args[0].data);
+      auto entriesArr = args[0].getGC<Array>();
       for (const auto& entryVal : entriesArr->elements) {
         if (entryVal.isArray()) {
-          auto entryArr = std::get<std::shared_ptr<Array>>(entryVal.data);
+          auto entryArr = entryVal.getGC<Array>();
           if (entryArr->elements.size() >= 2) {
             mapObj->set(entryArr->elements[0], entryArr->elements[1]);
           }
@@ -2343,25 +2344,25 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     return Value(mapObj);
   };
-  auto mapPrototype = std::make_shared<Object>();
+  auto mapPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   mapConstructor->properties["prototype"] = Value(mapPrototype);
   mapPrototype->properties["constructor"] = Value(mapConstructor);
   env->define("Map", Value(mapConstructor));
 
   // Set constructor
-  auto setConstructor = std::make_shared<Function>();
+  auto setConstructor = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   setConstructor->isNative = true;
   setConstructor->isConstructor = true;
   setConstructor->properties["name"] = Value(std::string("Set"));
   setConstructor->properties["length"] = Value(0.0);
   setConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto setObj = std::make_shared<Set>();
+    auto setObj = GarbageCollector::makeGC<Set>();
     GarbageCollector::instance().reportAllocation(sizeof(Set));
 
     if (!args.empty() && args[0].isArray()) {
-      auto entriesArr = std::get<std::shared_ptr<Array>>(args[0].data);
+      auto entriesArr = args[0].getGC<Array>();
       for (const auto& entryVal : entriesArr->elements) {
         setObj->add(entryVal);
       }
@@ -2369,34 +2370,34 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     return Value(setObj);
   };
-  auto setPrototype = std::make_shared<Object>();
+  auto setPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   setConstructor->properties["prototype"] = Value(setPrototype);
   setPrototype->properties["constructor"] = Value(setConstructor);
   env->define("Set", Value(setConstructor));
 
   // WeakMap constructor
-  auto weakMapConstructor = std::make_shared<Function>();
+  auto weakMapConstructor = GarbageCollector::makeGC<Function>();
   weakMapConstructor->isNative = true;
   weakMapConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
-    auto wm = std::make_shared<WeakMap>();
+    auto wm = GarbageCollector::makeGC<WeakMap>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakMap));
     return Value(wm);
   };
   env->define("WeakMap", Value(weakMapConstructor));
 
   // WeakSet constructor
-  auto weakSetConstructor = std::make_shared<Function>();
+  auto weakSetConstructor = GarbageCollector::makeGC<Function>();
   weakSetConstructor->isNative = true;
   weakSetConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
-    auto ws = std::make_shared<WeakSet>();
+    auto ws = GarbageCollector::makeGC<WeakSet>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakSet));
     return Value(ws);
   };
   env->define("WeakSet", Value(weakSetConstructor));
 
   // Proxy constructor
-  auto proxyConstructor = std::make_shared<Function>();
+  auto proxyConstructor = GarbageCollector::makeGC<Function>();
   proxyConstructor->isNative = true;
   proxyConstructor->isConstructor = true;
   proxyConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -2404,18 +2405,18 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       // Need target and handler
       return Value(Undefined{});
     }
-    auto proxy = std::make_shared<Proxy>(args[0], args[1]);
+    auto proxy = GarbageCollector::makeGC<Proxy>(args[0], args[1]);
     GarbageCollector::instance().reportAllocation(sizeof(Proxy));
     return Value(proxy);
   };
   env->define("Proxy", Value(proxyConstructor));
 
   // Reflect object with static methods
-  auto reflectObj = std::make_shared<Object>();
+  auto reflectObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Reflect.get(target, property)
-  auto reflectGet = std::make_shared<Function>();
+  auto reflectGet = GarbageCollector::makeGC<Function>();
   reflectGet->isNative = true;
   reflectGet->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
@@ -2424,7 +2425,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string prop = args[1].toString();
 
     if (target.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      auto obj = target.getGC<Object>();
       if (obj->isModuleNamespace) {
         auto getterIt = obj->properties.find("__get_" + prop);
         if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
@@ -2450,7 +2451,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["get"] = Value(reflectGet);
 
   // Reflect.set(target, property, value)
-  auto reflectSet = std::make_shared<Function>();
+  auto reflectSet = GarbageCollector::makeGC<Function>();
   reflectSet->isNative = true;
   reflectSet->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 3) return Value(false);
@@ -2460,7 +2461,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     const Value& value = args[2];
 
     if (target.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      auto obj = target.getGC<Object>();
       if (obj->isModuleNamespace) {
         return Value(false);
       }
@@ -2472,7 +2473,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["set"] = Value(reflectSet);
 
   // Reflect.has(target, property)
-  auto reflectHas = std::make_shared<Function>();
+  auto reflectHas = GarbageCollector::makeGC<Function>();
   reflectHas->isNative = true;
   reflectHas->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
@@ -2481,7 +2482,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string prop = args[1].toString();
 
     if (target.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      auto obj = target.getGC<Object>();
       if (obj->isModuleNamespace) {
         if (prop == WellKnownSymbols::toStringTagKey()) {
           return Value(true);
@@ -2495,7 +2496,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["has"] = Value(reflectHas);
 
   // Reflect.deleteProperty(target, property)
-  auto reflectDelete = std::make_shared<Function>();
+  auto reflectDelete = GarbageCollector::makeGC<Function>();
   reflectDelete->isNative = true;
   reflectDelete->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
@@ -2504,7 +2505,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string prop = args[1].toString();
 
     if (target.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(target.data);
+      auto obj = target.getGC<Object>();
       if (obj->isModuleNamespace) {
         if (prop == WellKnownSymbols::toStringTagKey()) {
           return Value(false);
@@ -2518,19 +2519,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["deleteProperty"] = Value(reflectDelete);
 
   // Reflect.apply(target, thisArg, argumentsList)
-  auto reflectApply = std::make_shared<Function>();
+  auto reflectApply = GarbageCollector::makeGC<Function>();
   reflectApply->isNative = true;
   reflectApply->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 3 || !args[0].isFunction()) {
       return Value(Undefined{});
     }
 
-    auto func = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto func = args[0].getGC<Function>();
     const Value& thisArg = args[1];
 
     std::vector<Value> callArgs;
     if (args[2].isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(args[2].data);
+      auto arr = args[2].getGC<Array>();
       callArgs = arr->elements;
     }
 
@@ -2545,7 +2546,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["apply"] = Value(reflectApply);
 
   // Reflect.construct(target, argumentsList, newTarget?)
-  auto reflectConstruct = std::make_shared<Function>();
+  auto reflectConstruct = GarbageCollector::makeGC<Function>();
   reflectConstruct->isNative = true;
   reflectConstruct->properties["__reflect_construct__"] = Value(true);
   reflectConstruct->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -2553,7 +2554,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Reflect.construct target is not a function");
     }
 
-    auto func = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto func = args[0].getGC<Function>();
     if (!func->isConstructor) {
       throw std::runtime_error("TypeError: target is not a constructor");
     }
@@ -2562,7 +2563,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (!args[2].isFunction()) {
         throw std::runtime_error("TypeError: newTarget is not a constructor");
       }
-      auto newTarget = std::get<std::shared_ptr<Function>>(args[2].data);
+      auto newTarget = args[2].getGC<Function>();
       if (!newTarget->isConstructor) {
         throw std::runtime_error("TypeError: newTarget is not a constructor");
       }
@@ -2570,7 +2571,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     std::vector<Value> callArgs;
     if (args[1].isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(args[1].data);
+      auto arr = args[1].getGC<Array>();
       callArgs = arr->elements;
     }
 
@@ -2583,22 +2584,22 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["construct"] = Value(reflectConstruct);
 
   // Reflect.getPrototypeOf(target) - delegates to Object.getPrototypeOf logic
-  auto reflectGetPrototypeOf = std::make_shared<Function>();
+  auto reflectGetPrototypeOf = GarbageCollector::makeGC<Function>();
   reflectGetPrototypeOf->isNative = true;
   reflectGetPrototypeOf->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Null{});
     if (args[0].isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto fn = args[0].getGC<Function>();
       auto protoIt = fn->properties.find("__proto__");
       if (protoIt != fn->properties.end()) return protoIt->second;
       if (auto funcCtor = env->get("Function"); funcCtor && funcCtor->isFunction()) {
-        auto funcFn = std::get<std::shared_ptr<Function>>(funcCtor->data);
+        auto funcFn = std::get<GCPtr<Function>>(funcCtor->data);
         auto fpIt = funcFn->properties.find("prototype");
         if (fpIt != funcFn->properties.end()) return fpIt->second;
       }
     }
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       auto it = obj->properties.find("__proto__");
       if (it != obj->properties.end()) return it->second;
     }
@@ -2607,7 +2608,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["getPrototypeOf"] = Value(reflectGetPrototypeOf);
 
   // Reflect.setPrototypeOf(target, proto) - returns false (not supported)
-  auto reflectSetPrototypeOf = std::make_shared<Function>();
+  auto reflectSetPrototypeOf = GarbageCollector::makeGC<Function>();
   reflectSetPrototypeOf->isNative = true;
   reflectSetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // LightJS doesn't support dynamic prototype modification
@@ -2616,7 +2617,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["setPrototypeOf"] = Value(reflectSetPrototypeOf);
 
   // Reflect.isExtensible(target) - check if object can be extended
-  auto reflectIsExtensible = std::make_shared<Function>();
+  auto reflectIsExtensible = GarbageCollector::makeGC<Function>();
   reflectIsExtensible->isNative = true;
   reflectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
@@ -2624,7 +2625,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(true);  // Functions and arrays are always extensible
     }
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
         return Value(false);
       }
@@ -2635,13 +2636,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["isExtensible"] = Value(reflectIsExtensible);
 
   // Reflect.preventExtensions(target) - prevent adding new properties
-  auto reflectPreventExtensions = std::make_shared<Function>();
+  auto reflectPreventExtensions = GarbageCollector::makeGC<Function>();
   reflectPreventExtensions->isNative = true;
   reflectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return Value(false);
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
       return Value(true);
     }
@@ -2651,15 +2652,15 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["preventExtensions"] = Value(reflectPreventExtensions);
 
   // Reflect.ownKeys(target) - return array of own property keys
-  auto reflectOwnKeys = std::make_shared<Function>();
+  auto reflectOwnKeys = GarbageCollector::makeGC<Function>();
   reflectOwnKeys->isNative = true;
   reflectOwnKeys->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
 
     if (args.empty()) return Value(result);
 
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
         for (const auto& key : obj->moduleExportNames) {
           result->elements.push_back(Value(key));
@@ -2679,7 +2680,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         result->elements.push_back(Value(key));
       }
     } else if (args[0].isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+      auto arr = args[0].getGC<Array>();
       for (size_t i = 0; i < arr->elements.size(); ++i) {
         result->elements.push_back(Value(std::to_string(i)));
       }
@@ -2691,7 +2692,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["ownKeys"] = Value(reflectOwnKeys);
 
   // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-  auto reflectGetOwnPropertyDescriptor = std::make_shared<Function>();
+  auto reflectGetOwnPropertyDescriptor = GarbageCollector::makeGC<Function>();
   reflectGetOwnPropertyDescriptor->isNative = true;
   reflectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
@@ -2699,9 +2700,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string prop = args[1].toString();
 
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
-        auto descriptor = std::make_shared<Object>();
+        auto descriptor = GarbageCollector::makeGC<Object>();
         if (prop == WellKnownSymbols::toStringTagKey()) {
           descriptor->properties["value"] = Value(std::string("Module"));
           descriptor->properties["writable"] = Value(false);
@@ -2741,7 +2742,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return Value(Undefined{});
       }
       // Create a simplified property descriptor
-      auto descriptor = std::make_shared<Object>();
+      auto descriptor = GarbageCollector::makeGC<Object>();
       descriptor->properties["value"] = it->second;
       descriptor->properties["writable"] = Value(!obj->frozen);
       descriptor->properties["enumerable"] = Value(true);
@@ -2754,19 +2755,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   reflectObj->properties["getOwnPropertyDescriptor"] = Value(reflectGetOwnPropertyDescriptor);
 
   // Reflect.defineProperty(target, propertyKey, attributes)
-  auto reflectDefineProperty = std::make_shared<Function>();
+  auto reflectDefineProperty = GarbageCollector::makeGC<Function>();
   reflectDefineProperty->isNative = true;
   reflectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 3) return Value(false);
     if (!args[0].isObject()) return Value(false);
 
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     std::string prop = args[1].toString();
     if (obj->isModuleNamespace) {
       if (!args[2].isObject()) {
         return Value(false);
       }
-      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      auto descriptor = args[2].getGC<Object>();
       return Value(defineModuleNamespaceProperty(obj, prop, descriptor));
     }
 
@@ -2778,7 +2779,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     // Get value from descriptor
     if (args[2].isObject()) {
-      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      auto descriptor = args[2].getGC<Object>();
       auto valueIt = descriptor->properties.find("value");
       if (valueIt != descriptor->properties.end()) {
         obj->properties[prop] = valueIt->second;
@@ -2793,7 +2794,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Reflect", Value(reflectObj));
 
   // Number object with static methods
-  auto numberObj = std::make_shared<Function>();
+  auto numberObj = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   numberObj->isNative = true;
   numberObj->isConstructor = true;
@@ -2812,7 +2813,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // Number.parseInt
-  auto parseIntFn = std::make_shared<Function>();
+  auto parseIntFn = GarbageCollector::makeGC<Function>();
   parseIntFn->isNative = true;
   parseIntFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
@@ -2861,7 +2862,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   numberObj->properties["parseInt"] = Value(parseIntFn);
 
   // Number.parseFloat
-  auto parseFloatFn = std::make_shared<Function>();
+  auto parseFloatFn = GarbageCollector::makeGC<Function>();
   parseFloatFn->isNative = true;
   parseFloatFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
@@ -2892,7 +2893,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   numberObj->properties["parseFloat"] = Value(parseFloatFn);
 
   // Number.isNaN
-  auto isNaNFn = std::make_shared<Function>();
+  auto isNaNFn = GarbageCollector::makeGC<Function>();
   isNaNFn->isNative = true;
   isNaNFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isNumber()) return Value(false);
@@ -2905,7 +2906,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   numberObj->properties["__non_enum_isNaN"] = Value(true);
 
   // Number.isFinite
-  auto isFiniteFn = std::make_shared<Function>();
+  auto isFiniteFn = GarbageCollector::makeGC<Function>();
   isFiniteFn->isNative = true;
   isFiniteFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isNumber()) return Value(false);
@@ -2918,7 +2919,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   numberObj->properties["__non_enum_isFinite"] = Value(true);
 
   // Number.isInteger
-  auto isIntegerFn = std::make_shared<Function>();
+  auto isIntegerFn = GarbageCollector::makeGC<Function>();
   isIntegerFn->isNative = true;
   isIntegerFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isNumber()) return Value(false);
@@ -2931,7 +2932,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   numberObj->properties["__non_enum_isInteger"] = Value(true);
 
   // Number.isSafeInteger
-  auto isSafeIntegerFn = std::make_shared<Function>();
+  auto isSafeIntegerFn = GarbageCollector::makeGC<Function>();
   isSafeIntegerFn->isNative = true;
   isSafeIntegerFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isNumber()) return Value(false);
@@ -2964,7 +2965,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Number", Value(numberObj));
 
   // Boolean constructor
-  auto booleanObj = std::make_shared<Function>();
+  auto booleanObj = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   booleanObj->isNative = true;
   booleanObj->isConstructor = true;
@@ -2985,7 +2986,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("parseFloat", Value(parseFloatFn));
 
   // Global isNaN (different from Number.isNaN - coerces to number first)
-  auto globalIsNaNFn = std::make_shared<Function>();
+  auto globalIsNaNFn = GarbageCollector::makeGC<Function>();
   globalIsNaNFn->isNative = true;
   globalIsNaNFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(true);
@@ -2995,7 +2996,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("isNaN", Value(globalIsNaNFn));
 
   // Global isFinite
-  auto globalIsFiniteFn = std::make_shared<Function>();
+  auto globalIsFiniteFn = GarbageCollector::makeGC<Function>();
   globalIsFiniteFn->isNative = true;
   globalIsFiniteFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
@@ -3005,14 +3006,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("isFinite", Value(globalIsFiniteFn));
 
   // Array constructor with static methods
-  auto arrayConstructorFn = std::make_shared<Function>();
+  auto arrayConstructorFn = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   arrayConstructorFn->isNative = true;
   arrayConstructorFn->isConstructor = true;
   arrayConstructorFn->properties["name"] = Value(std::string("Array"));
   arrayConstructorFn->properties["length"] = Value(1.0);
   arrayConstructorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     if (args.empty()) {
@@ -3032,19 +3033,19 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(result);
   };
 
-  auto arrayConstructorObj = std::make_shared<Object>();
+  auto arrayConstructorObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   arrayConstructorObj->properties["__callable_object__"] = Value(true);
   arrayConstructorObj->properties["constructor"] = Value(arrayConstructorFn);
 
-  auto arrayPrototype = std::make_shared<Object>();
+  auto arrayPrototype = GarbageCollector::makeGC<Object>();
   arrayConstructorObj->properties["prototype"] = Value(arrayPrototype);
   arrayConstructorFn->properties["prototype"] = Value(arrayPrototype);
   arrayPrototype->properties["constructor"] = Value(arrayConstructorObj);
   env->define("__array_prototype__", Value(arrayPrototype));
 
   // Array.prototype.push - receives this (array) via __uses_this_arg__
-  auto arrayProtoPush = std::make_shared<Function>();
+  auto arrayProtoPush = GarbageCollector::makeGC<Function>();
   arrayProtoPush->isNative = true;
   arrayProtoPush->properties["__uses_this_arg__"] = Value(true);
   arrayProtoPush->properties["name"] = Value(std::string("push"));
@@ -3053,7 +3054,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty() || !args[0].isArray()) {
       throw std::runtime_error("TypeError: Array.prototype.push called on non-array");
     }
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
     for (size_t i = 1; i < args.size(); ++i) {
       arr->elements.push_back(args[i]);
     }
@@ -3062,7 +3063,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   arrayPrototype->properties["push"] = Value(arrayProtoPush);
 
   // Array.prototype.join
-  auto arrayProtoJoin = std::make_shared<Function>();
+  auto arrayProtoJoin = GarbageCollector::makeGC<Function>();
   arrayProtoJoin->isNative = true;
   arrayProtoJoin->properties["__uses_this_arg__"] = Value(true);
   arrayProtoJoin->properties["name"] = Value(std::string("join"));
@@ -3071,7 +3072,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty() || !args[0].isArray()) {
       throw std::runtime_error("TypeError: Array.prototype.join called on non-array");
     }
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
     std::string separator = args.size() > 1 && !args[1].isUndefined() ? args[1].toString() : ",";
     std::string result;
     for (size_t i = 0; i < arr->elements.size(); ++i) {
@@ -3087,7 +3088,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Array.prototype[Symbol.iterator] - values iterator
   {
     const auto& iterKey = WellKnownSymbols::iteratorKey();
-    auto arrayProtoIterator = std::make_shared<Function>();
+    auto arrayProtoIterator = GarbageCollector::makeGC<Function>();
     arrayProtoIterator->isNative = true;
     arrayProtoIterator->properties["__uses_this_arg__"] = Value(true);
     arrayProtoIterator->properties["__builtin_array_iterator__"] = Value(true);
@@ -3095,13 +3096,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       if (args.empty() || !args[0].isArray()) {
         return Value(Undefined{});
       }
-      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-      auto iterObj = std::make_shared<Object>();
+      auto arr = args[0].getGC<Array>();
+      auto iterObj = GarbageCollector::makeGC<Object>();
       auto indexPtr = std::make_shared<size_t>(0);
-      auto nextFn = std::make_shared<Function>();
+      auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
       nextFn->nativeFunc = [arr, indexPtr](const std::vector<Value>&) -> Value {
-        auto result = std::make_shared<Object>();
+        auto result = GarbageCollector::makeGC<Object>();
         if (*indexPtr >= arr->elements.size()) {
           result->properties["value"] = Value(Undefined{});
           result->properties["done"] = Value(true);
@@ -3119,7 +3120,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   }
 
   // Array.isArray
-  auto isArrayFn = std::make_shared<Function>();
+  auto isArrayFn = GarbageCollector::makeGC<Function>();
   isArrayFn->isNative = true;
   isArrayFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
@@ -3128,10 +3129,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   arrayConstructorObj->properties["isArray"] = Value(isArrayFn);
 
   // Array.from - creates array from array-like or iterable object
-  auto fromFn = std::make_shared<Function>();
+  auto fromFn = GarbageCollector::makeGC<Function>();
   fromFn->isNative = true;
   fromFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
 
     if (args.empty()) {
       return Value(result);
@@ -3163,7 +3164,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return mapped;
       }
 
-      auto mapper = std::get<std::shared_ptr<Function>>(mapFn.data);
+      auto mapper = mapFn.getGC<Function>();
       if (mapper->isNative) {
         auto itUsesThis = mapper->properties.find("__uses_this_arg__");
         if (itUsesThis != mapper->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
@@ -3181,7 +3182,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     // If it's already an array, copy it
     if (arrayLike.isArray()) {
-      auto srcArray = std::get<std::shared_ptr<Array>>(arrayLike.data);
+      auto srcArray = arrayLike.getGC<Array>();
       size_t index = 0;
       for (const auto& elem : srcArray->elements) {
         result->elements.push_back(applyMap(elem, index++));
@@ -3202,7 +3203,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     // If it's an iterator object, consume it
     if (arrayLike.isObject()) {
       Value iteratorValue = arrayLike;
-      auto srcObj = std::get<std::shared_ptr<Object>>(arrayLike.data);
+      auto srcObj = arrayLike.getGC<Object>();
       const auto& iteratorKey = WellKnownSymbols::iteratorKey();
 
       auto iteratorMethodIt = srcObj->properties.find(iteratorKey);
@@ -3216,13 +3217,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
             throw std::runtime_error(err.toString());
           }
         } else {
-          auto iterMethod = std::get<std::shared_ptr<Function>>(iteratorMethodIt->second.data);
+          auto iterMethod = iteratorMethodIt->second.getGC<Function>();
           iteratorValue = iterMethod->isNative ? iterMethod->nativeFunc({}) : Value(Undefined{});
         }
       }
 
       if (iteratorValue.isObject()) {
-        auto iterObj = std::get<std::shared_ptr<Object>>(iteratorValue.data);
+        auto iterObj = iteratorValue.getGC<Object>();
         auto nextIt = iterObj->properties.find("next");
         if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
           size_t index = 0;
@@ -3237,12 +3238,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
                 throw std::runtime_error(err.toString());
               }
             } else {
-              auto nextFn = std::get<std::shared_ptr<Function>>(nextIt->second.data);
+              auto nextFn = nextIt->second.getGC<Function>();
               stepResult = nextFn->isNative ? nextFn->nativeFunc({}) : Value(Undefined{});
             }
 
             if (!stepResult.isObject()) break;
-            auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+            auto stepObj = stepResult.getGC<Object>();
             bool done = false;
             if (auto doneIt = stepObj->properties.find("done"); doneIt != stepObj->properties.end()) {
               done = doneIt->second.toBool();
@@ -3266,10 +3267,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   arrayConstructorObj->properties["from"] = Value(fromFn);
 
   // Array.of - creates array from arguments
-  auto ofFn = std::make_shared<Function>();
+  auto ofFn = GarbageCollector::makeGC<Function>();
   ofFn->isNative = true;
   ofFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     result->elements = args;
     return Value(result);
   };
@@ -3278,21 +3279,21 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Array", Value(arrayConstructorObj));
 
   // Promise constructor
-  auto promiseFunc = std::make_shared<Function>();
+  auto promiseFunc = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   promiseFunc->isNative = true;
   promiseFunc->isConstructor = true;
   promiseFunc->properties["name"] = Value(std::string("Promise"));
   promiseFunc->properties["length"] = Value(1.0);
 
-  auto promiseConstructor = std::make_shared<Object>();
+  auto promiseConstructor = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
-  auto promisePrototype = std::make_shared<Object>();
+  auto promisePrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   promiseConstructor->properties["prototype"] = Value(promisePrototype);
   promisePrototype->properties["constructor"] = Value(promiseFunc);
 
-  auto invokePromiseCallback = [](const std::shared_ptr<Function>& callback, const Value& arg) -> Value {
+  auto invokePromiseCallback = [](const GCPtr<Function>& callback, const Value& arg) -> Value {
     if (!callback) {
       return arg;
     }
@@ -3313,7 +3314,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return out;
   };
 
-  auto promiseProtoThen = std::make_shared<Function>();
+  auto promiseProtoThen = GarbageCollector::makeGC<Function>();
   promiseProtoThen->isNative = true;
   promiseProtoThen->properties["__uses_this_arg__"] = Value(true);
   promiseProtoThen->properties["name"] = Value(std::string("then"));
@@ -3323,18 +3324,18 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Promise.prototype.then called on non-Promise");
     }
 
-    auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+    auto promise = args[0].getGC<Promise>();
     std::function<Value(Value)> onFulfilled = nullptr;
     std::function<Value(Value)> onRejected = nullptr;
 
     if (args.size() > 1 && args[1].isFunction()) {
-      auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+      auto callback = args[1].getGC<Function>();
       onFulfilled = [callback, invokePromiseCallback](Value v) -> Value {
         return invokePromiseCallback(callback, v);
       };
     }
     if (args.size() > 2 && args[2].isFunction()) {
-      auto callback = std::get<std::shared_ptr<Function>>(args[2].data);
+      auto callback = args[2].getGC<Function>();
       onRejected = [callback, invokePromiseCallback](Value v) -> Value {
         return invokePromiseCallback(callback, v);
       };
@@ -3350,7 +3351,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promisePrototype->properties["then"] = Value(promiseProtoThen);
   promisePrototype->properties["__non_enum_then"] = Value(true);
 
-  auto promiseProtoCatch = std::make_shared<Function>();
+  auto promiseProtoCatch = GarbageCollector::makeGC<Function>();
   promiseProtoCatch->isNative = true;
   promiseProtoCatch->properties["__uses_this_arg__"] = Value(true);
   promiseProtoCatch->properties["name"] = Value(std::string("catch"));
@@ -3360,10 +3361,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Promise.prototype.catch called on non-Promise");
     }
 
-    auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+    auto promise = args[0].getGC<Promise>();
     std::function<Value(Value)> onRejected = nullptr;
     if (args.size() > 1 && args[1].isFunction()) {
-      auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+      auto callback = args[1].getGC<Function>();
       onRejected = [callback, invokePromiseCallback](Value v) -> Value {
         return invokePromiseCallback(callback, v);
       };
@@ -3379,7 +3380,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promisePrototype->properties["catch"] = Value(promiseProtoCatch);
   promisePrototype->properties["__non_enum_catch"] = Value(true);
 
-  auto promiseProtoFinally = std::make_shared<Function>();
+  auto promiseProtoFinally = GarbageCollector::makeGC<Function>();
   promiseProtoFinally->isNative = true;
   promiseProtoFinally->properties["__uses_this_arg__"] = Value(true);
   promiseProtoFinally->properties["name"] = Value(std::string("finally"));
@@ -3389,10 +3390,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Promise.prototype.finally called on non-Promise");
     }
 
-    auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+    auto promise = args[0].getGC<Promise>();
     std::function<Value()> onFinally = nullptr;
     if (args.size() > 1 && args[1].isFunction()) {
-      auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+      auto callback = args[1].getGC<Function>();
       onFinally = [callback]() -> Value {
         if (callback->isNative) {
           return callback->nativeFunc({});
@@ -3423,7 +3424,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promisePrototype->properties["__non_enum_finally"] = Value(true);
 
   // Promise.resolve
-  auto promiseResolve = std::make_shared<Function>();
+  auto promiseResolve = GarbageCollector::makeGC<Function>();
   promiseResolve->isNative = true;
   promiseResolve->properties["__uses_this_arg__"] = Value(true);
   promiseResolve->properties["name"] = Value(std::string("resolve"));
@@ -3434,13 +3435,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return resolution;
     }
 
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     promise->properties["__constructor__"] = Value(promiseFunc);
 
     auto getThenProperty = [&](const Value& candidate) -> std::pair<bool, Value> {
       if (candidate.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(candidate.data);
+        auto arr = candidate.getGC<Array>();
         auto getterIt = arr->properties.find("__get_then");
         if (getterIt != arr->properties.end()) {
           if (getterIt->second.isFunction()) {
@@ -3453,10 +3454,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           return {true, ownIt->second};
         }
         if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
-          auto arrayObjPtr = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+          auto arrayObjPtr = std::get<GCPtr<Object>>(arrayCtor->data);
           auto protoIt = arrayObjPtr->properties.find("prototype");
           if (protoIt != arrayObjPtr->properties.end() && protoIt->second.isObject()) {
-            auto protoObj = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+            auto protoObj = protoIt->second.getGC<Object>();
             auto protoGetterIt = protoObj->properties.find("__get_then");
             if (protoGetterIt != protoObj->properties.end()) {
               if (protoGetterIt->second.isFunction()) {
@@ -3483,9 +3484,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (value.isPromise()) {
-        auto nested = std::get<std::shared_ptr<Promise>>(value.data);
-        if (nested.get() == promise.get()) {
-          promise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself")));
+        auto nested = value.getGC<Promise>();
+        if (nested.get() == promise) {
+          promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Cannot resolve promise with itself")));
           return;
         }
         if (nested->state == PromiseState::Fulfilled) {
@@ -3513,7 +3514,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           auto [foundThen, thenValue] = getThenProperty(value);
           if (foundThen && thenValue.isFunction()) {
             auto alreadyCalled = std::make_shared<bool>(false);
-            auto resolveFn = std::make_shared<Function>();
+            auto resolveFn = GarbageCollector::makeGC<Function>();
             resolveFn->isNative = true;
             resolveFn->nativeFunc = [resolveSelf, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
               if (*alreadyCalled) {
@@ -3525,7 +3526,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
               return Value(Undefined{});
             };
 
-            auto rejectFn = std::make_shared<Function>();
+            auto rejectFn = GarbageCollector::makeGC<Function>();
             rejectFn->isNative = true;
             rejectFn->nativeFunc = [promise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
               if (*alreadyCalled) {
@@ -3555,12 +3556,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["resolve"] = Value(promiseResolve);
 
   // Promise.reject
-  auto promiseReject = std::make_shared<Function>();
+  auto promiseReject = GarbageCollector::makeGC<Function>();
   promiseReject->isNative = true;
   promiseReject->properties["name"] = Value(std::string("reject"));
   promiseReject->properties["length"] = Value(1.0);
   promiseReject->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     promise->properties["__constructor__"] = Value(promiseFunc);
     if (!args.empty()) {
@@ -3573,14 +3574,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["reject"] = Value(promiseReject);
 
   // Promise.withResolvers
-  auto promiseWithResolvers = std::make_shared<Function>();
+  auto promiseWithResolvers = GarbageCollector::makeGC<Function>();
   promiseWithResolvers->isNative = true;
   promiseWithResolvers->nativeFunc = [promiseFunc](const std::vector<Value>&) -> Value {
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     promise->properties["__constructor__"] = Value(promiseFunc);
 
-    auto resolveFunc = std::make_shared<Function>();
+    auto resolveFunc = GarbageCollector::makeGC<Function>();
     resolveFunc->isNative = true;
     auto promisePtr = promise;
     resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
@@ -3592,7 +3593,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     };
 
-    auto rejectFunc = std::make_shared<Function>();
+    auto rejectFunc = GarbageCollector::makeGC<Function>();
     rejectFunc->isNative = true;
     rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
       if (!args.empty()) {
@@ -3603,7 +3604,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     };
 
-    auto result = std::make_shared<Object>();
+    auto result = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     result->properties["promise"] = Value(promise);
     result->properties["resolve"] = Value(resolveFunc);
@@ -3613,29 +3614,29 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["withResolvers"] = Value(promiseWithResolvers);
 
   // Promise.all
-  auto promiseAll = std::make_shared<Function>();
+  auto promiseAll = GarbageCollector::makeGC<Function>();
   promiseAll->isNative = true;
   promiseAll->properties["name"] = Value(std::string("all"));
   promiseAll->properties["length"] = Value(1.0);
   promiseAll->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
-      auto promise = std::make_shared<Promise>();
+      auto promise = GarbageCollector::makeGC<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
       promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.all expects an array")));
       return Value(promise);
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto resultPromise = std::make_shared<Promise>();
+    auto arr = args[0].getGC<Array>();
+    auto resultPromise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     resultPromise->properties["__constructor__"] = Value(promiseFunc);
-    auto results = std::make_shared<Array>();
+    auto results = GarbageCollector::makeGC<Array>();
 
     bool hasRejection = false;
     for (const auto& elem : arr->elements) {
       if (elem.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        auto p = elem.getGC<Promise>();
         if (p->state == PromiseState::Rejected) {
           hasRejection = true;
           resultPromise->reject(p->result);
@@ -3657,7 +3658,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["all"] = Value(promiseAll);
 
   // Promise.allSettled - waits for all promises to settle (resolve or reject)
-  auto promiseAllSettled = std::make_shared<Function>();
+  auto promiseAllSettled = GarbageCollector::makeGC<Function>();
   promiseAllSettled->isNative = true;
   promiseAllSettled->properties["__uses_this_arg__"] = Value(true);
   promiseAllSettled->properties["name"] = Value(std::string("allSettled"));
@@ -3667,7 +3668,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     Value iterable = args.size() > 1 ? args[1] : Value(Undefined{});
 
     auto typeErrorValue = [](const std::string& msg) -> Value {
-      return Value(std::make_shared<Error>(ErrorType::TypeError, msg));
+      return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, msg));
     };
 
     auto callWithThis = [](const Value& callee,
@@ -3676,11 +3677,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
                            Value& out,
                            Value& thrown) -> bool {
       if (!callee.isFunction()) {
-        thrown = Value(std::make_shared<Error>(ErrorType::TypeError, "Value is not callable"));
+        thrown = Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Value is not callable"));
         return false;
       }
 
-      auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+      auto fn = callee.getGC<Function>();
       if (fn->isNative) {
         try {
           auto itUsesThis = fn->properties.find("__uses_this_arg__");
@@ -3726,7 +3727,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     auto capResolve = std::make_shared<Value>(Value(Undefined{}));
     auto capReject = std::make_shared<Value>(Value(Undefined{}));
 
-    auto executor = std::make_shared<Function>();
+    auto executor = GarbageCollector::makeGC<Function>();
     executor->isNative = true;
     executor->isConstructor = false;
     executor->nativeFunc = [capResolve, capReject](const std::vector<Value>& executorArgs) -> Value {
@@ -3752,7 +3753,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       Value err = interpreter->getError();
       interpreter->clearError();
       if (err.isError()) {
-        auto errPtr = std::get<std::shared_ptr<Error>>(err.data);
+        auto errPtr = err.getGC<Error>();
         throw std::runtime_error(errPtr->message);
       }
       throw std::runtime_error("TypeError: Failed to construct promise");
@@ -3782,7 +3783,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
                                     Value& out,
                                     bool& found,
                                     Value& thrown) -> bool {
-      auto resolveFromObject = [&](const std::shared_ptr<Object>& obj,
+      auto resolveFromObject = [&](const GCPtr<Object>& obj,
                                    const Value& originalReceiver) -> bool {
         auto current = obj;
         int depth = 0;
@@ -3815,7 +3816,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
             break;
           }
-          current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          current = protoIt->second.getGC<Object>();
         }
         return true;
       };
@@ -3824,10 +3825,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       out = Value(Undefined{});
 
       if (receiver.isObject()) {
-        return resolveFromObject(std::get<std::shared_ptr<Object>>(receiver.data), receiver);
+        return resolveFromObject(receiver.getGC<Object>(), receiver);
       }
       if (receiver.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+        auto fn = receiver.getGC<Function>();
         auto getterIt = fn->properties.find("__get_" + key);
         if (getterIt != fn->properties.end()) {
           found = true;
@@ -3845,7 +3846,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return true;
       }
       if (receiver.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(receiver.data);
+        auto arr = receiver.getGC<Array>();
         auto getterIt = arr->properties.find("__get_" + key);
         if (getterIt != arr->properties.end()) {
           found = true;
@@ -3867,16 +3868,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           return true;
         }
         if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
-          auto arrayObjPtr = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+          auto arrayObjPtr = std::get<GCPtr<Object>>(arrayCtor->data);
           auto protoIt = arrayObjPtr->properties.find("prototype");
           if (protoIt != arrayObjPtr->properties.end() && protoIt->second.isObject()) {
-            return resolveFromObject(std::get<std::shared_ptr<Object>>(protoIt->second.data), receiver);
+            return resolveFromObject(protoIt->second.getGC<Object>(), receiver);
           }
         }
         return true;
       }
       if (receiver.isClass()) {
-        auto cls = std::get<std::shared_ptr<Class>>(receiver.data);
+        auto cls = receiver.getGC<Class>();
         auto getterIt = cls->properties.find("__get_" + key);
         if (getterIt != cls->properties.end()) {
           found = true;
@@ -3907,7 +3908,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return rejectAndReturn(typeErrorValue("Promise.resolve is not callable"));
     }
 
-    auto results = std::make_shared<Array>();
+    auto results = GarbageCollector::makeGC<Array>();
     auto remaining = std::make_shared<size_t>(1);
 
     auto resolveResultPromise = std::make_shared<std::function<void(const Value&)>>();
@@ -3918,13 +3919,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       if (finalValue.isPromise()) {
-        auto nested = std::get<std::shared_ptr<Promise>>(finalValue.data);
+        auto nested = finalValue.getGC<Promise>();
         // Check self-reference
         if (resultPromiseVal->isPromise() &&
-            nested.get() == std::get<std::shared_ptr<Promise>>(resultPromiseVal->data).get()) {
+            nested.get() == std::get<GCPtr<Promise>>(resultPromiseVal->data).get()) {
           *alreadyResolved = true;
           Value out, thrown;
-          callWithThis(*capReject, {Value(std::make_shared<Error>(ErrorType::TypeError, "Cannot resolve promise with itself"))},
+          callWithThis(*capReject, {Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Cannot resolve promise with itself"))},
                        Value(Undefined{}), out, thrown);
           return;
         }
@@ -3967,7 +3968,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         if (hasThen && thenValue.isFunction()) {
           auto alreadyCalled = std::make_shared<bool>(false);
-          auto resolveFn = std::make_shared<Function>();
+          auto resolveFn = GarbageCollector::makeGC<Function>();
           resolveFn->isNative = true;
           resolveFn->nativeFunc = [resolveResultPromise, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
             if (*alreadyCalled) {
@@ -3978,7 +3979,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
             (*resolveResultPromise)(next);
             return Value(Undefined{});
           };
-          auto rejectFn = std::make_shared<Function>();
+          auto rejectFn = GarbageCollector::makeGC<Function>();
           rejectFn->isNative = true;
           rejectFn->nativeFunc = [alreadyResolved, capReject, callWithThis, alreadyCalled](const std::vector<Value>& innerArgs) -> Value {
             if (*alreadyCalled) {
@@ -4017,7 +4018,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     auto finalizeIfDone = [remaining, results, resolveResultPromise]() {
       if (*remaining == 0) {
-        auto valuesArray = std::make_shared<Array>();
+        auto valuesArray = GarbageCollector::makeGC<Array>();
         valuesArray->elements = results->elements;
         (*resolveResultPromise)(Value(valuesArray));
       }
@@ -4037,7 +4038,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
 
       auto alreadyCalled = std::make_shared<bool>(false);
-      auto resolveElement = std::make_shared<Function>();
+      auto resolveElement = GarbageCollector::makeGC<Function>();
       resolveElement->isNative = true;
       resolveElement->properties["length"] = Value(1.0);
       resolveElement->properties["name"] = Value(std::string(""));
@@ -4047,7 +4048,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         *alreadyCalled = true;
         Value settledValue = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
-        auto entry = std::make_shared<Object>();
+        auto entry = GarbageCollector::makeGC<Object>();
         entry->properties["status"] = Value(std::string("fulfilled"));
         entry->properties["value"] = settledValue;
         results->elements[index] = Value(entry);
@@ -4056,7 +4057,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return Value(Undefined{});
       };
 
-      auto rejectElement = std::make_shared<Function>();
+      auto rejectElement = GarbageCollector::makeGC<Function>();
       rejectElement->isNative = true;
       rejectElement->properties["length"] = Value(1.0);
       rejectElement->properties["name"] = Value(std::string(""));
@@ -4066,7 +4067,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         *alreadyCalled = true;
         Value settledReason = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
-        auto entry = std::make_shared<Object>();
+        auto entry = GarbageCollector::makeGC<Object>();
         entry->properties["status"] = Value(std::string("rejected"));
         entry->properties["reason"] = settledReason;
         results->elements[index] = Value(entry);
@@ -4076,7 +4077,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       };
 
       if (nextPromise.isPromise()) {
-        auto promisePtr = std::get<std::shared_ptr<Promise>>(nextPromise.data);
+        auto promisePtr = nextPromise.getGC<Promise>();
         Value overriddenThen = Value(Undefined{});
         bool hasOverriddenThen = false;
 
@@ -4175,7 +4176,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     // Check if array has a custom/poisoned Symbol.iterator getter before using fast path
     bool useArrayFastPath = false;
     if (iterable.isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(iterable.data);
+      auto arr = iterable.getGC<Array>();
       auto getterIt = arr->properties.find("__get_" + iteratorKey);
       auto propIt = arr->properties.find(iteratorKey);
       if (getterIt == arr->properties.end() && propIt == arr->properties.end()) {
@@ -4183,7 +4184,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       }
     }
     if (useArrayFastPath) {
-      auto arr = std::get<std::shared_ptr<Array>>(iterable.data);
+      auto arr = iterable.getGC<Array>();
       for (const auto& value : arr->elements) {
         Value failureReason;
         if (!processElement(nextIndex++, value, failureReason)) {
@@ -4276,37 +4277,37 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["allSettled"] = Value(promiseAllSettled);
 
   // Promise.any - resolves when any promise fulfills, rejects if all reject
-  auto promiseAny = std::make_shared<Function>();
+  auto promiseAny = GarbageCollector::makeGC<Function>();
   promiseAny->isNative = true;
   promiseAny->properties["name"] = Value(std::string("any"));
   promiseAny->properties["length"] = Value(1.0);
   promiseAny->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
-      auto promise = std::make_shared<Promise>();
+      auto promise = GarbageCollector::makeGC<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
       promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.any expects an array")));
       return Value(promise);
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto resultPromise = std::make_shared<Promise>();
+    auto arr = args[0].getGC<Array>();
+    auto resultPromise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
     if (arr->elements.empty()) {
       // Empty array - reject with AggregateError
-      auto err = std::make_shared<Error>(ErrorType::Error, "All promises were rejected");
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, "All promises were rejected");
       resultPromise->reject(Value(err));
       return Value(resultPromise);
     }
 
-    auto errors = std::make_shared<Array>();
+    auto errors = GarbageCollector::makeGC<Array>();
     bool hasResolved = false;
 
     for (const auto& elem : arr->elements) {
       if (elem.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        auto p = elem.getGC<Promise>();
         if (p->state == PromiseState::Fulfilled && !hasResolved) {
           hasResolved = true;
           resultPromise->resolve(p->result);
@@ -4326,7 +4327,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (!hasResolved) {
       // All rejected - create AggregateError-like object
-      auto err = std::make_shared<Error>(ErrorType::Error, "All promises were rejected");
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, "All promises were rejected");
       resultPromise->reject(Value(err));
     }
 
@@ -4335,27 +4336,27 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["any"] = Value(promiseAny);
 
   // Promise.race - resolves or rejects with the first settled promise
-  auto promiseRace = std::make_shared<Function>();
+  auto promiseRace = GarbageCollector::makeGC<Function>();
   promiseRace->isNative = true;
   promiseRace->properties["name"] = Value(std::string("race"));
   promiseRace->properties["length"] = Value(1.0);
   promiseRace->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArray()) {
-      auto promise = std::make_shared<Promise>();
+      auto promise = GarbageCollector::makeGC<Promise>();
       GarbageCollector::instance().reportAllocation(sizeof(Promise));
       promise->properties["__constructor__"] = Value(promiseFunc);
       promise->reject(Value(std::string("Promise.race expects an array")));
       return Value(promise);
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto resultPromise = std::make_shared<Promise>();
+    auto arr = args[0].getGC<Array>();
+    auto resultPromise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     resultPromise->properties["__constructor__"] = Value(promiseFunc);
 
     for (const auto& elem : arr->elements) {
       if (elem.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(elem.data);
+        auto p = elem.getGC<Promise>();
         if (p->state == PromiseState::Fulfilled) {
           resultPromise->resolve(p->result);
           break;
@@ -4376,15 +4377,15 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Promise constructor function
   promiseFunc->nativeFunc = [promiseFunc](const std::vector<Value>& args) -> Value {
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     promise->properties["__constructor__"] = Value(promiseFunc);
 
     if (!args.empty() && args[0].isFunction()) {
-      auto executor = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto executor = args[0].getGC<Function>();
 
       // Create resolve and reject functions
-      auto resolveFunc = std::make_shared<Function>();
+      auto resolveFunc = GarbageCollector::makeGC<Function>();
       resolveFunc->isNative = true;
       auto promisePtr = promise;
       resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
@@ -4396,7 +4397,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return Value(Undefined{});
       };
 
-      auto rejectFunc = std::make_shared<Function>();
+      auto rejectFunc = GarbageCollector::makeGC<Function>();
       rejectFunc->isNative = true;
       rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
@@ -4425,7 +4426,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
             promise->reject(err);
           }
         } else {
-          promise->reject(Value(std::make_shared<Error>(ErrorType::TypeError, "Interpreter unavailable")));
+          promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Interpreter unavailable")));
         }
       }
     }
@@ -4440,17 +4441,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("__intrinsic_Promise__", Value(promiseFunc));
 
   // JSON object
-  auto jsonObj = std::make_shared<Object>();
+  auto jsonObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // JSON.parse
-  auto jsonParse = std::make_shared<Function>();
+  auto jsonParse = GarbageCollector::makeGC<Function>();
   jsonParse->isNative = true;
   jsonParse->nativeFunc = JSON_parse;
   jsonObj->properties["parse"] = Value(jsonParse);
 
   // JSON.stringify
-  auto jsonStringify = std::make_shared<Function>();
+  auto jsonStringify = GarbageCollector::makeGC<Function>();
   jsonStringify->isNative = true;
   jsonStringify->nativeFunc = JSON_stringify;
   jsonObj->properties["stringify"] = Value(jsonStringify);
@@ -4458,7 +4459,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("JSON", Value(jsonObj));
 
   // Object static methods
-  auto objectConstructor = std::make_shared<Function>();
+  auto objectConstructor = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   objectConstructor->isNative = true;
   objectConstructor->isConstructor = true;
@@ -4466,7 +4467,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["length"] = Value(1.0);
   objectConstructor->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
-      auto obj = std::make_shared<Object>();
+      auto obj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       return Value(obj);
     }
@@ -4477,17 +4478,17 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return value;
     }
 
-    auto wrapped = std::make_shared<Object>();
+    auto wrapped = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     wrapped->properties["__primitive_value__"] = value;
 
     if (!value.isBigInt()) {
-      auto valueOf = std::make_shared<Function>();
+      auto valueOf = GarbageCollector::makeGC<Function>();
       valueOf->isNative = true;
       valueOf->properties["__uses_this_arg__"] = Value(true);
       valueOf->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
         if (!callArgs.empty() && callArgs[0].isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(callArgs[0].data);
+          auto obj = callArgs[0].getGC<Object>();
           auto it = obj->properties.find("__primitive_value__");
           if (it != obj->properties.end()) {
             return it->second;
@@ -4497,12 +4498,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       };
       wrapped->properties["valueOf"] = Value(valueOf);
 
-      auto toString = std::make_shared<Function>();
+      auto toString = GarbageCollector::makeGC<Function>();
       toString->isNative = true;
       toString->properties["__uses_this_arg__"] = Value(true);
       toString->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
         if (!callArgs.empty() && callArgs[0].isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(callArgs[0].data);
+          auto obj = callArgs[0].getGC<Object>();
           auto it = obj->properties.find("__primitive_value__");
           if (it != obj->properties.end()) {
             return Value(it->second.toString());
@@ -4516,7 +4517,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (value.isBigInt()) {
       if (auto bigIntCtor = env->get("BigInt")) {
         if (bigIntCtor->isFunction()) {
-          auto ctor = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
+          auto ctor = std::get<GCPtr<Function>>(bigIntCtor->data);
           auto protoIt = ctor->properties.find("prototype");
           if (protoIt != ctor->properties.end() && protoIt->second.isObject()) {
             wrapped->properties["__proto__"] = protoIt->second;
@@ -4528,20 +4529,20 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(wrapped);
   };
 
-  auto objectPrototype = std::make_shared<Object>();
+  auto objectPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   objectConstructor->properties["prototype"] = Value(objectPrototype);
   objectPrototype->properties["constructor"] = Value(objectConstructor);
   objectPrototype->properties["__non_enum_constructor"] = Value(true);
 
-  auto objectProtoHasOwnProperty = std::make_shared<Function>();
+  auto objectProtoHasOwnProperty = GarbageCollector::makeGC<Function>();
   objectProtoHasOwnProperty->isNative = true;
   objectProtoHasOwnProperty->properties["__uses_this_arg__"] = Value(true);
   objectProtoHasOwnProperty->nativeFunc = Object_hasOwnProperty;
   objectPrototype->properties["hasOwnProperty"] = Value(objectProtoHasOwnProperty);
   objectPrototype->properties["__non_enum_hasOwnProperty"] = Value(true);
 
-  auto objectProtoToString = std::make_shared<Function>();
+  auto objectProtoToString = GarbageCollector::makeGC<Function>();
   objectProtoToString->isNative = true;
   objectProtoToString->properties["__uses_this_arg__"] = Value(true);
   objectProtoToString->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -4554,7 +4555,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     std::string tag = "Object";
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       auto toStringTagIt = obj->properties.find(WellKnownSymbols::toStringTagKey());
       if (toStringTagIt != obj->properties.end()) {
         tag = toStringTagIt->second.toString();
@@ -4570,7 +4571,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectPrototype->properties["__non_enum_toString"] = Value(true);
 
   // Object.prototype.propertyIsEnumerable
-  auto objectProtoPropertyIsEnumerable = std::make_shared<Function>();
+  auto objectProtoPropertyIsEnumerable = GarbageCollector::makeGC<Function>();
   objectProtoPropertyIsEnumerable->isNative = true;
   objectProtoPropertyIsEnumerable->properties["__uses_this_arg__"] = Value(true);
   objectProtoPropertyIsEnumerable->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -4579,7 +4580,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string key = args[1].toString();
 
     if (thisVal.isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(thisVal.data);
+      auto fn = thisVal.getGC<Function>();
       // name, length, prototype are non-enumerable on functions
       if (key == "name" || key == "length" || key == "prototype") return Value(false);
       // Internal properties
@@ -4592,7 +4593,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(enumIt != fn->properties.end());
     }
     if (thisVal.isClass()) {
-      auto cls = std::get<std::shared_ptr<Class>>(thisVal.data);
+      auto cls = thisVal.getGC<Class>();
       // Internal properties
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
           key.substr(key.size() - 2) == "__") return Value(false);
@@ -4606,7 +4607,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(enumIt != cls->properties.end());
     }
     if (thisVal.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(thisVal.data);
+      auto obj = thisVal.getGC<Object>();
       if (obj->isModuleNamespace) {
         if (key == WellKnownSymbols::toStringTagKey()) {
           return Value(false);
@@ -4617,7 +4618,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         auto getterIt = obj->properties.find("__get_" + key);
         if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-          auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+          auto getter = getterIt->second.getGC<Function>();
           if (getter && getter->isNative) {
             getter->nativeFunc({});
           }
@@ -4633,7 +4634,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(neIt == obj->properties.end());
     }
     if (thisVal.isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(thisVal.data);
+      auto arr = thisVal.getGC<Array>();
       // Check if it's a valid index
       try {
         size_t idx = std::stoull(key);
@@ -4650,49 +4651,49 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectPrototype->properties["__non_enum_propertyIsEnumerable"] = Value(true);
 
   // Object.keys
-  auto objectKeys = std::make_shared<Function>();
+  auto objectKeys = GarbageCollector::makeGC<Function>();
   objectKeys->isNative = true;
   objectKeys->nativeFunc = Object_keys;
   objectConstructor->properties["keys"] = Value(objectKeys);
 
   // Object.values
-  auto objectValues = std::make_shared<Function>();
+  auto objectValues = GarbageCollector::makeGC<Function>();
   objectValues->isNative = true;
   objectValues->nativeFunc = Object_values;
   objectConstructor->properties["values"] = Value(objectValues);
 
   // Object.entries
-  auto objectEntries = std::make_shared<Function>();
+  auto objectEntries = GarbageCollector::makeGC<Function>();
   objectEntries->isNative = true;
   objectEntries->nativeFunc = Object_entries;
   objectConstructor->properties["entries"] = Value(objectEntries);
 
   // Object.assign
-  auto objectAssign = std::make_shared<Function>();
+  auto objectAssign = GarbageCollector::makeGC<Function>();
   objectAssign->isNative = true;
   objectAssign->nativeFunc = Object_assign;
   objectConstructor->properties["assign"] = Value(objectAssign);
 
   // Object.hasOwnProperty (for prototypal access)
-  auto objectHasOwnProperty = std::make_shared<Function>();
+  auto objectHasOwnProperty = GarbageCollector::makeGC<Function>();
   objectHasOwnProperty->isNative = true;
   objectHasOwnProperty->nativeFunc = Object_hasOwnProperty;
   objectConstructor->properties["hasOwnProperty"] = Value(objectHasOwnProperty);
 
   // Object.getOwnPropertyNames
-  auto objectGetOwnPropertyNames = std::make_shared<Function>();
+  auto objectGetOwnPropertyNames = GarbageCollector::makeGC<Function>();
   objectGetOwnPropertyNames->isNative = true;
   objectGetOwnPropertyNames->nativeFunc = Object_getOwnPropertyNames;
   objectConstructor->properties["getOwnPropertyNames"] = Value(objectGetOwnPropertyNames);
 
-  auto objectGetOwnPropertySymbols = std::make_shared<Function>();
+  auto objectGetOwnPropertySymbols = GarbageCollector::makeGC<Function>();
   objectGetOwnPropertySymbols->isNative = true;
   objectGetOwnPropertySymbols->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto result = std::make_shared<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     if (args.empty() || !args[0].isObject()) {
       return Value(result);
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     auto appendSymbolForKey = [&](const std::string& key) {
       if (key == WellKnownSymbols::iteratorKey()) {
         result->elements.push_back(WellKnownSymbols::iterator());
@@ -4722,25 +4723,25 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["getOwnPropertySymbols"] = Value(objectGetOwnPropertySymbols);
 
   // Object.create
-  auto objectCreate = std::make_shared<Function>();
+  auto objectCreate = GarbageCollector::makeGC<Function>();
   objectCreate->isNative = true;
   objectCreate->nativeFunc = Object_create;
   objectConstructor->properties["create"] = Value(objectCreate);
 
   // Object.fromEntries - converts array of [key, value] pairs to object
-  auto objectFromEntries = std::make_shared<Function>();
+  auto objectFromEntries = GarbageCollector::makeGC<Function>();
   objectFromEntries->isNative = true;
   objectFromEntries->nativeFunc = Object_fromEntries;
   objectConstructor->properties["fromEntries"] = Value(objectFromEntries);
 
   // Object.hasOwn - checks if object has own property
-  auto objectHasOwn = std::make_shared<Function>();
+  auto objectHasOwn = GarbageCollector::makeGC<Function>();
   objectHasOwn->isNative = true;
   objectHasOwn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
     std::string key = args[1].toString();
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
         if (key == WellKnownSymbols::toStringTagKey()) {
           return Value(true);
@@ -4750,7 +4751,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         }
         auto getterIt = obj->properties.find("__get_" + key);
         if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-          auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+          auto getter = getterIt->second.getGC<Function>();
           if (getter && getter->isNative) {
             getter->nativeFunc({});
           }
@@ -4760,7 +4761,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(obj->properties.find(key) != obj->properties.end());
     }
     if (args[0].isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+      auto arr = args[0].getGC<Array>();
       // Check numeric index
       try {
         size_t idx = std::stoul(key);
@@ -4773,7 +4774,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectConstructor->properties["hasOwn"] = Value(objectHasOwn);
 
-  auto objectGetPrototypeOf = std::make_shared<Function>();
+  auto objectGetPrototypeOf = GarbageCollector::makeGC<Function>();
   objectGetPrototypeOf->isNative = true;
   objectGetPrototypeOf->nativeFunc = [promisePrototype, env](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -4784,7 +4785,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
     if (args[0].isArray()) {
       if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
-        auto arrayObj = std::get<std::shared_ptr<Object>>(arrayCtor->data);
+        auto arrayObj = std::get<GCPtr<Object>>(arrayCtor->data);
         auto protoIt = arrayObj->properties.find("prototype");
         if (protoIt != arrayObj->properties.end()) {
           return protoIt->second;
@@ -4796,7 +4797,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Null{});
     }
     if (args[0].isError()) {
-      auto err = std::get<std::shared_ptr<Error>>(args[0].data);
+      auto err = args[0].getGC<Error>();
       std::string ctorName = "Error";
       switch (err->type) {
         case ErrorType::TypeError:
@@ -4823,7 +4824,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           break;
       }
       if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(ctor->data);
+        auto fn = std::get<GCPtr<Function>>(ctor->data);
         auto protoIt = fn->properties.find("prototype");
         if (protoIt != fn->properties.end()) {
           return protoIt->second;
@@ -4832,14 +4833,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Null{});
     }
     if (args[0].isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto fn = args[0].getGC<Function>();
       auto protoIt = fn->properties.find("__proto__");
       if (protoIt != fn->properties.end()) {
         return protoIt->second;
       }
       // Default: Function.prototype
       if (auto funcCtor = env->get("Function"); funcCtor && funcCtor->isFunction()) {
-        auto funcFn = std::get<std::shared_ptr<Function>>(funcCtor->data);
+        auto funcFn = std::get<GCPtr<Function>>(funcCtor->data);
         auto fpIt = funcFn->properties.find("prototype");
         if (fpIt != funcFn->properties.end()) {
           return fpIt->second;
@@ -4850,7 +4851,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args[0].isBigInt()) {
       // Return BigInt.prototype
       if (auto bigIntCtor = env->get("BigInt"); bigIntCtor && bigIntCtor->isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
+        auto fn = std::get<GCPtr<Function>>(bigIntCtor->data);
         auto protoIt = fn->properties.find("prototype");
         if (protoIt != fn->properties.end()) {
           return protoIt->second;
@@ -4859,7 +4860,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Null{});
     }
     if (args[0].isGenerator()) {
-      auto gen = std::get<std::shared_ptr<Generator>>(args[0].data);
+      auto gen = args[0].getGC<Generator>();
       auto it = gen->properties.find("__proto__");
       if (it != gen->properties.end()) {
         return it->second;
@@ -4869,7 +4870,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (!args[0].isObject()) {
       return Value(Null{});
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
       return Value(Null{});
     }
@@ -4881,13 +4882,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectConstructor->properties["getPrototypeOf"] = Value(objectGetPrototypeOf);
 
-  auto objectSetPrototypeOf = std::make_shared<Function>();
+  auto objectSetPrototypeOf = GarbageCollector::makeGC<Function>();
   objectSetPrototypeOf->isNative = true;
   objectSetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 || !args[0].isObject()) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
       if (args[1].isNull()) {
         return args[0];
@@ -4899,7 +4900,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectConstructor->properties["setPrototypeOf"] = Value(objectSetPrototypeOf);
 
-  auto objectIsExtensible = std::make_shared<Function>();
+  auto objectIsExtensible = GarbageCollector::makeGC<Function>();
   objectIsExtensible->isNative = true;
   objectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
@@ -4909,7 +4910,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (!args[0].isObject()) {
       return Value(false);
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
       return Value(false);
     }
@@ -4917,13 +4918,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   objectConstructor->properties["isExtensible"] = Value(objectIsExtensible);
 
-  auto objectPreventExtensions = std::make_shared<Function>();
+  auto objectPreventExtensions = GarbageCollector::makeGC<Function>();
   objectPreventExtensions->isNative = true;
   objectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (!obj->isModuleNamespace) {
       obj->sealed = true;
     }
@@ -4932,13 +4933,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["preventExtensions"] = Value(objectPreventExtensions);
 
   // Object.freeze - makes an object immutable
-  auto objectFreeze = std::make_shared<Function>();
+  auto objectFreeze = GarbageCollector::makeGC<Function>();
   objectFreeze->isNative = true;
   objectFreeze->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
       throw std::runtime_error("TypeError: Cannot freeze module namespace object");
     }
@@ -4949,44 +4950,44 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["freeze"] = Value(objectFreeze);
 
   // Object.seal - prevents adding or removing properties
-  auto objectSeal = std::make_shared<Function>();
+  auto objectSeal = GarbageCollector::makeGC<Function>();
   objectSeal->isNative = true;
   objectSeal->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     obj->sealed = true;
     return args[0];
   };
   objectConstructor->properties["seal"] = Value(objectSeal);
 
   // Object.isFrozen - check if object is frozen
-  auto objectIsFrozen = std::make_shared<Function>();
+  auto objectIsFrozen = GarbageCollector::makeGC<Function>();
   objectIsFrozen->isNative = true;
   objectIsFrozen->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return Value(true);  // Non-objects are considered frozen
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     return Value(obj->frozen);
   };
   objectConstructor->properties["isFrozen"] = Value(objectIsFrozen);
 
   // Object.isSealed - check if object is sealed
-  auto objectIsSealed = std::make_shared<Function>();
+  auto objectIsSealed = GarbageCollector::makeGC<Function>();
   objectIsSealed->isNative = true;
   objectIsSealed->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isObject()) {
       return Value(true);  // Non-objects are considered sealed
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+    auto obj = args[0].getGC<Object>();
     return Value(obj->sealed);
   };
   objectConstructor->properties["isSealed"] = Value(objectIsSealed);
 
   // Object.is - SameValue comparison (handles NaN and -0 correctly)
-  auto objectIs = std::make_shared<Function>();
+  auto objectIs = GarbageCollector::makeGC<Function>();
   objectIs->isNative = true;
   objectIs->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
@@ -5020,16 +5021,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
     // For objects, check reference equality
     if (a.isObject() && b.isObject()) {
-      return Value(std::get<std::shared_ptr<Object>>(a.data).get() ==
-                   std::get<std::shared_ptr<Object>>(b.data).get());
+      return Value(a.getGC<Object>().get() ==
+                   b.getGC<Object>().get());
     }
     if (a.isArray() && b.isArray()) {
-      return Value(std::get<std::shared_ptr<Array>>(a.data).get() ==
-                   std::get<std::shared_ptr<Array>>(b.data).get());
+      return Value(a.getGC<Array>().get() ==
+                   b.getGC<Array>().get());
     }
     if (a.isFunction() && b.isFunction()) {
-      return Value(std::get<std::shared_ptr<Function>>(a.data).get() ==
-                   std::get<std::shared_ptr<Function>>(b.data).get());
+      return Value(a.getGC<Function>().get() ==
+                   b.getGC<Function>().get());
     }
 
     return Value(false);
@@ -5037,7 +5038,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["is"] = Value(objectIs);
 
   // Object.getOwnPropertyDescriptor - get property descriptor
-  auto objectGetOwnPropertyDescriptor = std::make_shared<Function>();
+  auto objectGetOwnPropertyDescriptor = GarbageCollector::makeGC<Function>();
   objectGetOwnPropertyDescriptor->isNative = true;
   objectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 ||
@@ -5046,11 +5047,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
     std::string key = args[1].toString();
 
-    auto descriptor = std::make_shared<Object>();
+    auto descriptor = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
     if (args[0].isClass()) {
-      auto cls = std::get<std::shared_ptr<Class>>(args[0].data);
+      auto cls = args[0].getGC<Class>();
       // Internal properties are not visible
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
           key.substr(key.size() - 2) == "__") {
@@ -5091,7 +5092,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
 
     if (args[0].isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+      auto fn = args[0].getGC<Function>();
 
       // Internal properties are not visible
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
@@ -5142,7 +5143,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
 
     if (args[0].isPromise()) {
-      auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+      auto promise = args[0].getGC<Promise>();
       auto getterIt = promise->properties.find("__get_" + key);
       if (getterIt != promise->properties.end() && getterIt->second.isFunction()) {
         descriptor->properties["get"] = getterIt->second;
@@ -5162,7 +5163,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     }
 
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
         if (key == WellKnownSymbols::toStringTagKey()) {
           descriptor->properties["value"] = Value(std::string("Module"));
@@ -5236,7 +5237,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(descriptor);
     }
 
-    auto regex = std::get<std::shared_ptr<Regex>>(args[0].data);
+    auto regex = args[0].getGC<Regex>();
     auto getterIt = regex->properties.find("__get_" + key);
     if (getterIt != regex->properties.end() && getterIt->second.isFunction()) {
       descriptor->properties["get"] = getterIt->second;
@@ -5261,22 +5262,22 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["getOwnPropertyDescriptor"] = Value(objectGetOwnPropertyDescriptor);
 
   // Object.getOwnPropertyDescriptors (plural)
-  auto objectGetOwnPropertyDescriptors = std::make_shared<Function>();
+  auto objectGetOwnPropertyDescriptors = GarbageCollector::makeGC<Function>();
   objectGetOwnPropertyDescriptors->isNative = true;
   objectGetOwnPropertyDescriptors->nativeFunc = [objectGetOwnPropertyDescriptor](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Undefined{});
-    auto result = std::make_shared<Object>();
+    auto result = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     // Collect keys from the target object
     OrderedMap<std::string, Value>* props = nullptr;
     if (args[0].isObject()) {
-      props = &std::get<std::shared_ptr<Object>>(args[0].data)->properties;
+      props = &args[0].getGC<Object>()->properties;
     } else if (args[0].isFunction()) {
-      props = &std::get<std::shared_ptr<Function>>(args[0].data)->properties;
+      props = &args[0].getGC<Function>()->properties;
     } else if (args[0].isClass()) {
-      props = &std::get<std::shared_ptr<Class>>(args[0].data)->properties;
+      props = &args[0].getGC<Class>()->properties;
     } else if (args[0].isArray()) {
-      props = &std::get<std::shared_ptr<Array>>(args[0].data)->properties;
+      props = &args[0].getGC<Array>()->properties;
     }
     if (props) {
       for (const auto& key : props->orderedKeys()) {
@@ -5298,7 +5299,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["getOwnPropertyDescriptors"] = Value(objectGetOwnPropertyDescriptors);
 
   // Object.defineProperty - define property with descriptor
-  auto objectDefineProperty = std::make_shared<Function>();
+  auto objectDefineProperty = GarbageCollector::makeGC<Function>();
   objectDefineProperty->isNative = true;
   objectDefineProperty->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 3 ||
@@ -5308,7 +5309,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     std::string key = args[1].toString();
 
     if (args[2].isObject()) {
-      auto descriptor = std::get<std::shared_ptr<Object>>(args[2].data);
+      auto descriptor = args[2].getGC<Object>();
       auto readDescriptorField = [&](const std::string& name) -> std::optional<Value> {
         auto it = descriptor->properties.find(name);
         if (it != descriptor->properties.end()) {
@@ -5326,7 +5327,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return std::nullopt;
       };
       if (args[0].isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+        auto obj = args[0].getGC<Object>();
         if (obj->isModuleNamespace) {
           if (!defineModuleNamespaceProperty(obj, key, descriptor)) {
             throw std::runtime_error("TypeError: Cannot redefine module namespace property");
@@ -5382,7 +5383,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           }
         }
       } else if (args[0].isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto fn = args[0].getGC<Function>();
         if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
           fn->properties[key] = *valueField;
         }
@@ -5397,7 +5398,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           fn->properties["__set_" + key] = *setField;
         }
       } else if (args[0].isPromise()) {
-        auto promise = std::get<std::shared_ptr<Promise>>(args[0].data);
+        auto promise = args[0].getGC<Promise>();
         if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
           promise->properties[key] = *valueField;
         }
@@ -5412,7 +5413,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           promise->properties["__set_" + key] = *setField;
         }
       } else if (args[0].isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+        auto arr = args[0].getGC<Array>();
         if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
           // For numeric keys, set in elements array; for others, use properties
           bool isNumeric = true;
@@ -5470,7 +5471,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
           }
         }
       } else if (args[0].isRegex()) {
-        auto regex = std::get<std::shared_ptr<Regex>>(args[0].data);
+        auto regex = args[0].getGC<Regex>();
         if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
           regex->properties[key] = *valueField;
         }
@@ -5491,14 +5492,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   objectConstructor->properties["defineProperty"] = Value(objectDefineProperty);
 
   // Object.defineProperties - define multiple properties
-  auto objectDefineProperties = std::make_shared<Function>();
+  auto objectDefineProperties = GarbageCollector::makeGC<Function>();
   objectDefineProperties->isNative = true;
   objectDefineProperties->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 || !args[0].isObject() || !args[1].isObject()) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-    auto props = std::get<std::shared_ptr<Object>>(args[1].data);
+    auto obj = args[0].getGC<Object>();
+    auto props = args[1].getGC<Object>();
 
     if (obj->frozen) {
       return args[0];
@@ -5509,7 +5510,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         continue;  // Skip new properties on sealed object
       }
       if (descriptor.isObject()) {
-        auto descObj = std::get<std::shared_ptr<Object>>(descriptor.data);
+        auto descObj = descriptor.getGC<Object>();
         auto valueIt = descObj->properties.find("value");
         if (valueIt != descObj->properties.end()) {
           obj->properties[key] = valueIt->second;
@@ -5523,7 +5524,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Object", Value(objectConstructor));
 
   // Math object
-  auto mathObj = std::make_shared<Object>();
+  auto mathObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Math constants
@@ -5537,133 +5538,133 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   mathObj->properties["SQRT2"] = Value(1.4142135623730951);
 
   // Math methods
-  auto mathAbs = std::make_shared<Function>();
+  auto mathAbs = GarbageCollector::makeGC<Function>();
   mathAbs->isNative = true;
   mathAbs->nativeFunc = Math_abs;
   mathObj->properties["abs"] = Value(mathAbs);
 
-  auto mathCeil = std::make_shared<Function>();
+  auto mathCeil = GarbageCollector::makeGC<Function>();
   mathCeil->isNative = true;
   mathCeil->nativeFunc = Math_ceil;
   mathObj->properties["ceil"] = Value(mathCeil);
 
-  auto mathFloor = std::make_shared<Function>();
+  auto mathFloor = GarbageCollector::makeGC<Function>();
   mathFloor->isNative = true;
   mathFloor->nativeFunc = Math_floor;
   mathObj->properties["floor"] = Value(mathFloor);
 
-  auto mathRound = std::make_shared<Function>();
+  auto mathRound = GarbageCollector::makeGC<Function>();
   mathRound->isNative = true;
   mathRound->nativeFunc = Math_round;
   mathObj->properties["round"] = Value(mathRound);
 
-  auto mathTrunc = std::make_shared<Function>();
+  auto mathTrunc = GarbageCollector::makeGC<Function>();
   mathTrunc->isNative = true;
   mathTrunc->nativeFunc = Math_trunc;
   mathObj->properties["trunc"] = Value(mathTrunc);
 
-  auto mathMax = std::make_shared<Function>();
+  auto mathMax = GarbageCollector::makeGC<Function>();
   mathMax->isNative = true;
   mathMax->nativeFunc = Math_max;
   mathObj->properties["max"] = Value(mathMax);
 
-  auto mathMin = std::make_shared<Function>();
+  auto mathMin = GarbageCollector::makeGC<Function>();
   mathMin->isNative = true;
   mathMin->nativeFunc = Math_min;
   mathObj->properties["min"] = Value(mathMin);
 
-  auto mathPow = std::make_shared<Function>();
+  auto mathPow = GarbageCollector::makeGC<Function>();
   mathPow->isNative = true;
   mathPow->nativeFunc = Math_pow;
   mathObj->properties["pow"] = Value(mathPow);
 
-  auto mathSqrt = std::make_shared<Function>();
+  auto mathSqrt = GarbageCollector::makeGC<Function>();
   mathSqrt->isNative = true;
   mathSqrt->nativeFunc = Math_sqrt;
   mathObj->properties["sqrt"] = Value(mathSqrt);
 
-  auto mathSin = std::make_shared<Function>();
+  auto mathSin = GarbageCollector::makeGC<Function>();
   mathSin->isNative = true;
   mathSin->nativeFunc = Math_sin;
   mathObj->properties["sin"] = Value(mathSin);
 
-  auto mathCos = std::make_shared<Function>();
+  auto mathCos = GarbageCollector::makeGC<Function>();
   mathCos->isNative = true;
   mathCos->nativeFunc = Math_cos;
   mathObj->properties["cos"] = Value(mathCos);
 
-  auto mathTan = std::make_shared<Function>();
+  auto mathTan = GarbageCollector::makeGC<Function>();
   mathTan->isNative = true;
   mathTan->nativeFunc = Math_tan;
   mathObj->properties["tan"] = Value(mathTan);
 
-  auto mathRandom = std::make_shared<Function>();
+  auto mathRandom = GarbageCollector::makeGC<Function>();
   mathRandom->isNative = true;
   mathRandom->nativeFunc = Math_random;
   mathObj->properties["random"] = Value(mathRandom);
 
-  auto mathSign = std::make_shared<Function>();
+  auto mathSign = GarbageCollector::makeGC<Function>();
   mathSign->isNative = true;
   mathSign->nativeFunc = Math_sign;
   mathObj->properties["sign"] = Value(mathSign);
 
-  auto mathLog = std::make_shared<Function>();
+  auto mathLog = GarbageCollector::makeGC<Function>();
   mathLog->isNative = true;
   mathLog->nativeFunc = Math_log;
   mathObj->properties["log"] = Value(mathLog);
 
-  auto mathLog10 = std::make_shared<Function>();
+  auto mathLog10 = GarbageCollector::makeGC<Function>();
   mathLog10->isNative = true;
   mathLog10->nativeFunc = Math_log10;
   mathObj->properties["log10"] = Value(mathLog10);
 
-  auto mathExp = std::make_shared<Function>();
+  auto mathExp = GarbageCollector::makeGC<Function>();
   mathExp->isNative = true;
   mathExp->nativeFunc = Math_exp;
   mathObj->properties["exp"] = Value(mathExp);
 
-  auto mathCbrt = std::make_shared<Function>();
+  auto mathCbrt = GarbageCollector::makeGC<Function>();
   mathCbrt->isNative = true;
   mathCbrt->nativeFunc = Math_cbrt;
   mathObj->properties["cbrt"] = Value(mathCbrt);
 
-  auto mathLog2 = std::make_shared<Function>();
+  auto mathLog2 = GarbageCollector::makeGC<Function>();
   mathLog2->isNative = true;
   mathLog2->nativeFunc = Math_log2;
   mathObj->properties["log2"] = Value(mathLog2);
 
-  auto mathHypot = std::make_shared<Function>();
+  auto mathHypot = GarbageCollector::makeGC<Function>();
   mathHypot->isNative = true;
   mathHypot->nativeFunc = Math_hypot;
   mathObj->properties["hypot"] = Value(mathHypot);
 
-  auto mathExpm1 = std::make_shared<Function>();
+  auto mathExpm1 = GarbageCollector::makeGC<Function>();
   mathExpm1->isNative = true;
   mathExpm1->nativeFunc = Math_expm1;
   mathObj->properties["expm1"] = Value(mathExpm1);
 
-  auto mathLog1p = std::make_shared<Function>();
+  auto mathLog1p = GarbageCollector::makeGC<Function>();
   mathLog1p->isNative = true;
   mathLog1p->nativeFunc = Math_log1p;
   mathObj->properties["log1p"] = Value(mathLog1p);
 
-  auto mathFround = std::make_shared<Function>();
+  auto mathFround = GarbageCollector::makeGC<Function>();
   mathFround->isNative = true;
   mathFround->nativeFunc = Math_fround;
   mathObj->properties["fround"] = Value(mathFround);
 
-  auto mathClz32 = std::make_shared<Function>();
+  auto mathClz32 = GarbageCollector::makeGC<Function>();
   mathClz32->isNative = true;
   mathClz32->nativeFunc = Math_clz32;
   mathObj->properties["clz32"] = Value(mathClz32);
 
-  auto mathImul = std::make_shared<Function>();
+  auto mathImul = GarbageCollector::makeGC<Function>();
   mathImul->isNative = true;
   mathImul->nativeFunc = Math_imul;
   mathObj->properties["imul"] = Value(mathImul);
 
   auto registerMathFn = [&](const std::string& name, std::function<Value(const std::vector<Value>&)> fn, int length = 1) {
-    auto f = std::make_shared<Function>();
+    auto f = GarbageCollector::makeGC<Function>();
     f->isNative = true;
     f->nativeFunc = fn;
     f->properties["name"] = Value(name);
@@ -5689,7 +5690,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Math", Value(mathObj));
 
   // Date constructor
-  auto dateConstructor = std::make_shared<Function>();
+  auto dateConstructor = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
   dateConstructor->isNative = true;
   dateConstructor->isConstructor = true;
@@ -5710,12 +5711,12 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // Date static methods
-  auto dateNow = std::make_shared<Function>();
+  auto dateNow = GarbageCollector::makeGC<Function>();
   dateNow->isNative = true;
   dateNow->nativeFunc = Date_now;
   dateConstructor->properties["now"] = Value(dateNow);
 
-  auto dateParse = std::make_shared<Function>();
+  auto dateParse = GarbageCollector::makeGC<Function>();
   dateParse->isNative = true;
   dateParse->nativeFunc = Date_parse;
   dateConstructor->properties["parse"] = Value(dateParse);
@@ -5723,7 +5724,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("Date", Value(dateConstructor));
 
   // String constructor with static methods
-  auto stringConstructorFn = std::make_shared<Function>();
+  auto stringConstructorFn = GarbageCollector::makeGC<Function>();
   stringConstructorFn->isNative = true;
   stringConstructorFn->isConstructor = true;
   stringConstructorFn->properties["__wrap_primitive__"] = Value(true);
@@ -5736,7 +5737,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
 
   // Wrap in an Object to hold static methods
-  auto stringConstructorObj = std::make_shared<Object>();
+  auto stringConstructorObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // The constructor itself
@@ -5744,31 +5745,31 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   stringConstructorObj->properties["constructor"] = Value(stringConstructorFn);
 
   // String.fromCharCode
-  auto fromCharCode = std::make_shared<Function>();
+  auto fromCharCode = GarbageCollector::makeGC<Function>();
   fromCharCode->isNative = true;
   fromCharCode->nativeFunc = String_fromCharCode;
   stringConstructorObj->properties["fromCharCode"] = Value(fromCharCode);
 
   // String.fromCodePoint
-  auto fromCodePoint = std::make_shared<Function>();
+  auto fromCodePoint = GarbageCollector::makeGC<Function>();
   fromCodePoint->isNative = true;
   fromCodePoint->nativeFunc = String_fromCodePoint;
   stringConstructorObj->properties["fromCodePoint"] = Value(fromCodePoint);
 
   // String.raw
-  auto stringRaw = std::make_shared<Function>();
+  auto stringRaw = GarbageCollector::makeGC<Function>();
   stringRaw->isNative = true;
   stringRaw->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || (!args[0].isObject() && !args[0].isArray())) {
       return Value(std::string(""));
     }
     // Get the template object's raw property
-    std::shared_ptr<Array> rawArr;
+    GCPtr<Array> rawArr;
     if (args[0].isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto obj = args[0].getGC<Object>();
       auto rawIt = obj->properties.find("raw");
       if (rawIt != obj->properties.end() && rawIt->second.isArray()) {
-        rawArr = std::get<std::shared_ptr<Array>>(rawIt->second.data);
+        rawArr = rawIt->second.getGC<Array>();
       }
     }
     if (!rawArr) return Value(std::string(""));
@@ -5785,10 +5786,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   };
   stringConstructorObj->properties["raw"] = Value(stringRaw);
 
-  auto stringPrototype = std::make_shared<Object>();
+  auto stringPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
-  auto stringMatchAll = std::make_shared<Function>();
+  auto stringMatchAll = GarbageCollector::makeGC<Function>();
   stringMatchAll->isNative = true;
   stringMatchAll->isConstructor = false;
   stringMatchAll->properties["name"] = Value(std::string("matchAll"));
@@ -5822,7 +5823,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
         return out;
       }
 
-      auto fn = std::get<std::shared_ptr<Function>>(callee.data);
+      auto fn = callee.getGC<Function>();
       if (fn->isNative) {
         auto itUsesThis = fn->properties.find("__uses_this_arg__");
         if (itUsesThis != fn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
@@ -5838,7 +5839,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     };
 
-    auto getObjectValue = [&](const std::shared_ptr<Object>& obj,
+    auto getObjectValue = [&](const GCPtr<Object>& obj,
                               const Value& thisArg,
                               const std::string& key) -> Value {
       std::string getterName = "__get_" + key;
@@ -5854,7 +5855,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     };
 
-    auto getRegexValue = [&](const std::shared_ptr<Regex>& regex,
+    auto getRegexValue = [&](const GCPtr<Regex>& regex,
                              const std::string& key) -> Value {
       Value regexValue(regex);
 
@@ -5894,7 +5895,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     std::string input;
     if (thisValue.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(thisValue.data);
+      auto obj = thisValue.getGC<Object>();
       Value toPrimitive = Value(Undefined{});
       auto toPrimitiveIt = obj->properties.find("Symbol(Symbol.toPrimitive)");
       if (toPrimitiveIt != obj->properties.end()) {
@@ -5916,7 +5917,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     if (!regexp.isUndefined() && !regexp.isNull()) {
       if (regexp.isRegex()) {
-        auto regex = std::get<std::shared_ptr<Regex>>(regexp.data);
+        auto regex = regexp.getGC<Regex>();
         Value flagsValue = getRegexValue(regex, "flags");
         if (flagsValue.isUndefined() || flagsValue.isNull()) {
           throw std::runtime_error("TypeError: RegExp flags is undefined or null");
@@ -5928,11 +5929,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
       Value matcher(Undefined{});
       if (regexp.isRegex()) {
-        matcher = getRegexValue(std::get<std::shared_ptr<Regex>>(regexp.data), matchAllKey);
+        matcher = getRegexValue(regexp.getGC<Regex>(), matchAllKey);
       } else if (regexp.isObject()) {
-        matcher = getObjectValue(std::get<std::shared_ptr<Object>>(regexp.data), regexp, matchAllKey);
+        matcher = getObjectValue(regexp.getGC<Object>(), regexp, matchAllKey);
       } else if (regexp.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(regexp.data);
+        auto fn = regexp.getGC<Function>();
         auto it = fn->properties.find(matchAllKey);
         if (it != fn->properties.end()) {
           matcher = it->second;
@@ -5949,16 +5950,16 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     std::string pattern;
     if (regexp.isRegex()) {
-      pattern = std::get<std::shared_ptr<Regex>>(regexp.data)->pattern;
+      pattern = regexp.getGC<Regex>()->pattern;
     } else if (regexp.isUndefined()) {
       pattern = "";  // RegExp(undefined) uses empty pattern
     } else {
       pattern = regexp.toString();
     }
 
-    auto rx = std::make_shared<Regex>(pattern, "g");
+    auto rx = GarbageCollector::makeGC<Regex>(pattern, "g");
     Value rxValue(rx);
-    Value matcher = getRegexValue(rx, matchAllKey);
+    Value matcher = getRegexValue(GCPtr<Regex>(rx), matchAllKey);
     if (!matcher.isFunction()) {
       throw std::runtime_error("TypeError: RegExp @@matchAll is not callable");
     }
@@ -5976,7 +5977,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // globalThis - reference to the global object
   // Create a proxy object that reflects the current global environment
-  auto globalThisObj = std::make_shared<Object>();
+  auto globalThisObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Copy all current global bindings into globalThis
@@ -5993,14 +5994,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["globalThis"] = Value(globalThisObj);
 
   // Timer functions - setTimeout
-  auto setTimeoutFn = std::make_shared<Function>();
+  auto setTimeoutFn = GarbageCollector::makeGC<Function>();
   setTimeoutFn->isNative = true;
   setTimeoutFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isFunction()) {
       return Value(Undefined{});
     }
 
-    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto callback = args[0].getGC<Function>();
     int64_t delayMs = args.size() > 1 ? static_cast<int64_t>(args[1].toNumber()) : 0;
 
     // Create a timer callback that executes the JS function
@@ -6020,14 +6021,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("setTimeout", Value(setTimeoutFn));
 
   // Timer functions - setInterval
-  auto setIntervalFn = std::make_shared<Function>();
+  auto setIntervalFn = GarbageCollector::makeGC<Function>();
   setIntervalFn->isNative = true;
   setIntervalFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isFunction()) {
       return Value(Undefined{});
     }
 
-    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto callback = args[0].getGC<Function>();
     int64_t intervalMs = args.size() > 1 ? static_cast<int64_t>(args[1].toNumber()) : 0;
 
     // Create an interval timer callback
@@ -6045,7 +6046,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("setInterval", Value(setIntervalFn));
 
   // Timer functions - clearTimeout
-  auto clearTimeoutFn = std::make_shared<Function>();
+  auto clearTimeoutFn = GarbageCollector::makeGC<Function>();
   clearTimeoutFn->isNative = true;
   clearTimeoutFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -6061,7 +6062,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("clearTimeout", Value(clearTimeoutFn));
 
   // Timer functions - clearInterval (same implementation as clearTimeout)
-  auto clearIntervalFn = std::make_shared<Function>();
+  auto clearIntervalFn = GarbageCollector::makeGC<Function>();
   clearIntervalFn->isNative = true;
   clearIntervalFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -6077,14 +6078,14 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("clearInterval", Value(clearIntervalFn));
 
   // queueMicrotask function
-  auto queueMicrotaskFn = std::make_shared<Function>();
+  auto queueMicrotaskFn = GarbageCollector::makeGC<Function>();
   queueMicrotaskFn->isNative = true;
   queueMicrotaskFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isFunction()) {
       return Value(Undefined{});
     }
 
-    auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto callback = args[0].getGC<Function>();
 
     // Queue the microtask
     auto& loop = EventLoopContext::instance().getLoop();
@@ -6108,25 +6109,25 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("URLSearchParams", Value(createURLSearchParamsConstructor()));
 
   // AbortController and AbortSignal
-  auto abortControllerCtor = std::make_shared<Function>();
+  auto abortControllerCtor = GarbageCollector::makeGC<Function>();
   abortControllerCtor->isNative = true;
   abortControllerCtor->isConstructor = true;
   abortControllerCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto controller = std::make_shared<Object>();
+    auto controller = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
     // Create AbortSignal
-    auto signal = std::make_shared<Object>();
+    auto signal = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     signal->properties["aborted"] = Value(false);
     signal->properties["reason"] = Value(Undefined{});
 
     // Event listeners storage
-    auto listeners = std::make_shared<Array>();
+    auto listeners = GarbageCollector::makeGC<Array>();
     signal->properties["_listeners"] = Value(listeners);
 
     // addEventListener method
-    auto addEventListenerFn = std::make_shared<Function>();
+    auto addEventListenerFn = GarbageCollector::makeGC<Function>();
     addEventListenerFn->isNative = true;
     addEventListenerFn->nativeFunc = [listeners](const std::vector<Value>& args) -> Value {
       if (args.size() >= 2 && args[0].toString() == "abort" && args[1].isFunction()) {
@@ -6137,7 +6138,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     signal->properties["addEventListener"] = Value(addEventListenerFn);
 
     // removeEventListener method
-    auto removeEventListenerFn = std::make_shared<Function>();
+    auto removeEventListenerFn = GarbageCollector::makeGC<Function>();
     removeEventListenerFn->isNative = true;
     removeEventListenerFn->nativeFunc = [listeners](const std::vector<Value>& args) -> Value {
       // Simple implementation - just mark for removal
@@ -6148,7 +6149,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     controller->properties["signal"] = Value(signal);
 
     // abort method
-    auto abortFn = std::make_shared<Function>();
+    auto abortFn = GarbageCollector::makeGC<Function>();
     abortFn->isNative = true;
     abortFn->nativeFunc = [signal, listeners](const std::vector<Value>& args) -> Value {
       // Check if already aborted
@@ -6163,7 +6164,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       // Call all abort listeners
       for (const auto& listener : listeners->elements) {
         if (listener.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(listener.data);
+          auto fn = listener.getGC<Function>();
           if (fn->isNative && fn->nativeFunc) {
             fn->nativeFunc({});
           }
@@ -6179,13 +6180,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("AbortController", Value(abortControllerCtor));
 
   // AbortSignal.abort() static method
-  auto abortSignalObj = std::make_shared<Object>();
+  auto abortSignalObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
-  auto abortStaticFn = std::make_shared<Function>();
+  auto abortStaticFn = GarbageCollector::makeGC<Function>();
   abortStaticFn->isNative = true;
   abortStaticFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto signal = std::make_shared<Object>();
+    auto signal = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     signal->properties["aborted"] = Value(true);
     signal->properties["reason"] = args.empty() ?
@@ -6195,10 +6196,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   abortSignalObj->properties["abort"] = Value(abortStaticFn);
 
   // AbortSignal.timeout() static method
-  auto timeoutStaticFn = std::make_shared<Function>();
+  auto timeoutStaticFn = GarbageCollector::makeGC<Function>();
   timeoutStaticFn->isNative = true;
   timeoutStaticFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    auto signal = std::make_shared<Object>();
+    auto signal = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     signal->properties["aborted"] = Value(false);
     signal->properties["reason"] = Value(Undefined{});
@@ -6210,35 +6211,35 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("AbortSignal", Value(abortSignalObj));
 
   // Streams API - ReadableStream
-  auto readableStreamCtor = std::make_shared<Function>();
+  auto readableStreamCtor = GarbageCollector::makeGC<Function>();
   readableStreamCtor->isNative = true;
   readableStreamCtor->isConstructor = true;
   readableStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Create underlying source callbacks from argument
-    std::shared_ptr<Function> startFn = nullptr;
-    std::shared_ptr<Function> pullFn = nullptr;
-    std::shared_ptr<Function> cancelFn = nullptr;
+    GCPtr<Function> startFn = {};
+    GCPtr<Function> pullFn = {};
+    GCPtr<Function> cancelFn = {};
     double highWaterMark = 1.0;
 
     if (!args.empty() && args[0].isObject()) {
-      auto srcObj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto srcObj = args[0].getGC<Object>();
 
       // Get start callback
       auto startIt = srcObj->properties.find("start");
       if (startIt != srcObj->properties.end() && startIt->second.isFunction()) {
-        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+        startFn = startIt->second.getGC<Function>();
       }
 
       // Get pull callback
       auto pullIt = srcObj->properties.find("pull");
       if (pullIt != srcObj->properties.end() && pullIt->second.isFunction()) {
-        pullFn = std::get<std::shared_ptr<Function>>(pullIt->second.data);
+        pullFn = pullIt->second.getGC<Function>();
       }
 
       // Get cancel callback
       auto cancelIt = srcObj->properties.find("cancel");
       if (cancelIt != srcObj->properties.end() && cancelIt->second.isFunction()) {
-        cancelFn = std::get<std::shared_ptr<Function>>(cancelIt->second.data);
+        cancelFn = cancelIt->second.getGC<Function>();
       }
     }
 
@@ -6249,42 +6250,42 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("ReadableStream", Value(readableStreamCtor));
 
   // Streams API - WritableStream
-  auto writableStreamCtor = std::make_shared<Function>();
+  auto writableStreamCtor = GarbageCollector::makeGC<Function>();
   writableStreamCtor->isNative = true;
   writableStreamCtor->isConstructor = true;
   writableStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Create underlying sink callbacks from argument
-    std::shared_ptr<Function> startFn = nullptr;
-    std::shared_ptr<Function> writeFn = nullptr;
-    std::shared_ptr<Function> closeFn = nullptr;
-    std::shared_ptr<Function> abortFn = nullptr;
+    GCPtr<Function> startFn = {};
+    GCPtr<Function> writeFn = {};
+    GCPtr<Function> closeFn = {};
+    GCPtr<Function> abortFn = {};
     double highWaterMark = 1.0;
 
     if (!args.empty() && args[0].isObject()) {
-      auto sinkObj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto sinkObj = args[0].getGC<Object>();
 
       // Get start callback
       auto startIt = sinkObj->properties.find("start");
       if (startIt != sinkObj->properties.end() && startIt->second.isFunction()) {
-        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+        startFn = startIt->second.getGC<Function>();
       }
 
       // Get write callback
       auto writeIt = sinkObj->properties.find("write");
       if (writeIt != sinkObj->properties.end() && writeIt->second.isFunction()) {
-        writeFn = std::get<std::shared_ptr<Function>>(writeIt->second.data);
+        writeFn = writeIt->second.getGC<Function>();
       }
 
       // Get close callback
       auto closeIt = sinkObj->properties.find("close");
       if (closeIt != sinkObj->properties.end() && closeIt->second.isFunction()) {
-        closeFn = std::get<std::shared_ptr<Function>>(closeIt->second.data);
+        closeFn = closeIt->second.getGC<Function>();
       }
 
       // Get abort callback
       auto abortIt = sinkObj->properties.find("abort");
       if (abortIt != sinkObj->properties.end() && abortIt->second.isFunction()) {
-        abortFn = std::get<std::shared_ptr<Function>>(abortIt->second.data);
+        abortFn = abortIt->second.getGC<Function>();
       }
     }
 
@@ -6295,34 +6296,34 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   env->define("WritableStream", Value(writableStreamCtor));
 
   // Streams API - TransformStream
-  auto transformStreamCtor = std::make_shared<Function>();
+  auto transformStreamCtor = GarbageCollector::makeGC<Function>();
   transformStreamCtor->isNative = true;
   transformStreamCtor->isConstructor = true;
   transformStreamCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Create transformer callbacks from argument
-    std::shared_ptr<Function> startFn = nullptr;
-    std::shared_ptr<Function> transformFn = nullptr;
-    std::shared_ptr<Function> flushFn = nullptr;
+    GCPtr<Function> startFn = {};
+    GCPtr<Function> transformFn = {};
+    GCPtr<Function> flushFn = {};
 
     if (!args.empty() && args[0].isObject()) {
-      auto transformerObj = std::get<std::shared_ptr<Object>>(args[0].data);
+      auto transformerObj = args[0].getGC<Object>();
 
       // Get start callback
       auto startIt = transformerObj->properties.find("start");
       if (startIt != transformerObj->properties.end() && startIt->second.isFunction()) {
-        startFn = std::get<std::shared_ptr<Function>>(startIt->second.data);
+        startFn = startIt->second.getGC<Function>();
       }
 
       // Get transform callback
       auto transformIt = transformerObj->properties.find("transform");
       if (transformIt != transformerObj->properties.end() && transformIt->second.isFunction()) {
-        transformFn = std::get<std::shared_ptr<Function>>(transformIt->second.data);
+        transformFn = transformIt->second.getGC<Function>();
       }
 
       // Get flush callback
       auto flushIt = transformerObj->properties.find("flush");
       if (flushIt != transformerObj->properties.end() && flushIt->second.isFunction()) {
-        flushFn = std::get<std::shared_ptr<Function>>(flushIt->second.data);
+        flushFn = flushIt->second.getGC<Function>();
       }
     }
 
@@ -6338,7 +6339,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // performance.now() - high-resolution timing
   static auto startTime = std::chrono::steady_clock::now();
 
-  auto performanceNowFn = std::make_shared<Function>();
+  auto performanceNowFn = GarbageCollector::makeGC<Function>();
   performanceNowFn->isNative = true;
   performanceNowFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto now = std::chrono::steady_clock::now();
@@ -6346,7 +6347,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return Value(static_cast<double>(elapsed) / 1000.0);  // Return milliseconds
   };
 
-  auto performanceObj = std::make_shared<Object>();
+  auto performanceObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   performanceObj->properties["now"] = Value(performanceNowFn);
   env->define("performance", Value(performanceObj));
@@ -6364,8 +6365,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     // Clone arrays
     if (val.isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(val.data);
-      auto newArr = std::make_shared<Array>();
+      auto arr = val.getGC<Array>();
+      auto newArr = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (const auto& elem : arr->elements) {
         newArr->elements.push_back((*deepClone)(elem));
@@ -6375,8 +6376,8 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
     // Clone objects
     if (val.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(val.data);
-      auto newObj = std::make_shared<Object>();
+      auto obj = val.getGC<Object>();
+      auto newObj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       for (const auto& [key, value] : obj->properties) {
         newObj->properties[key] = (*deepClone)(value);
@@ -6388,7 +6389,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     return val;
   };
 
-  auto structuredCloneFn = std::make_shared<Function>();
+  auto structuredCloneFn = GarbageCollector::makeGC<Function>();
   structuredCloneFn->isNative = true;
   structuredCloneFn->nativeFunc = [deepClone](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(Undefined{});
@@ -6402,7 +6403,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
   // btoa - encode string to Base64
-  auto btoaFn = std::make_shared<Function>();
+  auto btoaFn = GarbageCollector::makeGC<Function>();
   btoaFn->isNative = true;
   btoaFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string(""));
@@ -6426,7 +6427,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["btoa"] = Value(btoaFn);
 
   // atob - decode Base64 to string
-  auto atobFn = std::make_shared<Function>();
+  auto atobFn = GarbageCollector::makeGC<Function>();
   atobFn->isNative = true;
   atobFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string(""));
@@ -6465,7 +6466,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["atob"] = Value(atobFn);
 
   // encodeURIComponent - encode URI component
-  auto encodeURIComponentFn = std::make_shared<Function>();
+  auto encodeURIComponentFn = GarbageCollector::makeGC<Function>();
   encodeURIComponentFn->isNative = true;
   encodeURIComponentFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string("undefined"));
@@ -6490,7 +6491,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["encodeURIComponent"] = Value(encodeURIComponentFn);
 
   // decodeURIComponent - decode URI component
-  auto decodeURIComponentFn = std::make_shared<Function>();
+  auto decodeURIComponentFn = GarbageCollector::makeGC<Function>();
   decodeURIComponentFn->isNative = true;
   decodeURIComponentFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string("undefined"));
@@ -6515,7 +6516,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["decodeURIComponent"] = Value(decodeURIComponentFn);
 
   // encodeURI - encode full URI (leaves more characters unencoded)
-  auto encodeURIFn = std::make_shared<Function>();
+  auto encodeURIFn = GarbageCollector::makeGC<Function>();
   encodeURIFn->isNative = true;
   encodeURIFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string("undefined"));
@@ -6543,7 +6544,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["encodeURI"] = Value(encodeURIFn);
 
   // decodeURI - decode full URI
-  auto decodeURIFn = std::make_shared<Function>();
+  auto decodeURIFn = GarbageCollector::makeGC<Function>();
   decodeURIFn->isNative = true;
   decodeURIFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(std::string("undefined"));
@@ -6568,7 +6569,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["decodeURI"] = Value(decodeURIFn);
 
   // ===== Function constructor =====
-  auto functionConstructor = std::make_shared<Function>();
+  auto functionConstructor = GarbageCollector::makeGC<Function>();
   functionConstructor->isNative = true;
   functionConstructor->isConstructor = true;
   functionConstructor->properties["name"] = Value(std::string("Function"));
@@ -6617,7 +6618,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
       throw std::runtime_error("SyntaxError: Function constructor parse error");
     }
 
-    auto fn = std::make_shared<Function>();
+    auto fn = GarbageCollector::makeGC<Function>();
     fn->isNative = false;
     fn->isAsync = fnDecl->isAsync;
     fn->isGenerator = fnDecl->isGenerator;
@@ -6659,7 +6660,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     fn->properties["name"] = Value(std::string("anonymous"));
     fn->properties["length"] = Value(static_cast<double>(fn->params.size()));
 
-    auto fnPrototype = std::make_shared<Object>();
+    auto fnPrototype = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     fnPrototype->properties["constructor"] = Value(fn);
     fnPrototype->properties["__proto__"] = Value(objectPrototype);
@@ -6668,7 +6669,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     // Set __proto__ to Function.prototype for proper prototype chain
     auto funcVal = env->get("Function");
     if (funcVal.has_value() && funcVal->isFunction()) {
-      auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+      auto funcCtor = std::get<GCPtr<Function>>(funcVal->data);
       auto protoIt = funcCtor->properties.find("prototype");
       if (protoIt != funcCtor->properties.end()) {
         fn->properties["__proto__"] = protoIt->second;
@@ -6680,13 +6681,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // Function.prototype - a minimal prototype with call/apply/bind
   // Per spec, Function.prototype is itself callable (it's a function that accepts any arguments and returns undefined)
-  auto functionPrototype = std::make_shared<Object>();
+  auto functionPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   functionPrototype->properties["__proto__"] = Value(objectPrototype);
   functionPrototype->properties["__callable_object__"] = Value(true);
 
   // Function.prototype.call - uses __uses_this_arg__ so args[0] = this (the function to call)
-  auto fpCall = std::make_shared<Function>();
+  auto fpCall = GarbageCollector::makeGC<Function>();
   fpCall->isNative = true;
   fpCall->properties["name"] = Value(std::string("call"));
   fpCall->properties["length"] = Value(1.0);
@@ -6696,7 +6697,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty() || !args[0].isFunction()) {
       throw std::runtime_error("TypeError: Function.prototype.call called on non-function");
     }
-    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto fn = args[0].getGC<Function>();
     Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> callArgs;
     if (args.size() > 2) {
@@ -6723,7 +6724,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   functionPrototype->properties["__non_enum_call"] = Value(true);
 
   // Function.prototype.apply
-  auto fpApply = std::make_shared<Function>();
+  auto fpApply = GarbageCollector::makeGC<Function>();
   fpApply->isNative = true;
   fpApply->properties["name"] = Value(std::string("apply"));
   fpApply->properties["length"] = Value(2.0);
@@ -6732,11 +6733,11 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty() || !args[0].isFunction()) {
       throw std::runtime_error("TypeError: Function.prototype.apply called on non-function");
     }
-    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto fn = args[0].getGC<Function>();
     Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> callArgs;
     if (args.size() > 2 && args[2].isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(args[2].data);
+      auto arr = args[2].getGC<Array>();
       callArgs = arr->elements;
     }
     if (fn->isNative) {
@@ -6759,7 +6760,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   functionPrototype->properties["__non_enum_apply"] = Value(true);
 
   // Function.prototype.bind
-  auto fpBind = std::make_shared<Function>();
+  auto fpBind = GarbageCollector::makeGC<Function>();
   fpBind->isNative = true;
   fpBind->properties["name"] = Value(std::string("bind"));
   fpBind->properties["length"] = Value(1.0);
@@ -6769,13 +6770,13 @@ std::shared_ptr<Environment> Environment::createGlobal() {
     if (args.empty() || !args[0].isFunction()) {
       throw std::runtime_error("TypeError: Function.prototype.bind called on non-function");
     }
-    auto targetFn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto targetFn = args[0].getGC<Function>();
     Value boundThis = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> boundArgs;
     if (args.size() > 2) {
       boundArgs.insert(boundArgs.end(), args.begin() + 2, args.end());
     }
-    auto boundFn = std::make_shared<Function>();
+    auto boundFn = GarbageCollector::makeGC<Function>();
     boundFn->isNative = true;
     std::string targetName = targetFn->properties.count("name") ? targetFn->properties["name"].toString() : "";
     boundFn->properties["name"] = Value(std::string("bound " + targetName));
@@ -6812,9 +6813,9 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   globalThisObj->properties["Function"] = Value(functionConstructor);
 
   // Generator function intrinsics setup
-  auto generatorFunctionPrototype = std::make_shared<Object>();
+  auto generatorFunctionPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
-  auto generatorPrototype = std::make_shared<Object>();
+  auto generatorPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   
   // %GeneratorFunction.prototype% inherits from Function.prototype
@@ -6823,7 +6824,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   generatorFunctionPrototype->properties["prototype"] = Value(generatorPrototype);
   // %GeneratorPrototype% inherits from Object.prototype
   if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
-    auto fn = std::get<std::shared_ptr<Function>>(objCtor->data);
+    auto fn = std::get<GCPtr<Function>>(objCtor->data);
     auto protoIt = fn->properties.find("prototype");
     if (protoIt != fn->properties.end()) {
       generatorPrototype->properties["__proto__"] = protoIt->second;
@@ -6841,10 +6842,10 @@ std::shared_ptr<Environment> Environment::createGlobal() {
 
   // BigInt.prototype.__proto__ = Object.prototype
   if (auto bigIntCtor = env->get("BigInt"); bigIntCtor && bigIntCtor->isFunction()) {
-    auto bigIntFnPtr = std::get<std::shared_ptr<Function>>(bigIntCtor->data);
+    auto bigIntFnPtr = std::get<GCPtr<Function>>(bigIntCtor->data);
     auto protoIt = bigIntFnPtr->properties.find("prototype");
     if (protoIt != bigIntFnPtr->properties.end() && protoIt->second.isObject()) {
-      auto bigIntProtoPtr = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      auto bigIntProtoPtr = protoIt->second.getGC<Object>();
       bigIntProtoPtr->properties["__proto__"] = Value(objectPrototype);
     }
     // BigInt.__proto__ = Function.prototype
@@ -6854,7 +6855,7 @@ std::shared_ptr<Environment> Environment::createGlobal() {
   // Promise.prototype.__proto__ = Object.prototype (already set via promisePrototype)
   // Promise.__proto__ = Function.prototype
   if (auto promiseCtor = env->get("Promise"); promiseCtor && promiseCtor->isFunction()) {
-    auto promiseFnPtr = std::get<std::shared_ptr<Function>>(promiseCtor->data);
+    auto promiseFnPtr = std::get<GCPtr<Function>>(promiseCtor->data);
     promiseFnPtr->properties["__proto__"] = Value(functionPrototype);
   }
 
@@ -6892,8 +6893,8 @@ Environment* Environment::getRoot() {
   return current;
 }
 
-std::shared_ptr<Object> Environment::getGlobal() const {
-  auto globalObj = std::make_shared<Object>();
+GCPtr<Object> Environment::getGlobal() const {
+  auto globalObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Walk up to the root environment
@@ -6907,7 +6908,7 @@ std::shared_ptr<Object> Environment::getGlobal() const {
     globalObj->properties[name] = value;
   }
 
-  return globalObj;
+  return GCPtr<Object>(globalObj);
 }
 
 }

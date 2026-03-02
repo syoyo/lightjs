@@ -78,7 +78,7 @@ int main() {
         return 1;
     }
 
-    auto env = Environment::createGlobal();
+    GCPtr<Environment> env = Environment::createGlobal();
     Interpreter interpreter(env);
 
     std::cout << "Executing script...\n\n";

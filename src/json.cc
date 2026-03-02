@@ -1,4 +1,6 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
@@ -164,7 +166,7 @@ private:
         }
         pos_++; // Skip opening brace
 
-        auto obj = std::make_shared<Object>();
+        auto obj = GarbageCollector::makeGC<Object>();
         skipWhitespace();
 
         if (pos_ < str_.size() && str_[pos_] == '}') {
@@ -220,7 +222,7 @@ private:
         }
         pos_++; // Skip opening bracket
 
-        auto arr = std::make_shared<Array>();
+        auto arr = GarbageCollector::makeGC<Array>();
         skipWhitespace();
 
         if (pos_ < str_.size() && str_[pos_] == ']') {
@@ -289,9 +291,9 @@ private:
         } else if (value.isString()) {
             stringifyString(std::get<std::string>(value.data));
         } else if (value.isArray()) {
-            stringifyArray(*std::get<std::shared_ptr<Array>>(value.data));
+            stringifyArray(*value.getGC<Array>());
         } else if (value.isObject()) {
-            stringifyObject(*std::get<std::shared_ptr<Object>>(value.data));
+            stringifyObject(*value.getGC<Object>());
         } else {
             // Functions, symbols, etc. become null
             out_ << "null";

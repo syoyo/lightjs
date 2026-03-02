@@ -36,7 +36,7 @@ int main() {
   if (interpreter.hasError()) {
     auto errorValue = interpreter.getError();
 
-    if (auto errorPtr = std::get_if<std::shared_ptr<Error>>(&errorValue.data)) {
+    if (auto errorPtr = std::get_if<GCPtr<Error>>(&errorValue.data)) {
       auto error = *errorPtr;
       std::cout << "Error Type: " << error->getName() << "\n";
       std::cout << "Error Message: " << error->message << "\n\n";

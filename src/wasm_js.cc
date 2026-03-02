@@ -1,5 +1,7 @@
 #include "wasm_js.h"
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "wasm/wasm_runtime.h"
 #include "wasm/wasm_decoder.h"
 #include <fstream>
@@ -40,10 +42,10 @@ Value wasm_js::wasmToValue(const wasm::WasmValue& val) {
 
 // Create WebAssembly global object
 Value wasm_js::createWebAssemblyGlobal() {
-    auto wasmObj = std::make_shared<Object>();
+    auto wasmObj = GarbageCollector::makeGC<Object>();
 
     // WebAssembly.instantiate(bufferSource, importObject?)
-    auto instantiate = std::make_shared<Function>();
+    auto instantiate = GarbageCollector::makeGC<Function>();
     instantiate->isNative = true;
     instantiate->nativeFunc = [](const std::vector<Value>& args) -> Value {
         if (args.empty()) {
@@ -54,11 +56,11 @@ Value wasm_js::createWebAssemblyGlobal() {
         std::vector<uint8_t> wasmBytes;
 
         const auto& bufferArg = args[0];
-        if (std::holds_alternative<std::shared_ptr<TypedArray>>(bufferArg.data)) {
-            auto typedArray = std::get<std::shared_ptr<TypedArray>>(bufferArg.data);
+        if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
+            auto typedArray = bufferArg.getGC<TypedArray>();
             wasmBytes = typedArray->buffer;
-        } else if (std::holds_alternative<std::shared_ptr<ArrayBuffer>>(bufferArg.data)) {
-            auto arrayBuffer = std::get<std::shared_ptr<ArrayBuffer>>(bufferArg.data);
+        } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
+            auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;
         } else if (std::holds_alternative<std::string>(bufferArg.data)) {
             // Allow reading from file path (extension for convenience)
@@ -78,8 +80,8 @@ Value wasm_js::createWebAssemblyGlobal() {
 
         // Parse import object if provided
         wasm::ImportResolver importResolver = nullptr;
-        if (args.size() > 1 && std::holds_alternative<std::shared_ptr<Object>>(args[1].data)) {
-            auto importObj = std::get<std::shared_ptr<Object>>(args[1].data);
+        if (args.size() > 1 && std::holds_alternative<GCPtr<Object>>(args[1].data)) {
+            auto importObj = args[1].getGC<Object>();
 
             // Create import resolver that captures importObj
             importResolver = [importObj](const std::string& module, const std::string& name)
@@ -88,12 +90,12 @@ Value wasm_js::createWebAssemblyGlobal() {
                 // Look up module.name in import object
                 if (importObj->properties.find(module) != importObj->properties.end()) {
                     const auto& moduleVal = importObj->properties.at(module);
-                    if (std::holds_alternative<std::shared_ptr<Object>>(moduleVal.data)) {
-                        auto moduleObj = std::get<std::shared_ptr<Object>>(moduleVal.data);
+                    if (std::holds_alternative<GCPtr<Object>>(moduleVal.data)) {
+                        auto moduleObj = moduleVal.getGC<Object>();
                         if (moduleObj->properties.find(name) != moduleObj->properties.end()) {
                             const auto& funcVal = moduleObj->properties.at(name);
-                            if (std::holds_alternative<std::shared_ptr<Function>>(funcVal.data)) {
-                                auto func = std::get<std::shared_ptr<Function>>(funcVal.data);
+                            if (std::holds_alternative<GCPtr<Function>>(funcVal.data)) {
+                                auto func = funcVal.getGC<Function>();
 
                                 // Create a wrapper that converts between WASM and JS values
                                 return [func](const std::vector<wasm::WasmValue>& wasmArgs)
@@ -140,18 +142,18 @@ Value wasm_js::createWebAssemblyGlobal() {
         auto wasmInstance = std::make_shared<WasmInstanceJS>(instance.value(), std::move(runtime));
 
         // Create result object with instance and exports
-        auto resultObj = std::make_shared<Object>();
+        auto resultObj = GarbageCollector::makeGC<Object>();
 
         // Add instance property (for future module access)
-        auto instanceObj = std::make_shared<Object>();
+        auto instanceObj = GarbageCollector::makeGC<Object>();
 
         // Create exports object
-        auto exportsObj = std::make_shared<Object>();
+        auto exportsObj = GarbageCollector::makeGC<Object>();
         auto exportNames = wasmInstance->runtime->getExports(wasmInstance->instance);
 
         for (const auto& exportName : exportNames) {
             // Create a function wrapper for each export
-            auto exportFunc = std::make_shared<Function>();
+            auto exportFunc = GarbageCollector::makeGC<Function>();
             exportFunc->isNative = true;
 
             // Capture the instance and function name
@@ -192,7 +194,7 @@ Value wasm_js::createWebAssemblyGlobal() {
     wasmObj->properties["instantiate"] = Value(instantiate);
 
     // WebAssembly.compile(bufferSource)
-    auto compile = std::make_shared<Function>();
+    auto compile = GarbageCollector::makeGC<Function>();
     compile->isNative = true;
     compile->nativeFunc = [](const std::vector<Value>& args) -> Value {
         // For now, compile just validates the WASM binary
@@ -203,11 +205,11 @@ Value wasm_js::createWebAssemblyGlobal() {
         std::vector<uint8_t> wasmBytes;
 
         const auto& bufferArg = args[0];
-        if (std::holds_alternative<std::shared_ptr<TypedArray>>(bufferArg.data)) {
-            auto typedArray = std::get<std::shared_ptr<TypedArray>>(bufferArg.data);
+        if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
+            auto typedArray = bufferArg.getGC<TypedArray>();
             wasmBytes = typedArray->buffer;
-        } else if (std::holds_alternative<std::shared_ptr<ArrayBuffer>>(bufferArg.data)) {
-            auto arrayBuffer = std::get<std::shared_ptr<ArrayBuffer>>(bufferArg.data);
+        } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
+            auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;
         } else {
             return Value(Undefined{});
@@ -228,7 +230,7 @@ Value wasm_js::createWebAssemblyGlobal() {
     wasmObj->properties["compile"] = Value(compile);
 
     // WebAssembly.validate(bufferSource)
-    auto validate = std::make_shared<Function>();
+    auto validate = GarbageCollector::makeGC<Function>();
     validate->isNative = true;
     validate->nativeFunc = [](const std::vector<Value>& args) -> Value {
         if (args.empty()) {
@@ -238,11 +240,11 @@ Value wasm_js::createWebAssemblyGlobal() {
         std::vector<uint8_t> wasmBytes;
 
         const auto& bufferArg = args[0];
-        if (std::holds_alternative<std::shared_ptr<TypedArray>>(bufferArg.data)) {
-            auto typedArray = std::get<std::shared_ptr<TypedArray>>(bufferArg.data);
+        if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
+            auto typedArray = bufferArg.getGC<TypedArray>();
             wasmBytes = typedArray->buffer;
-        } else if (std::holds_alternative<std::shared_ptr<ArrayBuffer>>(bufferArg.data)) {
-            auto arrayBuffer = std::get<std::shared_ptr<ArrayBuffer>>(bufferArg.data);
+        } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
+            auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;
         } else {
             return Value(false);

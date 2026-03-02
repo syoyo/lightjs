@@ -18,7 +18,7 @@ namespace {
 constexpr const char* kSyntheticDefaultExportBinding = "__lightjs_default_export__";
 
 Value makeErrorValue(ErrorType type, const std::string& message) {
-  return Value(std::make_shared<Error>(type, message));
+  return Value(GarbageCollector::makeGC<Error>(type, message));
 }
 
 Value makeErrorFromExceptionMessage(const std::string& message) {
@@ -570,7 +570,7 @@ bool validatePrivateNamesInStatement(const Statement& stmt,
 
 void setDefaultExportNameIfNeeded(Value& result) {
   if (result.isFunction()) {
-    auto fn = std::get<std::shared_ptr<Function>>(result.data);
+    auto fn = result.getGC<Function>();
     auto nameIt = fn->properties.find("name");
     bool shouldSet = true;
     if (nameIt != fn->properties.end() && nameIt->second.isString()) {
@@ -583,7 +583,7 @@ void setDefaultExportNameIfNeeded(Value& result) {
   }
 
   if (result.isClass()) {
-    auto cls = std::get<std::shared_ptr<Class>>(result.data);
+    auto cls = result.getGC<Class>();
     bool hasOwnNameProperty = cls->properties.find("name") != cls->properties.end();
     if (cls->name.empty() && !hasOwnNameProperty) {
       cls->name = "default";
@@ -873,9 +873,9 @@ bool isAwaitExportDefault(const Statement& stmt, const AwaitExpr** out) {
   return false;
 }
 
-std::shared_ptr<Promise> coerceToPromise(const Value& value) {
+GCPtr<Promise> coerceToPromise(const Value& value) {
   if (value.isPromise()) {
-    return std::get<std::shared_ptr<Promise>>(value.data);
+    return value.getGC<Promise>();
   }
   return Promise::resolved(value);
 }
@@ -1479,7 +1479,7 @@ bool Module::instantiate(ModuleLoader* loader) {
 
 void Module::ensureEvaluationPromise() {
   if (!topLevelPromise_) {
-    topLevelPromise_ = std::make_shared<Promise>();
+    topLevelPromise_ = GarbageCollector::makeGC<Promise>();
   }
 }
 
@@ -1790,7 +1790,7 @@ bool Module::initializeDeclaredExports(Interpreter* interpreter) {
   bool prevStrictMode = interpreter->strictMode_;
   struct ModuleInstantiationScopeGuard {
     Interpreter* interpreter;
-    std::shared_ptr<Environment> prevEnv;
+    GCPtr<Environment> prevEnv;
     bool prevStrictMode;
     ~ModuleInstantiationScopeGuard() {
       interpreter->setEnvironment(prevEnv);
@@ -1879,7 +1879,7 @@ bool Module::rebuildIndirectExports() {
                                            visited);
         }
         if (localValue && localValue->isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(localValue->data);
+          auto obj = std::get<GCPtr<Object>>(localValue->data);
           if (obj && obj->isModuleNamespace) {
             ResolvedBindingIdentity identity;
             identity.namespaceObject = obj.get();
@@ -1903,7 +1903,7 @@ bool Module::rebuildIndirectExports() {
                                          visited);
       }
       if (exportIt->second.isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(exportIt->second.data);
+        auto obj = exportIt->second.getGC<Object>();
         if (obj && obj->isModuleNamespace) {
           ResolvedBindingIdentity identity;
           identity.namespaceObject = obj.get();
@@ -1929,7 +1929,7 @@ bool Module::rebuildIndirectExports() {
                                     visited);
     }
     if (value.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(value.data);
+      auto obj = value.getGC<Object>();
       if (obj && obj->isModuleNamespace) {
         ResolvedBindingIdentity identity;
         identity.namespaceObject = obj.get();
@@ -2111,7 +2111,7 @@ bool Module::evaluateBody(Interpreter* interpreter) {
   bool prevStrictMode = interpreter->strictMode_;
   struct ModuleEvalScopeGuard {
     Interpreter* interpreter;
-    std::shared_ptr<Environment> prevEnv;
+    GCPtr<Environment> prevEnv;
     bool prevStrictMode;
     ~ModuleEvalScopeGuard() {
       interpreter->setEnvironment(prevEnv);
@@ -2525,15 +2525,14 @@ std::unordered_map<std::string, Value> Module::getAllExports() const {
   return all;
 }
 
-std::shared_ptr<Object> Module::getNamespaceObject() {
-  auto moduleNamespace = namespaceObject_.lock();
-  if (!moduleNamespace) {
-    moduleNamespace = std::make_shared<Object>();
-    moduleNamespace->isModuleNamespace = true;
-    moduleNamespace->properties["__esModule"] = Value(true);
-    namespaceObject_ = moduleNamespace;
+GCPtr<Object> Module::getNamespaceObject() {
+  if (!namespaceObject_) {
+    namespaceObject_ = GarbageCollector::makeGC<Object>();
+    namespaceObject_->isModuleNamespace = true;
+    namespaceObject_->properties["__esModule"] = Value(true);
   }
 
+  auto moduleNamespace = namespaceObject_;
   for (const auto& name : moduleNamespace->moduleExportNames) {
     moduleNamespace->properties.erase(name);
     moduleNamespace->properties.erase("__get_" + name);
@@ -2550,7 +2549,7 @@ std::shared_ptr<Object> Module::getNamespaceObject() {
       moduleNamespace->properties[name] = Value(Undefined{});
     }
 
-    auto getter = std::make_shared<Function>();
+    auto getter = GarbageCollector::makeGC<Function>();
     getter->isNative = true;
     getter->nativeFunc = [module = this, name](const std::vector<Value>&) -> Value {
       if (auto current = module->getExport(name)) {

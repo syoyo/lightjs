@@ -258,15 +258,15 @@ class Interpreter {
   friend class Module;
   friend struct TaskAwaiter;
 public:
-  explicit Interpreter(std::shared_ptr<Environment> env);
+  explicit Interpreter(GCPtr<Environment> env);
 
   Task evaluate(const Expression& expr);
   Task evaluate(const Statement& stmt);
   Task evaluate(const Program& program);
 
   // Environment management for modules
-  std::shared_ptr<Environment> getEnvironment() const { return env_; }
-  void setEnvironment(std::shared_ptr<Environment> env) { env_ = env; }
+  GCPtr<Environment> getEnvironment() const { return env_; }
+  void setEnvironment(GCPtr<Environment> env) { env_ = env; }
   void setSuppressMicrotasks(bool value) { suppressMicrotasks_ = value; }
   bool suppressMicrotasks() const { return suppressMicrotasks_; }
   bool inDirectEvalInvocation() const { return activeDirectEvalInvocation_; }
@@ -299,7 +299,7 @@ public:
                             const std::vector<Value>& args);
 
 private:
-  std::shared_ptr<Environment> env_;
+  GCPtr<Environment> env_;
   size_t stackDepth_ = 0;
   StackTraceManager stackTrace_;
   bool suppressMicrotasks_ = false;
@@ -369,31 +369,31 @@ private:
   bool strictMode_ = false;
   bool varDeclBypassWith_ = false;  // Set during var declaration eval to bypass with scopes
   bool inTailPosition_ = false;
-  std::shared_ptr<Function> activeFunction_ = nullptr;
+  GCPtr<Function> activeFunction_ = {};
   bool pendingSelfTailCall_ = false;
   std::vector<Value> pendingSelfTailArgs_;
   Value pendingSelfTailThis_ = Value(Undefined{});
   bool pendingDirectEvalCall_ = false;
   bool activeDirectEvalInvocation_ = false;
   std::shared_ptr<void> sourceKeepAlive_;  // Keeps eval AST alive for function bodies
-  std::vector<std::shared_ptr<Function>> activeNamedExpressionStack_;
+  std::vector<GCPtr<Function>> activeNamedExpressionStack_;
   std::string pendingIterationLabel_;  // Label for next iteration statement (consumed once)
 
   struct IteratorRecord {
     enum class Kind { Generator, Array, String, IteratorObject, TypedArray };
     Kind kind = Kind::Array;
-    std::shared_ptr<Generator> generator;
-    std::shared_ptr<Array> array;
-    std::shared_ptr<Object> iteratorObject;
-    std::shared_ptr<TypedArray> typedArray;
+    GCPtr<Generator> generator;
+    GCPtr<Array> array;
+    GCPtr<Object> iteratorObject;
+    GCPtr<TypedArray> typedArray;
     std::string stringValue;
     size_t index = 0;
     Value nextMethod;  // Cached next() method per GetIterator spec (7.4.1)
   };
 
   static Value makeIteratorResult(const Value& value, bool done);
-  static Value createIteratorFactory(const std::shared_ptr<Array>& arrPtr);
-  Value runGeneratorNext(const std::shared_ptr<Generator>& generator,
+  static Value createIteratorFactory(const GCPtr<Array>& arrPtr);
+  Value runGeneratorNext(const GCPtr<Generator>& generator,
                          ControlFlow::ResumeMode mode = ControlFlow::ResumeMode::None,
                          const Value& resumeValue = Value(Undefined{}));
   std::optional<IteratorRecord> getIterator(const Value& iterable);
@@ -449,7 +449,7 @@ private:
   Task bindDestructuringPattern(const Expression& pattern, Value value, bool isConst, bool useSet = false);
 
   // Helper to invoke a JavaScript function (used by native functions to call JS callbacks)
-  Value invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
+  Value invokeFunction(GCPtr<Function> func, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
 
   // Helper to format error message with line number
   static std::string formatError(const std::string& msg, const SourceLocation& loc) {
@@ -465,7 +465,7 @@ private:
 
   // Helper to throw error with stack trace
   void throwError(ErrorType type, const std::string& message) {
-    auto error = std::make_shared<Error>(type, message);
+    auto error = GarbageCollector::makeGC<Error>(type, message);
     // Format stack trace using ErrorFormatter
     error->stack = ErrorFormatter::formatError(
       error->getName(),

@@ -44,7 +44,7 @@ int main() {
   if (interpreter.hasError()) {
     std::cout << "SUCCESS: Error detected!\n";
     auto err = interpreter.getError();
-    if (auto* errPtr = std::get_if<std::shared_ptr<Error>>(&err.data)) {
+    if (auto* errPtr = std::get_if<GCPtr<Error>>(&err.data)) {
       std::cout << "Error: " << (*errPtr)->getName() << ": " << (*errPtr)->message << "\n";
     }
     return 0;

@@ -21,6 +21,7 @@ void TaskAwaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
 #include "event_loop.h"
 #include "symbols.h"
 #include "streams.h"
+#include "wasm_js.h"
 #include <iostream>
 #include <cmath>
 #include <climits>
@@ -298,7 +299,7 @@ bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
 // Forward declaration for TDZ initialization
 static void collectVarHoistNames(const Expression& expr, std::vector<std::string>& names);
 
-Interpreter::Interpreter(std::shared_ptr<Environment> env) : env_(env) {
+Interpreter::Interpreter(GCPtr<Environment> env) : env_(env) {
   setGlobalInterpreter(this);
 }
 
@@ -335,7 +336,7 @@ bool Interpreter::isObjectLike(const Value& value) const {
 
 std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receiver, const std::string& key) {
   if (receiver.isObject()) {
-    auto current = std::get<std::shared_ptr<Object>>(receiver.data);
+    auto current = receiver.getGC<Object>();
     int depth = 0;
     while (current && depth <= 16) {
       depth++;
@@ -358,13 +359,13 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
       if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
         break;
       }
-      current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      current = protoIt->second.getGC<Object>();
     }
     return {false, Value(Undefined{})};
   }
 
   if (receiver.isFunction()) {
-    auto fn = std::get<std::shared_ptr<Function>>(receiver.data);
+    auto fn = receiver.getGC<Function>();
     auto it = fn->properties.find(key);
     if (it != fn->properties.end()) {
       return {true, it->second};
@@ -372,7 +373,7 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
     // Walk prototype chain for functions
     auto protoIt = fn->properties.find("__proto__");
     if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
-      auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      auto proto = protoIt->second.getGC<Object>();
       int depth = 0;
       while (proto && depth < 16) {
         auto found = proto->properties.find(key);
@@ -381,7 +382,7 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
         }
         auto nextProto = proto->properties.find("__proto__");
         if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-        proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+        proto = nextProto->second.getGC<Object>();
         depth++;
       }
     }
@@ -389,7 +390,7 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
   }
 
   if (receiver.isRegex()) {
-    auto regex = std::get<std::shared_ptr<Regex>>(receiver.data);
+    auto regex = receiver.getGC<Regex>();
     std::string getterKey = "__get_" + key;
     auto getterIt = regex->properties.find(getterKey);
     if (getterIt != regex->properties.end()) {
@@ -406,7 +407,7 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
   }
 
   if (receiver.isProxy()) {
-    auto proxy = std::get<std::shared_ptr<Proxy>>(receiver.data);
+    auto proxy = receiver.getGC<Proxy>();
     if (proxy->target) {
       return getPropertyForPrimitive(*proxy->target, key);
     }
@@ -466,7 +467,7 @@ Value Interpreter::toPrimitiveValue(const Value& input, bool preferString) {
 
     if (std::string(methodName) == "toString") {
       if (input.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(input.data);
+        auto arr = input.getGC<Array>();
         std::string out;
         for (size_t i = 0; i < arr->elements.size(); i++) {
           if (i > 0) out += ",";
@@ -605,7 +606,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
     { auto _t = evaluateFuncDecl(*node); Value _v; LIGHTJS_RUN_TASK(_t, _v); LIGHTJS_RETURN(_v); }
   } else if (auto* node = std::get_if<ClassDeclaration>(&stmt.node)) {
     // Create the class directly
-    auto cls = std::make_shared<Class>(node->id.name);
+    auto cls = GarbageCollector::makeGC<Class>(node->id.name);
     GarbageCollector::instance().reportAllocation(sizeof(Class));
     cls->closure = env_;
 
@@ -615,11 +616,11 @@ Task Interpreter::evaluate(const Statement& stmt) {
   Value superVal;
   LIGHTJS_RUN_TASK(superTask, superVal);
       if (superVal.isClass()) {
-        cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+        cls->superClass = superVal.getGC<Class>();
       } else if (superVal.isFunction()) {
         cls->properties["__super_constructor__"] = superVal;
         // Inherit static properties from Function super class
-        auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+        auto superFunc = superVal.getGC<Function>();
         for (const auto& [key, val] : superFunc->properties) {
           if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
           if (key == "name" || key == "length" || key == "prototype" ||
@@ -631,25 +632,25 @@ Task Interpreter::evaluate(const Statement& stmt) {
       }
     }
 
-    auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> std::shared_ptr<Object> {
+    auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> GCPtr<Object> {
       if (ctorValue.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+        auto fn = ctorValue.getGC<Function>();
         auto protoIt = fn->properties.find("prototype");
         if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
-          return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          return protoIt->second.getGC<Object>();
         }
       } else if (ctorValue.isClass()) {
-        auto superCls = std::get<std::shared_ptr<Class>>(ctorValue.data);
+        auto superCls = ctorValue.getGC<Class>();
         auto protoIt = superCls->properties.find("prototype");
         if (protoIt != superCls->properties.end() && protoIt->second.isObject()) {
-          return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          return protoIt->second.getGC<Object>();
         }
       }
       return nullptr;
     };
 
     // Create Class.prototype object and wire prototype inheritance.
-    auto classPrototype = std::make_shared<Object>();
+    auto classPrototype = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     if (cls->superClass) {
       auto superProtoIt = cls->superClass->properties.find("prototype");
@@ -757,7 +758,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
         continue;
       }
 
-      auto func = std::make_shared<Function>();
+      auto func = GarbageCollector::makeGC<Function>();
       func->isNative = false;
       func->isAsync = method.isAsync;
       func->isGenerator = method.isGenerator;
@@ -863,7 +864,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
 
     // Class objects behave like functions: inherit from Function.prototype.
     if (auto funcVal = env_->get("Function"); funcVal && funcVal->isFunction()) {
-      auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+      auto funcCtor = std::get<GCPtr<Function>>(funcVal->data);
       auto protoIt = funcCtor->properties.find("prototype");
       if (protoIt != funcCtor->properties.end() && protoIt->second.isObject()) {
         cls->properties["__proto__"] = protoIt->second;
@@ -1015,7 +1016,7 @@ Task Interpreter::evaluate(const Expression& expr) {
     }
     LIGHTJS_RETURN(Value(result));
   } else if (auto* node = std::get_if<RegexLiteral>(&expr.node)) {
-    auto regex = std::make_shared<Regex>(node->pattern, node->flags);
+    auto regex = GarbageCollector::makeGC<Regex>(node->pattern, node->flags);
     LIGHTJS_RETURN(Value(regex));
   } else if (auto* node = std::get_if<BoolLiteral>(&expr.node)) {
     LIGHTJS_RETURN(Value(node->value));
@@ -1089,7 +1090,7 @@ Task Interpreter::evaluate(const Expression& expr) {
       }
 
       // Create import.meta object with common properties.
-      auto metaObj = std::make_shared<Object>();
+      auto metaObj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
 
       // import.meta.url - the URL of the current module
@@ -1100,7 +1101,7 @@ Task Interpreter::evaluate(const Expression& expr) {
       }
 
       // import.meta.resolve - function to resolve module specifiers
-      auto resolveFn = std::make_shared<Function>();
+      auto resolveFn = GarbageCollector::makeGC<Function>();
       resolveFn->isNative = true;
       resolveFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(std::string(""));
@@ -1703,88 +1704,88 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
 
       if (left.isObject() && right.isObject()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Object>>(left.data).get() ==
-                             std::get<std::shared_ptr<Object>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Object>().get() ==
+                             right.getGC<Object>().get()));
       }
       if (left.isArray() && right.isArray()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Array>>(left.data).get() ==
-                             std::get<std::shared_ptr<Array>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Array>().get() ==
+                             right.getGC<Array>().get()));
       }
       if (left.isFunction() && right.isFunction()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Function>>(left.data).get() ==
-                             std::get<std::shared_ptr<Function>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Function>().get() ==
+                             right.getGC<Function>().get()));
       }
       if (left.isTypedArray() && right.isTypedArray()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<TypedArray>>(left.data).get() ==
-                             std::get<std::shared_ptr<TypedArray>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<TypedArray>().get() ==
+                             right.getGC<TypedArray>().get()));
       }
       if (left.isPromise() && right.isPromise()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Promise>>(left.data).get() ==
-                             std::get<std::shared_ptr<Promise>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Promise>().get() ==
+                             right.getGC<Promise>().get()));
       }
       if (left.isRegex() && right.isRegex()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Regex>>(left.data).get() ==
-                             std::get<std::shared_ptr<Regex>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Regex>().get() ==
+                             right.getGC<Regex>().get()));
       }
       if (left.isMap() && right.isMap()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Map>>(left.data).get() ==
-                             std::get<std::shared_ptr<Map>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Map>().get() ==
+                             right.getGC<Map>().get()));
       }
       if (left.isSet() && right.isSet()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Set>>(left.data).get() ==
-                             std::get<std::shared_ptr<Set>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Set>().get() ==
+                             right.getGC<Set>().get()));
       }
       if (left.isError() && right.isError()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Error>>(left.data).get() ==
-                             std::get<std::shared_ptr<Error>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Error>().get() ==
+                             right.getGC<Error>().get()));
       }
       if (left.isGenerator() && right.isGenerator()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Generator>>(left.data).get() ==
-                             std::get<std::shared_ptr<Generator>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Generator>().get() ==
+                             right.getGC<Generator>().get()));
       }
       if (left.isProxy() && right.isProxy()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Proxy>>(left.data).get() ==
-                             std::get<std::shared_ptr<Proxy>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Proxy>().get() ==
+                             right.getGC<Proxy>().get()));
       }
       if (left.isWeakMap() && right.isWeakMap()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WeakMap>>(left.data).get() ==
-                             std::get<std::shared_ptr<WeakMap>>(right.data).get()));
+        LIGHTJS_RETURN(Value(std::get<GCPtr<WeakMap>>(left.data).get() ==
+                             std::get<GCPtr<WeakMap>>(right.data).get()));
       }
       if (left.isWeakSet() && right.isWeakSet()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WeakSet>>(left.data).get() ==
-                             std::get<std::shared_ptr<WeakSet>>(right.data).get()));
+        LIGHTJS_RETURN(Value(std::get<GCPtr<WeakSet>>(left.data).get() ==
+                             std::get<GCPtr<WeakSet>>(right.data).get()));
       }
       if (left.isArrayBuffer() && right.isArrayBuffer()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<ArrayBuffer>>(left.data).get() ==
-                             std::get<std::shared_ptr<ArrayBuffer>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<ArrayBuffer>().get() ==
+                             right.getGC<ArrayBuffer>().get()));
       }
       if (left.isDataView() && right.isDataView()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<DataView>>(left.data).get() ==
-                             std::get<std::shared_ptr<DataView>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<DataView>().get() ==
+                             right.getGC<DataView>().get()));
       }
       if (left.isClass() && right.isClass()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<Class>>(left.data).get() ==
-                             std::get<std::shared_ptr<Class>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<Class>().get() ==
+                             right.getGC<Class>().get()));
       }
       if (left.isWasmInstance() && right.isWasmInstance()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WasmInstanceJS>>(left.data).get() ==
-                             std::get<std::shared_ptr<WasmInstanceJS>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<WasmInstanceJS>().get() ==
+                             right.getGC<WasmInstanceJS>().get()));
       }
       if (left.isWasmMemory() && right.isWasmMemory()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WasmMemoryJS>>(left.data).get() ==
-                             std::get<std::shared_ptr<WasmMemoryJS>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<WasmMemoryJS>().get() ==
+                             right.getGC<WasmMemoryJS>().get()));
       }
       if (left.isReadableStream() && right.isReadableStream()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<ReadableStream>>(left.data).get() ==
-                             std::get<std::shared_ptr<ReadableStream>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<ReadableStream>().get() ==
+                             right.getGC<ReadableStream>().get()));
       }
       if (left.isWritableStream() && right.isWritableStream()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<WritableStream>>(left.data).get() ==
-                             std::get<std::shared_ptr<WritableStream>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<WritableStream>().get() ==
+                             right.getGC<WritableStream>().get()));
       }
       if (left.isTransformStream() && right.isTransformStream()) {
-        LIGHTJS_RETURN(Value(std::get<std::shared_ptr<TransformStream>>(left.data).get() ==
-                             std::get<std::shared_ptr<TransformStream>>(right.data).get()));
+        LIGHTJS_RETURN(Value(left.getGC<TransformStream>().get() ==
+                             right.getGC<TransformStream>().get()));
       }
 
       LIGHTJS_RETURN(Value(false));
@@ -1824,88 +1825,88 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       // For all reference types, strict inequality is pointer inequality.
       auto equalByPointer = [&](const Value& a, const Value& b) -> bool {
         if (a.isObject() && b.isObject()) {
-          return std::get<std::shared_ptr<Object>>(a.data).get() ==
-                 std::get<std::shared_ptr<Object>>(b.data).get();
+          return a.getGC<Object>().get() ==
+                 b.getGC<Object>().get();
         }
         if (a.isArray() && b.isArray()) {
-          return std::get<std::shared_ptr<Array>>(a.data).get() ==
-                 std::get<std::shared_ptr<Array>>(b.data).get();
+          return a.getGC<Array>().get() ==
+                 b.getGC<Array>().get();
         }
         if (a.isFunction() && b.isFunction()) {
-          return std::get<std::shared_ptr<Function>>(a.data).get() ==
-                 std::get<std::shared_ptr<Function>>(b.data).get();
+          return a.getGC<Function>().get() ==
+                 b.getGC<Function>().get();
         }
         if (a.isTypedArray() && b.isTypedArray()) {
-          return std::get<std::shared_ptr<TypedArray>>(a.data).get() ==
-                 std::get<std::shared_ptr<TypedArray>>(b.data).get();
+          return a.getGC<TypedArray>().get() ==
+                 b.getGC<TypedArray>().get();
         }
         if (a.isPromise() && b.isPromise()) {
-          return std::get<std::shared_ptr<Promise>>(a.data).get() ==
-                 std::get<std::shared_ptr<Promise>>(b.data).get();
+          return a.getGC<Promise>().get() ==
+                 b.getGC<Promise>().get();
         }
         if (a.isRegex() && b.isRegex()) {
-          return std::get<std::shared_ptr<Regex>>(a.data).get() ==
-                 std::get<std::shared_ptr<Regex>>(b.data).get();
+          return a.getGC<Regex>().get() ==
+                 b.getGC<Regex>().get();
         }
         if (a.isMap() && b.isMap()) {
-          return std::get<std::shared_ptr<Map>>(a.data).get() ==
-                 std::get<std::shared_ptr<Map>>(b.data).get();
+          return a.getGC<Map>().get() ==
+                 b.getGC<Map>().get();
         }
         if (a.isSet() && b.isSet()) {
-          return std::get<std::shared_ptr<Set>>(a.data).get() ==
-                 std::get<std::shared_ptr<Set>>(b.data).get();
+          return a.getGC<Set>().get() ==
+                 b.getGC<Set>().get();
         }
         if (a.isError() && b.isError()) {
-          return std::get<std::shared_ptr<Error>>(a.data).get() ==
-                 std::get<std::shared_ptr<Error>>(b.data).get();
+          return a.getGC<Error>().get() ==
+                 b.getGC<Error>().get();
         }
         if (a.isGenerator() && b.isGenerator()) {
-          return std::get<std::shared_ptr<Generator>>(a.data).get() ==
-                 std::get<std::shared_ptr<Generator>>(b.data).get();
+          return a.getGC<Generator>().get() ==
+                 b.getGC<Generator>().get();
         }
         if (a.isProxy() && b.isProxy()) {
-          return std::get<std::shared_ptr<Proxy>>(a.data).get() ==
-                 std::get<std::shared_ptr<Proxy>>(b.data).get();
+          return a.getGC<Proxy>().get() ==
+                 b.getGC<Proxy>().get();
         }
         if (a.isWeakMap() && b.isWeakMap()) {
-          return std::get<std::shared_ptr<WeakMap>>(a.data).get() ==
-                 std::get<std::shared_ptr<WeakMap>>(b.data).get();
+          return std::get<GCPtr<WeakMap>>(a.data).get() ==
+                 std::get<GCPtr<WeakMap>>(b.data).get();
         }
         if (a.isWeakSet() && b.isWeakSet()) {
-          return std::get<std::shared_ptr<WeakSet>>(a.data).get() ==
-                 std::get<std::shared_ptr<WeakSet>>(b.data).get();
+          return std::get<GCPtr<WeakSet>>(a.data).get() ==
+                 std::get<GCPtr<WeakSet>>(b.data).get();
         }
         if (a.isArrayBuffer() && b.isArrayBuffer()) {
-          return std::get<std::shared_ptr<ArrayBuffer>>(a.data).get() ==
-                 std::get<std::shared_ptr<ArrayBuffer>>(b.data).get();
+          return a.getGC<ArrayBuffer>().get() ==
+                 b.getGC<ArrayBuffer>().get();
         }
         if (a.isDataView() && b.isDataView()) {
-          return std::get<std::shared_ptr<DataView>>(a.data).get() ==
-                 std::get<std::shared_ptr<DataView>>(b.data).get();
+          return a.getGC<DataView>().get() ==
+                 b.getGC<DataView>().get();
         }
         if (a.isClass() && b.isClass()) {
-          return std::get<std::shared_ptr<Class>>(a.data).get() ==
-                 std::get<std::shared_ptr<Class>>(b.data).get();
+          return a.getGC<Class>().get() ==
+                 b.getGC<Class>().get();
         }
         if (a.isWasmInstance() && b.isWasmInstance()) {
-          return std::get<std::shared_ptr<WasmInstanceJS>>(a.data).get() ==
-                 std::get<std::shared_ptr<WasmInstanceJS>>(b.data).get();
+          return a.getGC<WasmInstanceJS>().get() ==
+                 b.getGC<WasmInstanceJS>().get();
         }
         if (a.isWasmMemory() && b.isWasmMemory()) {
-          return std::get<std::shared_ptr<WasmMemoryJS>>(a.data).get() ==
-                 std::get<std::shared_ptr<WasmMemoryJS>>(b.data).get();
+          return a.getGC<WasmMemoryJS>().get() ==
+                 b.getGC<WasmMemoryJS>().get();
         }
         if (a.isReadableStream() && b.isReadableStream()) {
-          return std::get<std::shared_ptr<ReadableStream>>(a.data).get() ==
-                 std::get<std::shared_ptr<ReadableStream>>(b.data).get();
+          return a.getGC<ReadableStream>().get() ==
+                 b.getGC<ReadableStream>().get();
         }
         if (a.isWritableStream() && b.isWritableStream()) {
-          return std::get<std::shared_ptr<WritableStream>>(a.data).get() ==
-                 std::get<std::shared_ptr<WritableStream>>(b.data).get();
+          return a.getGC<WritableStream>().get() ==
+                 b.getGC<WritableStream>().get();
         }
         if (a.isTransformStream() && b.isTransformStream()) {
-          return std::get<std::shared_ptr<TransformStream>>(a.data).get() ==
-                 std::get<std::shared_ptr<TransformStream>>(b.data).get();
+          return a.getGC<TransformStream>().get() ==
+                 b.getGC<TransformStream>().get();
         }
         return false;
       };
@@ -1919,12 +1920,12 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       // Handle Proxy has trap
       if (right.isProxy()) {
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(right.data);
+        auto proxyPtr = right.getGC<Proxy>();
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto trapIt = handlerObj->properties.find("has");
           if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
-            auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+            auto trap = trapIt->second.getGC<Function>();
             if (trap->isNative) {
               std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName)};
               LIGHTJS_RETURN(trap->nativeFunc(trapArgs));
@@ -1933,7 +1934,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         }
         // Fall through to check target
         if (proxyPtr->target && proxyPtr->target->isObject()) {
-          auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
           LIGHTJS_RETURN(Value(targetObj->properties.find(propName) != targetObj->properties.end()));
         }
         LIGHTJS_RETURN(Value(false));
@@ -1944,13 +1945,13 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         if (props.find(propName) != props.end()) return true;
         auto protoIt = props.find("__proto__");
         if (protoIt != props.end() && protoIt->second.isObject()) {
-          auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          auto proto = protoIt->second.getGC<Object>();
           int depth = 0;
           while (proto && depth < 50) {
             if (proto->properties.find(propName) != proto->properties.end()) return true;
             auto nextProto = proto->properties.find("__proto__");
             if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-            proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+            proto = nextProto->second.getGC<Object>();
             depth++;
           }
         }
@@ -1958,12 +1959,12 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       };
 
       if (right.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(right.data);
+        auto objPtr = right.getGC<Object>();
         LIGHTJS_RETURN(Value(hasPropertyInChain(objPtr->properties)));
       }
 
       if (right.isArray()) {
-        auto arrPtr = std::get<std::shared_ptr<Array>>(right.data);
+        auto arrPtr = right.getGC<Array>();
         size_t idx = 0;
         if (parseArrayIndex(propName, idx)) {
           LIGHTJS_RETURN(Value(idx < arrPtr->elements.size()));
@@ -1973,7 +1974,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
 
       if (right.isFunction()) {
-        auto fnPtr = std::get<std::shared_ptr<Function>>(right.data);
+        auto fnPtr = right.getGC<Function>();
         LIGHTJS_RETURN(Value(hasPropertyInChain(fnPtr->properties)));
       }
 
@@ -1987,7 +1988,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         // Check for callable objects (e.g., Proxy with apply trap)
         bool isCallable = false;
         if (right.isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(right.data);
+          auto obj = right.getGC<Object>();
           auto callableIt = obj->properties.find("__callable_object__");
           if (callableIt != obj->properties.end() &&
               callableIt->second.isBool() && callableIt->second.toBool()) {
@@ -2017,7 +2018,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
       auto unwrapConstructor = [&](const Value& ctor) -> Value {
         if (ctor.isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(ctor.data);
+          auto obj = ctor.getGC<Object>();
           auto callableIt = obj->properties.find("__callable_object__");
           if (callableIt != obj->properties.end() &&
               callableIt->second.isBool() && callableIt->second.toBool()) {
@@ -2036,44 +2037,44 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           return false;
         }
         if (candidate.isFunction()) {
-          return std::get<std::shared_ptr<Function>>(candidate.data) ==
-                 std::get<std::shared_ptr<Function>>(ctor.data);
+          return candidate.getGC<Function>() ==
+                 ctor.getGC<Function>();
         }
         if (candidate.isClass()) {
-          return std::get<std::shared_ptr<Class>>(candidate.data) ==
-                 std::get<std::shared_ptr<Class>>(ctor.data);
+          return candidate.getGC<Class>() ==
+                 ctor.getGC<Class>();
         }
         return false;
       };
 
       auto matchesConstructor = [&](const Value& instance, const Value& ctor) -> bool {
         if (instance.isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(instance.data);
+          auto obj = instance.getGC<Object>();
           auto it = obj->properties.find("__constructor__");
           return it != obj->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isGenerator()) {
-          auto gen = std::get<std::shared_ptr<Generator>>(instance.data);
+          auto gen = instance.getGC<Generator>();
           auto it = gen->properties.find("__constructor__");
           return it != gen->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isArray()) {
-          auto arr = std::get<std::shared_ptr<Array>>(instance.data);
+          auto arr = instance.getGC<Array>();
           auto it = arr->properties.find("__constructor__");
           return it != arr->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(instance.data);
+          auto fn = instance.getGC<Function>();
           auto it = fn->properties.find("__constructor__");
           return it != fn->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isRegex()) {
-          auto regex = std::get<std::shared_ptr<Regex>>(instance.data);
+          auto regex = instance.getGC<Regex>();
           auto it = regex->properties.find("__constructor__");
           return it != regex->properties.end() && sameCtor(it->second, ctor);
         }
         if (instance.isPromise()) {
-          auto promise = std::get<std::shared_ptr<Promise>>(instance.data);
+          auto promise = instance.getGC<Promise>();
           auto it = promise->properties.find("__constructor__");
           return it != promise->properties.end() && sameCtor(it->second, ctor);
         }
@@ -2083,10 +2084,10 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       Value ctorValue = unwrapConstructor(right);
 
       if (left.isError() && ctorValue.isFunction()) {
-        auto ctor = std::get<std::shared_ptr<Function>>(ctorValue.data);
+        auto ctor = ctorValue.getGC<Function>();
         auto tagIt = ctor->properties.find("__error_type__");
         if (tagIt != ctor->properties.end() && tagIt->second.isNumber()) {
-          auto err = std::get<std::shared_ptr<Error>>(left.data);
+          auto err = left.getGC<Error>();
           int expected = static_cast<int>(std::get<double>(tagIt->second.data));
           // Exact match (e.g., new TypeError instanceof TypeError)
           if (static_cast<int>(err->type) == expected) {
@@ -2102,20 +2103,20 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       // OrdinaryHasInstance: walk the prototype chain
       // Get the constructor's .prototype property
-      auto getCtorPrototype = [&](const Value& ctor) -> std::shared_ptr<Object> {
+      auto getCtorPrototype = [&](const Value& ctor) -> GCPtr<Object> {
         OrderedMap<std::string, Value>* props = nullptr;
         if (ctor.isFunction()) {
-          props = &std::get<std::shared_ptr<Function>>(ctor.data)->properties;
+          props = &ctor.getGC<Function>()->properties;
         } else if (ctor.isObject()) {
-          props = &std::get<std::shared_ptr<Object>>(ctor.data)->properties;
+          props = &ctor.getGC<Object>()->properties;
         } else if (ctor.isClass()) {
-          auto cls = std::get<std::shared_ptr<Class>>(ctor.data);
+          auto cls = ctor.getGC<Class>();
           props = &cls->properties;
         }
         if (props) {
           auto protoIt = props->find("prototype");
           if (protoIt != props->end() && protoIt->second.isObject()) {
-            return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+            return protoIt->second.getGC<Object>();
           }
         }
         return nullptr;
@@ -2128,9 +2129,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         // Check if prototype property exists but is not an object → TypeError
         OrderedMap<std::string, Value>* checkProps = nullptr;
         if (right.isFunction()) {
-          checkProps = &std::get<std::shared_ptr<Function>>(right.data)->properties;
+          checkProps = &right.getGC<Function>()->properties;
         } else if (right.isObject()) {
-          checkProps = &std::get<std::shared_ptr<Object>>(right.data)->properties;
+          checkProps = &right.getGC<Object>()->properties;
         }
         if (checkProps) {
           auto protoIt = checkProps->find("prototype");
@@ -2142,23 +2143,23 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
       }
       if (ctorProto) {
         // Get the instance's __proto__ chain
-        auto getProto = [](const Value& val) -> std::shared_ptr<Object> {
+        auto getProto = [](const Value& val) -> GCPtr<Object> {
           OrderedMap<std::string, Value>* props = nullptr;
           if (val.isObject()) {
-            props = &std::get<std::shared_ptr<Object>>(val.data)->properties;
+            props = &val.getGC<Object>()->properties;
           } else if (val.isArray()) {
-            props = &std::get<std::shared_ptr<Array>>(val.data)->properties;
+            props = &val.getGC<Array>()->properties;
           } else if (val.isFunction()) {
-            props = &std::get<std::shared_ptr<Function>>(val.data)->properties;
+            props = &val.getGC<Function>()->properties;
           } else if (val.isRegex()) {
-            props = &std::get<std::shared_ptr<Regex>>(val.data)->properties;
+            props = &val.getGC<Regex>()->properties;
           } else if (val.isPromise()) {
-            props = &std::get<std::shared_ptr<Promise>>(val.data)->properties;
+            props = &val.getGC<Promise>()->properties;
           }
           if (props) {
             auto it = props->find("__proto__");
             if (it != props->end() && it->second.isObject()) {
-              return std::get<std::shared_ptr<Object>>(it->second.data);
+              return it->second.getGC<Object>();
             }
           }
           return nullptr;
@@ -2174,7 +2175,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           if (protoIt == proto->properties.end() || !protoIt->second.isObject()) {
             break;
           }
-          proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          proto = protoIt->second.getGC<Object>();
           depth++;
         }
       }
@@ -2186,14 +2187,14 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       // Built-in type checks for instanceof when __proto__ chain not available
       if (ctorValue.isFunction()) {
-        auto ctor = std::get<std::shared_ptr<Function>>(ctorValue.data);
+        auto ctor = ctorValue.getGC<Function>();
         auto nameIt = ctor->properties.find("name");
         if (nameIt != ctor->properties.end() && nameIt->second.isString()) {
           std::string ctorName = nameIt->second.toString();
           if (ctorName == "Object") {
             // Any object, array, function, regex is instanceof Object
             if (left.isObject()) {
-              auto obj = std::get<std::shared_ptr<Object>>(left.data);
+              auto obj = left.getGC<Object>();
               if (obj->isModuleNamespace) {
                 LIGHTJS_RETURN(Value(false));
               }
@@ -2250,12 +2251,12 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       // Handle Proxy deleteProperty trap
       if (obj.isProxy()) {
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+        auto proxyPtr = obj.getGC<Proxy>();
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto trapIt = handlerObj->properties.find("deleteProperty");
           if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
-            auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+            auto trap = trapIt->second.getGC<Function>();
             if (trap->isNative) {
               std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName)};
               LIGHTJS_RETURN(trap->nativeFunc(trapArgs));
@@ -2264,7 +2265,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
         }
         // Fall through to delete from target
         if (proxyPtr->target && proxyPtr->target->isObject()) {
-          auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
           bool deleted = false;
           deleted = targetObj->properties.erase(propName) > 0 || deleted;
           deleted = targetObj->properties.erase("__get_" + propName) > 0 || deleted;
@@ -2279,7 +2280,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       // Delete on function properties
       if (obj.isFunction()) {
-        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        auto fnPtr = obj.getGC<Function>();
         // name, length are non-configurable in some contexts; prototype is non-configurable
         if (propName == "prototype") {
           LIGHTJS_RETURN(Value(false));
@@ -2294,7 +2295,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       // Delete on class properties
       if (obj.isClass()) {
-        auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+        auto clsPtr = obj.getGC<Class>();
         if (propName == "prototype") {
           LIGHTJS_RETURN(Value(false));
         }
@@ -2312,7 +2313,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       }
 
       if (obj.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        auto objPtr = obj.getGC<Object>();
         if (objPtr->isModuleNamespace) {
           const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
           bool isExport = std::find(
@@ -2347,7 +2348,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       }
 
       if (obj.isArray()) {
-        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        auto arrPtr = obj.getGC<Array>();
         size_t idx = 0;
         if (parseArrayIndex(propName, idx) && idx < arrPtr->elements.size()) {
           arrPtr->elements[idx] = Value(Undefined{});
@@ -2360,7 +2361,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       }
 
       if (obj.isPromise()) {
-        auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+        auto promisePtr = obj.getGC<Promise>();
         promisePtr->properties.erase(propName);
         promisePtr->properties.erase("__get_" + propName);
         promisePtr->properties.erase("__set_" + propName);
@@ -2369,7 +2370,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
 
       // Delete on class properties
       if (obj.isClass()) {
-        auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+        auto clsPtr = obj.getGC<Class>();
         if (clsPtr->properties.count("__non_configurable_" + propName)) {
           LIGHTJS_RETURN(Value(false));
         }
@@ -2468,7 +2469,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (arg.isClass()) LIGHTJS_RETURN(Value("function"));
       // Check for callable objects (e.g., String, Object constructors)
       if (arg.isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(arg.data);
+        auto obj = arg.getGC<Object>();
         auto it = obj->properties.find("__callable_object__");
         if (it != obj->properties.end() && it->second.isBool() && it->second.toBool()) {
           LIGHTJS_RETURN(Value("function"));
@@ -2526,7 +2527,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
           // Named evaluation: set name on anonymous function/class
           if (right.isFunction()) {
-            auto fn = std::get<std::shared_ptr<Function>>(right.data);
+            auto fn = right.getGC<Function>();
             auto nameIt = fn->properties.find("name");
             if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
               fn->properties["name"] = Value(id->name);
@@ -2534,7 +2535,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
               fn->properties["__non_enum_name"] = Value(true);
             }
           } else if (right.isClass()) {
-            auto cls = std::get<std::shared_ptr<Class>>(right.data);
+            auto cls = right.getGC<Class>();
             // Per spec: HasOwnProperty(v, "name") check before SetFunctionName
             if (cls->properties.find("name") == cls->properties.end()) {
               cls->name = id->name;
@@ -2588,11 +2589,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
       // Handle private field logical assignment (#name)
       if (!propName.empty() && propName[0] == '#' && obj.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
-        std::shared_ptr<Class> cls;
+        auto objPtr = obj.getGC<Object>();
+        GCPtr<Class> cls;
         auto ctorIt = objPtr->properties.find("__constructor__");
         if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
-          cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+          cls = ctorIt->second.getGC<Class>();
         }
 
         Value current(Undefined{});
@@ -2680,7 +2681,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       bool isExtensible = true;
       bool propExists = false;
       if (obj.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        auto objPtr = obj.getGC<Object>();
         // Check for getter
         auto getterIt = objPtr->properties.find("__get_" + propName);
         if (getterIt != objPtr->properties.end() && getterIt->second.isFunction()) {
@@ -2710,14 +2711,14 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           isExtensible = false;
         }
       } else if (obj.isFunction()) {
-        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        auto fnPtr = obj.getGC<Function>();
         auto it = fnPtr->properties.find(propName);
         if (it != fnPtr->properties.end()) {
           current = it->second;
           propExists = true;
         }
       } else if (obj.isArray()) {
-        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        auto arrPtr = obj.getGC<Array>();
         auto getterIt = arrPtr->properties.find("__get_" + propName);
         if (getterIt != arrPtr->properties.end() && getterIt->second.isFunction()) {
           current = callFunction(getterIt->second, {}, obj);
@@ -2775,7 +2776,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
       // Assign (with setter support)
       if (obj.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+        auto objPtr = obj.getGC<Object>();
         auto setterIt = objPtr->properties.find("__set_" + propName);
         if (setterIt != objPtr->properties.end() && setterIt->second.isFunction()) {
           callFunction(setterIt->second, {right2}, obj);
@@ -2783,10 +2784,10 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           objPtr->properties[propName] = right2;
         }
       } else if (obj.isFunction()) {
-        auto fnPtr = std::get<std::shared_ptr<Function>>(obj.data);
+        auto fnPtr = obj.getGC<Function>();
         fnPtr->properties[propName] = right2;
       } else if (obj.isArray()) {
-        auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+        auto arrPtr = obj.getGC<Array>();
         auto setterIt = arrPtr->properties.find("__set_" + propName);
         if (setterIt != arrPtr->properties.end() && setterIt->second.isFunction()) {
           callFunction(setterIt->second, {right2}, obj);
@@ -2820,7 +2821,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         isAnonFnDef = clsExpr->name.empty();
       }
       if (isAnonFnDef && right.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(right.data);
+        auto fn = right.getGC<Function>();
         auto nameIt = fn->properties.find("name");
         if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
           fn->properties["name"] = Value(id->name);
@@ -2828,7 +2829,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           fn->properties["__non_enum_name"] = Value(true);
         }
       } else if (isAnonFnDef && right.isClass()) {
-        auto cls = std::get<std::shared_ptr<Class>>(right.data);
+        auto cls = right.getGC<Class>();
         if (cls->properties.find("name") == cls->properties.end()) {
           cls->name = id->name;
           cls->properties["name"] = Value(id->name);
@@ -3002,12 +3003,12 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     // Handle Proxy set trap
     if (obj.isProxy()) {
-      auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+      auto proxyPtr = obj.getGC<Proxy>();
       if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-        auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+        auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
         auto trapIt = handlerObj->properties.find("set");
         if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
-          auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+          auto trap = trapIt->second.getGC<Function>();
           if (trap->isNative) {
             // Call set trap: handler.set(target, property, value, receiver)
             std::vector<Value> trapArgs = {*proxyPtr->target, Value(propName), right, obj};
@@ -3029,25 +3030,25 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       }
       // No set trap - fall through to set on target
       if (proxyPtr->target && proxyPtr->target->isObject()) {
-        auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+        auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
         targetObj->properties[propName] = right;
         LIGHTJS_RETURN(right);
       }
     }
 
     if (obj.isObject()) {
-      auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      auto objPtr = obj.getGC<Object>();
       auto writeObjPtr = objPtr;
       if (isSuperTarget && superReceiver.isObject()) {
-        writeObjPtr = std::get<std::shared_ptr<Object>>(superReceiver.data);
+        writeObjPtr = superReceiver.getGC<Object>();
       }
 
       // Handle private field assignment (#name)
       if (!propName.empty() && propName[0] == '#') {
-        std::shared_ptr<Class> cls;
+        GCPtr<Class> cls;
         auto ctorIt = objPtr->properties.find("__constructor__");
         if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
-          cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+          cls = ctorIt->second.getGC<Class>();
         }
 
         // Check for private setter
@@ -3120,7 +3121,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       std::string setterName = "__set_" + propName;
       auto setterIt = objPtr->properties.find(setterName);
       if (setterIt != objPtr->properties.end() && setterIt->second.isFunction()) {
-        auto setter = std::get<std::shared_ptr<Function>>(setterIt->second.data);
+        auto setter = setterIt->second.getGC<Function>();
         // Call the setter with 'this' bound to the object and the value as argument
         invokeFunction(setter, {right}, obj);
         LIGHTJS_RETURN(right);
@@ -3158,7 +3159,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       auto rootEnv = env_->getRoot();
       auto globalThisVal = rootEnv->get("globalThis");
       if (globalThisVal && globalThisVal->isObject()) {
-        auto globalObj = std::get<std::shared_ptr<Object>>(globalThisVal->data);
+        auto globalObj = std::get<GCPtr<Object>>(globalThisVal->data);
         if (globalObj.get() == writeObjPtr.get()) {
           rootEnv->set(propName, writeObjPtr->properties[propName]);
         }
@@ -3167,7 +3168,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isFunction()) {
-      auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+      auto funcPtr = obj.getGC<Function>();
       // name and length are non-writable on functions
       if (propName == "name" || propName == "length") {
         if (strictMode_) {
@@ -3194,7 +3195,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isPromise()) {
-      auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+      auto promisePtr = obj.getGC<Promise>();
       if (expr.op == AssignmentExpr::Op::Assign) {
         promisePtr->properties[propName] = right;
       } else {
@@ -3205,7 +3206,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isArray()) {
-      auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+      auto arrPtr = obj.getGC<Array>();
       size_t idx = 0;
       if (parseArrayIndex(propName, idx)) {
         auto setterIt = arrPtr->properties.find("__set_" + propName);
@@ -3285,7 +3286,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isTypedArray()) {
-      auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
+      auto taPtr = obj.getGC<TypedArray>();
       size_t idx = 0;
       if (parseArrayIndex(propName, idx)) {
         if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
@@ -3298,7 +3299,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isRegex()) {
-      auto regexPtr = std::get<std::shared_ptr<Regex>>(obj.data);
+      auto regexPtr = obj.getGC<Regex>();
       if (expr.op == AssignmentExpr::Op::Assign) {
         regexPtr->properties[propName] = right;
       } else {
@@ -3309,7 +3310,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     if (obj.isClass()) {
-      auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+      auto clsPtr = obj.getGC<Class>();
       // Handle private static field assignment (#name)
       if (!propName.empty() && propName[0] == '#') {
         std::string mangledName = "__private_" + propName + "__";
@@ -3417,7 +3418,7 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     };
 
     if (obj.isObject()) {
-      auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+      auto objPtr = obj.getGC<Object>();
       // Handle private field update (#name)
       std::string lookupName = propName;
       if (!propName.empty() && propName[0] == '#') {
@@ -3434,7 +3435,7 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     }
 
     if (obj.isClass()) {
-      auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+      auto clsPtr = obj.getGC<Class>();
       std::string lookupName = propName;
       if (!propName.empty() && propName[0] == '#') {
         lookupName = "__private_" + propName + "__";
@@ -3450,7 +3451,7 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     }
 
     if (obj.isArray()) {
-      auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+      auto arrPtr = obj.getGC<Array>();
       size_t index = 0;
       if (parseArrayIndex(propName, index)) {
         Value currentValue = index < arrPtr->elements.size()
@@ -3503,15 +3504,15 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
           args.push_back(argTask.result());
         }
 
-        auto func = std::get<std::shared_ptr<Function>>(importFunc->data);
+        auto func = std::get<GCPtr<Function>>(importFunc->data);
 	  if (func->isNative) {
           LIGHTJS_RETURN(func->nativeFunc(args));
         }
       }
 
       // If we couldn't find the import function, return an error Promise
-      auto promise = std::make_shared<Promise>();
-      auto err = std::make_shared<Error>(ErrorType::ReferenceError, "import is not defined");
+      auto promise = GarbageCollector::makeGC<Promise>();
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::ReferenceError, "import is not defined");
       promise->reject(Value(err));
       LIGHTJS_RETURN(Value(promise));
     }
@@ -3558,7 +3559,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
       // Spread the value into args
       if (val.isArray()) {
-        auto srcArr = std::get<std::shared_ptr<Array>>(val.data);
+        auto srcArr = val.getGC<Array>();
         for (const auto& item : srcArr->elements) {
           args.push_back(item);
         }
@@ -3592,7 +3593,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
   }
 
   if (inTailPosition_ && strictMode_ && callee.isFunction() && activeFunction_) {
-    auto calleeFunc = std::get<std::shared_ptr<Function>>(callee.data);
+    auto calleeFunc = callee.getGC<Function>();
     if (!calleeFunc->isNative &&
         !calleeFunc->isAsync &&
         !calleeFunc->isGenerator &&
@@ -3611,7 +3612,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       std::holds_alternative<Identifier>(expr.callee->node)) {
     auto* id = std::get_if<Identifier>(&expr.callee->node);
     if (id && id->name == "eval") {
-      auto evalFn = std::get<std::shared_ptr<Function>>(callee.data);
+      auto evalFn = callee.getGC<Function>();
       auto intrinsicEvalIt = evalFn->properties.find("__is_intrinsic_eval__");
       isDirectEvalCall = intrinsicEvalIt != evalFn->properties.end() &&
                          intrinsicEvalIt->second.isBool() &&
@@ -3621,14 +3622,14 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
   // Handle Proxy apply trap for callable proxies
   if (callee.isProxy()) {
-    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(callee.data);
+    auto proxyPtr = callee.getGC<Proxy>();
     if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
       auto trapIt = handlerObj->properties.find("apply");
       if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
-        auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+        auto trap = trapIt->second.getGC<Function>();
         // Create args array
-        auto argsArray = std::make_shared<Array>();
+        auto argsArray = GarbageCollector::makeGC<Array>();
         argsArray->elements = args;
         // Call apply trap: handler.apply(target, thisArg, argumentsList)
         std::vector<Value> trapArgs = {*proxyPtr->target, thisValue, Value(argsArray)};
@@ -3655,7 +3656,7 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
   // Some built-ins are represented as wrapper objects with a callable constructor.
   if (callee.isObject()) {
-    auto objPtr = std::get<std::shared_ptr<Object>>(callee.data);
+    auto objPtr = callee.getGC<Object>();
     auto callableIt = objPtr->properties.find("__callable_object__");
     bool isCallableWrapper = callableIt != objPtr->properties.end() &&
                              callableIt->second.isBool() &&
@@ -3748,7 +3749,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "valueOf") {
-      auto valueOfFn = std::make_shared<Function>();
+      auto valueOfFn = GarbageCollector::makeGC<Function>();
       valueOfFn->isNative = true;
       valueOfFn->properties["__throw_on_new__"] = Value(true);
       valueOfFn->nativeFunc = [bigintValue](const std::vector<Value>&) -> Value {
@@ -3758,7 +3759,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toLocaleString") {
-      auto toLocaleStringFn = std::make_shared<Function>();
+      auto toLocaleStringFn = GarbageCollector::makeGC<Function>();
       toLocaleStringFn->isNative = true;
       toLocaleStringFn->properties["__throw_on_new__"] = Value(true);
       toLocaleStringFn->nativeFunc = [bigintValue](const std::vector<Value>&) -> Value {
@@ -3768,7 +3769,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toString") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->properties["__throw_on_new__"] = Value(true);
       toStringFn->nativeFunc = [bigintValue](const std::vector<Value>& args) -> Value {
@@ -3798,7 +3799,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toString") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->properties["__throw_on_new__"] = Value(true);
       toStringFn->nativeFunc = [symbolValue](const std::vector<Value>&) -> Value {
@@ -3808,7 +3809,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "valueOf") {
-      auto valueOfFn = std::make_shared<Function>();
+      auto valueOfFn = GarbageCollector::makeGC<Function>();
       valueOfFn->isNative = true;
       valueOfFn->properties["__throw_on_new__"] = Value(true);
       valueOfFn->nativeFunc = [symbolValue](const std::vector<Value>&) -> Value {
@@ -3827,7 +3828,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // Proxy trap handling - intercept get operations
   if (obj.isProxy()) {
-    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(obj.data);
+    auto proxyPtr = obj.getGC<Proxy>();
 
     // Compute property name
     std::string propName;
@@ -3843,12 +3844,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Check if handler has a 'get' trap
     if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
       auto getTrapIt = handlerObj->properties.find("get");
 
       if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
         // Call the get trap: handler.get(target, property, receiver)
-        auto getTrap = std::get<std::shared_ptr<Function>>(getTrapIt->second.data);
+        auto getTrap = getTrapIt->second.getGC<Function>();
         std::vector<Value> trapArgs = {
           *proxyPtr->target,
           Value(propName),
@@ -3864,7 +3865,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // No trap, fall through to default behavior on target
     if (proxyPtr->target && proxyPtr->target->isObject()) {
-      auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+      auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
       auto it = targetObj->properties.find(propName);
       if (it != targetObj->properties.end()) {
         LIGHTJS_RETURN(it->second);
@@ -3876,7 +3877,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   const auto& iteratorKey = WellKnownSymbols::iteratorKey();
 
   if (obj.isPromise()) {
-    auto promisePtr = std::get<std::shared_ptr<Promise>>(obj.data);
+    auto promisePtr = obj.getGC<Promise>();
 
     // Promise own accessor/data properties can override built-in behavior.
     std::string promiseGetterName = "__get_" + propName;
@@ -3889,7 +3890,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(promiseOwnIt->second);
     }
 
-    auto getIntrinsicPromisePrototype = [&]() -> std::shared_ptr<Object> {
+    auto getIntrinsicPromisePrototype = [&]() -> GCPtr<Object> {
       Value promiseCtorValue = Value(Undefined{});
       if (auto intrinsicPromise = env_->get("__intrinsic_Promise__")) {
         promiseCtorValue = *intrinsicPromise;
@@ -3899,12 +3900,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       if (!promiseCtorValue.isFunction()) {
         return nullptr;
       }
-      auto ctorFn = std::get<std::shared_ptr<Function>>(promiseCtorValue.data);
+      auto ctorFn = promiseCtorValue.getGC<Function>();
       auto protoIt = ctorFn->properties.find("prototype");
       if (protoIt == ctorFn->properties.end() || !protoIt->second.isObject()) {
         return nullptr;
       }
-      return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      return protoIt->second.getGC<Object>();
     };
 
     if (auto promiseProto = getIntrinsicPromisePrototype()) {
@@ -3934,7 +3935,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Add toString method for Promise
     if (propName == "toString") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->nativeFunc = [](const std::vector<Value>&) -> Value {
         return Value("[Promise]");
@@ -3944,7 +3945,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Promise.prototype.then(onFulfilled, onRejected)
     if (propName == "then") {
-      auto thenFn = std::make_shared<Function>();
+      auto thenFn = GarbageCollector::makeGC<Function>();
       thenFn->isNative = true;
       thenFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
         std::function<Value(Value)> onFulfilled = nullptr;
@@ -3952,7 +3953,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         // Get onFulfilled callback if provided
         if (!args.empty() && args[0].isFunction()) {
-          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          auto callback = args[0].getGC<Function>();
           onFulfilled = [this, callback](Value val) -> Value {
             Value out = invokeFunction(callback, {val}, Value(Undefined{}));
             if (hasError()) {
@@ -3966,7 +3967,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         // Get onRejected callback if provided
         if (args.size() > 1 && args[1].isFunction()) {
-          auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+          auto callback = args[1].getGC<Function>();
           onRejected = [this, callback](Value val) -> Value {
             Value out = invokeFunction(callback, {val}, Value(Undefined{}));
             if (hasError()) {
@@ -3986,13 +3987,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Promise.prototype.catch(onRejected)
     if (propName == "catch") {
-      auto catchFn = std::make_shared<Function>();
+      auto catchFn = GarbageCollector::makeGC<Function>();
       catchFn->isNative = true;
       catchFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
         std::function<Value(Value)> onRejected = nullptr;
 
         if (!args.empty() && args[0].isFunction()) {
-          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          auto callback = args[0].getGC<Function>();
           onRejected = [this, callback](Value val) -> Value {
             Value out = invokeFunction(callback, {val}, Value(Undefined{}));
             if (hasError()) {
@@ -4012,13 +4013,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Promise.prototype.finally(onFinally)
     if (propName == "finally") {
-      auto finallyFn = std::make_shared<Function>();
+      auto finallyFn = GarbageCollector::makeGC<Function>();
       finallyFn->isNative = true;
       finallyFn->nativeFunc = [this, promisePtr](const std::vector<Value>& args) -> Value {
         std::function<Value()> onFinally = nullptr;
 
         if (!args.empty() && args[0].isFunction()) {
-          auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+          auto callback = args[0].getGC<Function>();
           onFinally = [this, callback]() -> Value {
             Value out = invokeFunction(callback, {}, Value(Undefined{}));
             if (hasError()) {
@@ -4039,7 +4040,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (promisePtr->state == PromiseState::Fulfilled) {
       Value resolvedValue = promisePtr->result;
       if (resolvedValue.isObject()) {
-        auto objPtr = std::get<std::shared_ptr<Object>>(resolvedValue.data);
+        auto objPtr = resolvedValue.getGC<Object>();
         auto it = objPtr->properties.find(propName);
         if (it != objPtr->properties.end()) {
           LIGHTJS_RETURN(it->second);
@@ -4050,7 +4051,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // ArrayBuffer property access
   if (obj.isArrayBuffer()) {
-    auto bufferPtr = std::get<std::shared_ptr<ArrayBuffer>>(obj.data);
+    auto bufferPtr = obj.getGC<ArrayBuffer>();
     if (propName == "byteLength") {
       LIGHTJS_RETURN(Value(static_cast<double>(bufferPtr->byteLength)));
     }
@@ -4058,7 +4059,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // DataView property and method access
   if (obj.isDataView()) {
-    auto viewPtr = std::get<std::shared_ptr<DataView>>(obj.data);
+    auto viewPtr = obj.getGC<DataView>();
 
     if (propName == "buffer") {
       LIGHTJS_RETURN(Value(viewPtr->buffer));
@@ -4072,98 +4073,98 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // DataView get methods
     if (propName == "getInt8") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt8 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getInt8 requires offset"));
         return Value(static_cast<double>(viewPtr->getInt8(static_cast<size_t>(args[0].toNumber()))));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint8") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint8 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getUint8 requires offset"));
         return Value(static_cast<double>(viewPtr->getUint8(static_cast<size_t>(args[0].toNumber()))));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getInt16") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt16 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getInt16 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint16") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint16 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getUint16 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint16(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getInt32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getInt32 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getInt32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getInt32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getUint32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getUint32 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getUint32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getUint32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getFloat32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getFloat32 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getFloat32 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(static_cast<double>(viewPtr->getFloat32(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getFloat64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getFloat64 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getFloat64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(viewPtr->getFloat64(static_cast<size_t>(args[0].toNumber()), littleEndian));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getBigInt64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getBigInt64 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getBigInt64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(viewPtr->getBigInt64(static_cast<size_t>(args[0].toNumber()), littleEndian)));
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "getBigUint64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::make_shared<Error>(ErrorType::TypeError, "getBigUint64 requires offset"));
+        if (args.empty()) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "getBigUint64 requires offset"));
         bool littleEndian = args.size() > 1 ? args[1].toBool() : false;
         return Value(BigInt(bigint::BigIntValue(viewPtr->getBigUint64(static_cast<size_t>(args[0].toNumber()), littleEndian))));
       };
@@ -4172,30 +4173,30 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // DataView set methods
     if (propName == "setInt8") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt8 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setInt8 requires offset and value"));
         viewPtr->setInt8(static_cast<size_t>(args[0].toNumber()), static_cast<int8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint8") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint8 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setUint8 requires offset and value"));
         viewPtr->setUint8(static_cast<size_t>(args[0].toNumber()), static_cast<uint8_t>(args[1].toNumber()));
         return Value(Undefined{});
       };
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setInt16") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt16 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setInt16 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setInt16(static_cast<size_t>(args[0].toNumber()), static_cast<int16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -4203,10 +4204,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint16") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint16 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setUint16 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setUint16(static_cast<size_t>(args[0].toNumber()), static_cast<uint16_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -4214,10 +4215,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setInt32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setInt32 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setInt32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setInt32(static_cast<size_t>(args[0].toNumber()), static_cast<int32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -4225,10 +4226,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setUint32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setUint32 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setUint32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setUint32(static_cast<size_t>(args[0].toNumber()), static_cast<uint32_t>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -4236,10 +4237,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setFloat32") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setFloat32 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setFloat32 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setFloat32(static_cast<size_t>(args[0].toNumber()), static_cast<float>(args[1].toNumber()), littleEndian);
         return Value(Undefined{});
@@ -4247,10 +4248,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setFloat64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setFloat64 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setFloat64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setFloat64(static_cast<size_t>(args[0].toNumber()), args[1].toNumber(), littleEndian);
         return Value(Undefined{});
@@ -4258,10 +4259,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setBigInt64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigInt64 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setBigInt64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setBigInt64(static_cast<size_t>(args[0].toNumber()), bigint::toInt64Trunc(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
@@ -4269,10 +4270,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "setBigUint64") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [viewPtr](const std::vector<Value>& args) -> Value {
-        if (args.size() < 2) return Value(std::make_shared<Error>(ErrorType::TypeError, "setBigUint64 requires offset and value"));
+        if (args.size() < 2) return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "setBigUint64 requires offset and value"));
         bool littleEndian = args.size() > 2 ? args[2].toBool() : false;
         viewPtr->setBigUint64(static_cast<size_t>(args[0].toNumber()), bigint::toUint64Trunc(args[1].toBigInt()), littleEndian);
         return Value(Undefined{});
@@ -4283,26 +4284,26 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // ReadableStream property and method access
   if (obj.isReadableStream()) {
-    auto streamPtr = std::get<std::shared_ptr<ReadableStream>>(obj.data);
+    auto streamPtr = obj.getGC<ReadableStream>();
 
     if (propName == "locked") {
       LIGHTJS_RETURN(Value(streamPtr->locked));
     }
 
     if (propName == "getReader") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         auto reader = streamPtr->getReader();
         if (!reader) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
         }
         // Return reader wrapped in an Object for now
-        auto readerObj = std::make_shared<Object>();
+        auto readerObj = GarbageCollector::makeGC<Object>();
         readerObj->properties["__reader__"] = Value(true);
 
         // Add read method
-        auto readFn = std::make_shared<Function>();
+        auto readFn = GarbageCollector::makeGC<Function>();
         readFn->isNative = true;
         readFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
           return Value(reader->read());
@@ -4310,7 +4311,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         readerObj->properties["read"] = Value(readFn);
 
         // Add releaseLock method
-        auto releaseFn = std::make_shared<Function>();
+        auto releaseFn = GarbageCollector::makeGC<Function>();
         releaseFn->isNative = true;
         releaseFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
           reader->releaseLock();
@@ -4327,7 +4328,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "cancel") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         Value reason = args.empty() ? Value(Undefined{}) : args[0];
@@ -4337,26 +4338,26 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "pipeTo") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isWritableStream()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "pipeTo requires a WritableStream"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "pipeTo requires a WritableStream"));
         }
-        auto dest = std::get<std::shared_ptr<WritableStream>>(args[0].data);
+        auto dest = args[0].getGC<WritableStream>();
         return Value(streamPtr->pipeTo(dest));
       };
       LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "pipeThrough") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isTransformStream()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "pipeThrough requires a TransformStream"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "pipeThrough requires a TransformStream"));
         }
-        auto transform = std::get<std::shared_ptr<TransformStream>>(args[0].data);
+        auto transform = args[0].getGC<TransformStream>();
         auto result = streamPtr->pipeThrough(transform);
         return result ? Value(result) : Value(Undefined{});
       };
@@ -4364,11 +4365,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "tee") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         auto [branch1, branch2] = streamPtr->tee();
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         result->elements.push_back(Value(branch1));
         result->elements.push_back(Value(branch2));
         return Value(result);
@@ -4379,20 +4380,20 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // Symbol.asyncIterator - returns async iterator for for-await-of
     const std::string& asyncIteratorKey = WellKnownSymbols::asyncIteratorKey();
     if (propName == asyncIteratorKey) {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         // Return an async iterator object
-        auto iteratorObj = std::make_shared<Object>();
+        auto iteratorObj = GarbageCollector::makeGC<Object>();
 
         // Get reader for the stream
         auto reader = streamPtr->getReader();
         if (!reader) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "ReadableStream is already locked"));
         }
 
         // next() method returns Promise<{value, done}>
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
           return Value(reader->read());
@@ -4400,12 +4401,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         iteratorObj->properties["next"] = Value(nextFn);
 
         // return() method for early termination
-        auto returnFn = std::make_shared<Function>();
+        auto returnFn = GarbageCollector::makeGC<Function>();
         returnFn->isNative = true;
         returnFn->nativeFunc = [reader](const std::vector<Value>& args) -> Value {
           reader->releaseLock();
-          auto promise = std::make_shared<Promise>();
-          auto resultObj = std::make_shared<Object>();
+          auto promise = GarbageCollector::makeGC<Promise>();
+          auto resultObj = GarbageCollector::makeGC<Object>();
           resultObj->properties["value"] = args.empty() ? Value(Undefined{}) : args[0];
           resultObj->properties["done"] = true;
           promise->resolve(Value(resultObj));
@@ -4421,26 +4422,26 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // WritableStream property and method access
   if (obj.isWritableStream()) {
-    auto streamPtr = std::get<std::shared_ptr<WritableStream>>(obj.data);
+    auto streamPtr = obj.getGC<WritableStream>();
 
     if (propName == "locked") {
       LIGHTJS_RETURN(Value(streamPtr->locked));
     }
 
     if (propName == "getWriter") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         auto writer = streamPtr->getWriter();
         if (!writer) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "WritableStream is already locked"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "WritableStream is already locked"));
         }
         // Return writer wrapped in an Object
-        auto writerObj = std::make_shared<Object>();
+        auto writerObj = GarbageCollector::makeGC<Object>();
         writerObj->properties["__writer__"] = Value(true);
 
         // Add write method
-        auto writeFn = std::make_shared<Function>();
+        auto writeFn = GarbageCollector::makeGC<Function>();
         writeFn->isNative = true;
         writeFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
           Value chunk = args.empty() ? Value(Undefined{}) : args[0];
@@ -4449,7 +4450,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         writerObj->properties["write"] = Value(writeFn);
 
         // Add close method
-        auto closeFn = std::make_shared<Function>();
+        auto closeFn = GarbageCollector::makeGC<Function>();
         closeFn->isNative = true;
         closeFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
           return Value(writer->close());
@@ -4457,7 +4458,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         writerObj->properties["close"] = Value(closeFn);
 
         // Add abort method
-        auto abortFn = std::make_shared<Function>();
+        auto abortFn = GarbageCollector::makeGC<Function>();
         abortFn->isNative = true;
         abortFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
           Value reason = args.empty() ? Value(Undefined{}) : args[0];
@@ -4466,7 +4467,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         writerObj->properties["abort"] = Value(abortFn);
 
         // Add releaseLock method
-        auto releaseFn = std::make_shared<Function>();
+        auto releaseFn = GarbageCollector::makeGC<Function>();
         releaseFn->isNative = true;
         releaseFn->nativeFunc = [writer](const std::vector<Value>& args) -> Value {
           writer->releaseLock();
@@ -4489,7 +4490,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "abort") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         Value reason = args.empty() ? Value(Undefined{}) : args[0];
@@ -4499,7 +4500,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "close") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [streamPtr](const std::vector<Value>& args) -> Value {
         return Value(streamPtr->close());
@@ -4510,7 +4511,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // TransformStream property access
   if (obj.isTransformStream()) {
-    auto streamPtr = std::get<std::shared_ptr<TransformStream>>(obj.data);
+    auto streamPtr = obj.getGC<TransformStream>();
 
     if (propName == "readable") {
       LIGHTJS_RETURN(Value(streamPtr->readable));
@@ -4522,10 +4523,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isClass()) {
-    auto clsPtr = std::get<std::shared_ptr<Class>>(obj.data);
+    auto clsPtr = obj.getGC<Class>();
     // hasOwnProperty from Object.prototype / Function.prototype chain.
     if (propName == "hasOwnProperty") {
-      auto hopFn = std::make_shared<Function>();
+      auto hopFn = GarbageCollector::makeGC<Function>();
       hopFn->isNative = true;
       hopFn->nativeFunc = [clsPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -4586,12 +4587,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     {
       auto protoIt = clsPtr->properties.find("__proto__");
       if (protoIt != clsPtr->properties.end() && protoIt->second.isObject()) {
-        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        auto proto = protoIt->second.getGC<Object>();
         int depth = 0;
         while (proto && depth < 50) {
           auto protoGetterIt = proto->properties.find("__get_" + propName);
           if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
-            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            auto getter = protoGetterIt->second.getGC<Function>();
             LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
           }
           auto found = proto->properties.find(propName);
@@ -4600,7 +4601,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           auto nextProto = proto->properties.find("__proto__");
           if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          proto = nextProto->second.getGC<Object>();
           depth++;
         }
       }
@@ -4608,7 +4609,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isObject()) {
-    auto objPtr = std::get<std::shared_ptr<Object>>(obj.data);
+    auto objPtr = obj.getGC<Object>();
 
     // Deferred dynamic import namespace: trigger evaluation on first external property access.
     if (propName.rfind("__", 0) != 0) {
@@ -4619,7 +4620,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           pendingIt->second.toBool() &&
           evalIt != objPtr->properties.end() &&
           evalIt->second.isFunction()) {
-        auto deferredEvalFn = std::get<std::shared_ptr<Function>>(evalIt->second.data);
+        auto deferredEvalFn = evalIt->second.getGC<Function>();
         invokeFunction(deferredEvalFn, {}, obj);
         if (hasError()) {
           LIGHTJS_RETURN(Value(Undefined{}));
@@ -4632,9 +4633,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (!propName.empty() && propName[0] == '#') {
       // Find the class from the constructor tag
       auto ctorIt = objPtr->properties.find("__constructor__");
-      std::shared_ptr<Class> cls;
+      GCPtr<Class> cls;
       if (ctorIt != objPtr->properties.end() && ctorIt->second.isClass()) {
-        cls = std::get<std::shared_ptr<Class>>(ctorIt->second.data);
+        cls = ctorIt->second.getGC<Class>();
       }
 
       // Check class getters for this private name
@@ -4666,7 +4667,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::string getterName = "__get_" + propName;
     auto getterIt = objPtr->properties.find(getterName);
     if (getterIt != objPtr->properties.end() && getterIt->second.isFunction()) {
-      auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+      auto getter = getterIt->second.getGC<Function>();
       // Call the getter with 'this' bound to the object
       LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
     }
@@ -4684,12 +4685,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       while (depth < 50) {
         auto protoIt = proto->properties.find("__proto__");
         if (protoIt == proto->properties.end() || !protoIt->second.isObject()) break;
-        proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        proto = protoIt->second.getGC<Object>();
         depth++;
         // Check getter on prototype
         auto protoGetterIt = proto->properties.find("__get_" + propName);
         if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
-          auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+          auto getter = protoGetterIt->second.getGC<Function>();
           LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
         }
         auto propIt = proto->properties.find(propName);
@@ -4701,7 +4702,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Object.prototype methods - hasOwnProperty
     if (propName == "hasOwnProperty") {
-      auto hopFn = std::make_shared<Function>();
+      auto hopFn = GarbageCollector::makeGC<Function>();
       hopFn->isNative = true;
       hopFn->nativeFunc = [objPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -4721,7 +4722,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "prototype") {
       if (auto arrayValue = env_->get("Array");
           arrayValue && arrayValue->isObject() &&
-          std::get<std::shared_ptr<Object>>(arrayValue->data).get() == objPtr.get()) {
+          std::get<GCPtr<Object>>(arrayValue->data).get() == objPtr.get()) {
         if (auto hiddenArrayProto = env_->get("__array_prototype__")) {
           LIGHTJS_RETURN(*hiddenArrayProto);
         }
@@ -4730,10 +4731,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isFunction()) {
-    auto funcPtr = std::get<std::shared_ptr<Function>>(obj.data);
+    auto funcPtr = obj.getGC<Function>();
 
     if (propName == "call") {
-      auto callFn = std::make_shared<Function>();
+      auto callFn = GarbageCollector::makeGC<Function>();
       callFn->isNative = true;
       callFn->properties["__throw_on_new__"] = Value(true);
       callFn->properties["name"] = Value(std::string("call"));
@@ -4750,7 +4751,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "apply") {
-      auto applyFn = std::make_shared<Function>();
+      auto applyFn = GarbageCollector::makeGC<Function>();
       applyFn->isNative = true;
       applyFn->properties["__throw_on_new__"] = Value(true);
       applyFn->properties["name"] = Value(std::string("apply"));
@@ -4759,7 +4760,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         Value thisArg = args.empty() ? Value(Undefined{}) : args[0];
         std::vector<Value> callArgs;
         if (args.size() > 1 && args[1].isArray()) {
-          auto arr = std::get<std::shared_ptr<Array>>(args[1].data);
+          auto arr = args[1].getGC<Array>();
           callArgs = arr->elements;
         }
         return callFunction(Value(funcPtr), callArgs, thisArg);
@@ -4768,7 +4769,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "bind") {
-      auto bindFn = std::make_shared<Function>();
+      auto bindFn = GarbageCollector::makeGC<Function>();
       bindFn->isNative = true;
       bindFn->properties["__throw_on_new__"] = Value(true);
       bindFn->properties["name"] = Value(std::string("bind"));
@@ -4779,7 +4780,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (args.size() > 1) {
           boundArgs.insert(boundArgs.end(), args.begin() + 1, args.end());
         }
-        auto boundFn = std::make_shared<Function>();
+        auto boundFn = GarbageCollector::makeGC<Function>();
         boundFn->isNative = true;
         boundFn->properties["name"] = Value(std::string("bound " + (funcPtr->properties.count("name") ? funcPtr->properties["name"].toString() : "")));
         auto capturedThis = this;
@@ -4798,7 +4799,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // hasOwnProperty from Object.prototype
     if (propName == "hasOwnProperty") {
-      auto hopFn = std::make_shared<Function>();
+      auto hopFn = GarbageCollector::makeGC<Function>();
       hopFn->isNative = true;
       hopFn->nativeFunc = [funcPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -4823,12 +4824,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     {
       auto protoIt = funcPtr->properties.find("__proto__");
       if (protoIt != funcPtr->properties.end() && protoIt->second.isObject()) {
-        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        auto proto = protoIt->second.getGC<Object>();
         int depth = 0;
         while (proto && depth < 50) {
           auto protoGetterIt = proto->properties.find("__get_" + propName);
           if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
-            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            auto getter = protoGetterIt->second.getGC<Function>();
             LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
           }
           auto found = proto->properties.find(propName);
@@ -4837,7 +4838,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           auto nextProto = proto->properties.find("__proto__");
           if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          proto = nextProto->second.getGC<Object>();
           depth++;
         }
       }
@@ -4846,12 +4847,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // Generator methods
   if (obj.isGenerator()) {
-    auto genPtr = std::get<std::shared_ptr<Generator>>(obj.data);
+    auto genPtr = obj.getGC<Generator>();
     bool isAsyncGenerator = genPtr->function && genPtr->function->isAsync;
     const auto& asyncIteratorKey = WellKnownSymbols::asyncIteratorKey();
 
     if (propName == iteratorKey) {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr](const std::vector<Value>&) -> Value {
         return Value(genPtr);
@@ -4860,7 +4861,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == asyncIteratorKey && isAsyncGenerator) {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr](const std::vector<Value>&) -> Value {
         return Value(genPtr);
@@ -4869,7 +4870,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "next") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
         Value resumeValue = args.empty() ? Value(Undefined{}) : args[0];
@@ -4879,7 +4880,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         Value step = this->runGeneratorNext(genPtr, mode, resumeValue);
         if (genPtr->function && genPtr->function->isAsync) {
-          auto promise = std::make_shared<Promise>();
+          auto promise = GarbageCollector::makeGC<Promise>();
           if (this->flow_.type == ControlFlow::Type::Throw) {
             Value rejection = this->flow_.value;
             this->clearError();
@@ -4895,7 +4896,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "return") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
         Value returnValue = args.empty() ? Value(Undefined{}) : args[0];
@@ -4924,7 +4925,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
 
         if (genPtr->function && genPtr->function->isAsync) {
-          auto promise = std::make_shared<Promise>();
+          auto promise = GarbageCollector::makeGC<Promise>();
           promise->resolve(makeIteratorResult(resultValue, true));
           return Value(promise);
         }
@@ -4934,10 +4935,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "throw") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
-        Value throwValue = args.empty() ? Value(std::make_shared<Error>(ErrorType::Error, "Generator error")) : args[0];
+        Value throwValue = args.empty() ? Value(GarbageCollector::makeGC<Error>(ErrorType::Error, "Generator error")) : args[0];
 
         if (genPtr->state == GeneratorState::Completed ||
             genPtr->state == GeneratorState::SuspendedStart) {
@@ -4959,13 +4960,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         // If the throw was not caught, flow_ will have type Throw
         if (genPtr->function && genPtr->function->isAsync) {
           if (this->flow_.type == ControlFlow::Type::Throw) {
-            auto promise = std::make_shared<Promise>();
+            auto promise = GarbageCollector::makeGC<Promise>();
             Value rejection = this->flow_.value;
             this->clearError();
             promise->reject(rejection);
             return Value(promise);
           }
-          auto promise = std::make_shared<Promise>();
+          auto promise = GarbageCollector::makeGC<Promise>();
           promise->resolve(step);
           return Value(promise);
         }
@@ -4977,7 +4978,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   // Array iterator helpers continue below
   if (obj.isArray()) {
-    auto arrPtr = std::get<std::shared_ptr<Array>>(obj.data);
+    auto arrPtr = obj.getGC<Array>();
     if (propName == "length") {
       LIGHTJS_RETURN(Value(static_cast<double>(arrPtr->elements.size())));
     }
@@ -4989,14 +4990,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // Array higher-order methods
     // Create a special native function that captures the array and method name
     if (propName == "map") {
-      auto mapFn = std::make_shared<Function>();
+      auto mapFn = GarbageCollector::makeGC<Function>();
       mapFn->isNative = true;
       mapFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "map requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "map requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
-        auto result = std::make_shared<Array>();
+        auto callback = args[0].getGC<Function>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         // Get thisArg if provided
@@ -5014,14 +5015,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "filter") {
-      auto filterFn = std::make_shared<Function>();
+      auto filterFn = GarbageCollector::makeGC<Function>();
       filterFn->isNative = true;
       filterFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "filter requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "filter requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
-        auto result = std::make_shared<Array>();
+        auto callback = args[0].getGC<Function>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         // Get thisArg if provided
@@ -5040,13 +5041,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "forEach") {
-      auto forEachFn = std::make_shared<Function>();
+      auto forEachFn = GarbageCollector::makeGC<Function>();
       forEachFn->isNative = true;
       forEachFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "forEach requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
 
         // Get thisArg if provided
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
@@ -5061,13 +5062,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "reduce") {
-      auto reduceFn = std::make_shared<Function>();
+      auto reduceFn = GarbageCollector::makeGC<Function>();
       reduceFn->isNative = true;
       reduceFn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "reduce requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "reduce requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
 
         if (arrPtr->elements.empty()) {
           return args.size() > 1 ? args[1] : Value(Undefined{});
@@ -5087,13 +5088,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "reduceRight") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "reduceRight requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "reduceRight requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
 
         if (arrPtr->elements.empty()) {
           return args.size() > 1 ? args[1] : Value(Undefined{});
@@ -5113,13 +5114,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "find") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "find requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "find requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
@@ -5134,13 +5135,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "findIndex") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "findIndex requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "findIndex requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
@@ -5155,13 +5156,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "findLast") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "findLast requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "findLast requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = arrPtr->elements.size(); i > 0; --i) {
@@ -5177,13 +5178,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "findLastIndex") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "findLastIndex requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "findLastIndex requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = arrPtr->elements.size(); i > 0; --i) {
@@ -5199,13 +5200,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "some") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "some requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "some requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
@@ -5220,13 +5221,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "every") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "every requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "every requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
@@ -5241,7 +5242,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "push") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         for (const auto& arg : args) {
@@ -5253,7 +5254,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "pop") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (arrPtr->elements.empty()) {
@@ -5267,7 +5268,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "shift") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (arrPtr->elements.empty()) {
@@ -5281,7 +5282,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "unshift") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         for (size_t i = 0; i < args.size(); ++i) {
@@ -5293,10 +5294,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "slice") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         int len = static_cast<int>(arrPtr->elements.size());
@@ -5324,10 +5325,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "splice") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto removed = std::make_shared<Array>();
+        auto removed = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         int len = static_cast<int>(arrPtr->elements.size());
@@ -5362,10 +5363,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toSpliced") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         // Copy all elements to new array
@@ -5404,7 +5405,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "join") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         std::string separator = ",";
@@ -5425,7 +5426,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "indexOf") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(-1.0);
@@ -5450,7 +5451,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "lastIndexOf") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(-1.0);
@@ -5476,7 +5477,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "includes") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -5501,7 +5502,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "at") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Undefined{});
@@ -5515,7 +5516,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "reverse") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         std::reverse(arrPtr->elements.begin(), arrPtr->elements.end());
@@ -5525,7 +5526,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "sort") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr, this](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
@@ -5536,7 +5537,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             });
         } else {
           // Sort with comparator function
-          auto compareFn = std::get<std::shared_ptr<Function>>(args[0].data);
+          auto compareFn = args[0].getGC<Function>();
           std::sort(arrPtr->elements.begin(), arrPtr->elements.end(),
             [compareFn, this](const Value& a, const Value& b) {
               std::vector<Value> compareArgs = {a, b};
@@ -5555,10 +5556,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toSorted") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr, this](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
         result->elements = arrPtr->elements;  // Copy
 
@@ -5568,7 +5569,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
               return a.toString() < b.toString();
             });
         } else {
-          auto compareFn = std::get<std::shared_ptr<Function>>(args[0].data);
+          auto compareFn = args[0].getGC<Function>();
           std::sort(result->elements.begin(), result->elements.end(),
             [compareFn, this](const Value& a, const Value& b) {
               std::vector<Value> compareArgs = {a, b};
@@ -5587,10 +5588,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toReversed") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
         result->elements = arrPtr->elements;
         std::reverse(result->elements.begin(), result->elements.end());
@@ -5600,7 +5601,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "at") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Undefined{});
@@ -5614,7 +5615,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "with") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) return Value(arrPtr);
@@ -5622,9 +5623,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         int size = static_cast<int>(arrPtr->elements.size());
         if (index < 0) index = size + index;
         if (index < 0 || index >= size) {
-          return Value(std::make_shared<Error>(ErrorType::RangeError, "Invalid index"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::RangeError, "Invalid index"));
         }
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
         result->elements = arrPtr->elements;
         result->elements[index] = args[1];
@@ -5634,10 +5635,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "concat") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         // Copy original array elements
@@ -5646,7 +5647,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         // Add all arguments
         for (const auto& arg : args) {
           if (arg.isArray()) {
-            auto otherArr = std::get<std::shared_ptr<Array>>(arg.data);
+            auto otherArr = arg.getGC<Array>();
             result->elements.insert(result->elements.end(),
                                   otherArr->elements.begin(),
                                   otherArr->elements.end());
@@ -5661,7 +5662,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "flat") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         int depth = 1;
@@ -5673,7 +5674,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         flattenImpl = [&flattenImpl](const std::vector<Value>& src, int d, std::vector<Value>& dest) {
           for (const auto& elem : src) {
             if (d > 0 && elem.isArray()) {
-              auto inner = std::get<std::shared_ptr<Array>>(elem.data);
+              auto inner = elem.getGC<Array>();
               flattenImpl(inner->elements, d - 1, dest);
             } else {
               dest.push_back(elem);
@@ -5681,7 +5682,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
         };
 
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
         flattenImpl(arrPtr->elements, depth, result->elements);
         return Value(result);
@@ -5690,16 +5691,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "flatMap") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "flatMap requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "flatMap requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
 
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         for (size_t i = 0; i < arrPtr->elements.size(); ++i) {
@@ -5707,7 +5708,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           Value mapped = invokeFunction(callback, callArgs, thisArg);
 
           if (mapped.isArray()) {
-            auto inner = std::get<std::shared_ptr<Array>>(mapped.data);
+            auto inner = mapped.getGC<Array>();
             result->elements.insert(result->elements.end(),
                                   inner->elements.begin(),
                                   inner->elements.end());
@@ -5721,7 +5722,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "fill") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(arrPtr);
@@ -5752,7 +5753,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "copyWithin") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(arrPtr);
@@ -5785,15 +5786,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "keys") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [arrPtr, indexPtr](const std::vector<Value>&) -> Value {
-          auto result = std::make_shared<Object>();
+          auto result = GarbageCollector::makeGC<Object>();
           if (*indexPtr >= arrPtr->elements.size()) {
             result->properties["value"] = Value(Undefined{});
             result->properties["done"] = Value(true);
@@ -5810,20 +5811,20 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "entries") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [arrPtr, indexPtr](const std::vector<Value>&) -> Value {
-          auto result = std::make_shared<Object>();
+          auto result = GarbageCollector::makeGC<Object>();
           if (*indexPtr >= arrPtr->elements.size()) {
             result->properties["value"] = Value(Undefined{});
             result->properties["done"] = Value(true);
           } else {
-            auto pair = std::make_shared<Array>();
+            auto pair = GarbageCollector::makeGC<Array>();
             pair->elements.push_back(Value(static_cast<double>(*indexPtr)));
             pair->elements.push_back(arrPtr->elements[*indexPtr]);
             (*indexPtr)++;
@@ -5839,15 +5840,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "values") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [arrPtr, indexPtr](const std::vector<Value>&) -> Value {
-          auto result = std::make_shared<Object>();
+          auto result = GarbageCollector::makeGC<Object>();
           if (*indexPtr >= arrPtr->elements.size()) {
             result->properties["value"] = Value(Undefined{});
             result->properties["done"] = Value(true);
@@ -5880,13 +5881,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     {
       auto protoIt = arrPtr->properties.find("__proto__");
       if (protoIt != arrPtr->properties.end() && protoIt->second.isObject()) {
-        auto proto = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        auto proto = protoIt->second.getGC<Object>();
         int depth = 0;
         while (proto && depth < 50) {
           // Check getter on prototype
           auto protoGetterIt = proto->properties.find("__get_" + propName);
           if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
-            auto getter = std::get<std::shared_ptr<Function>>(protoGetterIt->second.data);
+            auto getter = protoGetterIt->second.getGC<Function>();
             LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
           }
           auto found = proto->properties.find(propName);
@@ -5895,7 +5896,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           auto nextProto = proto->properties.find("__proto__");
           if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-          proto = std::get<std::shared_ptr<Object>>(nextProto->second.data);
+          proto = nextProto->second.getGC<Object>();
           depth++;
         }
       }
@@ -5903,12 +5904,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isMap()) {
-    auto mapPtr = std::get<std::shared_ptr<Map>>(obj.data);
+    auto mapPtr = obj.getGC<Map>();
     if (propName == "size") {
       LIGHTJS_RETURN(Value(static_cast<double>(mapPtr->size())));
     }
     if (propName == "set") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) {
@@ -5920,7 +5921,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "get") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Undefined{});
@@ -5929,7 +5930,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "has") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -5938,7 +5939,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "delete") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -5947,7 +5948,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "clear") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
         mapPtr->clear();
@@ -5956,13 +5957,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "forEach") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, mapPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "forEach requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
         for (size_t i = 0; i < mapPtr->entries.size(); ++i) {
           auto& entry = mapPtr->entries[i];
@@ -5973,19 +5974,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "entries" || propName == iteratorKey) {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
           if (*indexPtr >= mapPtr->entries.size()) {
             return makeIteratorResult(Value(Undefined{}), true);
           }
           auto& entry = mapPtr->entries[*indexPtr];
-          auto pair = std::make_shared<Array>();
+          auto pair = GarbageCollector::makeGC<Array>();
           pair->elements.push_back(entry.first);
           pair->elements.push_back(entry.second);
           (*indexPtr)++;
@@ -5997,12 +5998,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "keys") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
           if (*indexPtr >= mapPtr->entries.size()) {
@@ -6018,12 +6019,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "values") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [mapPtr](const std::vector<Value>&) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
           if (*indexPtr >= mapPtr->entries.size()) {
@@ -6047,12 +6048,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isSet()) {
-    auto setPtr = std::get<std::shared_ptr<Set>>(obj.data);
+    auto setPtr = obj.getGC<Set>();
     if (propName == "size") {
       LIGHTJS_RETURN(Value(static_cast<double>(setPtr->size())));
     }
     if (propName == "add") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
@@ -6063,7 +6064,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "has") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -6072,7 +6073,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "delete") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -6081,7 +6082,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "clear") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
         setPtr->clear();
@@ -6090,13 +6091,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "forEach") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, setPtr](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isFunction()) {
-          return Value(std::make_shared<Error>(ErrorType::TypeError, "forEach requires a callback function"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "forEach requires a callback function"));
         }
-        auto callback = std::get<std::shared_ptr<Function>>(args[0].data);
+        auto callback = args[0].getGC<Function>();
         Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
         for (size_t i = 0; i < setPtr->values.size(); ++i) {
           invokeFunction(callback, {setPtr->values[i], setPtr->values[i], Value(setPtr)}, thisArg);
@@ -6106,12 +6107,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "values" || propName == "keys" || propName == iteratorKey) {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
           if (*indexPtr >= setPtr->values.size()) {
@@ -6127,19 +6128,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
     if (propName == "entries") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [setPtr](const std::vector<Value>&) -> Value {
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         auto indexPtr = std::make_shared<size_t>(0);
-        auto nextFn = std::make_shared<Function>();
+        auto nextFn = GarbageCollector::makeGC<Function>();
         nextFn->isNative = true;
         nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
           if (*indexPtr >= setPtr->values.size()) {
             return makeIteratorResult(Value(Undefined{}), true);
           }
           Value val = setPtr->values[*indexPtr];
-          auto pair = std::make_shared<Array>();
+          auto pair = GarbageCollector::makeGC<Array>();
           pair->elements.push_back(val);
           pair->elements.push_back(val);
           (*indexPtr)++;
@@ -6159,7 +6160,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isTypedArray()) {
-    auto taPtr = std::get<std::shared_ptr<TypedArray>>(obj.data);
+    auto taPtr = obj.getGC<TypedArray>();
     if (propName == "length") {
       LIGHTJS_RETURN(Value(static_cast<double>(taPtr->length)));
     }
@@ -6177,10 +6178,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isRegex()) {
-    auto regexPtr = std::get<std::shared_ptr<Regex>>(obj.data);
+    auto regexPtr = obj.getGC<Regex>();
 
     if (propName == "test") {
-      auto testFn = std::make_shared<Function>();
+      auto testFn = GarbageCollector::makeGC<Function>();
       testFn->isNative = true;
       testFn->nativeFunc = [regexPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -6195,7 +6196,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "exec") {
-      auto execFn = std::make_shared<Function>();
+      auto execFn = GarbageCollector::makeGC<Function>();
       execFn->isNative = true;
       execFn->nativeFunc = [regexPtr](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Null{});
@@ -6203,7 +6204,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #if USE_SIMPLE_REGEX
         std::vector<simple_regex::Regex::Match> matches;
         if (regexPtr->regex->search(str, matches)) {
-          auto arr = std::make_shared<Array>();
+          auto arr = GarbageCollector::makeGC<Array>();
           for (const auto& m : matches) {
             arr->elements.push_back(Value(m.str));
           }
@@ -6212,7 +6213,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #else
         std::smatch match;
         if (std::regex_search(str, match, regexPtr->regex)) {
-          auto arr = std::make_shared<Array>();
+          auto arr = GarbageCollector::makeGC<Array>();
           for (const auto& m : match) {
             arr->elements.push_back(Value(m.str()));
           }
@@ -6234,10 +6235,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   }
 
   if (obj.isError()) {
-    auto errorPtr = std::get<std::shared_ptr<Error>>(obj.data);
+    auto errorPtr = obj.getGC<Error>();
 
     if (propName == "toString") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->nativeFunc = [errorPtr](const std::vector<Value>&) -> Value {
         return Value(errorPtr->toString());
@@ -6265,7 +6266,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     double num = std::get<double>(obj.data);
 
     if (propName == "toFixed") {
-      auto toFixedFn = std::make_shared<Function>();
+      auto toFixedFn = GarbageCollector::makeGC<Function>();
       toFixedFn->isNative = true;
       toFixedFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
         int digits = args.empty() ? 0 : static_cast<int>(args[0].toNumber());
@@ -6280,7 +6281,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toPrecision") {
-      auto toPrecisionFn = std::make_shared<Function>();
+      auto toPrecisionFn = GarbageCollector::makeGC<Function>();
       toPrecisionFn->isNative = true;
       toPrecisionFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
         if (args.empty()) {
@@ -6298,7 +6299,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toExponential") {
-      auto toExponentialFn = std::make_shared<Function>();
+      auto toExponentialFn = GarbageCollector::makeGC<Function>();
       toExponentialFn->isNative = true;
       toExponentialFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
         int digits = args.empty() ? 6 : static_cast<int>(args[0].toNumber());
@@ -6313,7 +6314,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toString") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->nativeFunc = [num](const std::vector<Value>& args) -> Value {
         if (args.empty()) {
@@ -6321,7 +6322,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         int radix = static_cast<int>(args[0].toNumber());
         if (radix < 2 || radix > 36) {
-          return Value(std::make_shared<Error>(ErrorType::RangeError, "toString() radix must be between 2 and 36"));
+          return Value(GarbageCollector::makeGC<Error>(ErrorType::RangeError, "toString() radix must be between 2 and 36"));
         }
         // For simplicity, only implement radix 10, 16, 8, 2
         if (radix == 10) {
@@ -6356,7 +6357,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     std::string str = std::get<std::string>(obj.data);
 
     if (propName == "toString" || propName == "valueOf") {
-      auto toStringFn = std::make_shared<Function>();
+      auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->nativeFunc = [str](const std::vector<Value>&) -> Value {
         return Value(str);
@@ -6384,7 +6385,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == iteratorKey) {
-      auto charArray = std::make_shared<Array>();
+      auto charArray = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (char c : str) {
         charArray->elements.push_back(Value(std::string(1, c)));
@@ -6393,7 +6394,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "charAt") {
-      auto charAtFn = std::make_shared<Function>();
+      auto charAtFn = GarbageCollector::makeGC<Function>();
       charAtFn->isNative = true;
       charAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::vector<Value> funcArgs = {Value(str)};
@@ -6404,7 +6405,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "charCodeAt") {
-      auto charCodeAtFn = std::make_shared<Function>();
+      auto charCodeAtFn = GarbageCollector::makeGC<Function>();
       charCodeAtFn->isNative = true;
       charCodeAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::vector<Value> funcArgs = {Value(str)};
@@ -6415,7 +6416,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "codePointAt") {
-      auto codePointAtFn = std::make_shared<Function>();
+      auto codePointAtFn = GarbageCollector::makeGC<Function>();
       codePointAtFn->isNative = true;
       codePointAtFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::vector<Value> funcArgs = {Value(str)};
@@ -6426,7 +6427,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "includes") {
-      auto includesFn = std::make_shared<Function>();
+      auto includesFn = GarbageCollector::makeGC<Function>();
       includesFn->isNative = true;
       includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
@@ -6441,7 +6442,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "repeat") {
-      auto repeatFn = std::make_shared<Function>();
+      auto repeatFn = GarbageCollector::makeGC<Function>();
       repeatFn->isNative = true;
       repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(std::string(""));
@@ -6457,7 +6458,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "padStart") {
-      auto padStartFn = std::make_shared<Function>();
+      auto padStartFn = GarbageCollector::makeGC<Function>();
       padStartFn->isNative = true;
       padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
@@ -6479,7 +6480,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "padEnd") {
-      auto padEndFn = std::make_shared<Function>();
+      auto padEndFn = GarbageCollector::makeGC<Function>();
       padEndFn->isNative = true;
       padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
@@ -6501,7 +6502,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trim") {
-      auto trimFn = std::make_shared<Function>();
+      auto trimFn = GarbageCollector::makeGC<Function>();
       trimFn->isNative = true;
       trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t start = 0;
@@ -6518,7 +6519,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trimStart") {
-      auto trimStartFn = std::make_shared<Function>();
+      auto trimStartFn = GarbageCollector::makeGC<Function>();
       trimStartFn->isNative = true;
       trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t start = 0;
@@ -6531,7 +6532,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trimEnd") {
-      auto trimEndFn = std::make_shared<Function>();
+      auto trimEndFn = GarbageCollector::makeGC<Function>();
       trimEndFn->isNative = true;
       trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t end = str.length();
@@ -6544,10 +6545,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "split") {
-      auto splitFn = std::make_shared<Function>();
+      auto splitFn = GarbageCollector::makeGC<Function>();
       splitFn->isNative = true;
       splitFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        auto result = std::make_shared<Array>();
+        auto result = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
 
         if (args.empty()) {
@@ -6586,7 +6587,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "startsWith") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(true);
@@ -6599,7 +6600,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "endsWith") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(true);
@@ -6613,7 +6614,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "at") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Undefined{});
@@ -6627,7 +6628,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "normalize") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         // Basic implementation - just returns the string as-is
@@ -6638,7 +6639,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "localeCompare") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(0.0);
@@ -6650,7 +6651,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "concat") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [this, str](const std::vector<Value>& args) -> Value {
         std::string result = str;
@@ -6670,7 +6671,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "indexOf") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(-1.0);
@@ -6690,7 +6691,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "lastIndexOf") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(-1.0);
@@ -6711,12 +6712,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "search") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(0.0);
         if (args[0].isRegex()) {
-          auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+          auto regexPtr = args[0].getGC<Regex>();
 #if USE_SIMPLE_REGEX
           std::vector<simple_regex::Regex::Match> matches;
           if (regexPtr->regex->search(str, matches) && !matches.empty()) {
@@ -6739,15 +6740,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "match") {
-      auto matchFn = std::make_shared<Function>();
+      auto matchFn = GarbageCollector::makeGC<Function>();
       matchFn->isNative = true;
       matchFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty() || !args[0].isRegex()) return Value(Null{});
-        auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+        auto regexPtr = args[0].getGC<Regex>();
 #if USE_SIMPLE_REGEX
         std::vector<simple_regex::Regex::Match> matches;
         if (regexPtr->regex->search(str, matches)) {
-          auto arr = std::make_shared<Array>();
+          auto arr = GarbageCollector::makeGC<Array>();
           for (const auto& m : matches) {
             arr->elements.push_back(Value(m.str));
           }
@@ -6756,7 +6757,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #else
         std::smatch match;
         if (std::regex_search(str, match, regexPtr->regex)) {
-          auto arr = std::make_shared<Array>();
+          auto arr = GarbageCollector::makeGC<Array>();
           for (const auto& m : match) {
             arr->elements.push_back(Value(m.str()));
           }
@@ -6771,10 +6772,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     // String.prototype.matchAll - ES2020
     if (propName == "matchAll") {
       if (auto strCtor = env_->get("String"); strCtor && strCtor->isObject()) {
-        auto strObj = std::get<std::shared_ptr<Object>>(strCtor->data);
+        auto strObj = std::get<GCPtr<Object>>(strCtor->data);
         auto protoIt = strObj->properties.find("prototype");
         if (protoIt != strObj->properties.end() && protoIt->second.isObject()) {
-          auto protoObj = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          auto protoObj = protoIt->second.getGC<Object>();
           auto methodIt = protoObj->properties.find("matchAll");
           if (methodIt != protoObj->properties.end() && methodIt->second.isFunction()) {
             LIGHTJS_RETURN(methodIt->second);
@@ -6785,12 +6786,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "replace") {
-      auto replaceFn = std::make_shared<Function>();
+      auto replaceFn = GarbageCollector::makeGC<Function>();
       replaceFn->isNative = true;
       replaceFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) return Value(str);
         if (args[0].isRegex()) {
-          auto regexPtr = std::get<std::shared_ptr<Regex>>(args[0].data);
+          auto regexPtr = args[0].getGC<Regex>();
           std::string replacement = args[1].toString();
 #if USE_SIMPLE_REGEX
           return Value(regexPtr->regex->replace(str, replacement));
@@ -6812,7 +6813,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "replaceAll") {
-      auto replaceAllFn = std::make_shared<Function>();
+      auto replaceAllFn = GarbageCollector::makeGC<Function>();
       replaceAllFn->isNative = true;
       replaceAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.size() < 2) return Value(str);
@@ -6831,7 +6832,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "at") {
-      auto atFn = std::make_shared<Function>();
+      auto atFn = GarbageCollector::makeGC<Function>();
       atFn->isNative = true;
       atFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(Undefined{});
@@ -6845,12 +6846,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "repeat") {
-      auto repeatFn = std::make_shared<Function>();
+      auto repeatFn = GarbageCollector::makeGC<Function>();
       repeatFn->isNative = true;
       repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(std::string(""));
         int count = static_cast<int>(args[0].toNumber());
-        if (count < 0) return Value(std::make_shared<Error>(ErrorType::RangeError, "Invalid count value"));
+        if (count < 0) return Value(GarbageCollector::makeGC<Error>(ErrorType::RangeError, "Invalid count value"));
         if (count == 0) return Value(std::string(""));
         std::string result;
         result.reserve(str.length() * count);
@@ -6863,7 +6864,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "padStart") {
-      auto padStartFn = std::make_shared<Function>();
+      auto padStartFn = GarbageCollector::makeGC<Function>();
       padStartFn->isNative = true;
       padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
@@ -6892,7 +6893,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "padEnd") {
-      auto padEndFn = std::make_shared<Function>();
+      auto padEndFn = GarbageCollector::makeGC<Function>();
       padEndFn->isNative = true;
       padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
@@ -6920,7 +6921,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trim") {
-      auto trimFn = std::make_shared<Function>();
+      auto trimFn = GarbageCollector::makeGC<Function>();
       trimFn->isNative = true;
       trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t start = 0;
@@ -6937,7 +6938,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trimStart") {
-      auto trimStartFn = std::make_shared<Function>();
+      auto trimStartFn = GarbageCollector::makeGC<Function>();
       trimStartFn->isNative = true;
       trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t start = 0;
@@ -6950,7 +6951,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "trimEnd") {
-      auto trimEndFn = std::make_shared<Function>();
+      auto trimEndFn = GarbageCollector::makeGC<Function>();
       trimEndFn->isNative = true;
       trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         size_t end = str.length();
@@ -6963,7 +6964,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "substring") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         int len = static_cast<int>(str.length());
@@ -6987,7 +6988,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "slice") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         int len = static_cast<int>(str.length());
@@ -7011,7 +7012,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "substr") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         int len = static_cast<int>(str.length());
@@ -7032,7 +7033,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toUpperCase" || propName == "toLocaleUpperCase") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::string result = str;
@@ -7043,7 +7044,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "toLowerCase" || propName == "toLocaleLowerCase") {
-      auto fn = std::make_shared<Function>();
+      auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::string result = str;
@@ -7064,21 +7065,21 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 }
 
 Value Interpreter::makeIteratorResult(const Value& value, bool done) {
-  auto resultObj = std::make_shared<Object>();
+  auto resultObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   resultObj->properties["value"] = value;
   resultObj->properties["done"] = Value(done);
   return Value(resultObj);
 }
 
-Value Interpreter::createIteratorFactory(const std::shared_ptr<Array>& arrPtr) {
-  auto iteratorFactory = std::make_shared<Function>();
+Value Interpreter::createIteratorFactory(const GCPtr<Array>& arrPtr) {
+  auto iteratorFactory = GarbageCollector::makeGC<Function>();
   iteratorFactory->isNative = true;
   iteratorFactory->nativeFunc = [arrPtr](const std::vector<Value>&) -> Value {
-    auto iteratorObj = std::make_shared<Object>();
+    auto iteratorObj = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     auto state = std::make_shared<size_t>(0);
-    auto nextFn = std::make_shared<Function>();
+    auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
     nextFn->nativeFunc = [arrPtr, state](const std::vector<Value>&) -> Value {
       if (!arrPtr || *state >= arrPtr->elements.size()) {
@@ -7092,7 +7093,7 @@ Value Interpreter::createIteratorFactory(const std::shared_ptr<Array>& arrPtr) {
   };
   return Value(iteratorFactory);
 }
-Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
+Value Interpreter::runGeneratorNext(const GCPtr<Generator>& genPtr,
                                     ControlFlow::ResumeMode mode,
                                     const Value& resumeValue) {
   if (!genPtr) {
@@ -7113,7 +7114,7 @@ Value Interpreter::runGeneratorNext(const std::shared_ptr<Generator>& genPtr,
 
   if (genPtr->function && genPtr->context) {
     auto prevEnv = env_;
-    env_ = std::static_pointer_cast<Environment>(genPtr->context);
+    env_ = genPtr->context;
 
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
     
@@ -7183,14 +7184,14 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
     IteratorRecord record;
     if (value.isGenerator()) {
       record.kind = IteratorRecord::Kind::Generator;
-      record.generator = std::get<std::shared_ptr<Generator>>(value.data);
+      record.generator = value.getGC<Generator>();
       return record;
     }
     if (value.isArray()) {
       // Check if Array.prototype[Symbol.iterator] has been deleted
       auto arrayProtoOpt = env_->get("__array_prototype__");
       if (arrayProtoOpt.has_value() && arrayProtoOpt->isObject()) {
-        auto protoObj = std::get<std::shared_ptr<Object>>(arrayProtoOpt->data);
+        auto protoObj = std::get<GCPtr<Object>>(arrayProtoOpt->data);
         const auto& iterKey = WellKnownSymbols::iteratorKey();
         if (protoObj->properties.find(iterKey) == protoObj->properties.end()) {
           // Symbol.iterator deleted from Array.prototype - not iterable
@@ -7198,7 +7199,7 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
         }
       }
       record.kind = IteratorRecord::Kind::Array;
-      record.array = std::get<std::shared_ptr<Array>>(value.data);
+      record.array = value.getGC<Array>();
       record.index = 0;
       return record;
     }
@@ -7210,22 +7211,22 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
     }
     if (value.isTypedArray()) {
       record.kind = IteratorRecord::Kind::TypedArray;
-      record.typedArray = std::get<std::shared_ptr<TypedArray>>(value.data);
+      record.typedArray = value.getGC<TypedArray>();
       record.index = 0;
       return record;
     }
     if (value.isMap()) {
-      auto mapPtr = std::get<std::shared_ptr<Map>>(value.data);
-      auto iterObj = std::make_shared<Object>();
+      auto mapPtr = value.getGC<Map>();
+      auto iterObj = GarbageCollector::makeGC<Object>();
       auto indexPtr = std::make_shared<size_t>(0);
-      auto nextFn = std::make_shared<Function>();
+      auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
       nextFn->nativeFunc = [mapPtr, indexPtr](const std::vector<Value>&) -> Value {
         if (*indexPtr >= mapPtr->entries.size()) {
           return makeIteratorResult(Value(Undefined{}), true);
         }
         auto& entry = mapPtr->entries[*indexPtr];
-        auto pair = std::make_shared<Array>();
+        auto pair = GarbageCollector::makeGC<Array>();
         pair->elements.push_back(entry.first);
         pair->elements.push_back(entry.second);
         (*indexPtr)++;
@@ -7238,10 +7239,10 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       return record;
     }
     if (value.isSet()) {
-      auto setPtr = std::get<std::shared_ptr<Set>>(value.data);
-      auto iterObj = std::make_shared<Object>();
+      auto setPtr = value.getGC<Set>();
+      auto iterObj = GarbageCollector::makeGC<Object>();
       auto indexPtr = std::make_shared<size_t>(0);
-      auto nextFn = std::make_shared<Function>();
+      auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
       nextFn->nativeFunc = [setPtr, indexPtr](const std::vector<Value>&) -> Value {
         if (*indexPtr >= setPtr->values.size()) {
@@ -7260,7 +7261,7 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
     if (value.isObject()) {
       // Only treat as IteratorObject if it has a 'next' method (i.e., it's already an iterator)
       // Otherwise, fall through to check for Symbol.iterator
-      auto obj = std::get<std::shared_ptr<Object>>(value.data);
+      auto obj = value.getGC<Object>();
       // Per GetIterator spec (7.4.1): cache next method (supports getters)
       auto getterIt = obj->properties.find("__get_next");
       if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
@@ -7290,10 +7291,10 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
   auto tryObjectIterator = [&](const Value& target) -> std::optional<IteratorRecord> {
     Value method;
     bool hasMethod = false;
-    std::shared_ptr<Object> targetObj;
+    GCPtr<Object> targetObj;
 
     if (target.isObject()) {
-      targetObj = std::get<std::shared_ptr<Object>>(target.data);
+      targetObj = target.getGC<Object>();
       auto it = targetObj->properties.find(iteratorKey);
       if (it != targetObj->properties.end()) {
         method = it->second;
@@ -7301,9 +7302,9 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       }
     } else if (target.isProxy()) {
       // Handle Proxy: resolve Symbol.iterator through the proxy's get trap
-      auto proxyPtr = std::get<std::shared_ptr<Proxy>>(target.data);
+      auto proxyPtr = target.getGC<Proxy>();
       if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-        auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+        auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
         auto getTrapIt = handlerObj->properties.find("get");
         if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
           Value resolved = callFunction(getTrapIt->second,
@@ -7314,7 +7315,7 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
             hasMethod = true;
           }
         } else if (proxyPtr->target && proxyPtr->target->isObject()) {
-          auto targetInner = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          auto targetInner = std::get<GCPtr<Object>>(proxyPtr->target->data);
           auto it = targetInner->properties.find(iteratorKey);
           if (it != targetInner->properties.end()) {
             method = it->second;
@@ -7322,7 +7323,7 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
           }
         }
       } else if (proxyPtr->target && proxyPtr->target->isObject()) {
-        auto targetInner = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+        auto targetInner = std::get<GCPtr<Object>>(proxyPtr->target->data);
         auto it = targetInner->properties.find(iteratorKey);
         if (it != targetInner->properties.end()) {
           method = it->second;
@@ -7330,7 +7331,7 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
         }
       }
     } else if (target.isFunction()) {
-      auto funcPtr = std::get<std::shared_ptr<Function>>(target.data);
+      auto funcPtr = target.getGC<Function>();
       auto it = funcPtr->properties.find(iteratorKey);
       if (it != funcPtr->properties.end() && it->second.isFunction()) {
         method = it->second;
@@ -7343,11 +7344,11 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       if (iterValue.isGenerator()) {
         IteratorRecord record;
         record.kind = IteratorRecord::Kind::Generator;
-        record.generator = std::get<std::shared_ptr<Generator>>(iterValue.data);
+        record.generator = iterValue.getGC<Generator>();
         return record;
       }
       if (iterValue.isObject()) {
-        auto iterObj = std::get<std::shared_ptr<Object>>(iterValue.data);
+        auto iterObj = iterValue.getGC<Object>();
         IteratorRecord record;
         record.kind = IteratorRecord::Kind::IteratorObject;
         record.iteratorObject = iterObj;
@@ -7365,11 +7366,11 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
       }
       // Handle Proxy as iterator result
       if (iterValue.isProxy()) {
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(iterValue.data);
+        auto proxyPtr = iterValue.getGC<Proxy>();
         // Resolve 'next' through the Proxy get trap
         Value nextMethod;
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto getTrapIt = handlerObj->properties.find("get");
           if (getTrapIt != handlerObj->properties.end() && getTrapIt->second.isFunction()) {
             nextMethod = callFunction(getTrapIt->second,
@@ -7377,25 +7378,25 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
               Value(Undefined{}));
           } else if (proxyPtr->target && proxyPtr->target->isObject()) {
             // No get trap - fall through to target
-            auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+            auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
             auto nextIt = targetObj->properties.find("next");
             if (nextIt != targetObj->properties.end()) {
               nextMethod = nextIt->second;
             }
           }
         } else if (proxyPtr->target && proxyPtr->target->isObject()) {
-          auto targetObj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          auto targetObj = std::get<GCPtr<Object>>(proxyPtr->target->data);
           auto nextIt = targetObj->properties.find("next");
           if (nextIt != targetObj->properties.end()) {
             nextMethod = nextIt->second;
           }
         }
         // Create a wrapper Object to act as the iterator
-        auto iterObj = std::make_shared<Object>();
+        auto iterObj = GarbageCollector::makeGC<Object>();
         iterObj->properties["__proxy__"] = iterValue;  // Keep proxy alive
         if (nextMethod.isFunction()) {
           // Create a next() wrapper that calls through the proxy
-          auto nextFunc = std::make_shared<Function>();
+          auto nextFunc = GarbageCollector::makeGC<Function>();
           nextFunc->isNative = true;
           auto proxyCopy = proxyPtr;
           auto handlerCopy = proxyPtr->handler;
@@ -7436,7 +7437,7 @@ Value Interpreter::iteratorNext(IteratorRecord& record) {
   switch (record.kind) {
     case IteratorRecord::Kind::Generator:
       if (record.generator && record.generator->function && record.generator->function->isAsync) {
-        auto promise = std::make_shared<Promise>();
+        auto promise = GarbageCollector::makeGC<Promise>();
         Value step = runGeneratorNext(
           record.generator, ControlFlow::ResumeMode::Next, Value(Undefined{}));
         if (flow_.type == ControlFlow::Type::Throw) {
@@ -7552,7 +7553,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     return Value(Undefined{});
   }
 
-  auto func = std::get<std::shared_ptr<Function>>(callee.data);
+  auto func = callee.getGC<Function>();
   std::vector<Value> currentArgs = args;
   Value currentThis = thisValue;
   auto namedExprIt = func->properties.find("__named_expression__");
@@ -7572,7 +7573,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     }
   } namedExprGuard{this, pushNamedExpr};
 
-  auto bindParameters = [&](std::shared_ptr<Environment>& targetEnv) {
+  auto bindParameters = [&](GCPtr<Environment>& targetEnv) {
     bool isArrowFunction = false;
     auto arrowIt = func->properties.find("__is_arrow_function__");
     if (arrowIt != func->properties.end() &&
@@ -7599,9 +7600,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       }
     }
 
-    std::shared_ptr<Array> argumentsArray;
+    GCPtr<Array> argumentsArray;
     if (!isArrowFunction) {
-      argumentsArray = std::make_shared<Array>();
+      argumentsArray = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       argumentsArray->elements = currentArgs;
       targetEnv->define("arguments", Value(argumentsArray));
@@ -7642,14 +7643,14 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         for (size_t i = 0; i < func->params.size() && i < currentArgs.size(); ++i) {
           std::string paramName = func->params[i].name;
           std::string idxStr = std::to_string(i);
-          auto getter = std::make_shared<Function>();
+          auto getter = GarbageCollector::makeGC<Function>();
           getter->isNative = true;
           getter->nativeFunc = [targetEnv, paramName](const std::vector<Value>&) -> Value {
             auto val = targetEnv->get(paramName);
             return val.has_value() ? *val : Value(Undefined{});
           };
           argumentsArray->properties["__get_" + idxStr] = Value(getter);
-          auto setter = std::make_shared<Function>();
+          auto setter = GarbageCollector::makeGC<Function>();
           setter->isNative = true;
           setter->nativeFunc = [targetEnv, paramName](const std::vector<Value>& args) -> Value {
             if (!args.empty()) {
@@ -7663,7 +7664,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     }
 
     if (func->restParam.has_value()) {
-      auto restArr = std::make_shared<Array>();
+      auto restArr = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = func->params.size(); i < currentArgs.size(); ++i) {
         restArr->elements.push_back(currentArgs[i]);
@@ -7703,7 +7704,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
 
       std::vector<Value> constructArgs;
       if (args[1].isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(args[1].data);
+        auto arr = args[1].getGC<Array>();
         constructArgs = arr->elements;
       }
 
@@ -7768,7 +7769,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   }
 
   if (func->isGenerator) {
-    auto generator = std::make_shared<Generator>(func, func->closure);
+    auto generator = GarbageCollector::makeGC<Generator>(func, func->closure);
     generator->properties["__constructor__"] = callee;
     
     // Set prototype: g() returns an object that inherits from g.prototype
@@ -7783,7 +7784,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     }
     
     GarbageCollector::instance().reportAllocation(sizeof(Generator));
-    auto genEnv = std::static_pointer_cast<Environment>(func->closure);
+    auto genEnv = func->closure;
     genEnv = genEnv->createChild();
     auto prevEnv2 = env_;
     bool prevStrict2 = strictMode_;
@@ -7803,14 +7804,14 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     // Push stack frame for async function calls
     auto stackFrame = pushStackFrame("<async>");
 
-    auto promise = std::make_shared<Promise>();
+    auto promise = GarbageCollector::makeGC<Promise>();
     if (auto promiseCtor = env_->getRoot()->get("Promise");
         promiseCtor.has_value() && promiseCtor->isFunction()) {
       promise->properties["__constructor__"] = *promiseCtor;
     }
     auto prevFlow = flow_;
     auto prevEnv = env_;
-    env_ = std::static_pointer_cast<Environment>(func->closure);
+    env_ = func->closure;
     env_ = env_->createChild();
 
     flow_.reset();
@@ -7920,9 +7921,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
                     return;
                   }
                   if (foundThen && thenValue.isFunction()) {
-                    auto thenablePromise = std::make_shared<Promise>();
+                    auto thenablePromise = GarbageCollector::makeGC<Promise>();
 
-                    auto resolveFunc = std::make_shared<Function>();
+                    auto resolveFunc = GarbageCollector::makeGC<Function>();
                     resolveFunc->isNative = true;
                     resolveFunc->nativeFunc = [thenablePromise](const std::vector<Value>& args) -> Value {
                       if (!args.empty()) {
@@ -7933,7 +7934,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
                       return Value(Undefined{});
                     };
 
-                    auto rejectFunc = std::make_shared<Function>();
+                    auto rejectFunc = GarbageCollector::makeGC<Function>();
                     rejectFunc->isNative = true;
                     rejectFunc->nativeFunc = [thenablePromise](const std::vector<Value>& args) -> Value {
                       if (!args.empty()) {
@@ -7959,11 +7960,11 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
                   }
                 }
 
-                std::shared_ptr<Promise> awaitedPromise;
+                GCPtr<Promise> awaitedPromise;
                 if (awaitedValue.isPromise()) {
-                  awaitedPromise = std::get<std::shared_ptr<Promise>>(awaitedValue.data);
+                  awaitedPromise = awaitedValue.getGC<Promise>();
                 } else {
-                  awaitedPromise = std::make_shared<Promise>();
+                  awaitedPromise = GarbageCollector::makeGC<Promise>();
                   awaitedPromise->resolve(awaitedValue);
                 }
 
@@ -8037,7 +8038,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
   pendingSelfTailThis_ = Value(Undefined{});
 
   while (true) {
-    env_ = std::static_pointer_cast<Environment>(func->closure);
+    env_ = func->closure;
     env_ = env_->createChild();
     bindParameters(env_);
     if (flow_.type == ControlFlow::Type::Throw) {
@@ -8149,7 +8150,7 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  auto arr = std::make_shared<Array>();
+  auto arr = GarbageCollector::makeGC<Array>();
   GarbageCollector::instance().reportAllocation(sizeof(Array));
 
   // Set __proto__ to Array.prototype for prototype chain resolution
@@ -8157,9 +8158,9 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
   if (arrCtor) {
     OrderedMap<std::string, Value>* ctorProps = nullptr;
     if (arrCtor->isFunction()) {
-      ctorProps = &std::get<std::shared_ptr<Function>>(arrCtor->data)->properties;
+      ctorProps = &std::get<GCPtr<Function>>(arrCtor->data)->properties;
     } else if (arrCtor->isObject()) {
-      ctorProps = &std::get<std::shared_ptr<Object>>(arrCtor->data)->properties;
+      ctorProps = &std::get<GCPtr<Object>>(arrCtor->data)->properties;
     }
     if (ctorProps) {
       auto protoIt = ctorProps->find("prototype");
@@ -8184,7 +8185,7 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
 
       // Spread the value into the array
       if (val.isArray()) {
-        auto srcArr = std::get<std::shared_ptr<Array>>(val.data);
+        auto srcArr = val.getGC<Array>();
         for (const auto& item : srcArr->elements) {
           arr->elements.push_back(item);
         }
@@ -8196,13 +8197,13 @@ Task Interpreter::evaluateArray(const ArrayExpr& expr) {
         }
       } else if (val.isObject()) {
         // Try iterator protocol: object with .next() method
-        auto obj = std::get<std::shared_ptr<Object>>(val.data);
+        auto obj = val.getGC<Object>();
         auto nextIt = obj->properties.find("next");
         if (nextIt != obj->properties.end() && nextIt->second.isFunction()) {
           for (size_t iterLimit = 0; iterLimit < 100000; ++iterLimit) {
             Value step = callFunction(nextIt->second, {}, val);
             if (step.isObject()) {
-              auto stepObj = std::get<std::shared_ptr<Object>>(step.data);
+              auto stepObj = step.getGC<Object>();
               auto doneIt = stepObj->properties.find("done");
               if (doneIt != stepObj->properties.end() && doneIt->second.toBool()) break;
               auto valueIt = stepObj->properties.find("value");
@@ -8232,7 +8233,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  auto obj = std::make_shared<Object>();
+  auto obj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Set __proto__ to Object.prototype for prototype chain resolution
@@ -8240,9 +8241,9 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
   if (objCtor) {
     OrderedMap<std::string, Value>* ctorProps = nullptr;
     if (objCtor->isFunction()) {
-      ctorProps = &std::get<std::shared_ptr<Function>>(objCtor->data)->properties;
+      ctorProps = &std::get<GCPtr<Function>>(objCtor->data)->properties;
     } else if (objCtor->isObject()) {
-      ctorProps = &std::get<std::shared_ptr<Object>>(objCtor->data)->properties;
+      ctorProps = &std::get<GCPtr<Object>>(objCtor->data)->properties;
     }
     if (ctorProps) {
       auto protoIt = ctorProps->find("prototype");
@@ -8261,7 +8262,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 
       // Copy properties from spread object
       if (spreadVal.isObject()) {
-        auto sourceObj = std::get<std::shared_ptr<Object>>(spreadVal.data);
+        auto sourceObj = spreadVal.getGC<Object>();
         for (const auto& [key, value] : sourceObj->properties) {
           obj->properties[key] = value;
         }
@@ -8302,7 +8303,7 @@ Task Interpreter::evaluateObject(const ObjectExpr& expr) {
 }
 
 Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
-  auto func = std::make_shared<Function>();
+  auto func = GarbageCollector::makeGC<Function>();
   func->isNative = false;
   func->isAsync = expr.isAsync;
   func->isGenerator = expr.isGenerator;
@@ -8346,7 +8347,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   if (!expr.isArrow) {
     func->isConstructor = true;
     // Create default prototype object with constructor back-reference
-    auto proto = std::make_shared<Object>();
+    auto proto = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     proto->properties["constructor"] = Value(func);
     proto->properties["__non_enum_constructor"] = Value(true);
@@ -8368,7 +8369,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
     if (func->isGenerator && protoVal->isObject()) {
       func->properties["__proto__"] = *protoVal;
     } else if (protoVal->isFunction()) {
-      auto protoCtor = std::get<std::shared_ptr<Function>>(protoVal->data);
+      auto protoCtor = std::get<GCPtr<Function>>(protoVal->data);
       auto protoIt = protoCtor->properties.find("prototype");
       if (protoIt != protoCtor->properties.end()) {
         func->properties["__proto__"] = protoIt->second;
@@ -8390,9 +8391,9 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
     if (foundThen && thenValue.isFunction()) {
-      auto promise = std::make_shared<Promise>();
+      auto promise = GarbageCollector::makeGC<Promise>();
 
-      auto resolveFunc = std::make_shared<Function>();
+      auto resolveFunc = GarbageCollector::makeGC<Function>();
       resolveFunc->isNative = true;
       resolveFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
@@ -8403,7 +8404,7 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
         return Value(Undefined{});
       };
 
-      auto rejectFunc = std::make_shared<Function>();
+      auto rejectFunc = GarbageCollector::makeGC<Function>();
       rejectFunc->isNative = true;
       rejectFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
         if (!args.empty()) {
@@ -8426,7 +8427,7 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
   }
 
   if (val.isPromise()) {
-    auto promise = std::get<std::shared_ptr<Promise>>(val.data);
+    auto promise = val.getGC<Promise>();
     if (promise->state == PromiseState::Pending) {
       // TinyJS models await synchronously; drive pending microtasks until settled.
       auto& loop = EventLoopContext::instance().getLoop();
@@ -8518,7 +8519,7 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
       bool done = false;
       Value val = Value(Undefined{});
       if (innerResult.isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(innerResult.data);
+        auto obj = innerResult.getGC<Object>();
         if (auto doneVal = obj->properties.find("done"); doneVal != obj->properties.end()) {
           done = doneVal->second.toBool();
         }
@@ -8573,7 +8574,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     if (newTargetOverride.isClass()) {
       validNewTarget = true;
     } else if (newTargetOverride.isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(newTargetOverride.data);
+      auto fn = newTargetOverride.getGC<Function>();
       validNewTarget = fn->isConstructor;
     } else if (newTargetOverride.isProxy()) {
       validNewTarget = true;
@@ -8588,14 +8589,14 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
   // Handle Proxy construct trap
   if (callee.isProxy()) {
-    auto proxyPtr = std::get<std::shared_ptr<Proxy>>(callee.data);
+    auto proxyPtr = callee.getGC<Proxy>();
     if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-      auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+      auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
       auto trapIt = handlerObj->properties.find("construct");
       if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
-        auto trap = std::get<std::shared_ptr<Function>>(trapIt->second.data);
+        auto trap = trapIt->second.getGC<Function>();
         // Create args array
-        auto argsArray = std::make_shared<Array>();
+        auto argsArray = GarbageCollector::makeGC<Array>();
         argsArray->elements = args;
         // Call construct trap: handler.construct(target, argumentsList, newTarget)
         std::vector<Value> trapArgs = {*proxyPtr->target, Value(argsArray), effectiveNewTarget};
@@ -8621,46 +8622,45 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
     auto setConstructorTag = [&](Value& instanceVal) {
       Value constructorTag = newTargetOverride.isUndefined() ? callee : effectiveNewTarget;
-      auto setTagOnObject = [&](auto& container) {
+      auto setTagOnObject = [&](const auto& container) {
         container->properties["__constructor__"] = constructorTag;
       };
       if (instanceVal.isObject()) {
-        setTagOnObject(std::get<std::shared_ptr<Object>>(instanceVal.data));
+        setTagOnObject(instanceVal.getGC<Object>());
       } else if (instanceVal.isArray()) {
-        setTagOnObject(std::get<std::shared_ptr<Array>>(instanceVal.data));
+        setTagOnObject(instanceVal.getGC<Array>());
       } else if (instanceVal.isFunction()) {
-        setTagOnObject(std::get<std::shared_ptr<Function>>(instanceVal.data));
+        setTagOnObject(instanceVal.getGC<Function>());
       } else if (instanceVal.isRegex()) {
-        setTagOnObject(std::get<std::shared_ptr<Regex>>(instanceVal.data));
+        setTagOnObject(instanceVal.getGC<Regex>());
       } else if (instanceVal.isPromise()) {
-        setTagOnObject(std::get<std::shared_ptr<Promise>>(instanceVal.data));
+        setTagOnObject(instanceVal.getGC<Promise>());
       }
     };
 
     auto setProtoOnValue = [&](Value& targetVal, const Value& protoVal) {
       if (!protoVal.isObject()) return;
-      auto setProto = [&](auto& container) {
-        container->properties["__proto__"] = protoVal;
+      auto setProto = [&](const auto& container) {
       };
       if (targetVal.isObject()) {
-        setProto(std::get<std::shared_ptr<Object>>(targetVal.data));
+        setProto(targetVal.getGC<Object>());
       } else if (targetVal.isArray()) {
-        setProto(std::get<std::shared_ptr<Array>>(targetVal.data));
+        setProto(targetVal.getGC<Array>());
       } else if (targetVal.isFunction()) {
-        setProto(std::get<std::shared_ptr<Function>>(targetVal.data));
+        setProto(targetVal.getGC<Function>());
       } else if (targetVal.isRegex()) {
-        setProto(std::get<std::shared_ptr<Regex>>(targetVal.data));
+        setProto(targetVal.getGC<Regex>());
       } else if (targetVal.isPromise()) {
-        setProto(std::get<std::shared_ptr<Promise>>(targetVal.data));
+        setProto(targetVal.getGC<Promise>());
       }
     };
 
   auto wrapPrimitiveValue = [&](const Value& primitive) -> Value {
-    auto wrapper = std::make_shared<Object>();
+    auto wrapper = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     wrapper->properties["__primitive_value__"] = primitive;
 
-    auto valueOfFn = std::make_shared<Function>();
+    auto valueOfFn = GarbageCollector::makeGC<Function>();
     valueOfFn->isNative = true;
     valueOfFn->properties["__uses_this_arg__"] = Value(true);
     valueOfFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
@@ -8669,7 +8669,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
           return args[0];
         }
         if (args[0].isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+          auto obj = args[0].getGC<Object>();
           auto it = obj->properties.find("__primitive_value__");
           if (it != obj->properties.end()) {
             return it->second;
@@ -8684,7 +8684,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
   };
 
   if (callee.isObject()) {
-    auto objPtr = std::get<std::shared_ptr<Object>>(callee.data);
+    auto objPtr = callee.getGC<Object>();
     auto callableIt = objPtr->properties.find("__callable_object__");
     bool isCallableWrapper = callableIt != objPtr->properties.end() &&
                              callableIt->second.isBool() &&
@@ -8699,10 +8699,10 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
   // Handle Class constructor
   if (callee.isClass()) {
-    auto cls = std::get<std::shared_ptr<Class>>(callee.data);
+    auto cls = callee.getGC<Class>();
 
     // Create the new instance object
-    auto instance = std::make_shared<Object>();
+    auto instance = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
     // Set up prototype chain from Class.prototype.
@@ -8714,7 +8714,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     // Execute constructor if it exists
     if (cls->constructor) {
       auto prevEnv = env_;
-      env_ = std::static_pointer_cast<Environment>(cls->closure);
+      env_ = cls->closure;
       env_ = env_->createChild();
 
       // Bind 'this' to the new instance
@@ -8748,7 +8748,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
       // Handle rest parameter
       if (func->restParam.has_value()) {
-        auto restArr = std::make_shared<Array>();
+        auto restArr = GarbageCollector::makeGC<Array>();
         GarbageCollector::instance().reportAllocation(sizeof(Array));
         for (size_t i = func->params.size(); i < args.size(); ++i) {
           restArr->elements.push_back(args[i]);
@@ -8829,14 +8829,14 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       // If super() replaced `this` with a different type, set `constructor` property
       // to point to this class (simulates prototype.constructor inheritance)
       if (finalThis.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(finalThis.data);
+        auto p = finalThis.getGC<Promise>();
         p->properties["constructor"] = callee;
       } else if (finalThis.isObject() &&
-                 std::get<std::shared_ptr<Object>>(finalThis.data).get() != instance.get()) {
-        auto obj = std::get<std::shared_ptr<Object>>(finalThis.data);
+                 finalThis.getGC<Object>().get() != instance) {
+        auto obj = finalThis.getGC<Object>();
         obj->properties["constructor"] = callee;
       } else if (finalThis.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(finalThis.data);
+        auto arr = finalThis.getGC<Array>();
         arr->properties["constructor"] = callee;
       }
       LIGHTJS_RETURN(finalThis);
@@ -8854,7 +8854,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         LIGHTJS_RETURN(Value(Undefined{}));
       }
       if (superVal.isFunction()) {
-        auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+        auto superFunc = superVal.getGC<Function>();
         if (superFunc && superFunc->isNative) {
           auto protoIt = cls->properties.find("prototype");
           if (protoIt != cls->properties.end()) {
@@ -8864,10 +8864,10 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       }
       setConstructorTag(result);
       if (result.isPromise()) {
-        auto p = std::get<std::shared_ptr<Promise>>(result.data);
+        auto p = result.getGC<Promise>();
         p->properties["constructor"] = callee;
       } else if (result.isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(result.data);
+        auto obj = result.getGC<Object>();
         obj->properties["constructor"] = callee;
       }
       LIGHTJS_RETURN(result);
@@ -8878,7 +8878,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       instance->properties["__constructor__"] = callee;
 
       auto prevEnv = env_;
-      env_ = std::static_pointer_cast<Environment>(cls->closure);
+      env_ = cls->closure;
       env_ = env_->createChild();
       env_->define("this", Value(instance));
 
@@ -8905,7 +8905,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
   // Handle Function constructor (regular constructor function)
   if (callee.isFunction()) {
-    auto func = std::get<std::shared_ptr<Function>>(callee.data);
+    auto func = callee.getGC<Function>();
 
     if (func->isGenerator || func->isAsync) {
       throwError(ErrorType::TypeError, "Function is not a constructor");
@@ -8932,7 +8932,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     }
 
     // Create the new instance object
-    auto instance = std::make_shared<Object>();
+    auto instance = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
     // Set __proto__ to constructor's prototype (OrdinaryCreateFromConstructor)
@@ -8943,7 +8943,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
     // Set up execution environment
     auto prevEnv = env_;
-    env_ = std::static_pointer_cast<Environment>(func->closure);
+    env_ = func->closure;
     env_ = env_->createChild();
 
     // Bind 'this' to the new instance
@@ -8966,7 +8966,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
     // Handle rest parameter
     if (func->restParam.has_value()) {
-      auto restArr = std::make_shared<Array>();
+      auto restArr = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (size_t i = func->params.size(); i < args.size(); ++i) {
         restArr->elements.push_back(args[i]);
@@ -9018,7 +9018,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         // If constructor returns an object-like value, use that; otherwise use the instance
         // ES spec: "If Type(result) is Object, return result."
         if (flow_.value.isObject()) {
-          instance = std::get<std::shared_ptr<Object>>(flow_.value.data);
+          instance = flow_.value.getGC<Object>();
         } else if (isObjectLike(flow_.value)) {
           // Constructor returned a non-plain-Object type (Promise, Array, Function, etc.)
           Value returnedVal = flow_.value;
@@ -9073,7 +9073,7 @@ Task Interpreter::evaluateNew(const NewExpr& expr) {
 }
 
 Task Interpreter::evaluateClass(const ClassExpr& expr) {
-  auto cls = std::make_shared<Class>(expr.name);
+  auto cls = GarbageCollector::makeGC<Class>(expr.name);
   GarbageCollector::instance().reportAllocation(sizeof(Class));
   cls->closure = env_;
 
@@ -9083,10 +9083,10 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
   Value superVal;
   LIGHTJS_RUN_TASK(superTask, superVal);
     if (superVal.isClass()) {
-      cls->superClass = std::get<std::shared_ptr<Class>>(superVal.data);
+      cls->superClass = superVal.getGC<Class>();
     } else if (superVal.isFunction()) {
       cls->properties["__super_constructor__"] = superVal;
-      auto superFunc = std::get<std::shared_ptr<Function>>(superVal.data);
+      auto superFunc = superVal.getGC<Function>();
       for (const auto& [key, val] : superFunc->properties) {
         if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
         if (key == "name" || key == "length" || key == "prototype" ||
@@ -9098,25 +9098,25 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
   }
 
-  auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> std::shared_ptr<Object> {
+  auto getPrototypeFromConstructor = [&](const Value& ctorValue) -> GCPtr<Object> {
     if (ctorValue.isFunction()) {
-      auto fn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+      auto fn = ctorValue.getGC<Function>();
       auto protoIt = fn->properties.find("prototype");
       if (protoIt != fn->properties.end() && protoIt->second.isObject()) {
-        return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        return protoIt->second.getGC<Object>();
       }
     } else if (ctorValue.isClass()) {
-      auto superCls = std::get<std::shared_ptr<Class>>(ctorValue.data);
+      auto superCls = ctorValue.getGC<Class>();
       auto protoIt = superCls->properties.find("prototype");
       if (protoIt != superCls->properties.end() && protoIt->second.isObject()) {
-        return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        return protoIt->second.getGC<Object>();
       }
     }
     return nullptr;
   };
 
   // Create Class.prototype object and wire prototype inheritance.
-  auto classPrototype = std::make_shared<Object>();
+  auto classPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   if (cls->superClass) {
     auto superProtoIt = cls->superClass->properties.find("prototype");
@@ -9222,7 +9222,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     }
 
     // Create function from method definition
-    auto func = std::make_shared<Function>();
+    auto func = GarbageCollector::makeGC<Function>();
     func->isNative = false;
     func->isAsync = method.isAsync;
     func->isGenerator = method.isGenerator;
@@ -9329,7 +9329,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
 
   // Class objects behave like functions: inherit from Function.prototype.
   if (auto funcVal = env_->get("Function"); funcVal && funcVal->isFunction()) {
-    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+    auto funcCtor = std::get<GCPtr<Function>>(funcVal->data);
     auto protoIt = funcCtor->properties.find("prototype");
     if (protoIt != funcCtor->properties.end() && protoIt->second.isObject()) {
       cls->properties["__proto__"] = protoIt->second;
@@ -9353,7 +9353,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       if (auto* leftId = std::get_if<Identifier>(&assign->left->node)) {
         bool isAnonymousFnDef = !std::get_if<SequenceExpr>(&assign->right->node);
         if (isAnonymousFnDef && boundValue.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(boundValue.data);
+          auto fn = boundValue.getGC<Function>();
           auto nameIt = fn->properties.find("name");
           if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
             fn->properties["name"] = Value(leftId->name);
@@ -9361,7 +9361,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
             fn->properties["name"] = Value(leftId->name);
           }
         } else if (isAnonymousFnDef) {
-          if (auto* cls = std::get_if<std::shared_ptr<Class>>(&boundValue.data)) {
+          if (auto* cls = std::get_if<GCPtr<Class>>(&boundValue.data)) {
             // Per spec: HasOwnProperty(v, "name") check before SetFunctionName
             bool hasNameProperty = (*cls)->properties.find("name") != (*cls)->properties.end();
             if (!hasNameProperty) {
@@ -9410,7 +9410,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
     Value objVal = Value(Undefined{});
     LIGHTJS_RUN_TASK(objTask, objVal);
     if (objVal.isObject()) {
-      auto obj = std::get<std::shared_ptr<Object>>(objVal.data);
+      auto obj = objVal.getGC<Object>();
       std::string prop;
       if (member->computed) {
         auto propTask = evaluate(*member->property);
@@ -9428,7 +9428,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
         obj->properties[prop] = value;
       }
     } else if (objVal.isArray()) {
-      auto arr = std::get<std::shared_ptr<Array>>(objVal.data);
+      auto arr = objVal.getGC<Array>();
       if (member->computed) {
         auto propTask = evaluate(*member->property);
         Value propVal = Value(Undefined{});
@@ -9445,16 +9445,16 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       throwError(ErrorType::TypeError, "Cannot destructure " + value.toString() + " as it is not iterable");
       LIGHTJS_RETURN(Value(Undefined{}));
     }
-    std::shared_ptr<Array> arr;
+    GCPtr<Array> arr;
     if (value.isArray()) {
       // Array destructuring must respect Array.prototype[Symbol.iterator] overrides.
       // Fast path: use direct indexing only when the builtin iterator is installed.
       auto arrayProtoOpt = env_->get("__array_prototype__");
       if (!arrayProtoOpt.has_value() || !arrayProtoOpt->isObject()) {
         // Fallback to the legacy behavior when the hidden prototype is missing.
-        arr = std::get<std::shared_ptr<Array>>(value.data);
+        arr = value.getGC<Array>();
       } else {
-        auto protoObj = std::get<std::shared_ptr<Object>>(arrayProtoOpt->data);
+        auto protoObj = std::get<GCPtr<Object>>(arrayProtoOpt->data);
         const auto& iterKey = WellKnownSymbols::iteratorKey();
         auto iterIt = protoObj->properties.find(iterKey);
         if (iterIt == protoObj->properties.end()) {
@@ -9468,14 +9468,14 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
         }
         bool isBuiltinIterator = false;
         if (iteratorMethod.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(iteratorMethod.data);
+          auto fn = iteratorMethod.getGC<Function>();
           auto builtinIt = fn->properties.find("__builtin_array_iterator__");
           isBuiltinIterator = builtinIt != fn->properties.end() &&
                               builtinIt->second.isBool() &&
                               builtinIt->second.toBool();
         }
         if (isBuiltinIterator) {
-          arr = std::get<std::shared_ptr<Array>>(value.data);
+          arr = value.getGC<Array>();
         } else {
           // Use the overridden @@iterator to collect elements.
           Value iterResult = callFunction(iteratorMethod, {}, value);
@@ -9484,9 +9484,9 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
           IteratorRecord iterRec;
           if (iterResult.isGenerator()) {
             iterRec.kind = IteratorRecord::Kind::Generator;
-            iterRec.generator = std::get<std::shared_ptr<Generator>>(iterResult.data);
+            iterRec.generator = iterResult.getGC<Generator>();
           } else if (iterResult.isObject()) {
-            auto iterObj = std::get<std::shared_ptr<Object>>(iterResult.data);
+            auto iterObj = iterResult.getGC<Object>();
             // Cache next method (with getter support).
             Value nextMethod;
             auto getterIt = iterObj->properties.find("__get_next");
@@ -9509,7 +9509,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
             LIGHTJS_RETURN(Value(Undefined{}));
           }
 
-          arr = std::make_shared<Array>();
+          arr = GarbageCollector::makeGC<Array>();
           GarbageCollector::instance().reportAllocation(sizeof(Array));
           size_t needed = arrayPat->elements.size();
           bool hasRest = (arrayPat->rest != nullptr);
@@ -9520,7 +9520,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
               throwError(ErrorType::TypeError, "Iterator result is not an object");
               LIGHTJS_RETURN(Value(Undefined{}));
             }
-            auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+            auto stepObj = stepResult.getGC<Object>();
             bool done = false;
             auto doneGetterIt = stepObj->properties.find("__get_done");
             if (doneGetterIt != stepObj->properties.end() && doneGetterIt->second.isFunction()) {
@@ -9550,14 +9550,14 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
     } else if (value.isString()) {
       // Strings are iterable - convert to array of chars
       auto str = std::get<std::string>(value.data);
-      arr = std::make_shared<Array>();
+      arr = GarbageCollector::makeGC<Array>();
       for (size_t i = 0; i < str.size(); ++i) {
         arr->elements.push_back(Value(std::string(1, str[i])));
       }
     } else if (value.isGenerator()) {
       // Generators are iterable - lazily iterate via next()
-      auto gen = std::get<std::shared_ptr<Generator>>(value.data);
-      arr = std::make_shared<Array>();
+      auto gen = value.getGC<Generator>();
+      arr = GarbageCollector::makeGC<Array>();
       IteratorRecord genRecord;
       genRecord.kind = IteratorRecord::Kind::Generator;
       genRecord.generator = gen;
@@ -9568,7 +9568,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       for (size_t i = 0; i < needed || hasRest; ++i) {
         Value stepResult = iteratorNext(genRecord);
         if (!stepResult.isObject()) { genExhausted = true; break; }
-        auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+        auto stepObj = stepResult.getGC<Object>();
         auto doneIt2 = stepObj->properties.find("done");
         if (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool()) { genExhausted = true; break; }
         auto valIt = stepObj->properties.find("value");
@@ -9583,13 +9583,13 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       }
     } else if (value.isObject()) {
       // Check for Symbol.iterator on objects
-      auto obj = std::get<std::shared_ptr<Object>>(value.data);
+      auto obj = value.getGC<Object>();
       const auto& iteratorKey = WellKnownSymbols::iteratorKey();
       auto it = obj->properties.find(iteratorKey);
       if (it != obj->properties.end() && it->second.isFunction()) {
         Value iterResult = callFunction(it->second, {}, value);
         if (iterResult.isObject()) {
-          auto iterObj = std::get<std::shared_ptr<Object>>(iterResult.data);
+          auto iterObj = iterResult.getGC<Object>();
           auto nextIt = iterObj->properties.find("next");
           if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
             // Single-pass lazy destructuring with IteratorClose protocol
@@ -9608,7 +9608,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
                 return Value(Undefined{});
               }
               if (!stepResult.isObject()) { iteratorDone = true; return Value(Undefined{}); }
-              auto stepObj = std::get<std::shared_ptr<Object>>(stepResult.data);
+              auto stepObj = stepResult.getGC<Object>();
               // Check done (with getter support)
               bool isDone = false;
               auto doneGetterIt2 = stepObj->properties.find("__get_done");
@@ -9693,7 +9693,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
 
                 // Bind value to pre-evaluated reference
                 if (objVal.isObject()) {
-                  auto obj2 = std::get<std::shared_ptr<Object>>(objVal.data);
+                  auto obj2 = objVal.getGC<Object>();
                   auto setterIt = obj2->properties.find("__set_" + prop);
                   if (setterIt != obj2->properties.end() && setterIt->second.isFunction()) {
                     callFunction(setterIt->second, {elemValue}, objVal);
@@ -9701,7 +9701,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
                     obj2->properties[prop] = elemValue;
                   }
                 } else if (objVal.isArray()) {
-                  auto arrRef = std::get<std::shared_ptr<Array>>(objVal.data);
+                  auto arrRef = objVal.getGC<Array>();
                   if (memberTarget->computed) {
                     size_t idx = static_cast<size_t>(std::stod(prop));
                     if (idx < arrRef->elements.size()) {
@@ -9756,7 +9756,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
                 }
 
                 // Collect remaining values
-                auto restArr = std::make_shared<Array>();
+                auto restArr = GarbageCollector::makeGC<Array>();
                 while (!iteratorDone) {
                   Value v = advanceIterator();
                   if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
@@ -9766,7 +9766,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
 
                 // Bind to pre-evaluated reference
                 if (objVal.isObject()) {
-                  auto obj2 = std::get<std::shared_ptr<Object>>(objVal.data);
+                  auto obj2 = objVal.getGC<Object>();
                   auto setterIt = obj2->properties.find("__set_" + prop);
                   if (setterIt != obj2->properties.end() && setterIt->second.isFunction()) {
                     callFunction(setterIt->second, {Value(restArr)}, objVal);
@@ -9774,7 +9774,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
                     obj2->properties[prop] = Value(restArr);
                   }
                 } else if (objVal.isArray()) {
-                  auto arrRef = std::get<std::shared_ptr<Array>>(objVal.data);
+                  auto arrRef = objVal.getGC<Array>();
                   if (memberTarget->computed) {
                     size_t idx = static_cast<size_t>(std::stod(prop));
                     if (idx < arrRef->elements.size()) {
@@ -9785,7 +9785,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
                 if (flow_.type == ControlFlow::Type::Throw) { closeWithThrow(); LIGHTJS_RETURN(Value(Undefined{})); }
               } else {
                 // Identifier or nested pattern rest: collect remaining, then bind
-                auto restArr = std::make_shared<Array>();
+                auto restArr = GarbageCollector::makeGC<Array>();
                 while (!iteratorDone) {
                   Value v = advanceIterator();
                   if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
@@ -9806,9 +9806,9 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
             LIGHTJS_RETURN(Value(Undefined{}));
           }
           // next method not found - treat as empty iterable
-          arr = std::make_shared<Array>();
+          arr = GarbageCollector::makeGC<Array>();
         } else {
-          arr = std::make_shared<Array>();
+          arr = GarbageCollector::makeGC<Array>();
         }
       } else {
         throwError(ErrorType::TypeError, value.toString() + " is not iterable");
@@ -9832,7 +9832,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
 
     // Handle rest element
     if (arrayPat->rest) {
-      auto restArr = std::make_shared<Array>();
+      auto restArr = GarbageCollector::makeGC<Array>();
       for (size_t i = arrayPat->elements.size(); i < arr->elements.size(); ++i) {
         restArr->elements.push_back(arr->elements[i]);
       }
@@ -9844,13 +9844,13 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       throwError(ErrorType::TypeError, "Cannot destructure " + value.toString() + " as it is not an object");
       LIGHTJS_RETURN(Value(Undefined{}));
     }
-    std::shared_ptr<Object> obj;
+    GCPtr<Object> obj;
     if (value.isObject()) {
-      obj = std::get<std::shared_ptr<Object>>(value.data);
+      obj = value.getGC<Object>();
     } else if (value.isArray()) {
       // Convert array to object-like representation for destructuring
-      auto arr = std::get<std::shared_ptr<Array>>(value.data);
-      obj = std::make_shared<Object>();
+      auto arr = value.getGC<Array>();
+      obj = GarbageCollector::makeGC<Object>();
       for (size_t i = 0; i < arr->elements.size(); ++i) {
         obj->properties[std::to_string(i)] = arr->elements[i];
       }
@@ -9858,14 +9858,14 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
     } else if (value.isString()) {
       // Convert string to object-like representation for destructuring
       auto str = std::get<std::string>(value.data);
-      obj = std::make_shared<Object>();
+      obj = GarbageCollector::makeGC<Object>();
       for (size_t i = 0; i < str.size(); ++i) {
         obj->properties[std::to_string(i)] = Value(std::string(1, str[i]));
       }
       obj->properties["length"] = Value(static_cast<double>(str.size()));
     } else {
       // Create empty object for other primitive values
-      obj = std::make_shared<Object>();
+      obj = GarbageCollector::makeGC<Object>();
     }
 
     std::unordered_set<std::string> extractedKeys;
@@ -9908,7 +9908,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
 
     // Handle rest properties
     if (objPat->rest) {
-      auto restObj = std::make_shared<Object>();
+      auto restObj = GarbageCollector::makeGC<Object>();
       // First collect getter property names
       std::unordered_set<std::string> getterKeys;
       for (const auto& [key, val] : obj->properties) {
@@ -9952,7 +9952,7 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
   LIGHTJS_RETURN(Value(Undefined{}));}
 
 // Helper to invoke a JavaScript function synchronously (used by native array methods for callbacks)
-Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vector<Value>& args, const Value& thisValue) {
+Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>& args, const Value& thisValue) {
   if (func->isNative) {
     auto itUsesThis = func->properties.find("__uses_this_arg__");
     if (itUsesThis != func->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
@@ -9967,7 +9967,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
 
   // Save current environment
   auto prevEnv = env_;
-  env_ = std::static_pointer_cast<Environment>(func->closure);
+  env_ = func->closure;
   env_ = env_->createChild();
 
   Value boundThis = thisValue;
@@ -9984,7 +9984,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
     env_->define("__super__", superIt->second);
   }
 
-  auto argumentsArray = std::make_shared<Array>();
+  auto argumentsArray = GarbageCollector::makeGC<Array>();
   GarbageCollector::instance().reportAllocation(sizeof(Array));
   argumentsArray->elements = args;
   env_->define("arguments", Value(argumentsArray));
@@ -10005,7 +10005,7 @@ Value Interpreter::invokeFunction(std::shared_ptr<Function> func, const std::vec
 
   // Handle rest parameter
   if (func->restParam.has_value()) {
-    auto restArr = std::make_shared<Array>();
+    auto restArr = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
     for (size_t i = func->params.size(); i < args.size(); ++i) {
       restArr->elements.push_back(args[i]);
@@ -10069,7 +10069,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
   for (const auto& declarator : decl.declarations) {
     // Per spec (13.3.2.4): ResolveBinding BEFORE evaluating initializer.
     // For var declarations in with-scope, capture the with-scope object first.
-    std::shared_ptr<Object> preResolvedWithObj;
+    GCPtr<Object> preResolvedWithObj;
     std::string preResolvedName;
     if (decl.kind == VarDeclaration::Kind::Var && declarator.init) {
       if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
@@ -10105,10 +10105,10 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
           // Anonymous function expression (not named like `function foo() {}`)
           isAnonFnDef = fnExpr->name.empty();
         } else if (std::get_if<ClassExpr>(&declarator.init->node)) {
-          isAnonFnDef = value.isClass() && std::get<std::shared_ptr<Class>>(value.data)->name.empty();
+          isAnonFnDef = value.isClass() && value.getGC<Class>()->name.empty();
         }
         if (isAnonFnDef && value.isFunction()) {
-          auto fn = std::get<std::shared_ptr<Function>>(value.data);
+          auto fn = value.getGC<Function>();
           auto nameIt = fn->properties.find("name");
           if (nameIt != fn->properties.end() && nameIt->second.isString() && nameIt->second.toString().empty()) {
             fn->properties["name"] = Value(id->name);
@@ -10116,7 +10116,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
             fn->properties["__non_enum_name"] = Value(true);
           }
         } else if (isAnonFnDef && value.isClass()) {
-          auto cls = std::get<std::shared_ptr<Class>>(value.data);
+          auto cls = value.getGC<Class>();
           if (cls->properties.find("name") == cls->properties.end()) {
             cls->name = id->name;
             cls->properties["name"] = Value(id->name);
@@ -10179,7 +10179,7 @@ void Interpreter::hoistVarDeclarationsFromStmt(const Statement& stmt) {
             if (!env_->getParent()) {
               auto globalThisOpt = env_->get("globalThis");
               if (globalThisOpt && globalThisOpt->isObject()) {
-                auto globalObj = std::get<std::shared_ptr<Object>>(globalThisOpt->data);
+                auto globalObj = std::get<GCPtr<Object>>(globalThisOpt->data);
                 globalObj->properties["__non_configurable_" + name] = Value(true);
               }
             }
@@ -10233,7 +10233,7 @@ void Interpreter::hoistVarDeclarations(const std::vector<StmtPtr>& body) {
 }
 
 Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
-  auto func = std::make_shared<Function>();
+  auto func = GarbageCollector::makeGC<Function>();
   func->isNative = false;
   func->isAsync = decl.isAsync;
   func->isGenerator = decl.isGenerator;
@@ -10271,7 +10271,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->isConstructor = true;
 
   // Create default prototype object with constructor back-reference
-  auto proto = std::make_shared<Object>();
+  auto proto = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   proto->properties["constructor"] = Value(func);
   proto->properties["__non_enum_constructor"] = Value(true);
@@ -10280,7 +10280,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   // Set __proto__ to Function.prototype for proper prototype chain
   auto funcVal = env_->getRoot()->get("Function");
   if (funcVal.has_value() && funcVal->isFunction()) {
-    auto funcCtor = std::get<std::shared_ptr<Function>>(funcVal->data);
+    auto funcCtor = std::get<GCPtr<Function>>(funcVal->data);
     auto protoIt = funcCtor->properties.find("prototype");
     if (protoIt != funcCtor->properties.end()) {
       func->properties["__proto__"] = protoIt->second;
@@ -10445,7 +10445,7 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
   }
   struct EnvRestoreGuard {
     Interpreter* interpreter;
-    std::shared_ptr<Environment> previous;
+    GCPtr<Environment> previous;
     ~EnvRestoreGuard() { interpreter->env_ = previous; }
   } restore{this, prevEnv};
 
@@ -10462,7 +10462,7 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
     }
   };
 
-  auto bindObjectChain = [&](const std::shared_ptr<Object>& root) {
+  auto bindObjectChain = [&](const GCPtr<Object>& root) {
     std::unordered_set<Object*> visited;
     auto current = root;
     int depth = 0;
@@ -10474,28 +10474,28 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
       if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
         break;
       }
-      current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+      current = protoIt->second.getGC<Object>();
       depth++;
     }
   };
 
-  auto resolvePromisePrototype = [&](const Value& ctorValue) -> std::shared_ptr<Object> {
+  auto resolvePromisePrototype = [&](const Value& ctorValue) -> GCPtr<Object> {
     if (!ctorValue.isFunction()) {
       return nullptr;
     }
-    auto ctorFn = std::get<std::shared_ptr<Function>>(ctorValue.data);
+    auto ctorFn = ctorValue.getGC<Function>();
     auto protoIt = ctorFn->properties.find("prototype");
     if (protoIt == ctorFn->properties.end() || !protoIt->second.isObject()) {
       return nullptr;
     }
-    return std::get<std::shared_ptr<Object>>(protoIt->second.data);
+    return protoIt->second.getGC<Object>();
   };
 
   if (scopeValue.isObject()) {
     // Keep with-object property resolution dynamic via __with_scope_object__.
     // Copying properties into lexical bindings breaks unscopables semantics.
   } else if (scopeValue.isPromise()) {
-    auto promisePtr = std::get<std::shared_ptr<Promise>>(scopeValue.data);
+    auto promisePtr = scopeValue.getGC<Promise>();
     for (const auto& [key, value] : promisePtr->properties) {
       defineVisible(key, value);
     }
@@ -10842,7 +10842,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
         if (this->flow_.type == ControlFlow::Type::Yield) return;
         objVal = objTask.result();
         if (objVal.isObject()) {
-          auto mObj = std::get<std::shared_ptr<Object>>(objVal.data);
+          auto mObj = objVal.getGC<Object>();
           std::string prop;
           if (member->computed) {
             auto propTask = evaluate(*member->property);
@@ -10889,7 +10889,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   };
 
   // Helper to collect enumerable keys from an object (including prototype chain)
-  auto collectObjectKeys = [&](const std::shared_ptr<Object>& objPtr) -> std::vector<std::string> {
+  auto collectObjectKeys = [&](const GCPtr<Object>& objPtr) -> std::vector<std::string> {
     std::vector<std::string> keys;
     std::unordered_set<std::string> seen;
     // Walk prototype chain
@@ -10913,7 +10913,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       // Walk up prototype chain
       auto protoIt = current->properties.find("__proto__");
       if (protoIt != current->properties.end() && protoIt->second.isObject()) {
-        current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+        current = protoIt->second.getGC<Object>();
         depth++;
       } else {
         break;
@@ -10923,7 +10923,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   };
 
   // Iterate over object properties (including prototype chain)
-  if (auto* objPtr = std::get_if<std::shared_ptr<Object>>(&obj.data)) {
+  if (auto* objPtr = std::get_if<GCPtr<Object>>(&obj.data)) {
     std::vector<std::string> keys = collectObjectKeys(*objPtr);
 
     for (const auto& key : keys) {
@@ -10939,7 +10939,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
         }
         auto protoIt = current->properties.find("__proto__");
         if (protoIt != current->properties.end() && protoIt->second.isObject()) {
-          current = std::get<std::shared_ptr<Object>>(protoIt->second.data);
+          current = protoIt->second.getGC<Object>();
           depth++;
         } else {
           break;
@@ -10972,7 +10972,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   }
 
   // Iterate over array indices and properties
-  else if (auto* arrPtr = std::get_if<std::shared_ptr<Array>>(&obj.data)) {
+  else if (auto* arrPtr = std::get_if<GCPtr<Array>>(&obj.data)) {
     std::vector<std::string> keys;
     // Add numeric indices first
     for (size_t i = 0; i < (*arrPtr)->elements.size(); ++i) {
@@ -11009,7 +11009,7 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
   }
 
   // Iterate over function properties
-  else if (auto* fnPtr = std::get_if<std::shared_ptr<Function>>(&obj.data)) {
+  else if (auto* fnPtr = std::get_if<GCPtr<Function>>(&obj.data)) {
     std::vector<std::string> keys;
     for (const auto& [key, _] : (*fnPtr)->properties) {
       if (isInternalProp(key)) continue;
@@ -11146,14 +11146,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   std::optional<IteratorRecord> iteratorOpt;
   if (stmt.isAwait && iterable.isObject()) {
     const auto& asyncIteratorKey = WellKnownSymbols::asyncIteratorKey();
-    auto obj = std::get<std::shared_ptr<Object>>(iterable.data);
+    auto obj = iterable.getGC<Object>();
     auto asyncIt = obj->properties.find(asyncIteratorKey);
     if (asyncIt != obj->properties.end() && asyncIt->second.isFunction()) {
       Value asyncIterValue = callFunction(asyncIt->second, {}, iterable);
       if (asyncIterValue.isObject()) {
         IteratorRecord record;
         record.kind = IteratorRecord::Kind::IteratorObject;
-        record.iteratorObject = std::get<std::shared_ptr<Object>>(asyncIterValue.data);
+        record.iteratorObject = asyncIterValue.getGC<Object>();
         iteratorOpt = std::move(record);
       }
     }
@@ -11177,7 +11177,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
     if (stmt.isAwait && stepResult.isPromise()) {
-      auto promise = std::get<std::shared_ptr<Promise>>(stepResult.data);
+      auto promise = stepResult.getGC<Promise>();
       if (promise->state == PromiseState::Rejected) {
         env_ = prevEnv;
         flow_.type = ControlFlow::Type::Throw;
@@ -11196,9 +11196,9 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     auto getProperty = [this](const Value& val, const std::string& key) -> std::optional<Value> {
       if (val.isProxy()) {
         // Use Proxy get trap
-        auto proxyPtr = std::get<std::shared_ptr<Proxy>>(val.data);
+        auto proxyPtr = val.getGC<Proxy>();
         if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-          auto handlerObj = std::get<std::shared_ptr<Object>>(proxyPtr->handler->data);
+          auto handlerObj = std::get<GCPtr<Object>>(proxyPtr->handler->data);
           auto trapIt = handlerObj->properties.find("get");
           if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
             return callFunction(trapIt->second, {proxyPtr->target ? *proxyPtr->target : Value(Undefined{}), Value(key), val}, Value(Undefined{}));
@@ -11206,14 +11206,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         }
         // Fall through to target if no get trap
         if (proxyPtr->target && proxyPtr->target->isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(proxyPtr->target->data);
+          auto obj = std::get<GCPtr<Object>>(proxyPtr->target->data);
           auto it = obj->properties.find(key);
           if (it != obj->properties.end()) return it->second;
         }
         return std::nullopt;
       }
       if (val.isObject()) {
-        auto obj = std::get<std::shared_ptr<Object>>(val.data);
+        auto obj = val.getGC<Object>();
         // Check for getter first
         auto getterIt = obj->properties.find("__get_" + key);
         if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
@@ -11222,15 +11222,15 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         auto it = obj->properties.find(key);
         if (it != obj->properties.end()) return it->second;
       } else if (val.isArray()) {
-        auto arr = std::get<std::shared_ptr<Array>>(val.data);
+        auto arr = val.getGC<Array>();
         auto it = arr->properties.find(key);
         if (it != arr->properties.end()) return it->second;
       } else if (val.isFunction()) {
-        auto fn = std::get<std::shared_ptr<Function>>(val.data);
+        auto fn = val.getGC<Function>();
         auto it = fn->properties.find(key);
         if (it != fn->properties.end()) return it->second;
       } else if (val.isRegex()) {
-        auto rx = std::get<std::shared_ptr<Regex>>(val.data);
+        auto rx = val.getGC<Regex>();
         auto it = rx->properties.find(key);
         if (it != rx->properties.end()) return it->second;
       }
@@ -11270,7 +11270,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
     if (stmt.isAwait && currentValue.isPromise()) {
-      auto valuePromise = std::get<std::shared_ptr<Promise>>(currentValue.data);
+      auto valuePromise = currentValue.getGC<Promise>();
       if (valuePromise->state == PromiseState::Rejected) {
         env_ = prevEnv;
         flow_.type = ControlFlow::Type::Throw;
@@ -11338,7 +11338,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
         Value objVal;
         LIGHTJS_RUN_TASK(objTask, objVal);
         if (objVal.isObject()) {
-          auto obj = std::get<std::shared_ptr<Object>>(objVal.data);
+          auto obj = objVal.getGC<Object>();
           std::string prop;
           if (member->computed) {
             auto propTask = evaluate(*member->property);
@@ -11458,14 +11458,14 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
       } else if (discriminant.isUndefined() && testValue.isUndefined()) {
         isEqual = true;
       } else if (discriminant.isFunction() && testValue.isFunction()) {
-        isEqual = (std::get<std::shared_ptr<Function>>(discriminant.data).get() ==
-                   std::get<std::shared_ptr<Function>>(testValue.data).get());
+        isEqual = (discriminant.getGC<Function>().get() ==
+                   testValue.getGC<Function>().get());
       } else if (discriminant.isObject() && testValue.isObject()) {
-        isEqual = (std::get<std::shared_ptr<Object>>(discriminant.data).get() ==
-                   std::get<std::shared_ptr<Object>>(testValue.data).get());
+        isEqual = (discriminant.getGC<Object>().get() ==
+                   testValue.getGC<Object>().get());
       } else if (discriminant.isArray() && testValue.isArray()) {
-        isEqual = (std::get<std::shared_ptr<Array>>(discriminant.data).get() ==
-                   std::get<std::shared_ptr<Array>>(testValue.data).get());
+        isEqual = (discriminant.getGC<Array>().get() ==
+                   testValue.getGC<Array>().get());
       }
 
       if (isEqual) {
@@ -11646,7 +11646,7 @@ Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  auto promise = std::get<std::shared_ptr<Promise>>(importResult.data);
+  auto promise = importResult.getGC<Promise>();
   if (promise->state == PromiseState::Rejected) {
     flow_.type = ControlFlow::Type::Throw;
     flow_.value = promise->result;
@@ -11658,7 +11658,7 @@ Task Interpreter::evaluateImport(const ImportDeclaration& stmt) {
   }
 
   Value namespaceValue = promise->result;
-  auto namespaceObj = std::get<std::shared_ptr<Object>>(namespaceValue.data);
+  auto namespaceObj = namespaceValue.getGC<Object>();
 
   auto hasExport = [&](const std::string& name) -> bool {
     if (namespaceObj->isModuleNamespace) {

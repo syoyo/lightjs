@@ -9,7 +9,7 @@ namespace lightjs {
 
 Value TextEncoder::encode(const std::string& input) {
   // Convert string to UTF-8 bytes (already UTF-8, just copy bytes)
-  auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8, input.size());
+  auto array = GarbageCollector::makeGC<TypedArray>(TypedArrayType::Uint8, input.size());
 
   for (size_t i = 0; i < input.size(); i++) {
     array->setElement(i, static_cast<uint8_t>(input[i]));
@@ -18,7 +18,7 @@ Value TextEncoder::encode(const std::string& input) {
   return Value(array);
 }
 
-Value TextEncoder::encodeInto(const std::string& source, std::shared_ptr<TypedArray> dest) {
+Value TextEncoder::encodeInto(const std::string& source, GCPtr<TypedArray> dest) {
   if (!dest || dest->type != TypedArrayType::Uint8) {
     throw std::runtime_error("TextEncoder.encodeInto: destination must be Uint8Array");
   }
@@ -41,7 +41,7 @@ Value TextEncoder::encodeInto(const std::string& source, std::shared_ptr<TypedAr
   }
 
   // Return result object
-  auto result = std::make_shared<Object>();
+  auto result = GarbageCollector::makeGC<Object>();
   result->properties["read"] = Value(static_cast<double>(read));
   result->properties["written"] = Value(static_cast<double>(written));
 
@@ -85,13 +85,13 @@ Value TextDecoder::decode(const Value& input) {
   const uint8_t* bytes = nullptr;
   size_t length = 0;
 
-  if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&input.data)) {
+  if (auto* typedArray = std::get_if<GCPtr<TypedArray>>(&input.data)) {
     bytes = (*typedArray)->buffer.data();
     length = (*typedArray)->length * (*typedArray)->elementSize();
-  } else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&input.data)) {
+  } else if (auto* arrayBuffer = std::get_if<GCPtr<ArrayBuffer>>(&input.data)) {
     bytes = (*arrayBuffer)->data.data();
     length = (*arrayBuffer)->byteLength;
-  } else if (auto* dataView = std::get_if<std::shared_ptr<DataView>>(&input.data)) {
+  } else if (auto* dataView = std::get_if<GCPtr<DataView>>(&input.data)) {
     if ((*dataView)->buffer) {
       bytes = (*dataView)->buffer->data.data() + (*dataView)->byteOffset;
       length = (*dataView)->byteLength;
@@ -106,8 +106,8 @@ Value TextDecoder::decode(const Value& input) {
 
 // Constructor functions
 
-std::shared_ptr<Function> createTextEncoderConstructor() {
-  auto constructor = std::make_shared<Function>();
+GCPtr<Function> createTextEncoderConstructor() {
+  auto constructor = GarbageCollector::makeGC<Function>();
   constructor->isNative = true;
   constructor->isConstructor = true;
 
@@ -115,7 +115,7 @@ std::shared_ptr<Function> createTextEncoderConstructor() {
     auto encoder = std::make_shared<TextEncoder>();
 
     // Add encode method
-    auto encodeMethod = std::make_shared<Function>();
+    auto encodeMethod = GarbageCollector::makeGC<Function>();
     encodeMethod->isNative = true;
     encodeMethod->nativeFunc = [encoder](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
@@ -124,12 +124,12 @@ std::shared_ptr<Function> createTextEncoderConstructor() {
       return encoder->encode(args[0].toString());
     };
 
-    auto encoderObj = std::make_shared<Object>();
+    auto encoderObj = GarbageCollector::makeGC<Object>();
     encoderObj->properties["encode"] = Value(encodeMethod);
     encoderObj->properties["encoding"] = Value(encoder->encoding);
 
     // Add encodeInto method
-    auto encodeIntoMethod = std::make_shared<Function>();
+    auto encodeIntoMethod = GarbageCollector::makeGC<Function>();
     encodeIntoMethod->isNative = true;
     encodeIntoMethod->nativeFunc = [encoder](const std::vector<Value>& args) -> Value {
       if (args.size() < 2) {
@@ -138,7 +138,7 @@ std::shared_ptr<Function> createTextEncoderConstructor() {
 
       std::string source = args[0].toString();
 
-      auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&args[1].data);
+      auto* typedArray = std::get_if<GCPtr<TypedArray>>(&args[1].data);
       if (!typedArray) {
         throw std::runtime_error("TextEncoder.encodeInto: second argument must be Uint8Array");
       }
@@ -150,11 +150,11 @@ std::shared_ptr<Function> createTextEncoderConstructor() {
     return Value(encoderObj);
   };
 
-  return constructor;
+  return GCPtr<Function>(constructor);
 }
 
-std::shared_ptr<Function> createTextDecoderConstructor() {
-  auto constructor = std::make_shared<Function>();
+GCPtr<Function> createTextDecoderConstructor() {
+  auto constructor = GarbageCollector::makeGC<Function>();
   constructor->isNative = true;
   constructor->isConstructor = true;
 
@@ -172,7 +172,7 @@ std::shared_ptr<Function> createTextDecoderConstructor() {
 
     // Parse options argument
     if (args.size() > 1) {
-      auto* optionsObj = std::get_if<std::shared_ptr<Object>>(&args[1].data);
+      auto* optionsObj = std::get_if<GCPtr<Object>>(&args[1].data);
       if (optionsObj) {
         auto fatalIt = (*optionsObj)->properties.find("fatal");
         if (fatalIt != (*optionsObj)->properties.end()) {
@@ -189,7 +189,7 @@ std::shared_ptr<Function> createTextDecoderConstructor() {
     auto decoder = std::make_shared<TextDecoder>(encoding, fatal, ignoreBOM);
 
     // Add decode method
-    auto decodeMethod = std::make_shared<Function>();
+    auto decodeMethod = GarbageCollector::makeGC<Function>();
     decodeMethod->isNative = true;
     decodeMethod->nativeFunc = [decoder](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
@@ -198,7 +198,7 @@ std::shared_ptr<Function> createTextDecoderConstructor() {
       return decoder->decode(args[0]);
     };
 
-    auto decoderObj = std::make_shared<Object>();
+    auto decoderObj = GarbageCollector::makeGC<Object>();
     decoderObj->properties["decode"] = Value(decodeMethod);
     decoderObj->properties["encoding"] = Value(decoder->encoding);
     decoderObj->properties["fatal"] = Value(decoder->fatal);
@@ -207,7 +207,7 @@ std::shared_ptr<Function> createTextDecoderConstructor() {
     return Value(decoderObj);
   };
 
-  return constructor;
+  return GCPtr<Function>(constructor);
 }
 
 } // namespace lightjs

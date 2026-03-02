@@ -40,7 +40,7 @@ int main() {
         std::cout << "Final result: " << result.toString() << std::endl;
 
         if (result.isArray()) {
-            auto arr = std::get<std::shared_ptr<Array>>(result.data);
+            auto arr = std::get<GCPtr<Array>>(result.data);
             std::cout << "Array size: " << arr->elements.size() << std::endl;
             for (size_t i = 0; i < arr->elements.size(); ++i) {
                 std::cout << "Element " << i << ": " << arr->elements[i].toString() << std::endl;

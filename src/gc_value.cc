@@ -1,44 +1,49 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "gc.h"
 #include "streams.h"
+#include "wasm_js.h"
 #include "interpreter.h"
 
 namespace lightjs {
 
 // Helper to extract GCObject pointers from Values
 static void addValueReferences(const Value& value, std::vector<GCObject*>& refs) {
-    if (auto* func = std::get_if<std::shared_ptr<Function>>(&value.data)) {
+    if (auto* func = std::get_if<GCPtr<Function>>(&value.data)) {
         if (*func) refs.push_back(func->get());
-    } else if (auto* arr = std::get_if<std::shared_ptr<Array>>(&value.data)) {
+    } else if (auto* arr = std::get_if<GCPtr<Array>>(&value.data)) {
         if (*arr) refs.push_back(arr->get());
-    } else if (auto* obj = std::get_if<std::shared_ptr<Object>>(&value.data)) {
+    } else if (auto* obj = std::get_if<GCPtr<Object>>(&value.data)) {
         if (*obj) refs.push_back(obj->get());
-    } else if (auto* typed = std::get_if<std::shared_ptr<TypedArray>>(&value.data)) {
+    } else if (auto* typed = std::get_if<GCPtr<TypedArray>>(&value.data)) {
         if (*typed) refs.push_back(typed->get());
-    } else if (auto* promise = std::get_if<std::shared_ptr<Promise>>(&value.data)) {
+    } else if (auto* promise = std::get_if<GCPtr<Promise>>(&value.data)) {
         if (*promise) refs.push_back(promise->get());
-    } else if (auto* regex = std::get_if<std::shared_ptr<Regex>>(&value.data)) {
+    } else if (auto* regex = std::get_if<GCPtr<Regex>>(&value.data)) {
         if (*regex) refs.push_back(regex->get());
-    } else if (auto* map = std::get_if<std::shared_ptr<Map>>(&value.data)) {
+    } else if (auto* map = std::get_if<GCPtr<Map>>(&value.data)) {
         if (*map) refs.push_back(map->get());
-    } else if (auto* set = std::get_if<std::shared_ptr<Set>>(&value.data)) {
+    } else if (auto* set = std::get_if<GCPtr<Set>>(&value.data)) {
         if (*set) refs.push_back(set->get());
-    } else if (auto* err = std::get_if<std::shared_ptr<Error>>(&value.data)) {
+    } else if (auto* err = std::get_if<GCPtr<Error>>(&value.data)) {
         if (*err) refs.push_back(err->get());
-    } else if (auto* gen = std::get_if<std::shared_ptr<Generator>>(&value.data)) {
+    } else if (auto* gen = std::get_if<GCPtr<Generator>>(&value.data)) {
         if (*gen) refs.push_back(gen->get());
-    } else if (auto* proxy = std::get_if<std::shared_ptr<Proxy>>(&value.data)) {
+    } else if (auto* proxy = std::get_if<GCPtr<Proxy>>(&value.data)) {
         if (*proxy) refs.push_back(proxy->get());
-    } else if (auto* weakmap = std::get_if<std::shared_ptr<WeakMap>>(&value.data)) {
+    } else if (auto* weakmap = std::get_if<GCPtr<WeakMap>>(&value.data)) {
         if (*weakmap) refs.push_back(weakmap->get());
-    } else if (auto* weakset = std::get_if<std::shared_ptr<WeakSet>>(&value.data)) {
+    } else if (auto* weakset = std::get_if<GCPtr<WeakSet>>(&value.data)) {
         if (*weakset) refs.push_back(weakset->get());
-    } else if (auto* readable = std::get_if<std::shared_ptr<ReadableStream>>(&value.data)) {
+    } else if (auto* readable = std::get_if<GCPtr<ReadableStream>>(&value.data)) {
         if (*readable) refs.push_back(readable->get());
-    } else if (auto* writable = std::get_if<std::shared_ptr<WritableStream>>(&value.data)) {
+    } else if (auto* writable = std::get_if<GCPtr<WritableStream>>(&value.data)) {
         if (*writable) refs.push_back(writable->get());
-    } else if (auto* transform = std::get_if<std::shared_ptr<TransformStream>>(&value.data)) {
+    } else if (auto* transform = std::get_if<GCPtr<TransformStream>>(&value.data)) {
         if (*transform) refs.push_back(transform->get());
+    } else if (auto* env = std::get_if<GCPtr<Environment>>(&value.data)) {
+        if (*env) refs.push_back(env->get());
     }
 }
 
@@ -46,12 +51,20 @@ void Value::getReferences(std::vector<GCObject*>& refs) const {
     addValueReferences(*this, refs);
 }
 
+void Environment::getReferences(std::vector<GCObject*>& refs) const {
+    if (parent_) refs.push_back(parent_.get());
+    for (const auto& [name, value] : bindings_) {
+        (void)name;
+        addValueReferences(value, refs);
+    }
+}
+
 void Function::getReferences(std::vector<GCObject*>& refs) const {
+    if (closure) refs.push_back(closure.get());
     for (const auto& [key, value] : properties) {
         (void)key;
         addValueReferences(value, refs);
     }
-    // Closures would add references here when implemented
 }
 
 void Array::getReferences(std::vector<GCObject*>& refs) const {
@@ -125,6 +138,7 @@ void Set::getReferences(std::vector<GCObject*>& refs) const {
 
 void Generator::getReferences(std::vector<GCObject*>& refs) const {
     if (function) refs.push_back(function.get());
+    if (context) refs.push_back(context.get());
     for (const auto& [key, value] : properties) {
         (void)key;
         addValueReferences(value, refs);
@@ -144,11 +158,11 @@ void WeakMap::set(const Value& key, const Value& value) {
     // WeakMap only accepts objects as keys
     GCObject* keyObj = nullptr;
     if (key.isObject()) {
-        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+        keyObj = key.getGC<Object>().get();
     } else if (key.isArray()) {
-        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+        keyObj = key.getGC<Array>().get();
     } else if (key.isFunction()) {
-        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+        keyObj = key.getGC<Function>().get();
     }
 
     if (keyObj) {
@@ -159,11 +173,11 @@ void WeakMap::set(const Value& key, const Value& value) {
 bool WeakMap::has(const Value& key) const {
     GCObject* keyObj = nullptr;
     if (key.isObject()) {
-        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+        keyObj = key.getGC<Object>().get();
     } else if (key.isArray()) {
-        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+        keyObj = key.getGC<Array>().get();
     } else if (key.isFunction()) {
-        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+        keyObj = key.getGC<Function>().get();
     }
 
     return keyObj && entries.find(keyObj) != entries.end();
@@ -172,11 +186,11 @@ bool WeakMap::has(const Value& key) const {
 Value WeakMap::get(const Value& key) const {
     GCObject* keyObj = nullptr;
     if (key.isObject()) {
-        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+        keyObj = key.getGC<Object>().get();
     } else if (key.isArray()) {
-        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+        keyObj = key.getGC<Array>().get();
     } else if (key.isFunction()) {
-        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+        keyObj = key.getGC<Function>().get();
     }
 
     if (keyObj) {
@@ -191,11 +205,11 @@ Value WeakMap::get(const Value& key) const {
 bool WeakMap::deleteKey(const Value& key) {
     GCObject* keyObj = nullptr;
     if (key.isObject()) {
-        keyObj = std::get<std::shared_ptr<Object>>(key.data).get();
+        keyObj = key.getGC<Object>().get();
     } else if (key.isArray()) {
-        keyObj = std::get<std::shared_ptr<Array>>(key.data).get();
+        keyObj = key.getGC<Array>().get();
     } else if (key.isFunction()) {
-        keyObj = std::get<std::shared_ptr<Function>>(key.data).get();
+        keyObj = key.getGC<Function>().get();
     }
 
     if (keyObj) {
@@ -216,11 +230,11 @@ void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
 bool WeakSet::add(const Value& value) {
     GCObject* obj = nullptr;
     if (value.isObject()) {
-        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+        obj = value.getGC<Object>().get();
     } else if (value.isArray()) {
-        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+        obj = value.getGC<Array>().get();
     } else if (value.isFunction()) {
-        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+        obj = value.getGC<Function>().get();
     }
 
     if (obj) {
@@ -233,11 +247,11 @@ bool WeakSet::add(const Value& value) {
 bool WeakSet::has(const Value& value) const {
     GCObject* obj = nullptr;
     if (value.isObject()) {
-        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+        obj = value.getGC<Object>().get();
     } else if (value.isArray()) {
-        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+        obj = value.getGC<Array>().get();
     } else if (value.isFunction()) {
-        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+        obj = value.getGC<Function>().get();
     }
 
     return obj && values.find(obj) != values.end();
@@ -246,11 +260,11 @@ bool WeakSet::has(const Value& value) const {
 bool WeakSet::deleteValue(const Value& value) {
     GCObject* obj = nullptr;
     if (value.isObject()) {
-        obj = std::get<std::shared_ptr<Object>>(value.data).get();
+        obj = value.getGC<Object>().get();
     } else if (value.isArray()) {
-        obj = std::get<std::shared_ptr<Array>>(value.data).get();
+        obj = value.getGC<Array>().get();
     } else if (value.isFunction()) {
-        obj = std::get<std::shared_ptr<Function>>(value.data).get();
+        obj = value.getGC<Function>().get();
     }
 
     if (obj) {

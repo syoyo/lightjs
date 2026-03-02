@@ -1,4 +1,6 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "gc.h"
 #include <chrono>
 #include <ctime>

@@ -49,7 +49,7 @@ struct QueuedChunk {
 
 // ReadableStreamDefaultController - controls a ReadableStream
 struct ReadableStreamDefaultController : public GCObject {
-  std::weak_ptr<ReadableStream> stream;  // Weak reference to avoid cycle
+  ReadableStream* stream = nullptr;  // Weak reference to avoid cycle (raw ptr, owned by stream)
   std::deque<QueuedChunk> queue;
   double desiredSize;                     // For backpressure
   bool closeRequested;
@@ -58,8 +58,8 @@ struct ReadableStreamDefaultController : public GCObject {
   bool started;
 
   // Underlying source callbacks (stored as shared_ptr<Function>)
-  std::shared_ptr<Function> pullCallback;
-  std::shared_ptr<Function> cancelCallback;
+  GCPtr<Function> pullCallback;
+  GCPtr<Function> cancelCallback;
 
   ReadableStreamDefaultController()
     : desiredSize(1.0), closeRequested(false), pullAgain(false),
@@ -77,22 +77,22 @@ struct ReadableStreamDefaultController : public GCObject {
 
 // ReadableStreamDefaultReader - reads from a ReadableStream
 struct ReadableStreamDefaultReader : public GCObject {
-  std::shared_ptr<ReadableStream> stream;
-  std::shared_ptr<Promise> closedPromise;
+  GCPtr<ReadableStream> stream;
+  GCPtr<Promise> closedPromise;
 
   // Pending read requests
   struct ReadRequest {
-    std::shared_ptr<Promise> promise;
+    GCPtr<Promise> promise;
   };
   std::vector<ReadRequest> readRequests;
 
   ReadableStreamDefaultReader() = default;
-  explicit ReadableStreamDefaultReader(std::shared_ptr<ReadableStream> s);
+  explicit ReadableStreamDefaultReader(GCPtr<ReadableStream> s);
 
   // Reader methods
-  std::shared_ptr<Promise> read();      // Returns Promise<{value, done}>
+  GCPtr<Promise> read();      // Returns Promise<{value, done}>
   void releaseLock();
-  std::shared_ptr<Promise> cancel(const Value& reason);
+  GCPtr<Promise> cancel(const Value& reason);
 
   // GCObject interface
   const char* typeName() const override { return "ReadableStreamDefaultReader"; }
@@ -108,7 +108,7 @@ struct ReadableStream : public GCObject, public std::enable_shared_from_this<Rea
   std::shared_ptr<ReadableStreamDefaultController> controller;
 
   // Reader attached to this stream (if any)
-  std::weak_ptr<ReadableStreamDefaultReader> reader;
+  ReadableStreamDefaultReader* reader = nullptr;
   bool locked;
 
   // For piping
@@ -118,21 +118,21 @@ struct ReadableStream : public GCObject, public std::enable_shared_from_this<Rea
     : state(ReadableStreamState::Readable), locked(false), disturbed(false) {}
 
   // Stream methods
-  std::shared_ptr<ReadableStreamDefaultReader> getReader();
-  std::shared_ptr<Promise> cancel(const Value& reason);
+  GCPtr<ReadableStreamDefaultReader> getReader();
+  GCPtr<Promise> cancel(const Value& reason);
 
   // Piping methods
-  std::shared_ptr<Promise> pipeTo(std::shared_ptr<WritableStream> destination,
+  GCPtr<Promise> pipeTo(GCPtr<WritableStream> destination,
                                    bool preventClose = false,
                                    bool preventAbort = false,
                                    bool preventCancel = false);
-  std::shared_ptr<ReadableStream> pipeThrough(std::shared_ptr<TransformStream> transform,
+  GCPtr<ReadableStream> pipeThrough(GCPtr<TransformStream> transform,
                                                bool preventClose = false,
                                                bool preventAbort = false,
                                                bool preventCancel = false);
 
   // Tee creates two branches of the stream
-  std::pair<std::shared_ptr<ReadableStream>, std::shared_ptr<ReadableStream>> tee();
+  std::pair<GCPtr<ReadableStream>, GCPtr<ReadableStream>> tee();
 
   // GCObject interface
   const char* typeName() const override { return "ReadableStream"; }
@@ -141,15 +141,15 @@ struct ReadableStream : public GCObject, public std::enable_shared_from_this<Rea
 
 // WritableStreamDefaultController - controls a WritableStream
 struct WritableStreamDefaultController : public GCObject {
-  std::weak_ptr<WritableStream> stream;
+  WritableStream* stream = nullptr;
   std::deque<QueuedChunk> queue;
   double desiredSize;
   bool started;
 
   // Underlying sink callbacks
-  std::shared_ptr<Function> writeCallback;
-  std::shared_ptr<Function> closeCallback;
-  std::shared_ptr<Function> abortCallback;
+  GCPtr<Function> writeCallback;
+  GCPtr<Function> closeCallback;
+  GCPtr<Function> abortCallback;
 
   WritableStreamDefaultController()
     : desiredSize(1.0), started(false) {}
@@ -164,24 +164,24 @@ struct WritableStreamDefaultController : public GCObject {
 
 // WritableStreamDefaultWriter - writes to a WritableStream
 struct WritableStreamDefaultWriter : public GCObject {
-  std::shared_ptr<WritableStream> stream;
-  std::shared_ptr<Promise> closedPromise;
-  std::shared_ptr<Promise> readyPromise;  // For backpressure
+  GCPtr<WritableStream> stream;
+  GCPtr<Promise> closedPromise;
+  GCPtr<Promise> readyPromise;  // For backpressure
 
   // Pending write requests
   struct WriteRequest {
     std::shared_ptr<Value> chunk;
-    std::shared_ptr<Promise> promise;
+    GCPtr<Promise> promise;
   };
   std::vector<WriteRequest> writeRequests;
 
   WritableStreamDefaultWriter() = default;
-  explicit WritableStreamDefaultWriter(std::shared_ptr<WritableStream> s);
+  explicit WritableStreamDefaultWriter(GCPtr<WritableStream> s);
 
   // Writer methods
-  std::shared_ptr<Promise> write(const Value& chunk);
-  std::shared_ptr<Promise> close();
-  std::shared_ptr<Promise> abort(const Value& reason);
+  GCPtr<Promise> write(const Value& chunk);
+  GCPtr<Promise> close();
+  GCPtr<Promise> abort(const Value& reason);
   void releaseLock();
 
   // Properties
@@ -201,24 +201,24 @@ struct WritableStream : public GCObject, public std::enable_shared_from_this<Wri
   std::shared_ptr<WritableStreamDefaultController> controller;
 
   // Writer attached to this stream (if any)
-  std::weak_ptr<WritableStreamDefaultWriter> writer;
+  WritableStreamDefaultWriter* writer = nullptr;
   bool locked;
 
   // Pending operations
-  std::shared_ptr<Promise> pendingAbortRequest;
+  GCPtr<Promise> pendingAbortRequest;
 
   // For close operation
-  std::shared_ptr<Promise> closeRequest;
-  std::shared_ptr<Promise> inFlightWriteRequest;
-  std::shared_ptr<Promise> inFlightCloseRequest;
+  GCPtr<Promise> closeRequest;
+  GCPtr<Promise> inFlightWriteRequest;
+  GCPtr<Promise> inFlightCloseRequest;
 
   WritableStream()
     : state(WritableStreamState::Writable), locked(false) {}
 
   // Stream methods
-  std::shared_ptr<WritableStreamDefaultWriter> getWriter();
-  std::shared_ptr<Promise> abort(const Value& reason);
-  std::shared_ptr<Promise> close();
+  GCPtr<WritableStreamDefaultWriter> getWriter();
+  GCPtr<Promise> abort(const Value& reason);
+  GCPtr<Promise> close();
 
   // GCObject interface
   const char* typeName() const override { return "WritableStream"; }
@@ -227,9 +227,9 @@ struct WritableStream : public GCObject, public std::enable_shared_from_this<Wri
 
 // TransformStreamDefaultController - controls a TransformStream
 struct TransformStreamDefaultController : public GCObject {
-  std::weak_ptr<TransformStream> stream;
-  std::shared_ptr<Function> transformCallback;
-  std::shared_ptr<Function> flushCallback;
+  TransformStream* stream = nullptr;
+  GCPtr<Function> transformCallback;
+  GCPtr<Function> flushCallback;
 
   TransformStreamDefaultController() = default;
 
@@ -248,13 +248,13 @@ struct TransformStreamDefaultController : public GCObject {
 
 // TransformStream - connects a ReadableStream and WritableStream with a transformer
 struct TransformStream : public GCObject {
-  std::shared_ptr<ReadableStream> readable;
-  std::shared_ptr<WritableStream> writable;
+  GCPtr<ReadableStream> readable;
+  GCPtr<WritableStream> writable;
   std::shared_ptr<TransformStreamDefaultController> controller;
 
   // Backpressure state
   bool backpressure;
-  std::shared_ptr<Promise> backpressureChangePromise;
+  GCPtr<Promise> backpressureChangePromise;
 
   TransformStream() : backpressure(false) {}
 
@@ -264,22 +264,22 @@ struct TransformStream : public GCObject {
 };
 
 // Helper functions for stream creation
-std::shared_ptr<ReadableStream> createReadableStream(
-  std::shared_ptr<Function> start,
-  std::shared_ptr<Function> pull = nullptr,
-  std::shared_ptr<Function> cancel = nullptr,
+GCPtr<ReadableStream> createReadableStream(
+  GCPtr<Function> start = {},
+    GCPtr<Function> pull = {},
+    GCPtr<Function> cancel = {},
   double highWaterMark = 1.0);
 
-std::shared_ptr<WritableStream> createWritableStream(
-  std::shared_ptr<Function> start,
-  std::shared_ptr<Function> write = nullptr,
-  std::shared_ptr<Function> close = nullptr,
-  std::shared_ptr<Function> abort = nullptr,
+GCPtr<WritableStream> createWritableStream(
+  GCPtr<Function> start,
+  GCPtr<Function> write = {},
+  GCPtr<Function> close = {},
+  GCPtr<Function> abort = {},
   double highWaterMark = 1.0);
 
-std::shared_ptr<TransformStream> createTransformStream(
-  std::shared_ptr<Function> start,
-  std::shared_ptr<Function> transform = nullptr,
-  std::shared_ptr<Function> flush = nullptr);
+GCPtr<TransformStream> createTransformStream(
+  GCPtr<Function> start,
+  GCPtr<Function> transform = {},
+  GCPtr<Function> flush = {});
 
 }  // namespace lightjs

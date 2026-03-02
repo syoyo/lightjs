@@ -29,7 +29,7 @@ bool runTest(const std::string& name, const std::string& code, const std::string
   // Check for errors
   if (interp.hasError()) {
     Value err = interp.getError();
-    if (auto* errPtr = std::get_if<std::shared_ptr<Error>>(&err.data)) {
+    if (auto* errPtr = std::get_if<GCPtr<Error>>(&err.data)) {
       std::cout << "  Error: " << (*errPtr)->message << std::endl;
     } else {
       std::cout << "  Thrown: " << err.toString() << std::endl;

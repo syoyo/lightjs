@@ -1,8 +1,11 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "event_loop.h"
 #include "simd.h"
 #include "symbols.h"
 #include "streams.h"
+#include "wasm_js.h"
 #include <sstream>
 #include <cmath>
 #include <algorithm>
@@ -16,13 +19,13 @@ void queuePromiseCallback(std::function<void()> callback) {
   EventLoopContext::instance().getLoop().queueMicrotask(std::move(callback));
 }
 
-void resolveChainedPromise(const std::shared_ptr<Promise>& target, const Value& value) {
+void resolveChainedPromise(const GCPtr<Promise>& target, const Value& value) {
   if (!target || target->state != PromiseState::Pending) {
     return;
   }
 
   if (value.isPromise()) {
-    auto nested = std::get<std::shared_ptr<Promise>>(value.data);
+    auto nested = value.getGC<Promise>();
     if (!nested) {
       target->resolve(value);
       return;
@@ -177,37 +180,37 @@ std::string Value::toString() const {
       return "[ModuleBinding]";
     } else if constexpr (std::is_same_v<T, std::string>) {
       return arg;
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Function>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Function>>) {
       return "[Function]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Array>>) {
       return "[Array]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Object>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Object>>) {
       return "[Object]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<TypedArray>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<TypedArray>>) {
       return "[TypedArray]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Promise>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Promise>>) {
       return "[Promise]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Regex>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Regex>>) {
       return "/" + arg->pattern + "/" + arg->flags;
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Error>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Error>>) {
       return arg->toString();
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Generator>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Generator>>) {
       return "[Generator]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<Proxy>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<Proxy>>) {
       return "[Proxy]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<WeakMap>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<WeakMap>>) {
       return "[WeakMap]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<WeakSet>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<WeakSet>>) {
       return "[WeakSet]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<ArrayBuffer>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<ArrayBuffer>>) {
       return "[ArrayBuffer]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<DataView>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<DataView>>) {
       return "[DataView]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<ReadableStream>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<ReadableStream>>) {
       return "[ReadableStream]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<WritableStream>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<WritableStream>>) {
       return "[WritableStream]";
-    } else if constexpr (std::is_same_v<T, std::shared_ptr<TransformStream>>) {
+    } else if constexpr (std::is_same_v<T, GCPtr<TransformStream>>) {
       return "[TransformStream]";
     } else {
       return "";
@@ -580,11 +583,11 @@ static bool valuesEqual(const Value& a, const Value& b) {
   if (a.isNull() || a.isUndefined()) return true;
 
   // For objects, compare by reference
-  if (a.isObject()) return std::get<std::shared_ptr<Object>>(a.data) == std::get<std::shared_ptr<Object>>(b.data);
-  if (a.isArray()) return std::get<std::shared_ptr<Array>>(a.data) == std::get<std::shared_ptr<Array>>(b.data);
-  if (a.isFunction()) return std::get<std::shared_ptr<Function>>(a.data) == std::get<std::shared_ptr<Function>>(b.data);
-  if (a.isMap()) return std::get<std::shared_ptr<Map>>(a.data) == std::get<std::shared_ptr<Map>>(b.data);
-  if (a.isSet()) return std::get<std::shared_ptr<Set>>(a.data) == std::get<std::shared_ptr<Set>>(b.data);
+  if (a.isObject()) return a.getGC<Object>() == b.getGC<Object>();
+  if (a.isArray()) return a.getGC<Array>() == b.getGC<Array>();
+  if (a.isFunction()) return a.getGC<Function>() == b.getGC<Function>();
+  if (a.isMap()) return a.getGC<Map>() == b.getGC<Map>();
+  if (a.isSet()) return a.getGC<Set>() == b.getGC<Set>();
 
   return false;
 }
@@ -672,7 +675,7 @@ void Promise::resolve(Value val) {
   // Promise reactions must run as microtasks.
   for (size_t i = 0; i < callbacks.size(); ++i) {
     auto callback = callbacks[i];
-    std::shared_ptr<Promise> chainedPromise = i < chained.size() ? chained[i] : nullptr;
+    GCPtr<Promise> chainedPromise = i < chained.size() ? chained[i] : GCPtr<Promise>{};
     queuePromiseCallback([callback, chainedPromise, val]() {
       if (!chainedPromise) {
         return;
@@ -704,7 +707,7 @@ void Promise::reject(Value val) {
   // Promise reactions must run as microtasks.
   for (size_t i = 0; i < callbacks.size(); ++i) {
     auto callback = callbacks[i];
-    std::shared_ptr<Promise> chainedPromise = i < chained.size() ? chained[i] : nullptr;
+    GCPtr<Promise> chainedPromise = i < chained.size() ? chained[i] : GCPtr<Promise>{};
     queuePromiseCallback([callback, chainedPromise, val]() {
       if (!chainedPromise) {
         return;
@@ -725,10 +728,10 @@ void Promise::reject(Value val) {
   }
 }
 
-std::shared_ptr<Promise> Promise::then(
+GCPtr<Promise> Promise::then(
     std::function<Value(Value)> onFulfilled,
     std::function<Value(Value)> onRejected) {
-  auto chainedPromise = std::make_shared<Promise>();
+  auto chainedPromise = GarbageCollector::makeGC<Promise>();
 
   if (state == PromiseState::Pending) {
     fulfilledCallbacks.push_back(onFulfilled ? onFulfilled : [](Value v) { return v; });
@@ -771,16 +774,16 @@ std::shared_ptr<Promise> Promise::then(
   return chainedPromise;
 }
 
-std::shared_ptr<Promise> Promise::catch_(std::function<Value(Value)> onRejected) {
+GCPtr<Promise> Promise::catch_(std::function<Value(Value)> onRejected) {
   return then(nullptr, onRejected);
 }
 
-std::shared_ptr<Promise> Promise::finally(std::function<Value()> onFinally) {
+GCPtr<Promise> Promise::finally(std::function<Value()> onFinally) {
   if (!onFinally) {
     return then(nullptr, nullptr);
   }
 
-  auto chainedPromise = std::make_shared<Promise>();
+  auto chainedPromise = GarbageCollector::makeGC<Promise>();
 
   auto settleWithOriginal = [chainedPromise](const Value& original,
                                              bool rejectOriginal,
@@ -794,7 +797,7 @@ std::shared_ptr<Promise> Promise::finally(std::function<Value()> onFinally) {
     };
 
     if (finallyResult.isPromise()) {
-      auto finPromise = std::get<std::shared_ptr<Promise>>(finallyResult.data);
+      auto finPromise = finallyResult.getGC<Promise>();
       if (finPromise->state == PromiseState::Fulfilled) {
         settleOriginal();
         return;
@@ -845,11 +848,11 @@ std::shared_ptr<Promise> Promise::finally(std::function<Value()> onFinally) {
   return chainedPromise;
 }
 
-std::shared_ptr<Promise> Promise::all(const std::vector<std::shared_ptr<Promise>>& promises) {
-  auto resultPromise = std::make_shared<Promise>();
+GCPtr<Promise> Promise::all(const std::vector<GCPtr<Promise>>& promises) {
+  auto resultPromise = GarbageCollector::makeGC<Promise>();
 
   if (promises.empty()) {
-    auto emptyArray = std::make_shared<Array>();
+    auto emptyArray = GarbageCollector::makeGC<Array>();
     resultPromise->resolve(Value(emptyArray));
     return resultPromise;
   }
@@ -864,7 +867,7 @@ std::shared_ptr<Promise> Promise::all(const std::vector<std::shared_ptr<Promise>
         (*results)[index] = v;
         (*resolvedCount)++;
         if (*resolvedCount == promiseCount) {
-          auto arrayResult = std::make_shared<Array>();
+          auto arrayResult = GarbageCollector::makeGC<Array>();
           arrayResult->elements = *results;
           resultPromise->resolve(Value(arrayResult));
         }
@@ -880,8 +883,8 @@ std::shared_ptr<Promise> Promise::all(const std::vector<std::shared_ptr<Promise>
   return resultPromise;
 }
 
-std::shared_ptr<Promise> Promise::race(const std::vector<std::shared_ptr<Promise>>& promises) {
-  auto resultPromise = std::make_shared<Promise>();
+GCPtr<Promise> Promise::race(const std::vector<GCPtr<Promise>>& promises) {
+  auto resultPromise = GarbageCollector::makeGC<Promise>();
 
   for (auto& promise : promises) {
     promise->then(
@@ -899,14 +902,14 @@ std::shared_ptr<Promise> Promise::race(const std::vector<std::shared_ptr<Promise
   return resultPromise;
 }
 
-std::shared_ptr<Promise> Promise::resolved(const Value& value) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> Promise::resolved(const Value& value) {
+  auto promise = GarbageCollector::makeGC<Promise>();
   promise->resolve(value);
   return promise;
 }
 
-std::shared_ptr<Promise> Promise::rejected(const Value& reason) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> Promise::rejected(const Value& reason) {
+  auto promise = GarbageCollector::makeGC<Promise>();
   promise->reject(reason);
   return promise;
 }
@@ -917,18 +920,18 @@ static bool isSymbolKey(const std::string& key);
 // Object static methods implementation
 Value Object_keys(const std::vector<Value>& args) {
   if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = std::make_shared<Array>();
+    auto emptyArray = GarbageCollector::makeGC<Array>();
     return Value(emptyArray);
   }
 
-  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  auto result = std::make_shared<Array>();
+  auto obj = args[0].getGC<Object>();
+  auto result = GarbageCollector::makeGC<Array>();
 
   if (obj->isModuleNamespace) {
     for (const auto& key : obj->moduleExportNames) {
       auto getterIt = obj->properties.find("__get_" + key);
       if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-        auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+        auto getter = getterIt->second.getGC<Function>();
         if (getter && getter->isNative) {
           getter->nativeFunc({});
         }
@@ -951,12 +954,12 @@ Value Object_keys(const std::vector<Value>& args) {
 
 Value Object_values(const std::vector<Value>& args) {
   if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = std::make_shared<Array>();
+    auto emptyArray = GarbageCollector::makeGC<Array>();
     return Value(emptyArray);
   }
 
-  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  auto result = std::make_shared<Array>();
+  auto obj = args[0].getGC<Object>();
+  auto result = GarbageCollector::makeGC<Array>();
 
   for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
@@ -972,12 +975,12 @@ Value Object_values(const std::vector<Value>& args) {
 
 Value Object_entries(const std::vector<Value>& args) {
   if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = std::make_shared<Array>();
+    auto emptyArray = GarbageCollector::makeGC<Array>();
     return Value(emptyArray);
   }
 
-  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
-  auto result = std::make_shared<Array>();
+  auto obj = args[0].getGC<Object>();
+  auto result = GarbageCollector::makeGC<Array>();
 
   for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
@@ -985,7 +988,7 @@ Value Object_entries(const std::vector<Value>& args) {
     if (isSymbolKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
     auto it = obj->properties.find(key);
-    auto entry = std::make_shared<Array>();
+    auto entry = GarbageCollector::makeGC<Array>();
     entry->elements.push_back(Value(key));
     entry->elements.push_back(it->second);
     result->elements.push_back(Value(entry));
@@ -1005,11 +1008,11 @@ Value Object_assign(const std::vector<Value>& args) {
   }
 
   // Convert target to object if needed
-  std::shared_ptr<Object> targetObj;
+  GCPtr<Object> targetObj;
   if (target.isObject()) {
-    targetObj = std::get<std::shared_ptr<Object>>(target.data);
+    targetObj = target.getGC<Object>();
   } else {
-    targetObj = std::make_shared<Object>();
+    targetObj = GarbageCollector::makeGC<Object>();
   }
 
   // Copy properties from sources
@@ -1019,7 +1022,7 @@ Value Object_assign(const std::vector<Value>& args) {
     }
 
     if (args[i].isObject()) {
-      auto sourceObj = std::get<std::shared_ptr<Object>>(args[i].data);
+      auto sourceObj = args[i].getGC<Object>();
       for (const auto& [key, value] : sourceObj->properties) {
         targetObj->properties[key] = value;
       }
@@ -1038,7 +1041,7 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
 
   // Handle Function objects
   if (args[0].isFunction()) {
-    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto fn = args[0].getGC<Function>();
     // Internal properties are not own properties
     if (isInternalProperty(key)) return Value(false);
     if (fn->properties.find(key) != fn->properties.end()) return Value(true);
@@ -1049,7 +1052,7 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
 
   // Handle Class objects
   if (args[0].isClass()) {
-    auto cls = std::get<std::shared_ptr<Class>>(args[0].data);
+    auto cls = args[0].getGC<Class>();
     if (isInternalProperty(key)) return Value(false);
     if (cls->properties.find(key) != cls->properties.end()) return Value(true);
     if (cls->properties.find("__get_" + key) != cls->properties.end()) return Value(true);
@@ -1061,7 +1064,7 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     return Value(false);
   }
 
-  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto obj = args[0].getGC<Object>();
 
   if (obj->isModuleNamespace) {
     if (key == WellKnownSymbols::toStringTagKey()) {
@@ -1074,7 +1077,7 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     }
     auto getterIt = obj->properties.find("__get_" + key);
     if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-      auto getter = std::get<std::shared_ptr<Function>>(getterIt->second.data);
+      auto getter = getterIt->second.getGC<Function>();
       if (getter && getter->isNative) {
         getter->nativeFunc({});
       }
@@ -1105,14 +1108,14 @@ static bool isSymbolKey(const std::string& key) {
 }
 
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
-  auto result = std::make_shared<Array>();
+  auto result = GarbageCollector::makeGC<Array>();
 
   if (args.empty()) {
     return Value(result);
   }
 
   if (args[0].isFunction()) {
-    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto fn = args[0].getGC<Function>();
     // Ensure spec-mandated order: length, name first, then rest
     if (fn->properties.count("length")) {
       result->elements.push_back(Value(std::string("length")));
@@ -1132,7 +1135,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     return Value(result);
   }
 
-  auto obj = std::get<std::shared_ptr<Object>>(args[0].data);
+  auto obj = args[0].getGC<Object>();
 
   if (obj->isModuleNamespace) {
     for (const auto& key : obj->moduleExportNames) {
@@ -1151,16 +1154,16 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
 }
 
 Value Object_create(const std::vector<Value>& args) {
-  auto newObj = std::make_shared<Object>();
+  auto newObj = GarbageCollector::makeGC<Object>();
 
   // Simple implementation - doesn't handle prototype properly
   // but creates a new object
   if (args.size() > 1 && args[1].isObject()) {
     // Add properties from the properties descriptor object
-    auto props = std::get<std::shared_ptr<Object>>(args[1].data);
+    auto props = args[1].getGC<Object>();
     for (const auto& [key, descriptor] : props->properties) {
       if (descriptor.isObject()) {
-        auto desc = std::get<std::shared_ptr<Object>>(descriptor.data);
+        auto desc = descriptor.getGC<Object>();
         auto valueIt = desc->properties.find("value");
         if (valueIt != desc->properties.end()) {
           newObj->properties[key] = valueIt->second;
@@ -1173,17 +1176,17 @@ Value Object_create(const std::vector<Value>& args) {
 }
 
 Value Object_fromEntries(const std::vector<Value>& args) {
-  auto newObj = std::make_shared<Object>();
+  auto newObj = GarbageCollector::makeGC<Object>();
 
   if (args.empty() || !args[0].isArray()) {
     return Value(newObj);
   }
 
-  auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+  auto arr = args[0].getGC<Array>();
   for (const auto& entry : arr->elements) {
     // Each entry should be an array with [key, value]
     if (entry.isArray()) {
-      auto pair = std::get<std::shared_ptr<Array>>(entry.data);
+      auto pair = entry.getGC<Array>();
       if (pair->elements.size() >= 2) {
         std::string key = pair->elements[0].toString();
         newObj->properties[key] = pair->elements[1];

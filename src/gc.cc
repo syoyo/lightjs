@@ -1,5 +1,7 @@
 #include "gc.h"
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include <algorithm>
 #include <iostream>
 #include <fstream>

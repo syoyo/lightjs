@@ -45,7 +45,7 @@ void testStackTrace() {
   if (interpreter.hasError()) {
     auto errorValue = interpreter.getError();
 
-    if (auto errorPtr = std::get_if<std::shared_ptr<Error>>(&errorValue.data)) {
+    if (auto errorPtr = std::get_if<GCPtr<Error>>(&errorValue.data)) {
       auto error = *errorPtr;
 
       std::cout << "Error Type: " << error->getName() << "\n";
@@ -108,7 +108,7 @@ void testStackOverflowError() {
   if (interpreter.hasError()) {
     auto errorValue = interpreter.getError();
 
-    if (auto errorPtr = std::get_if<std::shared_ptr<Error>>(&errorValue.data)) {
+    if (auto errorPtr = std::get_if<GCPtr<Error>>(&errorValue.data)) {
       auto error = *errorPtr;
 
       std::cout << "Error Type: " << error->getName() << "\n";
@@ -167,7 +167,7 @@ void testTypeError() {
   if (interpreter.hasError()) {
     auto errorValue = interpreter.getError();
 
-    if (auto errorPtr = std::get_if<std::shared_ptr<Error>>(&errorValue.data)) {
+    if (auto errorPtr = std::get_if<GCPtr<Error>>(&errorValue.data)) {
       auto error = *errorPtr;
 
       std::cout << "Error Type: " << error->getName() << "\n";

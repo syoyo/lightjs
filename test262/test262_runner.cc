@@ -776,7 +776,7 @@ private:
 
         // For async tests, check if the result is a Promise
         if (metadata.isAsync && finalResult.isPromise()) {
-          auto promise = std::get<std::shared_ptr<Promise>>(finalResult.data);
+          auto promise = std::get<GCPtr<Promise>>(finalResult.data);
           // Check Promise state
           if (promise->state == PromiseState::Rejected) {
             result.actualError = "Promise rejected";

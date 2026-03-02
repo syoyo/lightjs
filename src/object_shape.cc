@@ -1,5 +1,7 @@
 #include "object_shape.h"
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include <algorithm>
 
 namespace lightjs {

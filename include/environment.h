@@ -15,11 +15,10 @@ class Interpreter;
 void setGlobalModuleLoader(std::shared_ptr<ModuleLoader> loader);
 void setGlobalInterpreter(Interpreter* interpreter);
 Interpreter* getGlobalInterpreter();
-
-class Environment : public std::enable_shared_from_this<Environment> {
+class Environment : public GCObject, public std::enable_shared_from_this<Environment> {
 public:
   Environment() = default;
-  explicit Environment(std::shared_ptr<Environment> parent);
+  explicit Environment(Environment* parent);
 
   void define(const std::string& name, const Value& value, bool isConst = false);
   void defineLexical(const std::string& name, const Value& value, bool isConst = false);
@@ -36,16 +35,20 @@ public:
   // Set a var binding, bypassing with-scope objects (for var declarations)
   bool setVar(const std::string& name, const Value& value);
   // Resolve where a name would be written (returns with-scope object if applicable)
-  std::shared_ptr<Object> resolveWithScopeObject(const std::string& name) const;
+  GCPtr<Object> resolveWithScopeObject(const std::string& name) const;
 
-  static std::shared_ptr<Environment> createGlobal();
-  std::shared_ptr<Environment> createChild();
-  std::shared_ptr<Environment> getParent() const { return parent_; }
-  std::shared_ptr<Object> getGlobal() const;
+  static GCPtr<Environment> createGlobal();
+  GCPtr<Environment> createChild();
+  Environment* getParent() const { return parent_.get(); }
+  GCPtr<Object> getGlobal() const;
   Environment* getRoot();
 
+  // GCObject interface
+  const char* typeName() const override { return "Environment"; }
+  void getReferences(std::vector<GCObject*>& refs) const override;
+
 private:
-  std::shared_ptr<Environment> parent_;
+  GCPtr<Environment> parent_;
   std::unordered_map<std::string, Value> bindings_;
   std::unordered_map<std::string, bool> constants_;
   std::unordered_map<std::string, bool> tdzBindings_;  // temporal dead zone

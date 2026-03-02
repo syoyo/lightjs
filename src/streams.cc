@@ -1,5 +1,7 @@
 #include "streams.h"
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 
 namespace lightjs {
 
@@ -12,7 +14,7 @@ void ReadableStreamDefaultController::enqueue(const Value& chunk) {
     return;  // Cannot enqueue after close is requested
   }
 
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr || streamPtr->state != ReadableStreamState::Readable) {
     return;  // Stream not readable
   }
@@ -24,7 +26,7 @@ void ReadableStreamDefaultController::enqueue(const Value& chunk) {
   desiredSize -= 1.0;
 
   // Try to fulfill pending read requests
-  auto readerPtr = streamPtr->reader.lock();
+  auto* readerPtr = streamPtr->reader;
   if (readerPtr && !readerPtr->readRequests.empty()) {
     // Dequeue and fulfill the oldest read request
     auto& request = readerPtr->readRequests.front();
@@ -34,7 +36,7 @@ void ReadableStreamDefaultController::enqueue(const Value& chunk) {
       desiredSize += 1.0;
 
       // Create result object {value, done}
-      auto resultObj = std::make_shared<Object>();
+      auto resultObj = GarbageCollector::makeGC<Object>();
       resultObj->properties["value"] = *queuedChunk.value;
       resultObj->properties["done"] = false;
 
@@ -52,7 +54,7 @@ void ReadableStreamDefaultController::close() {
 
   closeRequested = true;
 
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr) {
     return;
   }
@@ -62,10 +64,10 @@ void ReadableStreamDefaultController::close() {
     streamPtr->state = ReadableStreamState::Closed;
 
     // Resolve any pending read requests with done=true
-    auto readerPtr = streamPtr->reader.lock();
+    auto* readerPtr = streamPtr->reader;
     if (readerPtr) {
       for (auto& request : readerPtr->readRequests) {
-        auto resultObj = std::make_shared<Object>();
+        auto resultObj = GarbageCollector::makeGC<Object>();
         resultObj->properties["value"] = Undefined{};
         resultObj->properties["done"] = true;
         request.promise->resolve(Value(resultObj));
@@ -81,7 +83,7 @@ void ReadableStreamDefaultController::close() {
 }
 
 void ReadableStreamDefaultController::error(const Value& reason) {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr) {
     return;
   }
@@ -96,7 +98,7 @@ void ReadableStreamDefaultController::error(const Value& reason) {
   streamPtr->storedError = std::make_shared<Value>(reason);
 
   // Reject any pending read requests
-  auto readerPtr = streamPtr->reader.lock();
+  auto* readerPtr = streamPtr->reader;
   if (readerPtr) {
     for (auto& request : readerPtr->readRequests) {
       request.promise->reject(reason);
@@ -122,9 +124,9 @@ void ReadableStreamDefaultController::getReferences(std::vector<GCObject*>& refs
 // ReadableStreamDefaultReader implementation
 // ===========================================================================
 
-ReadableStreamDefaultReader::ReadableStreamDefaultReader(std::shared_ptr<ReadableStream> s)
+ReadableStreamDefaultReader::ReadableStreamDefaultReader(GCPtr<ReadableStream> s)
   : stream(s) {
-  closedPromise = std::make_shared<Promise>();
+  closedPromise = GarbageCollector::makeGC<Promise>();
 
   if (s) {
     // Lock the stream
@@ -132,27 +134,27 @@ ReadableStreamDefaultReader::ReadableStreamDefaultReader(std::shared_ptr<Readabl
   }
 }
 
-std::shared_ptr<Promise> ReadableStreamDefaultReader::read() {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> ReadableStreamDefaultReader::read() {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (!stream) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Reader has no stream");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Reader has no stream");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == ReadableStreamState::Closed) {
     // Return {value: undefined, done: true}
-    auto resultObj = std::make_shared<Object>();
+    auto resultObj = GarbageCollector::makeGC<Object>();
     resultObj->properties["value"] = Undefined{};
     resultObj->properties["done"] = true;
     promise->resolve(Value(resultObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == ReadableStreamState::Errored) {
     promise->reject(*stream->storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // Stream is readable - check if there's a chunk in queue
@@ -161,7 +163,7 @@ std::shared_ptr<Promise> ReadableStreamDefaultReader::read() {
     stream->controller->queue.pop_front();
     stream->controller->desiredSize += 1.0;
 
-    auto resultObj = std::make_shared<Object>();
+    auto resultObj = GarbageCollector::makeGC<Object>();
     resultObj->properties["value"] = *chunk.value;
     resultObj->properties["done"] = false;
     promise->resolve(Value(resultObj));
@@ -182,7 +184,7 @@ std::shared_ptr<Promise> ReadableStreamDefaultReader::read() {
     }
   }
 
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
 void ReadableStreamDefaultReader::releaseLock() {
@@ -192,7 +194,7 @@ void ReadableStreamDefaultReader::releaseLock() {
 
   // Reject any pending read requests
   for (auto& request : readRequests) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Reader was released");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Reader was released");
     request.promise->reject(Value(errorObj));
   }
   readRequests.clear();
@@ -202,12 +204,12 @@ void ReadableStreamDefaultReader::releaseLock() {
   stream.reset();
 }
 
-std::shared_ptr<Promise> ReadableStreamDefaultReader::cancel(const Value& reason) {
+GCPtr<Promise> ReadableStreamDefaultReader::cancel(const Value& reason) {
   if (!stream) {
-    auto promise = std::make_shared<Promise>();
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Reader has no stream");
+    auto promise = GarbageCollector::makeGC<Promise>();
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Reader has no stream");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   return stream->cancel(reason);
@@ -225,30 +227,29 @@ void ReadableStreamDefaultReader::getReferences(std::vector<GCObject*>& refs) co
 // ReadableStream implementation
 // ===========================================================================
 
-std::shared_ptr<ReadableStreamDefaultReader> ReadableStream::getReader() {
+GCPtr<ReadableStreamDefaultReader> ReadableStream::getReader() {
   if (locked) {
-    return nullptr;  // Stream already locked
+    return {};  // Stream already locked
   }
 
-  auto sharedThis = std::dynamic_pointer_cast<ReadableStream>(shared_from_this());
-  auto readerPtr = std::make_shared<ReadableStreamDefaultReader>(sharedThis);
+  auto readerPtr = GarbageCollector::makeGC<ReadableStreamDefaultReader>(GCPtr<ReadableStream>(const_cast<ReadableStream*>(this)));
   reader = readerPtr;
   locked = true;
 
-  return readerPtr;
+  return GCPtr<ReadableStreamDefaultReader>(readerPtr);
 }
 
-std::shared_ptr<Promise> ReadableStream::cancel(const Value& reason) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> ReadableStream::cancel(const Value& reason) {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (state == ReadableStreamState::Closed) {
     promise->resolve(Undefined{});
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (state == ReadableStreamState::Errored) {
     promise->reject(*storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // Mark as disturbed
@@ -268,27 +269,27 @@ std::shared_ptr<Promise> ReadableStream::cancel(const Value& reason) {
   }
 
   promise->resolve(Undefined{});
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
-std::shared_ptr<Promise> ReadableStream::pipeTo(
-    std::shared_ptr<WritableStream> destination,
+GCPtr<Promise> ReadableStream::pipeTo(
+    GCPtr<WritableStream> destination,
     bool preventClose,
     bool preventAbort,
     bool preventCancel) {
 
-  auto promise = std::make_shared<Promise>();
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (locked) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "ReadableStream is locked");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "ReadableStream is locked");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (destination->locked) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "WritableStream is locked");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "WritableStream is locked");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // Mark streams as disturbed/locked
@@ -299,39 +300,39 @@ std::shared_ptr<Promise> ReadableStream::pipeTo(
   auto writerPtr = destination->getWriter();
 
   if (!readerPtr || !writerPtr) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Failed to get reader/writer");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Failed to get reader/writer");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // TODO: Implement actual piping loop
   // This would need integration with the interpreter's event loop
 
   promise->resolve(Undefined{});
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
-std::shared_ptr<ReadableStream> ReadableStream::pipeThrough(
-    std::shared_ptr<TransformStream> transform,
+GCPtr<ReadableStream> ReadableStream::pipeThrough(
+    GCPtr<TransformStream> transform,
     bool preventClose,
     bool preventAbort,
     bool preventCancel) {
 
   if (!transform) {
-    return nullptr;
+    return {};
   }
 
   // Pipe to the writable side of the transform
   pipeTo(transform->writable, preventClose, preventAbort, preventCancel);
 
   // Return the readable side of the transform
-  return transform->readable;
+  return GCPtr<ReadableStream>(transform->readable);
 }
 
-std::pair<std::shared_ptr<ReadableStream>, std::shared_ptr<ReadableStream>> ReadableStream::tee() {
+std::pair<GCPtr<ReadableStream>, GCPtr<ReadableStream>> ReadableStream::tee() {
   // Create two new readable streams
-  auto branch1 = std::make_shared<ReadableStream>();
-  auto branch2 = std::make_shared<ReadableStream>();
+  auto branch1 = GarbageCollector::makeGC<ReadableStream>();
+  auto branch2 = GarbageCollector::makeGC<ReadableStream>();
 
   // Create controllers for both branches
   branch1->controller = std::make_shared<ReadableStreamDefaultController>();
@@ -349,8 +350,8 @@ void ReadableStream::getReferences(std::vector<GCObject*>& refs) const {
     // storedError is a Value, which manages its own memory
   }
   if (controller) refs.push_back(controller.get());
-  auto readerPtr = reader.lock();
-  if (readerPtr) refs.push_back(readerPtr.get());
+  auto* readerPtr = reader;
+  if (readerPtr) refs.push_back(readerPtr);
 }
 
 // ===========================================================================
@@ -358,7 +359,7 @@ void ReadableStream::getReferences(std::vector<GCObject*>& refs) const {
 // ===========================================================================
 
 void WritableStreamDefaultController::error(const Value& reason) {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr) {
     return;
   }
@@ -373,7 +374,7 @@ void WritableStreamDefaultController::error(const Value& reason) {
   streamPtr->storedError = std::make_shared<Value>(reason);
 
   // Reject any pending write requests
-  auto writerPtr = streamPtr->writer.lock();
+  auto* writerPtr = streamPtr->writer;
   if (writerPtr) {
     for (auto& request : writerPtr->writeRequests) {
       request.promise->reject(reason);
@@ -397,10 +398,10 @@ void WritableStreamDefaultController::getReferences(std::vector<GCObject*>& refs
 // WritableStreamDefaultWriter implementation
 // ===========================================================================
 
-WritableStreamDefaultWriter::WritableStreamDefaultWriter(std::shared_ptr<WritableStream> s)
+WritableStreamDefaultWriter::WritableStreamDefaultWriter(GCPtr<WritableStream> s)
   : stream(s) {
-  closedPromise = std::make_shared<Promise>();
-  readyPromise = std::make_shared<Promise>();
+  closedPromise = GarbageCollector::makeGC<Promise>();
+  readyPromise = GarbageCollector::makeGC<Promise>();
   readyPromise->resolve(Undefined{});  // Initially ready
 
   if (s) {
@@ -408,25 +409,25 @@ WritableStreamDefaultWriter::WritableStreamDefaultWriter(std::shared_ptr<Writabl
   }
 }
 
-std::shared_ptr<Promise> WritableStreamDefaultWriter::write(const Value& chunk) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> WritableStreamDefaultWriter::write(const Value& chunk) {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (!stream) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Writer has no stream");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Writer has no stream");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == WritableStreamState::Errored) {
     promise->reject(*stream->storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == WritableStreamState::Closed ||
       stream->state == WritableStreamState::Closing) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Stream is closed");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Stream is closed");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // Add to queue
@@ -448,26 +449,26 @@ std::shared_ptr<Promise> WritableStreamDefaultWriter::write(const Value& chunk) 
   promise->resolve(Undefined{});
   writeRequests.clear();
 
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
-std::shared_ptr<Promise> WritableStreamDefaultWriter::close() {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> WritableStreamDefaultWriter::close() {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (!stream) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Writer has no stream");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Writer has no stream");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == WritableStreamState::Closed) {
     promise->resolve(Undefined{});
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (stream->state == WritableStreamState::Errored) {
     promise->reject(*stream->storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   stream->state = WritableStreamState::Closing;
@@ -490,16 +491,16 @@ std::shared_ptr<Promise> WritableStreamDefaultWriter::close() {
     closedPromise->resolve(Undefined{});
   }
 
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
-std::shared_ptr<Promise> WritableStreamDefaultWriter::abort(const Value& reason) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> WritableStreamDefaultWriter::abort(const Value& reason) {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (!stream) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Writer has no stream");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Writer has no stream");
     promise->reject(Value(errorObj));
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   return stream->abort(reason);
@@ -512,7 +513,7 @@ void WritableStreamDefaultWriter::releaseLock() {
 
   // Reject any pending write requests
   for (auto& request : writeRequests) {
-    auto errorObj = std::make_shared<Error>(ErrorType::TypeError, "Writer was released");
+    auto errorObj = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Writer was released");
     request.promise->reject(Value(errorObj));
   }
   writeRequests.clear();
@@ -541,30 +542,29 @@ void WritableStreamDefaultWriter::getReferences(std::vector<GCObject*>& refs) co
 // WritableStream implementation
 // ===========================================================================
 
-std::shared_ptr<WritableStreamDefaultWriter> WritableStream::getWriter() {
+GCPtr<WritableStreamDefaultWriter> WritableStream::getWriter() {
   if (locked) {
-    return nullptr;  // Stream already locked
+    return {};  // Stream already locked
   }
 
-  auto sharedThis = std::dynamic_pointer_cast<WritableStream>(shared_from_this());
-  auto writerPtr = std::make_shared<WritableStreamDefaultWriter>(sharedThis);
+  auto writerPtr = GarbageCollector::makeGC<WritableStreamDefaultWriter>(GCPtr<WritableStream>(const_cast<WritableStream*>(this)));
   writer = writerPtr;
   locked = true;
 
-  return writerPtr;
+  return GCPtr<WritableStreamDefaultWriter>(writerPtr);
 }
 
-std::shared_ptr<Promise> WritableStream::abort(const Value& reason) {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> WritableStream::abort(const Value& reason) {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (state == WritableStreamState::Closed) {
     promise->resolve(Undefined{});
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (state == WritableStreamState::Errored) {
     promise->reject(*storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   // Set error state
@@ -582,20 +582,20 @@ std::shared_ptr<Promise> WritableStream::abort(const Value& reason) {
   }
 
   promise->resolve(Undefined{});
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
-std::shared_ptr<Promise> WritableStream::close() {
-  auto promise = std::make_shared<Promise>();
+GCPtr<Promise> WritableStream::close() {
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   if (state == WritableStreamState::Closed) {
     promise->resolve(Undefined{});
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   if (state == WritableStreamState::Errored) {
     promise->reject(*storedError);
-    return promise;
+    return GCPtr<Promise>(promise);
   }
 
   state = WritableStreamState::Closing;
@@ -608,13 +608,13 @@ std::shared_ptr<Promise> WritableStream::close() {
   state = WritableStreamState::Closed;
   promise->resolve(Undefined{});
 
-  return promise;
+  return GCPtr<Promise>(promise);
 }
 
 void WritableStream::getReferences(std::vector<GCObject*>& refs) const {
   if (controller) refs.push_back(controller.get());
-  auto writerPtr = writer.lock();
-  if (writerPtr) refs.push_back(writerPtr.get());
+  auto* writerPtr = writer;
+  if (writerPtr) refs.push_back(writerPtr);
   if (pendingAbortRequest) refs.push_back(pendingAbortRequest.get());
   if (closeRequest) refs.push_back(closeRequest.get());
   if (inFlightWriteRequest) refs.push_back(inFlightWriteRequest.get());
@@ -626,7 +626,7 @@ void WritableStream::getReferences(std::vector<GCObject*>& refs) const {
 // ===========================================================================
 
 void TransformStreamDefaultController::enqueue(const Value& chunk) {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr || !streamPtr->readable) {
     return;
   }
@@ -637,7 +637,7 @@ void TransformStreamDefaultController::enqueue(const Value& chunk) {
 }
 
 void TransformStreamDefaultController::error(const Value& reason) {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr) {
     return;
   }
@@ -652,7 +652,7 @@ void TransformStreamDefaultController::error(const Value& reason) {
 }
 
 void TransformStreamDefaultController::terminate() {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr) {
     return;
   }
@@ -664,7 +664,7 @@ void TransformStreamDefaultController::terminate() {
 }
 
 double TransformStreamDefaultController::desiredSize() const {
-  auto streamPtr = stream.lock();
+  auto* streamPtr = stream;
   if (!streamPtr || !streamPtr->readable || !streamPtr->readable->controller) {
     return 0.0;
   }
@@ -691,13 +691,13 @@ void TransformStream::getReferences(std::vector<GCObject*>& refs) const {
 // Helper functions for stream creation
 // ===========================================================================
 
-std::shared_ptr<ReadableStream> createReadableStream(
-    std::shared_ptr<Function> start,
-    std::shared_ptr<Function> pull,
-    std::shared_ptr<Function> cancel,
+GCPtr<ReadableStream> createReadableStream(
+    GCPtr<Function> start,
+    GCPtr<Function> pull,
+    GCPtr<Function> cancel,
     double highWaterMark) {
 
-  auto stream = std::make_shared<ReadableStream>();
+  auto stream = GarbageCollector::makeGC<ReadableStream>();
   auto controller = std::make_shared<ReadableStreamDefaultController>();
 
   controller->stream = stream;
@@ -709,17 +709,17 @@ std::shared_ptr<ReadableStream> createReadableStream(
 
   // TODO: Call start callback when integrated with interpreter
 
-  return stream;
+  return GCPtr<ReadableStream>(stream);
 }
 
-std::shared_ptr<WritableStream> createWritableStream(
-    std::shared_ptr<Function> start,
-    std::shared_ptr<Function> write,
-    std::shared_ptr<Function> close,
-    std::shared_ptr<Function> abort,
+GCPtr<WritableStream> createWritableStream(
+    GCPtr<Function> start,
+    GCPtr<Function> write,
+    GCPtr<Function> close,
+    GCPtr<Function> abort,
     double highWaterMark) {
 
-  auto stream = std::make_shared<WritableStream>();
+  auto stream = GarbageCollector::makeGC<WritableStream>();
   auto controller = std::make_shared<WritableStreamDefaultController>();
 
   controller->stream = stream;
@@ -732,15 +732,15 @@ std::shared_ptr<WritableStream> createWritableStream(
 
   // TODO: Call start callback when integrated with interpreter
 
-  return stream;
+  return GCPtr<WritableStream>(stream);
 }
 
-std::shared_ptr<TransformStream> createTransformStream(
-    std::shared_ptr<Function> start,
-    std::shared_ptr<Function> transform,
-    std::shared_ptr<Function> flush) {
+GCPtr<TransformStream> createTransformStream(
+    GCPtr<Function> start,
+    GCPtr<Function> transform,
+    GCPtr<Function> flush) {
 
-  auto transformStream = std::make_shared<TransformStream>();
+  auto transformStream = GarbageCollector::makeGC<TransformStream>();
   auto controller = std::make_shared<TransformStreamDefaultController>();
 
   controller->stream = transformStream;
@@ -750,20 +750,20 @@ std::shared_ptr<TransformStream> createTransformStream(
   transformStream->controller = controller;
 
   // Create readable side
-  transformStream->readable = std::make_shared<ReadableStream>();
+  transformStream->readable = GarbageCollector::makeGC<ReadableStream>();
   auto readableController = std::make_shared<ReadableStreamDefaultController>();
   readableController->stream = transformStream->readable;
   transformStream->readable->controller = readableController;
 
   // Create writable side
-  transformStream->writable = std::make_shared<WritableStream>();
+  transformStream->writable = GarbageCollector::makeGC<WritableStream>();
   auto writableController = std::make_shared<WritableStreamDefaultController>();
   writableController->stream = transformStream->writable;
   transformStream->writable->controller = writableController;
 
   // TODO: Call start callback when integrated with interpreter
 
-  return transformStream;
+  return GCPtr<TransformStream>(transformStream);
 }
 
 }  // namespace lightjs

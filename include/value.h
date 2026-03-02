@@ -39,7 +39,7 @@ struct Function : public GCObject {
   // Keeps parsed AST storage alive when params/body point into transient parses
   // (e.g. Function constructor-created functions).
   std::shared_ptr<void> astOwner;
-  std::shared_ptr<void> closure;
+  GCPtr<Environment> closure;
   bool isNative;
   bool isAsync;
   bool isGenerator;
@@ -58,14 +58,14 @@ struct Function : public GCObject {
 // Class structure for ES6 classes
 struct Class : public GCObject {
   std::string name;
-  std::shared_ptr<Function> constructor;  // The constructor function
-  std::shared_ptr<Class> superClass;       // Parent class (if any)
-  std::unordered_map<std::string, std::shared_ptr<Function>> methods;        // Instance methods
-  std::unordered_map<std::string, std::shared_ptr<Function>> staticMethods;  // Static methods
-  std::unordered_map<std::string, std::shared_ptr<Function>> getters;        // Getter methods
-  std::unordered_map<std::string, std::shared_ptr<Function>> setters;        // Setter methods
+  GCPtr<Function> constructor;  // The constructor function
+  GCPtr<Class> superClass;       // Parent class (if any)
+  std::unordered_map<std::string, GCPtr<Function>> methods;        // Instance methods
+  std::unordered_map<std::string, GCPtr<Function>> staticMethods;  // Static methods
+  std::unordered_map<std::string, GCPtr<Function>> getters;        // Getter methods
+  std::unordered_map<std::string, GCPtr<Function>> setters;        // Setter methods
   OrderedMap<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
-  std::shared_ptr<void> closure;  // Closure environment
+  GCPtr<Environment> closure;  // Closure environment
 
   // Field initializers (public and private) - evaluated during construction
   struct FieldInit {
@@ -305,17 +305,16 @@ enum class GeneratorState {
   Executing,       // Currently executing
   Completed        // Generator has returned
 };
-
 struct Generator : public GCObject {
-  std::shared_ptr<Function> function;  // The generator function
-  std::shared_ptr<void> context;       // Execution context (closure)
+  GCPtr<Function> function;  // The generator function
+  GCPtr<Environment> context;       // Execution context (closure)
   GeneratorState state;
   std::shared_ptr<Value> currentValue;  // Last yielded or returned value
   size_t yieldIndex;   // Index of last yield point (for resumption)
   std::shared_ptr<void> suspendedTask;  // Suspended C++ coroutine (Task)
   OrderedMap<std::string, Value> properties;
 
-  Generator(std::shared_ptr<Function> func, std::shared_ptr<void> ctx)
+  Generator(GCPtr<Function> func, GCPtr<Environment> ctx)
     : function(func), context(ctx), state(GeneratorState::SuspendedStart),
       currentValue(std::make_shared<Value>(Undefined{})), yieldIndex(0),
       suspendedTask(nullptr, [](void* p) { 
@@ -362,20 +361,24 @@ struct ArrayBuffer : public GCObject {
 
 // DataView - Low-level interface for reading/writing multiple number types in an ArrayBuffer
 struct DataView : public GCObject {
-  std::shared_ptr<ArrayBuffer> buffer;
+  GCPtr<ArrayBuffer> buffer;
   size_t byteOffset;
   size_t byteLength;
 
-  DataView(std::shared_ptr<ArrayBuffer> buf, size_t offset = 0, size_t length = 0)
+  DataView(GCPtr<ArrayBuffer> buf, size_t offset = 0, size_t length = 0)
     : buffer(buf), byteOffset(offset) {
-    if (length == 0) {
-      byteLength = buf->byteLength - offset;
+    if (buf) {
+      if (length == 0) {
+        byteLength = buf->byteLength - offset;
+      } else {
+        byteLength = length;
+      }
+      // Validate bounds
+      if (byteOffset + byteLength > buf->byteLength) {
+        byteLength = buf->byteLength > byteOffset ? buf->byteLength - byteOffset : 0;
+      }
     } else {
-      byteLength = length;
-    }
-    // Validate bounds
-    if (byteOffset + byteLength > buf->byteLength) {
-      byteLength = buf->byteLength > byteOffset ? buf->byteLength - byteOffset : 0;
+      byteLength = 0;
     }
   }
 
@@ -541,7 +544,7 @@ struct Promise : public GCObject {
   Value result;
   std::vector<std::function<Value(Value)>> fulfilledCallbacks;
   std::vector<std::function<Value(Value)>> rejectedCallbacks;
-  std::vector<std::shared_ptr<Promise>> chainedPromises;
+  std::vector<GCPtr<Promise>> chainedPromises;
   OrderedMap<std::string, Value> properties;
 
   Promise() : state(PromiseState::Pending), result(Undefined{}) {}
@@ -549,18 +552,18 @@ struct Promise : public GCObject {
   void resolve(Value val);
   void reject(Value val);
 
-  std::shared_ptr<Promise> then(
+  GCPtr<Promise> then(
     std::function<Value(Value)> onFulfilled,
     std::function<Value(Value)> onRejected = nullptr);
 
-  std::shared_ptr<Promise> catch_(std::function<Value(Value)> onRejected);
-  std::shared_ptr<Promise> finally(std::function<Value()> onFinally);
+  GCPtr<Promise> catch_(std::function<Value(Value)> onRejected);
+  GCPtr<Promise> finally(std::function<Value()> onFinally);
 
   // Static methods
-  static std::shared_ptr<Promise> all(const std::vector<std::shared_ptr<Promise>>& promises);
-  static std::shared_ptr<Promise> race(const std::vector<std::shared_ptr<Promise>>& promises);
-  static std::shared_ptr<Promise> resolved(const Value& value);
-  static std::shared_ptr<Promise> rejected(const Value& reason);
+  static GCPtr<Promise> all(const std::vector<GCPtr<Promise>>& promises);
+  static GCPtr<Promise> race(const std::vector<GCPtr<Promise>>& promises);
+  static GCPtr<Promise> resolved(const Value& value);
+  static GCPtr<Promise> rejected(const Value& reason);
 
   // GCObject interface
   const char* typeName() const override { return "Promise"; }

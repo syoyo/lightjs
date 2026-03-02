@@ -109,11 +109,11 @@ std::string percentDecode(const std::string& str);
 /**
  * Create URL constructor for JavaScript
  */
-std::shared_ptr<Function> createURLConstructor();
+GCPtr<Function> createURLConstructor();
 
 /**
  * Create URLSearchParams constructor for JavaScript
  */
-std::shared_ptr<Function> createURLSearchParamsConstructor();
+GCPtr<Function> createURLSearchParamsConstructor();
 
 } // namespace lightjs

@@ -1,4 +1,6 @@
 #include "value.h"
+#include "streams.h"
+#include "wasm_js.h"
 #include "gc.h"
 #include <stdexcept>
 #include <algorithm>
@@ -11,7 +13,7 @@ Value Array_push(const std::vector<Value>& args) {
         throw std::runtime_error("Array.push called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     // Push all arguments to the array
     for (size_t i = 1; i < args.size(); ++i) {
@@ -27,7 +29,7 @@ Value Array_pop(const std::vector<Value>& args) {
         throw std::runtime_error("Array.pop called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     if (arr->elements.empty()) {
         return Value(Undefined{});
@@ -44,7 +46,7 @@ Value Array_shift(const std::vector<Value>& args) {
         throw std::runtime_error("Array.shift called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     if (arr->elements.empty()) {
         return Value(Undefined{});
@@ -61,7 +63,7 @@ Value Array_unshift(const std::vector<Value>& args) {
         throw std::runtime_error("Array.unshift called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     // Insert all arguments at the beginning
     for (size_t i = 1; i < args.size(); ++i) {
@@ -77,8 +79,8 @@ Value Array_slice(const std::vector<Value>& args) {
         throw std::runtime_error("Array.slice called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto result = std::make_shared<Array>();
+    auto arr = args[0].getGC<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     size_t len = arr->elements.size();
@@ -110,8 +112,8 @@ Value Array_splice(const std::vector<Value>& args) {
         throw std::runtime_error("Array.splice called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto removed = std::make_shared<Array>();
+    auto arr = args[0].getGC<Array>();
+    auto removed = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     size_t len = arr->elements.size();
@@ -149,7 +151,7 @@ Value Array_join(const std::vector<Value>& args) {
         throw std::runtime_error("Array.join called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
     std::string separator = ",";
 
     if (args.size() > 1 && args[1].isString()) {
@@ -171,7 +173,7 @@ Value Array_indexOf(const std::vector<Value>& args) {
         throw std::runtime_error("Array.indexOf called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     if (args.size() < 2) {
         return Value(-1.0);
@@ -201,7 +203,7 @@ Value Array_includes(const std::vector<Value>& args) {
         throw std::runtime_error("Array.includes called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
 
     if (args.size() < 2) {
         return Value(false);
@@ -231,7 +233,7 @@ Value Array_reverse(const std::vector<Value>& args) {
         throw std::runtime_error("Array.reverse called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
+    auto arr = args[0].getGC<Array>();
     std::reverse(arr->elements.begin(), arr->elements.end());
     return args[0]; // Return the array itself
 }
@@ -242,8 +244,8 @@ Value Array_concat(const std::vector<Value>& args) {
         throw std::runtime_error("Array.concat called on non-array");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto result = std::make_shared<Array>();
+    auto arr = args[0].getGC<Array>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     // Copy original array elements
@@ -252,7 +254,7 @@ Value Array_concat(const std::vector<Value>& args) {
     // Add all arguments
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i].isArray()) {
-            auto otherArr = std::get<std::shared_ptr<Array>>(args[i].data);
+            auto otherArr = args[i].getGC<Array>();
             result->elements.insert(result->elements.end(),
                                   otherArr->elements.begin(),
                                   otherArr->elements.end());
@@ -273,9 +275,9 @@ Value Array_map(const std::vector<Value>& args) {
         throw std::runtime_error("Array.map requires a callback function");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
-    auto result = std::make_shared<Array>();
+    auto arr = args[0].getGC<Array>();
+    auto callback = args[1].getGC<Function>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     for (size_t i = 0; i < arr->elements.size(); ++i) {
@@ -296,9 +298,9 @@ Value Array_filter(const std::vector<Value>& args) {
         throw std::runtime_error("Array.filter requires a callback function");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
-    auto result = std::make_shared<Array>();
+    auto arr = args[0].getGC<Array>();
+    auto callback = args[1].getGC<Function>();
+    auto result = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
 
     for (size_t i = 0; i < arr->elements.size(); ++i) {
@@ -321,8 +323,8 @@ Value Array_reduce(const std::vector<Value>& args) {
         throw std::runtime_error("Array.reduce requires a callback function");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+    auto arr = args[0].getGC<Array>();
+    auto callback = args[1].getGC<Function>();
 
     if (arr->elements.empty()) {
         return args.size() > 2 ? args[2] : Value(Undefined{});
@@ -348,8 +350,8 @@ Value Array_forEach(const std::vector<Value>& args) {
         throw std::runtime_error("Array.forEach requires a callback function");
     }
 
-    auto arr = std::get<std::shared_ptr<Array>>(args[0].data);
-    auto callback = std::get<std::shared_ptr<Function>>(args[1].data);
+    auto arr = args[0].getGC<Array>();
+    auto callback = args[1].getGC<Function>();
 
     for (size_t i = 0; i < arr->elements.size(); ++i) {
         std::vector<Value> callArgs = {arr->elements[i], Value(static_cast<double>(i)), args[0]};

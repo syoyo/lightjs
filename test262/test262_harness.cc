@@ -43,104 +43,104 @@ bool isSameValue(const Value& actual, const Value& expected) {
     return std::get<std::string>(actual.data) == std::get<std::string>(expected.data);
   }
   if (actual.isFunction()) {
-    return std::get<std::shared_ptr<Function>>(actual.data) ==
-           std::get<std::shared_ptr<Function>>(expected.data);
+    return std::get<GCPtr<Function>>(actual.data) ==
+           std::get<GCPtr<Function>>(expected.data);
   }
   if (actual.isArray()) {
-    return std::get<std::shared_ptr<Array>>(actual.data) ==
-           std::get<std::shared_ptr<Array>>(expected.data);
+    return std::get<GCPtr<Array>>(actual.data) ==
+           std::get<GCPtr<Array>>(expected.data);
   }
   if (actual.isObject()) {
-    return std::get<std::shared_ptr<Object>>(actual.data) ==
-           std::get<std::shared_ptr<Object>>(expected.data);
+    return std::get<GCPtr<Object>>(actual.data) ==
+           std::get<GCPtr<Object>>(expected.data);
   }
   if (actual.isTypedArray()) {
-    return std::get<std::shared_ptr<TypedArray>>(actual.data) ==
-           std::get<std::shared_ptr<TypedArray>>(expected.data);
+    return std::get<GCPtr<TypedArray>>(actual.data) ==
+           std::get<GCPtr<TypedArray>>(expected.data);
   }
   if (actual.isPromise()) {
-    return std::get<std::shared_ptr<Promise>>(actual.data) ==
-           std::get<std::shared_ptr<Promise>>(expected.data);
+    return std::get<GCPtr<Promise>>(actual.data) ==
+           std::get<GCPtr<Promise>>(expected.data);
   }
   if (actual.isRegex()) {
-    return std::get<std::shared_ptr<Regex>>(actual.data) ==
-           std::get<std::shared_ptr<Regex>>(expected.data);
+    return std::get<GCPtr<Regex>>(actual.data) ==
+           std::get<GCPtr<Regex>>(expected.data);
   }
   if (actual.isMap()) {
-    return std::get<std::shared_ptr<Map>>(actual.data) ==
-           std::get<std::shared_ptr<Map>>(expected.data);
+    return std::get<GCPtr<Map>>(actual.data) ==
+           std::get<GCPtr<Map>>(expected.data);
   }
   if (actual.isSet()) {
-    return std::get<std::shared_ptr<Set>>(actual.data) ==
-           std::get<std::shared_ptr<Set>>(expected.data);
+    return std::get<GCPtr<Set>>(actual.data) ==
+           std::get<GCPtr<Set>>(expected.data);
   }
   if (actual.isError()) {
-    return std::get<std::shared_ptr<Error>>(actual.data) ==
-           std::get<std::shared_ptr<Error>>(expected.data);
+    return std::get<GCPtr<Error>>(actual.data) ==
+           std::get<GCPtr<Error>>(expected.data);
   }
   if (actual.isGenerator()) {
-    return std::get<std::shared_ptr<Generator>>(actual.data) ==
-           std::get<std::shared_ptr<Generator>>(expected.data);
+    return std::get<GCPtr<Generator>>(actual.data) ==
+           std::get<GCPtr<Generator>>(expected.data);
   }
   if (actual.isProxy()) {
-    return std::get<std::shared_ptr<Proxy>>(actual.data) ==
-           std::get<std::shared_ptr<Proxy>>(expected.data);
+    return std::get<GCPtr<Proxy>>(actual.data) ==
+           std::get<GCPtr<Proxy>>(expected.data);
   }
   if (actual.isWeakMap()) {
-    return std::get<std::shared_ptr<WeakMap>>(actual.data) ==
-           std::get<std::shared_ptr<WeakMap>>(expected.data);
+    return std::get<GCPtr<WeakMap>>(actual.data) ==
+           std::get<GCPtr<WeakMap>>(expected.data);
   }
   if (actual.isWeakSet()) {
-    return std::get<std::shared_ptr<WeakSet>>(actual.data) ==
-           std::get<std::shared_ptr<WeakSet>>(expected.data);
+    return std::get<GCPtr<WeakSet>>(actual.data) ==
+           std::get<GCPtr<WeakSet>>(expected.data);
   }
   if (actual.isArrayBuffer()) {
-    return std::get<std::shared_ptr<ArrayBuffer>>(actual.data) ==
-           std::get<std::shared_ptr<ArrayBuffer>>(expected.data);
+    return std::get<GCPtr<ArrayBuffer>>(actual.data) ==
+           std::get<GCPtr<ArrayBuffer>>(expected.data);
   }
   if (actual.isDataView()) {
-    return std::get<std::shared_ptr<DataView>>(actual.data) ==
-           std::get<std::shared_ptr<DataView>>(expected.data);
+    return std::get<GCPtr<DataView>>(actual.data) ==
+           std::get<GCPtr<DataView>>(expected.data);
   }
   if (actual.isClass()) {
-    return std::get<std::shared_ptr<Class>>(actual.data) ==
-           std::get<std::shared_ptr<Class>>(expected.data);
+    return std::get<GCPtr<Class>>(actual.data) ==
+           std::get<GCPtr<Class>>(expected.data);
   }
   if (actual.isWasmInstance()) {
-    return std::get<std::shared_ptr<WasmInstanceJS>>(actual.data) ==
-           std::get<std::shared_ptr<WasmInstanceJS>>(expected.data);
+    return std::get<GCPtr<WasmInstanceJS>>(actual.data) ==
+           std::get<GCPtr<WasmInstanceJS>>(expected.data);
   }
   if (actual.isWasmMemory()) {
-    return std::get<std::shared_ptr<WasmMemoryJS>>(actual.data) ==
-           std::get<std::shared_ptr<WasmMemoryJS>>(expected.data);
+    return std::get<GCPtr<WasmMemoryJS>>(actual.data) ==
+           std::get<GCPtr<WasmMemoryJS>>(expected.data);
   }
   if (actual.isReadableStream()) {
-    return std::get<std::shared_ptr<ReadableStream>>(actual.data) ==
-           std::get<std::shared_ptr<ReadableStream>>(expected.data);
+    return std::get<GCPtr<ReadableStream>>(actual.data) ==
+           std::get<GCPtr<ReadableStream>>(expected.data);
   }
   if (actual.isWritableStream()) {
-    return std::get<std::shared_ptr<WritableStream>>(actual.data) ==
-           std::get<std::shared_ptr<WritableStream>>(expected.data);
+    return std::get<GCPtr<WritableStream>>(actual.data) ==
+           std::get<GCPtr<WritableStream>>(expected.data);
   }
   if (actual.isTransformStream()) {
-    return std::get<std::shared_ptr<TransformStream>>(actual.data) ==
-           std::get<std::shared_ptr<TransformStream>>(expected.data);
+    return std::get<GCPtr<TransformStream>>(actual.data) ==
+           std::get<GCPtr<TransformStream>>(expected.data);
   }
 
   return false;
 }
 }  // namespace
 
-void installTest262Harness(std::shared_ptr<Environment> env) {
+void installTest262Harness(GCPtr<Environment> env) {
   // Test262 Error constructor
-  auto Test262Error = std::make_shared<Function>();
+  auto Test262Error = GarbageCollector::makeGC<Function>();
   Test262Error->isNative = true;
   Test262Error->isConstructor = true;
-  auto test262ErrorProto = std::make_shared<Object>();
+  auto test262ErrorProto = GarbageCollector::makeGC<Object>();
   test262ErrorProto->properties["constructor"] = Value(Test262Error);
   Test262Error->properties["prototype"] = Value(test262ErrorProto);
   Test262Error->nativeFunc = [Test262Error, test262ErrorProto](const std::vector<Value>& args) -> Value {
-    auto error = std::make_shared<Object>();
+    auto error = GarbageCollector::makeGC<Object>();
     error->properties["__proto__"] = Value(test262ErrorProto);
     error->properties["constructor"] = Value(Test262Error);
     error->properties["message"] = args.empty() ? Value(std::string("")) : args[0];
@@ -148,7 +148,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     return Value(error);
   };
   // Test262Error.thrower - throws a Test262Error (defined in sta.js)
-  auto throwerFunc = std::make_shared<Function>();
+  auto throwerFunc = GarbageCollector::makeGC<Function>();
   throwerFunc->isNative = true;
   throwerFunc->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string message = args.empty() ? "" : args[0].toString();
@@ -159,7 +159,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("Test262Error", Value(Test262Error));
 
   // $ERROR function (throws Test262Error)
-  auto $ERROR = std::make_shared<Function>();
+  auto $ERROR = GarbageCollector::makeGC<Function>();
   $ERROR->isNative = true;
   $ERROR->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string message = args.empty() ? "Test262 Error" : args[0].toString();
@@ -168,17 +168,17 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("$ERROR", Value($ERROR));
 
   // $262 global object
-  auto $262 = std::make_shared<Object>();
+  auto $262 = GarbageCollector::makeGC<Object>();
 
   // $262.createRealm()
-  auto createRealm = std::make_shared<Function>();
+  auto createRealm = GarbageCollector::makeGC<Function>();
   createRealm->isNative = true;
   createRealm->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto realmEnv = createTest262Environment();
-    auto realm = std::make_shared<Object>();
+    auto realm = GarbageCollector::makeGC<Object>();
     realm->properties["global"] = Value(realmEnv->getGlobal());
 
-    auto $eval = std::make_shared<Function>();
+    auto $eval = GarbageCollector::makeGC<Function>();
     $eval->isNative = true;
     $eval->nativeFunc = [realmEnv](const std::vector<Value>& args) -> Value {
       if (args.empty() || !args[0].isString()) {
@@ -213,12 +213,12 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   $262->properties["createRealm"] = Value(createRealm);
 
   // $262.detachArrayBuffer()
-  auto detachArrayBuffer = std::make_shared<Function>();
+  auto detachArrayBuffer = GarbageCollector::makeGC<Function>();
   detachArrayBuffer->isNative = true;
   detachArrayBuffer->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Mark TypedArray as detached (simplified)
     if (!args.empty()) {
-      if (auto* arr = std::get_if<std::shared_ptr<TypedArray>>(&args[0].data)) {
+      if (auto* arr = std::get_if<GCPtr<TypedArray>>(&args[0].data)) {
         (*arr)->buffer.clear();
       }
     }
@@ -227,7 +227,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   $262->properties["detachArrayBuffer"] = Value(detachArrayBuffer);
 
   // $262.evalScript()
-  auto evalScript = std::make_shared<Function>();
+  auto evalScript = GarbageCollector::makeGC<Function>();
   evalScript->isNative = true;
   evalScript->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // Simplified evalScript
@@ -236,7 +236,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   $262->properties["evalScript"] = Value(evalScript);
 
   // $262.gc()
-  auto gc = std::make_shared<Function>();
+  auto gc = GarbageCollector::makeGC<Function>();
   gc->isNative = true;
   gc->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // No-op for GC
@@ -248,30 +248,30 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   $262->properties["global"] = Value(env->getGlobal());
 
   // $262.agent object
-  auto agent = std::make_shared<Object>();
+  auto agent = GarbageCollector::makeGC<Object>();
 
-  auto start = std::make_shared<Function>();
+  auto start = GarbageCollector::makeGC<Function>();
   start->isNative = true;
   start->nativeFunc = [](const std::vector<Value>& args) -> Value {
     return Value(Undefined{});
   };
   agent->properties["start"] = Value(start);
 
-  auto broadcast = std::make_shared<Function>();
+  auto broadcast = GarbageCollector::makeGC<Function>();
   broadcast->isNative = true;
   broadcast->nativeFunc = [](const std::vector<Value>& args) -> Value {
     return Value(Undefined{});
   };
   agent->properties["broadcast"] = Value(broadcast);
 
-  auto getReport = std::make_shared<Function>();
+  auto getReport = GarbageCollector::makeGC<Function>();
   getReport->isNative = true;
   getReport->nativeFunc = [](const std::vector<Value>& args) -> Value {
     return Value(std::string(""));
   };
   agent->properties["getReport"] = Value(getReport);
 
-  auto sleep = std::make_shared<Function>();
+  auto sleep = GarbageCollector::makeGC<Function>();
   sleep->isNative = true;
   sleep->nativeFunc = [](const std::vector<Value>& args) -> Value {
     return Value(Undefined{});
@@ -283,7 +283,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("$262", Value($262));
 
   // Basic assert function
-  auto assertFunc = std::make_shared<Function>();
+  auto assertFunc = GarbageCollector::makeGC<Function>();
   assertFunc->isNative = true;
   assertFunc->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].toBool()) {
@@ -294,12 +294,12 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   };
 
   // Make assert callable
-  auto assertCallable = std::make_shared<Function>();
+  auto assertCallable = GarbageCollector::makeGC<Function>();
   assertCallable->isNative = true;
   assertCallable->nativeFunc = assertFunc->nativeFunc;
 
   // assert.sameValue
-  auto sameValue = std::make_shared<Function>();
+  auto sameValue = GarbageCollector::makeGC<Function>();
   sameValue->isNative = true;
   sameValue->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -319,7 +319,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   assertCallable->properties["sameValue"] = Value(sameValue);
 
   // assert.notSameValue
-  auto notSameValue = std::make_shared<Function>();
+  auto notSameValue = GarbageCollector::makeGC<Function>();
   notSameValue->isNative = true;
   notSameValue->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -339,7 +339,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   assertCallable->properties["notSameValue"] = Value(notSameValue);
 
   // assert.throws
-  auto throws = std::make_shared<Function>();
+  auto throws = GarbageCollector::makeGC<Function>();
   throws->isNative = true;
   throws->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -350,7 +350,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     auto errorConstructor = args[0];
     auto func = args[1];
 
-    if (auto* f = std::get_if<std::shared_ptr<Function>>(&func.data)) {
+    if (auto* f = std::get_if<GCPtr<Function>>(&func.data)) {
       bool thrown = false;
       Interpreter* interpreter = getGlobalInterpreter();
 
@@ -382,8 +382,8 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   assertCallable->properties["throws"] = Value(throws);
 
   auto arraysEqual = [](const Value& lhs, const Value& rhs) -> bool {
-    auto* arr1 = std::get_if<std::shared_ptr<Array>>(&lhs.data);
-    auto* arr2 = std::get_if<std::shared_ptr<Array>>(&rhs.data);
+    auto* arr1 = std::get_if<GCPtr<Array>>(&lhs.data);
+    auto* arr2 = std::get_if<GCPtr<Array>>(&rhs.data);
     if (!arr1 || !arr2) return false;
     if ((*arr1)->elements.size() != (*arr2)->elements.size()) return false;
     for (size_t i = 0; i < (*arr1)->elements.size(); i++) {
@@ -396,7 +396,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
 
   // assert.compareArray(actual, expected[, message])
   // Test262 expects this to return `undefined` on success and throw on mismatch.
-  auto assertCompareArray = std::make_shared<Function>();
+  auto assertCompareArray = GarbageCollector::makeGC<Function>();
   assertCompareArray->isNative = true;
   assertCompareArray->nativeFunc = [arraysEqual](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -404,8 +404,8 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
     }
     if (!arraysEqual(args[0], args[1])) {
       std::string message = args.size() > 2 ? args[2].toString() : "Array comparison failed";
-      auto* arr1 = std::get_if<std::shared_ptr<Array>>(&args[0].data);
-      auto* arr2 = std::get_if<std::shared_ptr<Array>>(&args[1].data);
+      auto* arr1 = std::get_if<GCPtr<Array>>(&args[0].data);
+      auto* arr2 = std::get_if<GCPtr<Array>>(&args[1].data);
       if (!arr1 || !arr2) {
         throw std::runtime_error("AssertionError: " + message + " (non-array operand)");
       }
@@ -432,7 +432,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("assert", Value(assertCallable));
 
   // Legacy global compareArray helper returns boolean.
-  auto compareArray = std::make_shared<Function>();
+  auto compareArray = GarbageCollector::makeGC<Function>();
   compareArray->isNative = true;
   compareArray->nativeFunc = [arraysEqual](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
@@ -441,7 +441,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("compareArray", Value(compareArray));
 
   // $DONE function for async tests
-  auto $DONE = std::make_shared<Function>();
+  auto $DONE = GarbageCollector::makeGC<Function>();
   $DONE->isNative = true;
   $DONE->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (!args.empty() && !std::holds_alternative<Undefined>(args[0].data)) {
@@ -454,20 +454,20 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   // Test262 specific helpers
 
   // isConstructor
-  auto isConstructor = std::make_shared<Function>();
+  auto isConstructor = GarbageCollector::makeGC<Function>();
   isConstructor->isNative = true;
   isConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
-    if (!std::holds_alternative<std::shared_ptr<Function>>(args[0].data)) {
+    if (!std::holds_alternative<GCPtr<Function>>(args[0].data)) {
       return Value(false);
     }
-    auto fn = std::get<std::shared_ptr<Function>>(args[0].data);
+    auto fn = std::get<GCPtr<Function>>(args[0].data);
     return Value(fn->isConstructor);
   };
   env->define("isConstructor", Value(isConstructor));
 
   // fnGlobalObject
-  auto fnGlobalObject = std::make_shared<Function>();
+  auto fnGlobalObject = GarbageCollector::makeGC<Function>();
   fnGlobalObject->isNative = true;
   fnGlobalObject->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     return Value(env->getGlobal());
@@ -478,7 +478,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   // We don't define a native version to avoid conflicts with the more complete JS implementation.
 
   // buildString helper
-  auto buildString = std::make_shared<Function>();
+  auto buildString = GarbageCollector::makeGC<Function>();
   buildString->isNative = true;
   buildString->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string result;
@@ -495,7 +495,7 @@ void installTest262Harness(std::shared_ptr<Environment> env) {
   env->define("buildString", Value(buildString));
 }
 
-std::shared_ptr<Environment> createTest262Environment() {
+GCPtr<Environment> createTest262Environment() {
   auto env = Environment::createGlobal();
   installTest262Harness(env);
   return env;

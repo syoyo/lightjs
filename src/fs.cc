@@ -28,7 +28,7 @@ Value readFileSync(const std::string& path, const std::string& encoding) {
     }
 
     // Otherwise return as Uint8Array
-    auto array = std::make_shared<TypedArray>(TypedArrayType::Uint8, contents.size());
+    auto array = GarbageCollector::makeGC<TypedArray>(TypedArrayType::Uint8, contents.size());
     for (size_t i = 0; i < contents.size(); i++) {
       array->setElement(i, static_cast<uint8_t>(contents[i]));
     }
@@ -51,13 +51,13 @@ void writeFileSync(const std::string& path, const Value& data) {
       file << *str;
     }
     // Handle TypedArray data
-    else if (auto* typedArray = std::get_if<std::shared_ptr<TypedArray>>(&data.data)) {
+    else if (auto* typedArray = std::get_if<GCPtr<TypedArray>>(&data.data)) {
       for (size_t i = 0; i < (*typedArray)->length; i++) {
         file.put(static_cast<char>((*typedArray)->getElement(i)));
       }
     }
     // Handle ArrayBuffer data
-    else if (auto* arrayBuffer = std::get_if<std::shared_ptr<ArrayBuffer>>(&data.data)) {
+    else if (auto* arrayBuffer = std::get_if<GCPtr<ArrayBuffer>>(&data.data)) {
       file.write(reinterpret_cast<const char*>((*arrayBuffer)->data.data()),
                  (*arrayBuffer)->byteLength);
     }
@@ -125,7 +125,7 @@ void rmdirSync(const std::string& path, bool recursive) {
 
 Value readdirSync(const std::string& path) {
   try {
-    auto arr = std::make_shared<Array>();
+    auto arr = GarbageCollector::makeGC<Array>();
 
     auto entries = fs_compat::readDirectory(path);
     for (const auto& entry : entries) {
@@ -140,7 +140,7 @@ Value readdirSync(const std::string& path) {
 
 Value statSync(const std::string& path) {
   try {
-    auto stats = std::make_shared<Object>();
+    auto stats = GarbageCollector::makeGC<Object>();
 
     auto status = fs_compat::getStatus(path);
     if (!status.exists) {
@@ -176,7 +176,7 @@ void renameSync(const std::string& oldPath, const std::string& newPath) {
 // Asynchronous implementations (return Promises)
 
 Value readFile(const std::string& path, const std::string& encoding) {
-  auto promise = std::make_shared<Promise>();
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   try {
     Value result = readFileSync(path, encoding);
@@ -184,7 +184,7 @@ Value readFile(const std::string& path, const std::string& encoding) {
     promise->result = result;
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
-    auto error = std::make_shared<Error>(ErrorType::Error);
+    auto error = GarbageCollector::makeGC<Error>(ErrorType::Error, std::string{});
     error->message = e.what();
     promise->result = Value(error);
   }
@@ -193,7 +193,7 @@ Value readFile(const std::string& path, const std::string& encoding) {
 }
 
 Value writeFile(const std::string& path, const Value& data) {
-  auto promise = std::make_shared<Promise>();
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   try {
     writeFileSync(path, data);
@@ -201,7 +201,7 @@ Value writeFile(const std::string& path, const Value& data) {
     promise->result = Value(Undefined{});
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
-    auto error = std::make_shared<Error>(ErrorType::Error);
+    auto error = GarbageCollector::makeGC<Error>(ErrorType::Error, std::string{});
     error->message = e.what();
     promise->result = Value(error);
   }
@@ -210,7 +210,7 @@ Value writeFile(const std::string& path, const Value& data) {
 }
 
 Value appendFile(const std::string& path, const Value& data) {
-  auto promise = std::make_shared<Promise>();
+  auto promise = GarbageCollector::makeGC<Promise>();
 
   try {
     appendFileSync(path, data);
@@ -218,7 +218,7 @@ Value appendFile(const std::string& path, const Value& data) {
     promise->result = Value(Undefined{});
   } catch (const std::exception& e) {
     promise->state = PromiseState::Rejected;
-    auto error = std::make_shared<Error>(ErrorType::Error);
+    auto error = GarbageCollector::makeGC<Error>(ErrorType::Error, std::string{});
     error->message = e.what();
     promise->result = Value(error);
   }
@@ -230,11 +230,11 @@ Value appendFile(const std::string& path, const Value& data) {
 
 // Create fs module object
 
-std::shared_ptr<Object> createFSModule() {
-  auto fsModule = std::make_shared<Object>();
+GCPtr<Object> createFSModule() {
+  auto fsModule = GarbageCollector::makeGC<Object>();
 
   // readFileSync
-  auto readFileSyncFn = std::make_shared<Function>();
+  auto readFileSyncFn = GarbageCollector::makeGC<Function>();
   readFileSyncFn->isNative = true;
   readFileSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -247,7 +247,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["readFileSync"] = Value(readFileSyncFn);
 
   // writeFileSync
-  auto writeFileSyncFn = std::make_shared<Function>();
+  auto writeFileSyncFn = GarbageCollector::makeGC<Function>();
   writeFileSyncFn->isNative = true;
   writeFileSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -259,7 +259,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["writeFileSync"] = Value(writeFileSyncFn);
 
   // appendFileSync
-  auto appendFileSyncFn = std::make_shared<Function>();
+  auto appendFileSyncFn = GarbageCollector::makeGC<Function>();
   appendFileSyncFn->isNative = true;
   appendFileSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -271,7 +271,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["appendFileSync"] = Value(appendFileSyncFn);
 
   // existsSync
-  auto existsSyncFn = std::make_shared<Function>();
+  auto existsSyncFn = GarbageCollector::makeGC<Function>();
   existsSyncFn->isNative = true;
   existsSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
@@ -280,7 +280,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["existsSync"] = Value(existsSyncFn);
 
   // unlinkSync
-  auto unlinkSyncFn = std::make_shared<Function>();
+  auto unlinkSyncFn = GarbageCollector::makeGC<Function>();
   unlinkSyncFn->isNative = true;
   unlinkSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -292,7 +292,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["unlinkSync"] = Value(unlinkSyncFn);
 
   // mkdirSync
-  auto mkdirSyncFn = std::make_shared<Function>();
+  auto mkdirSyncFn = GarbageCollector::makeGC<Function>();
   mkdirSyncFn->isNative = true;
   mkdirSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -300,7 +300,7 @@ std::shared_ptr<Object> createFSModule() {
     }
     bool recursive = false;
     if (args.size() > 1) {
-      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].data)) {
+      if (auto* obj = std::get_if<GCPtr<Object>>(&args[1].data)) {
         auto it = (*obj)->properties.find("recursive");
         if (it != (*obj)->properties.end()) {
           recursive = it->second.toBool();
@@ -313,7 +313,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["mkdirSync"] = Value(mkdirSyncFn);
 
   // rmdirSync
-  auto rmdirSyncFn = std::make_shared<Function>();
+  auto rmdirSyncFn = GarbageCollector::makeGC<Function>();
   rmdirSyncFn->isNative = true;
   rmdirSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -321,7 +321,7 @@ std::shared_ptr<Object> createFSModule() {
     }
     bool recursive = false;
     if (args.size() > 1) {
-      if (auto* obj = std::get_if<std::shared_ptr<Object>>(&args[1].data)) {
+      if (auto* obj = std::get_if<GCPtr<Object>>(&args[1].data)) {
         auto it = (*obj)->properties.find("recursive");
         if (it != (*obj)->properties.end()) {
           recursive = it->second.toBool();
@@ -334,7 +334,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["rmdirSync"] = Value(rmdirSyncFn);
 
   // readdirSync
-  auto readdirSyncFn = std::make_shared<Function>();
+  auto readdirSyncFn = GarbageCollector::makeGC<Function>();
   readdirSyncFn->isNative = true;
   readdirSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -345,7 +345,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["readdirSync"] = Value(readdirSyncFn);
 
   // statSync
-  auto statSyncFn = std::make_shared<Function>();
+  auto statSyncFn = GarbageCollector::makeGC<Function>();
   statSyncFn->isNative = true;
   statSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -356,7 +356,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["statSync"] = Value(statSyncFn);
 
   // copyFileSync
-  auto copyFileSyncFn = std::make_shared<Function>();
+  auto copyFileSyncFn = GarbageCollector::makeGC<Function>();
   copyFileSyncFn->isNative = true;
   copyFileSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -368,7 +368,7 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["copyFileSync"] = Value(copyFileSyncFn);
 
   // renameSync
-  auto renameSyncFn = std::make_shared<Function>();
+  auto renameSyncFn = GarbageCollector::makeGC<Function>();
   renameSyncFn->isNative = true;
   renameSyncFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -380,10 +380,10 @@ std::shared_ptr<Object> createFSModule() {
   fsModule->properties["renameSync"] = Value(renameSyncFn);
 
   // Async versions (promises submodule)
-  auto promises = std::make_shared<Object>();
+  auto promises = GarbageCollector::makeGC<Object>();
 
   // promises.readFile
-  auto readFileFn = std::make_shared<Function>();
+  auto readFileFn = GarbageCollector::makeGC<Function>();
   readFileFn->isNative = true;
   readFileFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
@@ -396,7 +396,7 @@ std::shared_ptr<Object> createFSModule() {
   promises->properties["readFile"] = Value(readFileFn);
 
   // promises.writeFile
-  auto writeFileFn = std::make_shared<Function>();
+  auto writeFileFn = GarbageCollector::makeGC<Function>();
   writeFileFn->isNative = true;
   writeFileFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -407,7 +407,7 @@ std::shared_ptr<Object> createFSModule() {
   promises->properties["writeFile"] = Value(writeFileFn);
 
   // promises.appendFile
-  auto appendFileFn = std::make_shared<Function>();
+  auto appendFileFn = GarbageCollector::makeGC<Function>();
   appendFileFn->isNative = true;
   appendFileFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
@@ -419,7 +419,7 @@ std::shared_ptr<Object> createFSModule() {
 
   fsModule->properties["promises"] = Value(promises);
 
-  return fsModule;
+  return GCPtr<Object>(fsModule);
 }
 
 } // namespace lightjs

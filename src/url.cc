@@ -319,8 +319,8 @@ void URL::updateHref() {
 
 // Constructor functions
 
-std::shared_ptr<Function> createURLSearchParamsConstructor() {
-  auto constructor = std::make_shared<Function>();
+GCPtr<Function> createURLSearchParamsConstructor() {
+  auto constructor = GarbageCollector::makeGC<Function>();
   constructor->isNative = true;
   constructor->isConstructor = true;
 
@@ -333,10 +333,10 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     auto params = std::make_shared<URLSearchParams>(query);
 
     // Create wrapper object with methods
-    auto obj = std::make_shared<Object>();
+    auto obj = GarbageCollector::makeGC<Object>();
 
     // append method
-    auto appendFn = std::make_shared<Function>();
+    auto appendFn = GarbageCollector::makeGC<Function>();
     appendFn->isNative = true;
     appendFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (args.size() >= 2) {
@@ -347,7 +347,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["append"] = Value(appendFn);
 
     // delete method
-    auto deleteFn = std::make_shared<Function>();
+    auto deleteFn = GarbageCollector::makeGC<Function>();
     deleteFn->isNative = true;
     deleteFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (!args.empty()) {
@@ -358,7 +358,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["delete"] = Value(deleteFn);
 
     // get method
-    auto getFn = std::make_shared<Function>();
+    auto getFn = GarbageCollector::makeGC<Function>();
     getFn->isNative = true;
     getFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (args.empty()) return Value(Null{});
@@ -368,14 +368,14 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["get"] = Value(getFn);
 
     // getAll method
-    auto getAllFn = std::make_shared<Function>();
+    auto getAllFn = GarbageCollector::makeGC<Function>();
     getAllFn->isNative = true;
     getAllFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
-        return Value(std::make_shared<Array>());
+        return Value(GarbageCollector::makeGC<Array>());
       }
       auto values = params->getAll(args[0].toString());
-      auto arr = std::make_shared<Array>();
+      auto arr = GarbageCollector::makeGC<Array>();
       for (const auto& v : values) {
         arr->elements.push_back(Value(v));
       }
@@ -384,7 +384,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["getAll"] = Value(getAllFn);
 
     // has method
-    auto hasFn = std::make_shared<Function>();
+    auto hasFn = GarbageCollector::makeGC<Function>();
     hasFn->isNative = true;
     hasFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (args.empty()) return Value(false);
@@ -393,7 +393,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["has"] = Value(hasFn);
 
     // set method
-    auto setFn = std::make_shared<Function>();
+    auto setFn = GarbageCollector::makeGC<Function>();
     setFn->isNative = true;
     setFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       if (args.size() >= 2) {
@@ -404,7 +404,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["set"] = Value(setFn);
 
     // sort method
-    auto sortFn = std::make_shared<Function>();
+    auto sortFn = GarbageCollector::makeGC<Function>();
     sortFn->isNative = true;
     sortFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       params->sort();
@@ -413,7 +413,7 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     obj->properties["sort"] = Value(sortFn);
 
     // toString method
-    auto toStringFn = std::make_shared<Function>();
+    auto toStringFn = GarbageCollector::makeGC<Function>();
     toStringFn->isNative = true;
     toStringFn->nativeFunc = [params](const std::vector<Value>& args) -> Value {
       return Value(params->toString());
@@ -423,11 +423,11 @@ std::shared_ptr<Function> createURLSearchParamsConstructor() {
     return Value(obj);
   };
 
-  return constructor;
+  return GCPtr<Function>(constructor);
 }
 
-std::shared_ptr<Function> createURLConstructor() {
-  auto constructor = std::make_shared<Function>();
+GCPtr<Function> createURLConstructor() {
+  auto constructor = GarbageCollector::makeGC<Function>();
   constructor->isNative = true;
   constructor->isConstructor = true;
 
@@ -442,7 +442,7 @@ std::shared_ptr<Function> createURLConstructor() {
     auto url = std::make_shared<URL>(urlStr, base);
 
     // Create wrapper object with properties
-    auto obj = std::make_shared<Object>();
+    auto obj = GarbageCollector::makeGC<Object>();
 
     obj->properties["href"] = Value(url->href);
     obj->properties["protocol"] = Value(url->protocol);
@@ -462,7 +462,7 @@ std::shared_ptr<Function> createURLConstructor() {
     obj->properties["searchParams"] = searchParamsObj;
 
     // toString method
-    auto toStringFn = std::make_shared<Function>();
+    auto toStringFn = GarbageCollector::makeGC<Function>();
     toStringFn->isNative = true;
     toStringFn->nativeFunc = [url](const std::vector<Value>& args) -> Value {
       return Value(url->toString());
@@ -472,7 +472,7 @@ std::shared_ptr<Function> createURLConstructor() {
     return Value(obj);
   };
 
-  return constructor;
+  return GCPtr<Function>(constructor);
 }
 
 } // namespace lightjs
