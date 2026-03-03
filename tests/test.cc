@@ -910,7 +910,7 @@ int main() {
 
   runTest("Symbol - with description", R"(
     const sym = Symbol("mySymbol");
-    "" + sym  // This will use toString() internally
+    sym.toString()
   )", "Symbol(mySymbol)");
 
   runTest("Symbol - unique identity", R"(
