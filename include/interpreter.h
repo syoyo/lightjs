@@ -9,6 +9,8 @@
 #include <memory>
 #include <iostream>
 #include <exception>
+#include <set>
+#include <unordered_map>
 #include <utility>
 
 #if LIGHTJS_HAS_COROUTINES
@@ -254,6 +256,16 @@ inline Value runTask(Task&& t) {
 
 #endif // LIGHTJS_HAS_COROUTINES
 
+class JsValueException : public std::exception {
+public:
+  explicit JsValueException(const Value& value) : value_(value) {}
+  const char* what() const noexcept override { return "JavaScript value exception"; }
+  const Value& value() const { return value_; }
+
+private:
+  Value value_;
+};
+
 class Interpreter {
   friend class Module;
   friend struct TaskAwaiter;
@@ -270,7 +282,16 @@ public:
   void setSuppressMicrotasks(bool value) { suppressMicrotasks_ = value; }
   bool suppressMicrotasks() const { return suppressMicrotasks_; }
   bool inDirectEvalInvocation() const { return activeDirectEvalInvocation_; }
+  bool inParameterInitializerEvaluation() const { return activeParameterInitializerEvaluation_; }
+  bool inFieldInitializerEvaluation() const { return activeFieldInitializerEvaluation_; }
   bool isStrictMode() const { return strictMode_; }
+  bool activeFunctionIsArrow() const;
+  bool activeFunctionHasHomeObject() const;
+  bool activeFunctionHasSuperClassBinding() const;
+  bool activeFunctionIsConstructor() const;
+  std::set<std::string> activePrivateNamesForEval() const;
+  void inheritDirectEvalContextFrom(const Interpreter& caller);
+  bool hasActiveFunction() const { return activeFunction_.get() != nullptr; }
   void setStrictMode(bool strict) { strictMode_ = strict; }
   void setSourceKeepAlive(std::shared_ptr<void> keep) { sourceKeepAlive_ = std::move(keep); }
 
@@ -303,6 +324,8 @@ private:
   size_t stackDepth_ = 0;
   StackTraceManager stackTrace_;
   bool suppressMicrotasks_ = false;
+  // Per-realm (Interpreter) template object cache for tagged templates.
+  std::unordered_map<const void*, Value> templateObjectCache_;
 
   // RAII helper for stack depth tracking
   struct StackGuard {
@@ -327,6 +350,9 @@ private:
     std::string label;
     ResumeMode resumeMode = ResumeMode::None;
     Value resumeValue = Value(Undefined{});
+    // Internal: `yield*` needs to yield iterator result objects directly (i.e.
+    // without wrapping in `{ value, done: false }`).
+    bool yieldIsIteratorResult = false;
     // Completion value from try/finally override for break/continue.
     // Set when finally block produces break/continue to carry the UpdateEmpty'd value.
     std::optional<Value> breakCompletionValue;
@@ -338,11 +364,19 @@ private:
       resumeMode = ResumeMode::None;
       resumeValue = Value(Undefined{});
       breakCompletionValue = std::nullopt;
+      yieldIsIteratorResult = false;
     }
 
     void setYield(const Value& v) {
       type = Type::Yield;
       value = v;
+      yieldIsIteratorResult = false;
+    }
+
+    void setYieldIteratorResult(const Value& iterResult) {
+      type = Type::Yield;
+      value = iterResult;
+      yieldIsIteratorResult = true;
     }
 
     void prepareResume(ResumeMode mode, const Value& v) {
@@ -370,11 +404,15 @@ private:
   bool varDeclBypassWith_ = false;  // Set during var declaration eval to bypass with scopes
   bool inTailPosition_ = false;
   GCPtr<Function> activeFunction_ = {};
+  GCPtr<Class> activePrivateOwnerClass_ = {};
   bool pendingSelfTailCall_ = false;
   std::vector<Value> pendingSelfTailArgs_;
   Value pendingSelfTailThis_ = Value(Undefined{});
   bool pendingDirectEvalCall_ = false;
   bool activeDirectEvalInvocation_ = false;
+  bool activeParameterInitializerEvaluation_ = false;
+  bool activeFieldInitializerEvaluation_ = false;
+  std::optional<std::string> pendingAnonymousClassName_;
   std::shared_ptr<void> sourceKeepAlive_;  // Keeps eval AST alive for function bodies
   std::vector<GCPtr<Function>> activeNamedExpressionStack_;
   std::string pendingIterationLabel_;  // Label for next iteration statement (consumed once)
@@ -384,7 +422,8 @@ private:
     Kind kind = Kind::Array;
     GCPtr<Generator> generator;
     GCPtr<Array> array;
-    GCPtr<Object> iteratorObject;
+    // Iterator value for Kind::IteratorObject (may be Object, Function, Proxy, etc.)
+    Value iteratorValue = Value(Undefined{});
     GCPtr<TypedArray> typedArray;
     std::string stringValue;
     size_t index = 0;
@@ -403,6 +442,23 @@ private:
   bool isObjectLike(const Value& value) const;
   std::pair<bool, Value> getPropertyForPrimitive(const Value& receiver, const std::string& key);
   Value toPrimitiveValue(const Value& input, bool preferString, bool useDefaultHint = false);
+  bool defineClassElementOnValue(Value& targetVal,
+                                 const std::string& key,
+                                 const Value& propertyValue,
+                                 bool useProxyDefineTrapForPublic);
+  Value getPrototypeFromConstructorValue(const Value& ctorValue);
+  GCPtr<Environment> getRealmRootEnvFromConstructorValue(const Value& ctorValue);
+  Value getIntrinsicObjectPrototypeForCtor(const Value& ctorValue);
+  Value getOrdinaryCreatePrototypeFromNewTarget(const Value& newTargetValue);
+  Value getInstanceFieldSuperBase(const GCPtr<Class>& cls);
+  Value getStaticFieldSuperBase(const GCPtr<Class>& cls);
+  void maybeInferAnonymousFieldInitializerName(const std::string& fieldName,
+                                               bool isPrivate,
+                                               const Expression* initExpr,
+                                               Value& fieldValue);
+  Task initializeClassInstanceElements(const GCPtr<Class>& cls, Value receiver);
+  Task initializeClassStaticFields(const GCPtr<Class>& cls,
+                                   const std::vector<Class::FieldInit>& staticFields);
 
   Task evaluateBinary(const BinaryExpr& expr);
   Task evaluateUnary(const UnaryExpr& expr);

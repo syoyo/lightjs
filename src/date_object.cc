@@ -102,16 +102,78 @@ Value Date_constructor(const std::vector<Value>& args) {
         date->setTime(ms);
     } else if (args.size() >= 2) {
         // Date(year, month, day?, hour?, minute?, second?, millisecond?)
-        int year = args[0].isNumber() ? static_cast<int>(std::get<double>(args[0].data)) : 1970;
-        int month = args[1].isNumber() ? static_cast<int>(std::get<double>(args[1].data)) : 0;
-        int day = args.size() > 2 && args[2].isNumber() ? static_cast<int>(std::get<double>(args[2].data)) : 1;
-        int hour = args.size() > 3 && args[3].isNumber() ? static_cast<int>(std::get<double>(args[3].data)) : 0;
-        int minute = args.size() > 4 && args[4].isNumber() ? static_cast<int>(std::get<double>(args[4].data)) : 0;
-        int second = args.size() > 5 && args[5].isNumber() ? static_cast<int>(std::get<double>(args[5].data)) : 0;
-        int ms = args.size() > 6 && args[6].isNumber() ? static_cast<int>(std::get<double>(args[6].data)) : 0;
+        int year = args[0].isUndefined() ? 1970 : static_cast<int>(args[0].toNumber());
+        int month = args[1].isUndefined() ? 0 : static_cast<int>(args[1].toNumber());
+        int day = args.size() > 2 && !args[2].isUndefined() ? static_cast<int>(args[2].toNumber()) : 1;
+        int hour = args.size() > 3 && !args[3].isUndefined() ? static_cast<int>(args[3].toNumber()) : 0;
+        int minute = args.size() > 4 && !args[4].isUndefined() ? static_cast<int>(args[4].toNumber()) : 0;
+        int second = args.size() > 5 && !args[5].isUndefined() ? static_cast<int>(args[5].toNumber()) : 0;
+        int ms = args.size() > 6 && !args[6].isUndefined() ? static_cast<int>(args[6].toNumber()) : 0;
 
         date = GarbageCollector::makeGC<Date>(year, month, day, hour, minute, second, ms);
     }
+
+    // Store time value for prototype/instance methods.
+    date->properties["__date_ms__"] = Value(static_cast<double>(date->getTime()));
+
+    auto readThisMs = [](const std::vector<Value>& args) -> int64_t {
+      if (args.empty() || !args[0].isObject()) {
+        throw std::runtime_error("TypeError: Date method called on non-object");
+      }
+      auto obj = args[0].getGC<Object>();
+      auto it = obj->properties.find("__date_ms__");
+      if (it == obj->properties.end() || !it->second.isNumber()) {
+        throw std::runtime_error("TypeError: Date method called on incompatible receiver");
+      }
+      return static_cast<int64_t>(it->second.toNumber());
+    };
+
+    auto install = [&](const std::string& name, std::function<Value(const std::vector<Value>&)> fn) {
+      auto f = GarbageCollector::makeGC<Function>();
+      f->isNative = true;
+      f->properties["__uses_this_arg__"] = Value(true);
+      f->properties["__throw_on_new__"] = Value(true);
+      f->nativeFunc = fn;
+      date->properties[name] = Value(f);
+      date->properties["__non_enum_" + name] = Value(true);
+    };
+
+    install("getFullYear", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toTm();
+      return Value(static_cast<double>(tm.tm_year + 1900));
+    });
+    install("getMonth", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toTm();
+      return Value(static_cast<double>(tm.tm_mon));
+    });
+    install("getDate", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toTm();
+      return Value(static_cast<double>(tm.tm_mday));
+    });
+    install("getUTCFullYear", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toUtcTm();
+      return Value(static_cast<double>(tm.tm_year + 1900));
+    });
+    install("getUTCMonth", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toUtcTm();
+      return Value(static_cast<double>(tm.tm_mon));
+    });
+    install("getUTCDate", [readThisMs](const std::vector<Value>& args) -> Value {
+      int64_t ms = readThisMs(args);
+      Date tmp(ms);
+      auto tm = tmp.toUtcTm();
+      return Value(static_cast<double>(tm.tm_mday));
+    });
 
     auto toStringFn = GarbageCollector::makeGC<Function>();
     toStringFn->isNative = true;

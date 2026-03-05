@@ -42,9 +42,24 @@ struct StringLiteral {
   std::string value;
 };
 
+struct TemplateElement {
+  std::string raw;
+  // In tagged templates, illegal escape sequences produce `undefined` for the
+  // cooked value. In untagged templates, they are SyntaxError (we enforce at
+  // evaluation time for now).
+  std::optional<std::string> cooked;
+};
+
 struct TemplateLiteral {
-  std::vector<std::string> quasis;  // Static string parts
+  std::vector<TemplateElement> quasis;  // Static string parts (raw + cooked)
   std::vector<ExprPtr> expressions;  // Interpolated expressions
+};
+
+// First argument to tagged template calls: an array-like template object whose
+// identity is canonicalized per "site" (parse node) and which defines a frozen
+// `.raw` array.
+struct TemplateObjectExpr {
+  std::vector<TemplateElement> quasis;
 };
 
 struct RegexLiteral {
@@ -107,10 +122,11 @@ struct MemberExpr {
   ExprPtr object;
   ExprPtr property;
   bool computed;
+  bool privateIdentifier = false;  // True only for syntax forms obj.#x / obj?.#x
   bool optional;  // Optional chaining (?.)
   bool inOptionalChain = false;  // Part of an optional chain (propagate short-circuit)
   mutable PropertyCache cache;  // Inline cache for property access optimization
-  MemberExpr() : computed(false), optional(false), inOptionalChain(false) {}
+  MemberExpr() : computed(false), privateIdentifier(false), optional(false), inOptionalChain(false) {}
 };
 
 struct ConditionalExpr {
@@ -134,6 +150,7 @@ struct ObjectProperty {
   bool isComputed = false;  // For computed property names ([expr])
   bool isGetter = false;
   bool isSetter = false;
+  bool isProtoSetter = false;  // For non-computed "__proto__": value
 };
 
 struct ObjectExpr {
@@ -163,7 +180,8 @@ struct FunctionExpr {
   bool isAsync;
   bool isGenerator;  // Generator function (function*)
   bool isArrow;  // Arrow function expression (e.g., (x) => x * 2)
-  FunctionExpr() : isAsync(false), isGenerator(false), isArrow(false) {}
+  bool isMethod;  // Concise object/class method semantics
+  FunctionExpr() : isAsync(false), isGenerator(false), isArrow(false), isMethod(false) {}
 };
 
 struct SuperExpr {};
@@ -180,7 +198,7 @@ struct NewExpr {
 struct ThisExpr {};
 
 struct MethodDefinition {
-  enum class Kind { Constructor, Method, Get, Set, Field };
+  enum class Kind { Constructor, Method, Get, Set, Field, StaticBlock };
   Kind kind;
   Identifier key;
   ExprPtr computedKey;  // For computed property names in class elements ([expr])
@@ -251,6 +269,7 @@ struct Expression {
     BigIntLiteral,
     StringLiteral,
     TemplateLiteral,
+    TemplateObjectExpr,
     RegexLiteral,
     BoolLiteral,
     NullLiteral,
@@ -312,6 +331,8 @@ struct ClassDeclaration {
   ExprPtr superClass;
   std::vector<MethodDefinition> methods;
 };
+
+struct EmptyStmt {};
 
 struct ReturnStmt {
   ExprPtr argument;
@@ -445,6 +466,7 @@ struct Statement {
     VarDeclaration,
     FunctionDeclaration,
     ClassDeclaration,
+    EmptyStmt,
     ReturnStmt,
     ExpressionStmt,
     BlockStmt,

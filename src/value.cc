@@ -8,7 +8,9 @@
 #include "wasm_js.h"
 #include <sstream>
 #include <cmath>
+#include <iomanip>
 #include <algorithm>
+#include <limits>
 #include <cstdlib>
 #include <cctype>
 
@@ -62,10 +64,111 @@ void resolveChainedPromise(const GCPtr<Promise>& target, const Value& value) {
 // Initialize static member for Symbol IDs
 size_t Symbol::nextId = 0;
 
+namespace {
+constexpr const char* kSymbolPropertyKeyPrefix = "@@sym:";
+}  // namespace
+
+std::string symbolToPropertyKey(const Symbol& symbol) {
+  return std::string(kSymbolPropertyKeyPrefix) + std::to_string(symbol.id) + ":" + symbol.description;
+}
+
+bool isSymbolPropertyKey(const std::string& key) {
+  if (key.rfind(kSymbolPropertyKeyPrefix, 0) != 0) {
+    return false;
+  }
+  const size_t idStart = std::char_traits<char>::length(kSymbolPropertyKeyPrefix);
+  const size_t colonPos = key.find(':', idStart);
+  if (colonPos == std::string::npos || colonPos == idStart) {
+    return false;
+  }
+  for (size_t i = idStart; i < colonPos; ++i) {
+    if (key[i] < '0' || key[i] > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool propertyKeyToSymbol(const std::string& key, Symbol& outSymbol) {
+  if (!isSymbolPropertyKey(key)) {
+    return false;
+  }
+  const size_t idStart = std::char_traits<char>::length(kSymbolPropertyKeyPrefix);
+  const size_t colonPos = key.find(':', idStart);
+  size_t symbolId = 0;
+  try {
+    symbolId = std::stoull(key.substr(idStart, colonPos - idStart));
+  } catch (...) {
+    return false;
+  }
+  const std::string description = key.substr(colonPos + 1);
+  outSymbol = Symbol(symbolId, description);
+  return true;
+}
+
+std::string valueToPropertyKey(const Value& value) {
+  if (value.isSymbol()) {
+    return symbolToPropertyKey(std::get<Symbol>(value.data));
+  }
+  if (value.isNumber()) {
+    double number = value.toNumber();
+    if (std::isnan(number)) return "NaN";
+    if (std::isinf(number)) return number < 0 ? "-Infinity" : "Infinity";
+    if (number == 0.0) return "0";
+    double absNumber = std::fabs(number);
+    const bool useExponent = absNumber >= 1e21 || (absNumber > 0.0 && absNumber < 1e-6);
+
+    std::ostringstream oss;
+    if (useExponent) {
+      oss << std::scientific << std::setprecision(15) << number;
+    } else {
+      // Fixed with trimming approximates ES Number::toString for the ranges
+      // exercised by property key conversion tests.
+      oss << std::fixed << std::setprecision(15) << number;
+    }
+    std::string out = oss.str();
+
+    auto expPos = out.find_first_of("eE");
+    if (expPos != std::string::npos) {
+      std::string mantissa = out.substr(0, expPos);
+      std::string exponent = out.substr(expPos + 1);
+      // Trim mantissa trailing zeros/dot.
+      auto dot = mantissa.find('.');
+      if (dot != std::string::npos) {
+        while (!mantissa.empty() && mantissa.back() == '0') mantissa.pop_back();
+        if (!mantissa.empty() && mantissa.back() == '.') mantissa.pop_back();
+      }
+
+      char sign = '+';
+      size_t idx = 0;
+      if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
+        sign = exponent[0];
+        idx = 1;
+      }
+      while (idx < exponent.size() && exponent[idx] == '0') idx++;
+      std::string expDigits = (idx < exponent.size()) ? exponent.substr(idx) : "0";
+
+      out = mantissa + "e";
+      out += sign;
+      out += expDigits;
+      return out;
+    }
+
+    // Non-exponent form: trim trailing zeros/dot.
+    auto dot = out.find('.');
+    if (dot != std::string::npos) {
+      while (!out.empty() && out.back() == '0') out.pop_back();
+      if (!out.empty() && out.back() == '.') out.pop_back();
+    }
+    return out;
+  }
+  return value.toString();
+}
+
 bool Value::toBool() const {
   return std::visit([](auto&& arg) -> bool {
     using T = std::decay_t<decltype(arg)>;
-    if constexpr (std::is_same_v<T, Undefined>) {
+    if constexpr (std::is_same_v<T, Undefined> || std::is_same_v<T, Empty>) {
       return false;
     } else if constexpr (std::is_same_v<T, Null>) {
       return false;
@@ -88,7 +191,7 @@ bool Value::toBool() const {
 double Value::toNumber() const {
   return std::visit([](auto&& arg) -> double {
     using T = std::decay_t<decltype(arg)>;
-    if constexpr (std::is_same_v<T, Undefined>) {
+    if constexpr (std::is_same_v<T, Undefined> || std::is_same_v<T, Empty>) {
       return std::nan("");
     } else if constexpr (std::is_same_v<T, Null>) {
       return 0.0;
@@ -114,7 +217,29 @@ double Value::toNumber() const {
         return 0.0;
       }
 
+      // ECMAScript ToNumber(String) recognizes "Infinity" (case-sensitive),
+      // but should not accept "inf"/"infinity" in other casings even though
+      // libc strtod() does.
+      if (s == "Infinity" || s == "+Infinity") {
+        return std::numeric_limits<double>::infinity();
+      }
+      if (s == "-Infinity") {
+        return -std::numeric_limits<double>::infinity();
+      }
+      auto lowerAscii = [](std::string in) {
+        for (char& ch : in) {
+          if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        return in;
+      };
+      std::string lower = lowerAscii(s);
+      if (lower == "inf" || lower == "+inf" || lower == "-inf" ||
+          lower == "infinity" || lower == "+infinity" || lower == "-infinity") {
+        return std::nan("");
+      }
+
       char* parseEnd = nullptr;
+      errno = 0;
       double parsed = std::strtod(s.c_str(), &parseEnd);
       if (parseEnd == s.c_str()) {
         return std::nan("");
@@ -136,7 +261,7 @@ double Value::toNumber() const {
 bigint::BigIntValue Value::toBigInt() const {
   return std::visit([](auto&& arg) -> bigint::BigIntValue {
     using T = std::decay_t<decltype(arg)>;
-    if constexpr (std::is_same_v<T, Undefined>) {
+    if constexpr (std::is_same_v<T, Undefined> || std::is_same_v<T, Empty>) {
       return 0;
     } else if constexpr (std::is_same_v<T, Null>) {
       return 0;
@@ -162,7 +287,7 @@ bigint::BigIntValue Value::toBigInt() const {
 std::string Value::toString() const {
   return std::visit([](auto&& arg) -> std::string {
     using T = std::decay_t<decltype(arg)>;
-    if constexpr (std::is_same_v<T, Undefined>) {
+    if constexpr (std::is_same_v<T, Undefined> || std::is_same_v<T, Empty>) {
       return "undefined";
     } else if constexpr (std::is_same_v<T, Null>) {
       return "null";
@@ -915,7 +1040,6 @@ GCPtr<Promise> Promise::rejected(const Value& reason) {
 }
 
 static bool isInternalProperty(const std::string& key);
-static bool isSymbolKey(const std::string& key);
 
 // Object static methods implementation
 Value Object_keys(const std::vector<Value>& args) {
@@ -944,7 +1068,7 @@ Value Object_keys(const std::vector<Value>& args) {
   for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
-    if (isSymbolKey(key)) continue;
+    if (isSymbolPropertyKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
     result->elements.push_back(Value(key));
   }
@@ -964,7 +1088,7 @@ Value Object_values(const std::vector<Value>& args) {
   for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
-    if (isSymbolKey(key)) continue;
+    if (isSymbolPropertyKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
     auto it = obj->properties.find(key);
     result->elements.push_back(it->second);
@@ -985,7 +1109,7 @@ Value Object_entries(const std::vector<Value>& args) {
   for (const auto& key : obj->properties.orderedKeys()) {
     // Skip internal, non-enumerable, and Symbol-keyed properties
     if (isInternalProperty(key)) continue;
-    if (isSymbolKey(key)) continue;
+    if (isSymbolPropertyKey(key)) continue;
     if (obj->properties.count("__non_enum_" + key)) continue;
     auto it = obj->properties.find(key);
     auto entry = GarbageCollector::makeGC<Array>();
@@ -1037,7 +1161,7 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     return Value(false);
   }
 
-  std::string key = args[1].toString();
+  std::string key = valueToPropertyKey(args[1]);
 
   // Handle Function objects
   if (args[0].isFunction()) {
@@ -1057,6 +1181,131 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
     if (cls->properties.find(key) != cls->properties.end()) return Value(true);
     if (cls->properties.find("__get_" + key) != cls->properties.end()) return Value(true);
     if (cls->properties.find("__set_" + key) != cls->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  // Handle Array objects
+  if (args[0].isArray()) {
+    auto arr = args[0].getGC<Array>();
+    if (isInternalProperty(key)) return Value(false);
+    // Arrays always have an own `length` data property.
+    if (key == "length") return Value(true);
+    try {
+      size_t idx = std::stoull(key);
+      if (idx < arr->elements.size()) return Value(true);
+    } catch (...) {}
+    if (arr->properties.find(key) != arr->properties.end()) return Value(true);
+    if (arr->properties.find("__get_" + key) != arr->properties.end()) return Value(true);
+    if (arr->properties.find("__set_" + key) != arr->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isRegex()) {
+    auto rx = args[0].getGC<Regex>();
+    if (isInternalProperty(key)) return Value(false);
+    if (key == "source" || key == "flags") return Value(true);
+    if (rx->properties.find(key) != rx->properties.end()) return Value(true);
+    if (rx->properties.find("__get_" + key) != rx->properties.end()) return Value(true);
+    if (rx->properties.find("__set_" + key) != rx->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isPromise()) {
+    auto p = args[0].getGC<Promise>();
+    if (isInternalProperty(key)) return Value(false);
+    if (p->properties.find(key) != p->properties.end()) return Value(true);
+    if (p->properties.find("__get_" + key) != p->properties.end()) return Value(true);
+    if (p->properties.find("__set_" + key) != p->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isError()) {
+    auto e = args[0].getGC<Error>();
+    if (isInternalProperty(key)) return Value(false);
+    if (e->properties.find(key) != e->properties.end()) return Value(true);
+    if (e->properties.find("__get_" + key) != e->properties.end()) return Value(true);
+    if (e->properties.find("__set_" + key) != e->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isMap()) {
+    auto m = args[0].getGC<Map>();
+    if (isInternalProperty(key)) return Value(false);
+    if (m->properties.find(key) != m->properties.end()) return Value(true);
+    if (m->properties.find("__get_" + key) != m->properties.end()) return Value(true);
+    if (m->properties.find("__set_" + key) != m->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isSet()) {
+    auto s = args[0].getGC<Set>();
+    if (isInternalProperty(key)) return Value(false);
+    if (s->properties.find(key) != s->properties.end()) return Value(true);
+    if (s->properties.find("__get_" + key) != s->properties.end()) return Value(true);
+    if (s->properties.find("__set_" + key) != s->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isWeakMap()) {
+    auto wm = args[0].getGC<WeakMap>();
+    if (isInternalProperty(key)) return Value(false);
+    if (wm->properties.find(key) != wm->properties.end()) return Value(true);
+    if (wm->properties.find("__get_" + key) != wm->properties.end()) return Value(true);
+    if (wm->properties.find("__set_" + key) != wm->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isWeakSet()) {
+    auto ws = args[0].getGC<WeakSet>();
+    if (isInternalProperty(key)) return Value(false);
+    if (ws->properties.find(key) != ws->properties.end()) return Value(true);
+    if (ws->properties.find("__get_" + key) != ws->properties.end()) return Value(true);
+    if (ws->properties.find("__set_" + key) != ws->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isTypedArray()) {
+    auto ta = args[0].getGC<TypedArray>();
+    if (isInternalProperty(key)) return Value(false);
+    if (key == "length" || key == "byteLength") return Value(true);
+    if (!key.empty() && std::all_of(key.begin(), key.end(), ::isdigit)) {
+      try {
+        size_t idx = std::stoull(key);
+        if (idx < ta->length) return Value(true);
+      } catch (...) {
+      }
+    }
+    if (ta->properties.find(key) != ta->properties.end()) return Value(true);
+    if (ta->properties.find("__get_" + key) != ta->properties.end()) return Value(true);
+    if (ta->properties.find("__set_" + key) != ta->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isArrayBuffer()) {
+    auto b = args[0].getGC<ArrayBuffer>();
+    if (isInternalProperty(key)) return Value(false);
+    if (key == "byteLength") return Value(true);
+    if (b->properties.find(key) != b->properties.end()) return Value(true);
+    if (b->properties.find("__get_" + key) != b->properties.end()) return Value(true);
+    if (b->properties.find("__set_" + key) != b->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isDataView()) {
+    auto v = args[0].getGC<DataView>();
+    if (isInternalProperty(key)) return Value(false);
+    if (v->properties.find(key) != v->properties.end()) return Value(true);
+    if (v->properties.find("__get_" + key) != v->properties.end()) return Value(true);
+    if (v->properties.find("__set_" + key) != v->properties.end()) return Value(true);
+    return Value(false);
+  }
+
+  if (args[0].isGenerator()) {
+    auto g = args[0].getGC<Generator>();
+    if (isInternalProperty(key)) return Value(false);
+    if (g->properties.find(key) != g->properties.end()) return Value(true);
+    if (g->properties.find("__get_" + key) != g->properties.end()) return Value(true);
+    if (g->properties.find("__set_" + key) != g->properties.end()) return Value(true);
     return Value(false);
   }
 
@@ -1086,6 +1335,9 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
   }
 
   // Internal properties are not own properties
+  if (key == "__proto__" && obj->properties.find("__own_prop___proto__") != obj->properties.end()) {
+    return Value(true);
+  }
   if (isInternalProperty(key)) return Value(false);
   if (obj->properties.find(key) != obj->properties.end()) return Value(true);
   if (obj->properties.find("__get_" + key) != obj->properties.end()) return Value(true);
@@ -1102,11 +1354,6 @@ static bool isInternalProperty(const std::string& key) {
   return false;
 }
 
-// Symbol-keyed properties are stored as "Symbol(<description>)" strings
-static bool isSymbolKey(const std::string& key) {
-  return key.size() >= 8 && key.substr(0, 7) == "Symbol(" && key.back() == ')';
-}
-
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
   auto result = GarbageCollector::makeGC<Array>();
 
@@ -1114,20 +1361,98 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     return Value(result);
   }
 
+  auto parseArrayIndexKey = [](const std::string& key, uint32_t& out) -> bool {
+    if (key.empty()) return false;
+    if (key.size() > 1 && key[0] == '0') return false;
+    for (char c : key) {
+      if (c < '0' || c > '9') return false;
+    }
+    try {
+      unsigned long long parsed = std::stoull(key);
+      if (parsed >= static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) {
+        return false;
+      }
+      out = static_cast<uint32_t>(parsed);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  auto appendInOwnPropertyKeyOrder = [&](const std::vector<std::string>& keys,
+                                         bool prioritizeLengthName) {
+    std::vector<std::pair<uint32_t, std::string>> indexKeys;
+    std::vector<std::string> stringKeys;
+    for (const auto& k : keys) {
+      uint32_t idx = 0;
+      if (parseArrayIndexKey(k, idx)) {
+        indexKeys.emplace_back(idx, k);
+      } else {
+        stringKeys.push_back(k);
+      }
+    }
+    std::sort(indexKeys.begin(), indexKeys.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [_, k] : indexKeys) {
+      result->elements.push_back(Value(k));
+    }
+    if (prioritizeLengthName) {
+      auto emitFirst = [&](const char* key) {
+        for (size_t i = 0; i < stringKeys.size(); i++) {
+          if (stringKeys[i] == key) {
+            result->elements.push_back(Value(stringKeys[i]));
+            stringKeys.erase(stringKeys.begin() + static_cast<long>(i));
+            return;
+          }
+        }
+      };
+      emitFirst("length");
+      emitFirst("name");
+    }
+    for (const auto& k : stringKeys) {
+      result->elements.push_back(Value(k));
+    }
+  };
+
   if (args[0].isFunction()) {
     auto fn = args[0].getGC<Function>();
-    // Ensure spec-mandated order: length, name first, then rest
-    if (fn->properties.count("length")) {
-      result->elements.push_back(Value(std::string("length")));
+    std::vector<std::string> keys;
+    keys.reserve(fn->properties.size());
+    for (const auto& rawKey : fn->properties.orderedKeys()) {
+      if (isInternalProperty(rawKey)) continue;
+      if (isSymbolPropertyKey(rawKey)) continue;
+      keys.push_back(rawKey);
     }
-    if (fn->properties.count("name")) {
-      result->elements.push_back(Value(std::string("name")));
+    appendInOwnPropertyKeyOrder(keys, true);
+    return Value(result);
+  }
+
+  if (args[0].isClass()) {
+    auto cls = args[0].getGC<Class>();
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> keys;
+    keys.reserve(cls->properties.size());
+    for (const auto& rawKey : cls->properties.orderedKeys()) {
+      if (rawKey.size() >= 4 && rawKey.substr(0, 2) == "__" &&
+          rawKey.substr(rawKey.size() - 2) == "__") {
+        continue;
+      }
+      if (isSymbolPropertyKey(rawKey)) continue;
+      if (rawKey.rfind("__non_enum_", 0) == 0 ||
+          rawKey.rfind("__non_writable_", 0) == 0 ||
+          rawKey.rfind("__non_configurable_", 0) == 0 ||
+          rawKey.rfind("__enum_", 0) == 0) {
+        continue;
+      }
+      std::string exposed = rawKey;
+      if (rawKey.rfind("__get_", 0) == 0 || rawKey.rfind("__set_", 0) == 0) {
+        exposed = rawKey.substr(6);
+      }
+      if (!exposed.empty() && seen.insert(exposed).second) {
+        keys.push_back(exposed);
+      }
     }
-    for (const auto& key : fn->properties.orderedKeys()) {
-      if (isInternalProperty(key)) continue;
-      if (key == "length" || key == "name") continue;
-      result->elements.push_back(Value(key));
-    }
+    appendInOwnPropertyKeyOrder(keys, true);
     return Value(result);
   }
 
@@ -1144,11 +1469,30 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     return Value(result);
   }
 
-  for (const auto& key : obj->properties.orderedKeys()) {
-    if (isInternalProperty(key)) continue;
-    if (isSymbolKey(key)) continue;
-    result->elements.push_back(Value(key));
+  std::unordered_set<std::string> seen;
+  std::vector<std::string> keys;
+  keys.reserve(obj->properties.size());
+  for (const auto& rawKey : obj->properties.orderedKeys()) {
+    if (rawKey.size() >= 4 && rawKey.substr(0, 2) == "__" &&
+        rawKey.substr(rawKey.size() - 2) == "__") {
+      continue;
+    }
+    if (isSymbolPropertyKey(rawKey)) continue;
+    if (rawKey.rfind("__non_enum_", 0) == 0 ||
+        rawKey.rfind("__non_writable_", 0) == 0 ||
+        rawKey.rfind("__non_configurable_", 0) == 0 ||
+        rawKey.rfind("__enum_", 0) == 0) {
+      continue;
+    }
+    std::string exposed = rawKey;
+    if (rawKey.rfind("__get_", 0) == 0 || rawKey.rfind("__set_", 0) == 0) {
+      exposed = rawKey.substr(6);
+    }
+    if (!exposed.empty() && seen.insert(exposed).second) {
+      keys.push_back(exposed);
+    }
   }
+  appendInOwnPropertyKeyOrder(keys, false);
 
   return Value(result);
 }
@@ -1156,8 +1500,19 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
 Value Object_create(const std::vector<Value>& args) {
   auto newObj = GarbageCollector::makeGC<Object>();
 
-  // Simple implementation - doesn't handle prototype properly
-  // but creates a new object
+  // Object.create(proto[, propertiesObject])
+  if (!args.empty()) {
+    const Value& proto = args[0];
+    if (proto.isObject()) {
+      newObj->properties["__proto__"] = proto;
+    } else if (proto.isNull()) {
+      newObj->properties["__proto__"] = Value(Null{});
+    } else if (!proto.isUndefined()) {
+      // Spec: TypeError if proto is neither Object nor null.
+      throw std::runtime_error("TypeError: Object prototype may only be an Object or null");
+    }
+  }
+
   if (args.size() > 1 && args[1].isObject()) {
     // Add properties from the properties descriptor object
     auto props = args[1].getGC<Object>();

@@ -58,13 +58,16 @@ struct Function : public GCObject {
 // Class structure for ES6 classes
 struct Class : public GCObject {
   std::string name;
+  uint64_t privateBrandId = 0;
   GCPtr<Function> constructor;  // The constructor function
   GCPtr<Class> superClass;       // Parent class (if any)
+  GCPtr<Class> lexicalParentClass;  // Enclosing class for private-name lexical resolution
   std::unordered_map<std::string, GCPtr<Function>> methods;        // Instance methods
   std::unordered_map<std::string, GCPtr<Function>> staticMethods;  // Static methods
   std::unordered_map<std::string, GCPtr<Function>> getters;        // Getter methods
   std::unordered_map<std::string, GCPtr<Function>> setters;        // Setter methods
   OrderedMap<std::string, Value> properties;  // Own properties (name, length, prototype, etc.)
+  std::shared_ptr<void> astOwner;  // Keeps class method/field AST storage alive.
   GCPtr<Environment> closure;  // Closure environment
 
   // Field initializers (public and private) - evaluated during construction
@@ -83,6 +86,7 @@ struct Class : public GCObject {
   void getReferences(std::vector<GCObject*>& refs) const override {
     if (constructor) refs.push_back(constructor.get());
     if (superClass) refs.push_back(superClass.get());
+    if (lexicalParentClass) refs.push_back(lexicalParentClass.get());
     for (const auto& [_, method] : methods) {
       if (method) refs.push_back(method.get());
     }
@@ -125,6 +129,7 @@ struct Object : public GCObject {
 // Map collection - maintains insertion order
 struct Map : public GCObject {
   std::vector<std::pair<Value, Value>> entries;
+  OrderedMap<std::string, Value> properties;
 
   void set(const Value& key, const Value& value);
   bool has(const Value& key) const;
@@ -141,6 +146,7 @@ struct Map : public GCObject {
 // Set collection - maintains insertion order
 struct Set : public GCObject {
   std::vector<Value> values;
+  OrderedMap<std::string, Value> properties;
 
   bool add(const Value& value);
   bool has(const Value& value) const;
@@ -158,6 +164,7 @@ struct Set : public GCObject {
 // A full implementation would use weak_ptr or custom GC weak references
 struct WeakMap : public GCObject {
   std::unordered_map<GCObject*, Value> entries;  // Map from object pointer to value
+  OrderedMap<std::string, Value> properties;
 
   void set(const Value& key, const Value& value);
   bool has(const Value& key) const;
@@ -173,6 +180,7 @@ struct WeakMap : public GCObject {
 // WeakSet - weak references to objects
 struct WeakSet : public GCObject {
   std::unordered_set<GCObject*> values;  // Set of object pointers
+  OrderedMap<std::string, Value> properties;
 
   bool add(const Value& value);
   bool has(const Value& value) const;
@@ -269,6 +277,7 @@ struct Error : public GCObject {
   ErrorType type;
   std::string message;
   std::string stack;  // Optional stack trace
+  OrderedMap<std::string, Value> properties;
 
   Error(ErrorType t = ErrorType::Error, const std::string& msg = "")
     : type(t), message(msg) {}
@@ -295,7 +304,7 @@ struct Error : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "Error"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {}
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 // Generator state for iterator protocol
@@ -331,6 +340,9 @@ struct Generator : public GCObject {
 struct Proxy : public GCObject {
   std::shared_ptr<Value> target;   // The target object being proxied
   std::shared_ptr<Value> handler;  // Handler object with trap functions
+  // Proxy [[Call]]-ness is fixed at creation time. Needed for typeof on revoked proxies.
+  bool isCallable = false;
+  bool revoked = false;
 
   Proxy(const Value& t, const Value& h)
     : target(std::make_shared<Value>(t)),
@@ -345,6 +357,7 @@ struct Proxy : public GCObject {
 struct ArrayBuffer : public GCObject {
   std::vector<uint8_t> data;
   size_t byteLength;
+  OrderedMap<std::string, Value> properties;
 
   ArrayBuffer(size_t length) : byteLength(length) {
     data.resize(length, 0);
@@ -356,7 +369,7 @@ struct ArrayBuffer : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "ArrayBuffer"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {}
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 // DataView - Low-level interface for reading/writing multiple number types in an ArrayBuffer
@@ -364,6 +377,7 @@ struct DataView : public GCObject {
   GCPtr<ArrayBuffer> buffer;
   size_t byteOffset;
   size_t byteLength;
+  OrderedMap<std::string, Value> properties;
 
   DataView(GCPtr<ArrayBuffer> buf, size_t offset = 0, size_t length = 0)
     : buffer(buf), byteOffset(offset) {
@@ -408,7 +422,7 @@ struct DataView : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "DataView"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {}
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 enum class TypedArrayType {
@@ -481,6 +495,7 @@ struct TypedArray : public GCObject {
   std::vector<uint8_t> buffer;
   size_t byteOffset;
   size_t length;
+  OrderedMap<std::string, Value> properties;
 
   TypedArray(TypedArrayType t, size_t len)
     : type(t), byteOffset(0), length(len) {
@@ -530,7 +545,7 @@ struct TypedArray : public GCObject {
 
   // GCObject interface
   const char* typeName() const override { return "TypedArray"; }
-  void getReferences(std::vector<GCObject*>& refs) const override {}
+  void getReferences(std::vector<GCObject*>& refs) const override;
 };
 
 enum class PromiseState {
@@ -645,5 +660,13 @@ private:
 
   Value cache_[MAX_CACHED - MIN_CACHED + 1];
 };
+
+// Internal property-key helpers used by runtime objects/builtins.
+// Symbol keys are encoded as stable internal strings so different symbols with
+// the same description don't collide in OrderedMap<string, Value>.
+std::string symbolToPropertyKey(const Symbol& symbol);
+bool isSymbolPropertyKey(const std::string& key);
+bool propertyKeyToSymbol(const std::string& key, Symbol& outSymbol);
+std::string valueToPropertyKey(const Value& value);
 
 }

@@ -30,17 +30,22 @@ public:
   bool has(const std::string& name) const;
   bool hasLocal(const std::string& name) const;
   bool hasLexicalLocal(const std::string& name) const;
+  bool deleteLocalMutable(const std::string& name);
   bool isConst(const std::string& name) const;
   // Delete from with-scope object: 0=not found, 1=deleted, -1=non-configurable
   int deleteFromWithScope(const std::string& name);
   // Set a var binding, bypassing with-scope objects (for var declarations)
   bool setVar(const std::string& name, const Value& value);
+  // Resolve the declarative environment that currently owns `name`.
+  // Ignores with-scope object bindings.
+  Environment* resolveBindingEnvironment(const std::string& name);
   // Resolve where a name would be written (returns with-scope object if applicable)
   GCPtr<Object> resolveWithScopeObject(const std::string& name) const;
 
   static GCPtr<Environment> createGlobal();
   GCPtr<Environment> createChild();
   Environment* getParent() const { return parent_.get(); }
+  GCPtr<Environment> getParentPtr() const { return parent_; }
   GCPtr<Object> getGlobal() const;
   Environment* getRoot();
 

@@ -584,8 +584,10 @@ void setDefaultExportNameIfNeeded(Value& result) {
 
   if (result.isClass()) {
     auto cls = result.getGC<Class>();
-    bool hasOwnNameProperty = cls->properties.find("name") != cls->properties.end();
-    if (cls->name.empty() && !hasOwnNameProperty) {
+    auto nameIt = cls->properties.find("name");
+    bool shouldSet = nameIt == cls->properties.end() ||
+                     (nameIt->second.isString() && std::get<std::string>(nameIt->second.data).empty());
+    if (cls->name.empty() && shouldSet) {
       cls->name = "default";
       cls->properties["name"] = Value(std::string("default"));
       cls->properties["__non_writable_name"] = Value(true);
@@ -2305,8 +2307,8 @@ bool Module::evaluateBody(Interpreter* interpreter) {
             return false;
           }
         }
-      } else if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
-        auto task = interpreter->evaluate(*exportDefault->declaration);
+      } else if (std::holds_alternative<ExportDefaultDeclaration>(stmt.node)) {
+        auto task = interpreter->evaluate(stmt);
         Value result;
         while (!task.done()) {
           task.resume();

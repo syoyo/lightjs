@@ -50,6 +50,10 @@ struct Set;
 class Module;
 
 struct Undefined {};
+// Internal completion record marker (spec "empty" completion value).
+// This must never be observable to user code; it is used only by statement
+// evaluation to implement UpdateEmpty correctly.
+struct Empty {};
 struct Null {};
 struct BigInt {
   bigint::BigIntValue value;
@@ -64,6 +68,11 @@ struct Symbol {
   std::string description;
 
   Symbol(const std::string& desc = "") : id(nextId++), description(desc) {}
+  Symbol(size_t symbolId, const std::string& desc) : id(symbolId), description(desc) {
+    if (nextId <= symbolId) {
+      nextId = symbolId + 1;
+    }
+  }
 
   bool operator==(const Symbol& other) const { return id == other.id; }
   bool operator!=(const Symbol& other) const { return id != other.id; }
@@ -80,6 +89,7 @@ struct Date;
 struct Value {
   std::variant<
     Undefined,
+    Empty,
     Null,
     bool,
     double,
@@ -114,6 +124,7 @@ struct Value {
 
   Value() : data(Undefined{}) {}
   Value(Undefined u) : data(u) {}
+  Value(Empty e) : data(e) {}
   Value(Null n) : data(n) {}
   Value(bool b) : data(b) {}
   Value(double d) : data(d) {}
@@ -152,6 +163,7 @@ struct Value {
   Value(std::shared_ptr<void> d) : data(d) {}
 
   bool isUndefined() const { return std::holds_alternative<Undefined>(data); }
+  bool isEmpty() const { return std::holds_alternative<Empty>(data); }
   bool isNull() const { return std::holds_alternative<Null>(data); }
   bool isBool() const { return std::holds_alternative<bool>(data); }
   bool isNumber() const { return std::holds_alternative<double>(data); }

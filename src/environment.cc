@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <regex>
 #include <unordered_set>
 
@@ -66,8 +67,50 @@ constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_sourc
 constexpr const char* kImportPhaseDeferSentinel = "__lightjs_import_phase_defer__";
 constexpr const char* kWithScopeObjectBinding = "__with_scope_object__";
 
+bool isInternalPropertyKeyForReflection(const std::string& key) {
+  // Hide LightJS internal bookkeeping keys from reflection APIs.
+  // Do NOT hide arbitrary "__user__" property names: Test262 relies on them.
+  if (key.rfind("__non_writable_", 0) == 0) return true;
+  if (key.rfind("__non_enum_", 0) == 0) return true;
+  if (key.rfind("__non_configurable_", 0) == 0) return true;
+  if (key.rfind("__enum_", 0) == 0) return true;
+  if (key.rfind("__get_", 0) == 0) return true;
+  if (key.rfind("__set_", 0) == 0) return true;
+  if (key.rfind("__mapped_arg_index_", 0) == 0) return true;
+  if (key.rfind("__mapped_arg_name_", 0) == 0) return true;
+
+  static const std::unordered_set<std::string> internalKeys = {
+    "__callable_object__",
+    "__constructor_wrapper__",
+    "__constructor__",
+    "__primitive_value__",
+    "__is_arguments_object__",
+    "__throw_on_new__",
+    "__is_arrow_function__",
+    "__named_expression__",
+    "__bound_target__",
+    "__bound_this__",
+    "__bound_args__",
+    "__reflect_construct__",
+    "__eval_deletable_bindings__",
+    "__builtin_array_iterator__",
+    "__in_class_field_initializer__",
+    "__super_called__",
+  };
+  return internalKeys.count(key) > 0;
+}
+
 bool isVisibleWithIdentifier(const std::string& name) {
-  return !name.empty() && name.rfind("__", 0) != 0;
+  if (name.empty()) {
+    return false;
+  }
+  // Hide internal sentinels like "__foo__", but allow user identifiers that
+  // merely begin with underscores (e.g. "__x").
+  if (name.size() >= 4 && name.rfind("__", 0) == 0 &&
+      name.substr(name.size() - 2) == "__") {
+    return false;
+  }
+  return true;
 }
 
 bool isBlockedByUnscopables(const GCPtr<Object>& bindings, const std::string& name) {
@@ -76,13 +119,28 @@ bool isBlockedByUnscopables(const GCPtr<Object>& bindings, const std::string& na
   }
 
   const auto& unscopablesKey = WellKnownSymbols::unscopablesKey();
-  auto unscopablesIt = bindings->properties.find(unscopablesKey);
-  if (unscopablesIt == bindings->properties.end() || !unscopablesIt->second.isObject()) {
+  Value unscopablesValue(Undefined{});
+  auto unscopablesGetterIt = bindings->properties.find("__get_" + unscopablesKey);
+  if (unscopablesGetterIt != bindings->properties.end() &&
+      unscopablesGetterIt->second.isFunction()) {
+    if (auto* interpreter = getGlobalInterpreter()) {
+      unscopablesValue = interpreter->callForHarness(unscopablesGetterIt->second, {}, Value(bindings));
+      if (interpreter->hasError()) {
+        return true;
+      }
+    }
+  } else {
+    auto unscopablesIt = bindings->properties.find(unscopablesKey);
+    if (unscopablesIt != bindings->properties.end()) {
+      unscopablesValue = unscopablesIt->second;
+    }
+  }
+  if (!unscopablesValue.isObject()) {
     return false;
   }
 
   std::unordered_set<Object*> visited;
-  auto current = unscopablesIt->second.getGC<Object>();
+  auto current = unscopablesValue.getGC<Object>();
   int depth = 0;
   while (current && depth < 64 && visited.insert(current.get()).second) {
     auto it = current->properties.find(name);
@@ -100,12 +158,40 @@ bool isBlockedByUnscopables(const GCPtr<Object>& bindings, const std::string& na
 }
 
 std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std::string& name) {
-  if (!isVisibleWithIdentifier(name) || !scopeValue.isObject()) {
+  if (!isVisibleWithIdentifier(name)) {
+    return std::nullopt;
+  }
+
+  Value lookupScope = scopeValue;
+  if (scopeValue.isProxy()) {
+    auto proxyPtr = scopeValue.getGC<Proxy>();
+    if (!proxyPtr->target || !proxyPtr->target->isObject()) {
+      return std::nullopt;
+    }
+    lookupScope = *proxyPtr->target;
+    if (proxyPtr->handler && proxyPtr->handler->isObject()) {
+      auto handlerObj = proxyPtr->handler->getGC<Object>();
+      auto hasIt = handlerObj->properties.find("has");
+      if (hasIt != handlerObj->properties.end() && hasIt->second.isFunction()) {
+        if (auto* interpreter = getGlobalInterpreter()) {
+          Value hasResult = interpreter->callForHarness(
+            hasIt->second, {*proxyPtr->target, Value(name)}, Value(handlerObj));
+          if (interpreter->hasError()) {
+            return std::nullopt;
+          }
+          if (!hasResult.toBool()) {
+            return std::nullopt;
+          }
+        }
+      }
+    }
+  }
+  if (!lookupScope.isObject()) {
     return std::nullopt;
   }
 
   std::unordered_set<Object*> visited;
-  auto bindings = scopeValue.getGC<Object>();
+  auto bindings = lookupScope.getGC<Object>();
   auto current = bindings;
   int depth = 0;
   while (current && depth < 64 && visited.insert(current.get()).second) {
@@ -334,6 +420,985 @@ void collectVarNamesFromStatement(const Statement& stmt, std::vector<std::string
       collectVarNamesFromStatement(*withStmt->body, names);
     }
   }
+}
+
+void collectDeclaredNamesForDirectEval(const Statement& stmt, std::vector<std::string>& names) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& declarator : varDecl->declarations) {
+      if (declarator.pattern) {
+        collectVarNamesFromPattern(*declarator.pattern, names);
+      }
+    }
+    return;
+  }
+  if (auto* funcDecl = std::get_if<FunctionDeclaration>(&stmt.node)) {
+    if (!funcDecl->id.name.empty()) {
+      names.push_back(funcDecl->id.name);
+    }
+    return;
+  }
+  if (auto* classDecl = std::get_if<ClassDeclaration>(&stmt.node)) {
+    if (!classDecl->id.name.empty()) {
+      names.push_back(classDecl->id.name);
+    }
+    return;
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& inner : block->body) {
+      if (inner) {
+        collectDeclaredNamesForDirectEval(*inner, names);
+      }
+    }
+    return;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->consequent) {
+      collectDeclaredNamesForDirectEval(*ifStmt->consequent, names);
+    }
+    if (ifStmt->alternate) {
+      collectDeclaredNamesForDirectEval(*ifStmt->alternate, names);
+    }
+    return;
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->body) {
+      collectDeclaredNamesForDirectEval(*whileStmt->body, names);
+    }
+    return;
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body) {
+      collectDeclaredNamesForDirectEval(*doWhileStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init) {
+      collectDeclaredNamesForDirectEval(*forStmt->init, names);
+    }
+    if (forStmt->body) {
+      collectDeclaredNamesForDirectEval(*forStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left) {
+      collectDeclaredNamesForDirectEval(*forInStmt->left, names);
+    }
+    if (forInStmt->body) {
+      collectDeclaredNamesForDirectEval(*forInStmt->body, names);
+    }
+    return;
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left) {
+      collectDeclaredNamesForDirectEval(*forOfStmt->left, names);
+    }
+    if (forOfStmt->body) {
+      collectDeclaredNamesForDirectEval(*forOfStmt->body, names);
+    }
+    return;
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    for (const auto& caseClause : switchStmt->cases) {
+      for (const auto& cons : caseClause.consequent) {
+        if (cons) {
+          collectDeclaredNamesForDirectEval(*cons, names);
+        }
+      }
+    }
+    return;
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& inner : tryStmt->block) {
+      if (inner) {
+        collectDeclaredNamesForDirectEval(*inner, names);
+      }
+    }
+    if (tryStmt->hasHandler) {
+      for (const auto& inner : tryStmt->handler.body) {
+        if (inner) {
+          collectDeclaredNamesForDirectEval(*inner, names);
+        }
+      }
+    }
+    if (tryStmt->hasFinalizer) {
+      for (const auto& inner : tryStmt->finalizer) {
+        if (inner) {
+          collectDeclaredNamesForDirectEval(*inner, names);
+        }
+      }
+    }
+    return;
+  }
+  if (auto* labelled = std::get_if<LabelledStmt>(&stmt.node)) {
+    if (labelled->body) {
+      collectDeclaredNamesForDirectEval(*labelled->body, names);
+    }
+    return;
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->body) {
+      collectDeclaredNamesForDirectEval(*withStmt->body, names);
+    }
+  }
+}
+
+bool bodyHasUseStrictDirective(const std::vector<StmtPtr>& body) {
+  for (const auto& stmt : body) {
+    if (!stmt) {
+      break;
+    }
+    auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+    if (!exprStmt || !exprStmt->expression) {
+      break;
+    }
+    auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node);
+    if (!str) {
+      break;
+    }
+    if (str->value == "use strict") {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool expressionContainsSuperForEval(const Expression& expr);
+bool statementContainsSuperForEval(const Statement& stmt);
+bool expressionContainsSuperCallForEval(const Expression& expr);
+bool statementContainsSuperCallForEval(const Statement& stmt);
+bool expressionContainsArgumentsForEval(const Expression& expr);
+bool statementContainsArgumentsForEval(const Statement& stmt);
+bool expressionContainsNewTargetForEval(const Expression& expr);
+bool statementContainsNewTargetForEval(const Statement& stmt);
+
+bool expressionContainsSuperForEval(const Expression& expr) {
+  if (std::holds_alternative<SuperExpr>(expr.node)) return true;
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionContainsSuperForEval(*binary->left)) ||
+           (binary->right && expressionContainsSuperForEval(*binary->right));
+  }
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionContainsSuperForEval(*unary->argument);
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionContainsSuperForEval(*assign->left)) ||
+           (assign->right && expressionContainsSuperForEval(*assign->right));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionContainsSuperForEval(*update->argument);
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && expressionContainsSuperForEval(*call->callee)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionContainsSuperForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return (member->object && expressionContainsSuperForEval(*member->object)) ||
+           (member->property && expressionContainsSuperForEval(*member->property));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionContainsSuperForEval(*cond->test)) ||
+           (cond->consequent && expressionContainsSuperForEval(*cond->consequent)) ||
+           (cond->alternate && expressionContainsSuperForEval(*cond->alternate));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionContainsSuperForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionContainsSuperForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionContainsSuperForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsSuperForEval(*prop.value)) return true;
+    }
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionContainsSuperForEval(*awaitExpr->argument);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionContainsSuperForEval(*yieldExpr->argument);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionContainsSuperForEval(*spread->argument);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionContainsSuperForEval(*newExpr->callee)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionContainsSuperForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& e : arrPat->elements) {
+      if (e && expressionContainsSuperForEval(*e)) return true;
+    }
+    return arrPat->rest && expressionContainsSuperForEval(*arrPat->rest);
+  }
+  if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.key && expressionContainsSuperForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsSuperForEval(*prop.value)) return true;
+    }
+    return objPat->rest && expressionContainsSuperForEval(*objPat->rest);
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionContainsSuperForEval(*assignPat->left)) ||
+           (assignPat->right && expressionContainsSuperForEval(*assignPat->right));
+  }
+  return false;
+}
+
+bool statementContainsSuperForEval(const Statement& stmt) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& decl : varDecl->declarations) {
+      if (decl.pattern && expressionContainsSuperForEval(*decl.pattern)) return true;
+      if (decl.init && expressionContainsSuperForEval(*decl.init)) return true;
+    }
+    return false;
+  }
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionContainsSuperForEval(*exprStmt->expression);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionContainsSuperForEval(*ret->argument);
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementContainsSuperForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionContainsSuperForEval(*ifStmt->test)) return true;
+    if (ifStmt->consequent && statementContainsSuperForEval(*ifStmt->consequent)) return true;
+    return ifStmt->alternate && statementContainsSuperForEval(*ifStmt->alternate);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionContainsSuperForEval(*whileStmt->test)) return true;
+    return whileStmt->body && statementContainsSuperForEval(*whileStmt->body);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementContainsSuperForEval(*forStmt->init)) return true;
+    if (forStmt->test && expressionContainsSuperForEval(*forStmt->test)) return true;
+    if (forStmt->update && expressionContainsSuperForEval(*forStmt->update)) return true;
+    return forStmt->body && statementContainsSuperForEval(*forStmt->body);
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionContainsSuperForEval(*withStmt->object)) return true;
+    return withStmt->body && statementContainsSuperForEval(*withStmt->body);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementContainsSuperForEval(*forInStmt->left)) return true;
+    if (forInStmt->right && expressionContainsSuperForEval(*forInStmt->right)) return true;
+    return forInStmt->body && statementContainsSuperForEval(*forInStmt->body);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementContainsSuperForEval(*forOfStmt->left)) return true;
+    if (forOfStmt->right && expressionContainsSuperForEval(*forOfStmt->right)) return true;
+    return forOfStmt->body && statementContainsSuperForEval(*forOfStmt->body);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementContainsSuperForEval(*doWhileStmt->body)) return true;
+    return doWhileStmt->test && expressionContainsSuperForEval(*doWhileStmt->test);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionContainsSuperForEval(*switchStmt->discriminant)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionContainsSuperForEval(*c.test)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementContainsSuperForEval(*s)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementContainsSuperForEval(*label->body);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionContainsSuperForEval(*throwStmt->argument);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementContainsSuperForEval(*s)) return true;
+    }
+    if (tryStmt->handler.paramPattern && expressionContainsSuperForEval(*tryStmt->handler.paramPattern)) return true;
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementContainsSuperForEval(*s)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementContainsSuperForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    return exportDefault->declaration && expressionContainsSuperForEval(*exportDefault->declaration);
+  }
+  return false;
+}
+
+bool expressionContainsSuperCallForEval(const Expression& expr) {
+  if (auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
+    // Arrow functions inherit super-call semantics from the surrounding
+    // context, so Contains(SuperCall) must recurse into arrow bodies.
+    if (!fn->isArrow) {
+      return false;
+    }
+    for (const auto& p : fn->params) {
+      if (p.defaultValue && expressionContainsSuperCallForEval(*p.defaultValue)) {
+        return true;
+      }
+    }
+    for (const auto& s : fn->body) {
+      if (s && statementContainsSuperCallForEval(*s)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && std::holds_alternative<SuperExpr>(call->callee->node)) {
+      return true;
+    }
+    if (call->callee && expressionContainsSuperCallForEval(*call->callee)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionContainsSuperCallForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionContainsSuperCallForEval(*binary->left)) ||
+           (binary->right && expressionContainsSuperCallForEval(*binary->right));
+  }
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionContainsSuperCallForEval(*unary->argument);
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionContainsSuperCallForEval(*assign->left)) ||
+           (assign->right && expressionContainsSuperCallForEval(*assign->right));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionContainsSuperCallForEval(*update->argument);
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return (member->object && expressionContainsSuperCallForEval(*member->object)) ||
+           (member->property && expressionContainsSuperCallForEval(*member->property));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionContainsSuperCallForEval(*cond->test)) ||
+           (cond->consequent && expressionContainsSuperCallForEval(*cond->consequent)) ||
+           (cond->alternate && expressionContainsSuperCallForEval(*cond->alternate));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionContainsSuperCallForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionContainsSuperCallForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionContainsSuperCallForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsSuperCallForEval(*prop.value)) return true;
+    }
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionContainsSuperCallForEval(*awaitExpr->argument);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionContainsSuperCallForEval(*yieldExpr->argument);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionContainsSuperCallForEval(*spread->argument);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionContainsSuperCallForEval(*newExpr->callee)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionContainsSuperCallForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionContainsSuperCallForEval(*assignPat->left)) ||
+           (assignPat->right && expressionContainsSuperCallForEval(*assignPat->right));
+  }
+  return false;
+}
+
+bool statementContainsSuperCallForEval(const Statement& stmt) {
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionContainsSuperCallForEval(*exprStmt->expression);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionContainsSuperCallForEval(*ret->argument);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionContainsSuperCallForEval(*throwStmt->argument);
+  }
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& decl : varDecl->declarations) {
+      if (decl.pattern && expressionContainsSuperCallForEval(*decl.pattern)) return true;
+      if (decl.init && expressionContainsSuperCallForEval(*decl.init)) return true;
+    }
+    return false;
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementContainsSuperCallForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionContainsSuperCallForEval(*ifStmt->test)) return true;
+    if (ifStmt->consequent && statementContainsSuperCallForEval(*ifStmt->consequent)) return true;
+    return ifStmt->alternate && statementContainsSuperCallForEval(*ifStmt->alternate);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionContainsSuperCallForEval(*whileStmt->test)) return true;
+    return whileStmt->body && statementContainsSuperCallForEval(*whileStmt->body);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementContainsSuperCallForEval(*forStmt->init)) return true;
+    if (forStmt->test && expressionContainsSuperCallForEval(*forStmt->test)) return true;
+    if (forStmt->update && expressionContainsSuperCallForEval(*forStmt->update)) return true;
+    return forStmt->body && statementContainsSuperCallForEval(*forStmt->body);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementContainsSuperCallForEval(*forInStmt->left)) return true;
+    if (forInStmt->right && expressionContainsSuperCallForEval(*forInStmt->right)) return true;
+    return forInStmt->body && statementContainsSuperCallForEval(*forInStmt->body);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementContainsSuperCallForEval(*forOfStmt->left)) return true;
+    if (forOfStmt->right && expressionContainsSuperCallForEval(*forOfStmt->right)) return true;
+    return forOfStmt->body && statementContainsSuperCallForEval(*forOfStmt->body);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementContainsSuperCallForEval(*doWhileStmt->body)) return true;
+    return doWhileStmt->test && expressionContainsSuperCallForEval(*doWhileStmt->test);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionContainsSuperCallForEval(*switchStmt->discriminant)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionContainsSuperCallForEval(*c.test)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementContainsSuperCallForEval(*s)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementContainsSuperCallForEval(*label->body);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementContainsSuperCallForEval(*s)) return true;
+    }
+    if (tryStmt->handler.paramPattern && expressionContainsSuperCallForEval(*tryStmt->handler.paramPattern)) return true;
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementContainsSuperCallForEval(*s)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementContainsSuperCallForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionContainsSuperCallForEval(*withStmt->object)) return true;
+    return withStmt->body && statementContainsSuperCallForEval(*withStmt->body);
+  }
+  return false;
+}
+
+bool expressionContainsArgumentsForEval(const Expression& expr) {
+  if (auto* id = std::get_if<Identifier>(&expr.node)) {
+    return id->name == "arguments";
+  }
+  if (auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
+    if (!fn->isArrow) {
+      return false;
+    }
+    for (const auto& p : fn->params) {
+      if (p.defaultValue && expressionContainsArgumentsForEval(*p.defaultValue)) {
+        return true;
+      }
+    }
+    for (const auto& s : fn->body) {
+      if (s && statementContainsArgumentsForEval(*s)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (std::holds_alternative<ClassExpr>(expr.node)) {
+    return false;
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && expressionContainsArgumentsForEval(*call->callee)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionContainsArgumentsForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionContainsArgumentsForEval(*binary->left)) ||
+           (binary->right && expressionContainsArgumentsForEval(*binary->right));
+  }
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionContainsArgumentsForEval(*unary->argument);
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionContainsArgumentsForEval(*assign->left)) ||
+           (assign->right && expressionContainsArgumentsForEval(*assign->right));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionContainsArgumentsForEval(*update->argument);
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return (member->object && expressionContainsArgumentsForEval(*member->object)) ||
+           (member->property && expressionContainsArgumentsForEval(*member->property));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionContainsArgumentsForEval(*cond->test)) ||
+           (cond->consequent && expressionContainsArgumentsForEval(*cond->consequent)) ||
+           (cond->alternate && expressionContainsArgumentsForEval(*cond->alternate));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionContainsArgumentsForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionContainsArgumentsForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionContainsArgumentsForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsArgumentsForEval(*prop.value)) return true;
+    }
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionContainsArgumentsForEval(*awaitExpr->argument);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionContainsArgumentsForEval(*yieldExpr->argument);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionContainsArgumentsForEval(*spread->argument);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionContainsArgumentsForEval(*newExpr->callee)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionContainsArgumentsForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* tmpl = std::get_if<TemplateLiteral>(&expr.node)) {
+    for (const auto& e : tmpl->expressions) {
+      if (e && expressionContainsArgumentsForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionContainsArgumentsForEval(*assignPat->left)) ||
+           (assignPat->right && expressionContainsArgumentsForEval(*assignPat->right));
+  }
+  return false;
+}
+
+bool statementContainsArgumentsForEval(const Statement& stmt) {
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionContainsArgumentsForEval(*exprStmt->expression);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionContainsArgumentsForEval(*ret->argument);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionContainsArgumentsForEval(*throwStmt->argument);
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementContainsArgumentsForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& d : varDecl->declarations) {
+      if (d.pattern && expressionContainsArgumentsForEval(*d.pattern)) return true;
+      if (d.init && expressionContainsArgumentsForEval(*d.init)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionContainsArgumentsForEval(*ifStmt->test)) return true;
+    if (ifStmt->consequent && statementContainsArgumentsForEval(*ifStmt->consequent)) return true;
+    return ifStmt->alternate && statementContainsArgumentsForEval(*ifStmt->alternate);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionContainsArgumentsForEval(*whileStmt->test)) return true;
+    return whileStmt->body && statementContainsArgumentsForEval(*whileStmt->body);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementContainsArgumentsForEval(*forStmt->init)) return true;
+    if (forStmt->test && expressionContainsArgumentsForEval(*forStmt->test)) return true;
+    if (forStmt->update && expressionContainsArgumentsForEval(*forStmt->update)) return true;
+    return forStmt->body && statementContainsArgumentsForEval(*forStmt->body);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementContainsArgumentsForEval(*forInStmt->left)) return true;
+    if (forInStmt->right && expressionContainsArgumentsForEval(*forInStmt->right)) return true;
+    return forInStmt->body && statementContainsArgumentsForEval(*forInStmt->body);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementContainsArgumentsForEval(*forOfStmt->left)) return true;
+    if (forOfStmt->right && expressionContainsArgumentsForEval(*forOfStmt->right)) return true;
+    return forOfStmt->body && statementContainsArgumentsForEval(*forOfStmt->body);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementContainsArgumentsForEval(*doWhileStmt->body)) return true;
+    return doWhileStmt->test && expressionContainsArgumentsForEval(*doWhileStmt->test);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionContainsArgumentsForEval(*switchStmt->discriminant)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionContainsArgumentsForEval(*c.test)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementContainsArgumentsForEval(*s)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementContainsArgumentsForEval(*label->body);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementContainsArgumentsForEval(*s)) return true;
+    }
+    if (tryStmt->handler.paramPattern &&
+        expressionContainsArgumentsForEval(*tryStmt->handler.paramPattern)) {
+      return true;
+    }
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementContainsArgumentsForEval(*s)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementContainsArgumentsForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionContainsArgumentsForEval(*withStmt->object)) return true;
+    return withStmt->body && statementContainsArgumentsForEval(*withStmt->body);
+  }
+  if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    return exportDefault->declaration &&
+           expressionContainsArgumentsForEval(*exportDefault->declaration);
+  }
+  return false;
+}
+
+bool expressionContainsNewTargetForEval(const Expression& expr) {
+  if (auto* fn = std::get_if<FunctionExpr>(&expr.node)) {
+    if (!fn->isArrow) {
+      return false;
+    }
+    for (const auto& p : fn->params) {
+      if (p.defaultValue && expressionContainsNewTargetForEval(*p.defaultValue)) {
+        return true;
+      }
+    }
+    for (const auto& s : fn->body) {
+      if (s && statementContainsNewTargetForEval(*s)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto* meta = std::get_if<MetaProperty>(&expr.node)) {
+    return meta->meta == "new" && meta->property == "target";
+  }
+  if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+    return (binary->left && expressionContainsNewTargetForEval(*binary->left)) ||
+           (binary->right && expressionContainsNewTargetForEval(*binary->right));
+  }
+  if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+    return unary->argument && expressionContainsNewTargetForEval(*unary->argument);
+  }
+  if (auto* assign = std::get_if<AssignmentExpr>(&expr.node)) {
+    return (assign->left && expressionContainsNewTargetForEval(*assign->left)) ||
+           (assign->right && expressionContainsNewTargetForEval(*assign->right));
+  }
+  if (auto* update = std::get_if<UpdateExpr>(&expr.node)) {
+    return update->argument && expressionContainsNewTargetForEval(*update->argument);
+  }
+  if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+    if (call->callee && expressionContainsNewTargetForEval(*call->callee)) return true;
+    for (const auto& arg : call->arguments) {
+      if (arg && expressionContainsNewTargetForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* member = std::get_if<MemberExpr>(&expr.node)) {
+    return (member->object && expressionContainsNewTargetForEval(*member->object)) ||
+           (member->property && expressionContainsNewTargetForEval(*member->property));
+  }
+  if (auto* cond = std::get_if<ConditionalExpr>(&expr.node)) {
+    return (cond->test && expressionContainsNewTargetForEval(*cond->test)) ||
+           (cond->consequent && expressionContainsNewTargetForEval(*cond->consequent)) ||
+           (cond->alternate && expressionContainsNewTargetForEval(*cond->alternate));
+  }
+  if (auto* seq = std::get_if<SequenceExpr>(&expr.node)) {
+    for (const auto& e : seq->expressions) {
+      if (e && expressionContainsNewTargetForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* arr = std::get_if<ArrayExpr>(&expr.node)) {
+    for (const auto& e : arr->elements) {
+      if (e && expressionContainsNewTargetForEval(*e)) return true;
+    }
+    return false;
+  }
+  if (auto* obj = std::get_if<ObjectExpr>(&expr.node)) {
+    for (const auto& prop : obj->properties) {
+      if (prop.key && expressionContainsNewTargetForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsNewTargetForEval(*prop.value)) return true;
+    }
+    return false;
+  }
+  if (auto* awaitExpr = std::get_if<AwaitExpr>(&expr.node)) {
+    return awaitExpr->argument && expressionContainsNewTargetForEval(*awaitExpr->argument);
+  }
+  if (auto* yieldExpr = std::get_if<YieldExpr>(&expr.node)) {
+    return yieldExpr->argument && expressionContainsNewTargetForEval(*yieldExpr->argument);
+  }
+  if (auto* spread = std::get_if<SpreadElement>(&expr.node)) {
+    return spread->argument && expressionContainsNewTargetForEval(*spread->argument);
+  }
+  if (auto* newExpr = std::get_if<NewExpr>(&expr.node)) {
+    if (newExpr->callee && expressionContainsNewTargetForEval(*newExpr->callee)) return true;
+    for (const auto& arg : newExpr->arguments) {
+      if (arg && expressionContainsNewTargetForEval(*arg)) return true;
+    }
+    return false;
+  }
+  if (auto* arrPat = std::get_if<ArrayPattern>(&expr.node)) {
+    for (const auto& e : arrPat->elements) {
+      if (e && expressionContainsNewTargetForEval(*e)) return true;
+    }
+    return arrPat->rest && expressionContainsNewTargetForEval(*arrPat->rest);
+  }
+  if (auto* objPat = std::get_if<ObjectPattern>(&expr.node)) {
+    for (const auto& prop : objPat->properties) {
+      if (prop.key && expressionContainsNewTargetForEval(*prop.key)) return true;
+      if (prop.value && expressionContainsNewTargetForEval(*prop.value)) return true;
+    }
+    return objPat->rest && expressionContainsNewTargetForEval(*objPat->rest);
+  }
+  if (auto* assignPat = std::get_if<AssignmentPattern>(&expr.node)) {
+    return (assignPat->left && expressionContainsNewTargetForEval(*assignPat->left)) ||
+           (assignPat->right && expressionContainsNewTargetForEval(*assignPat->right));
+  }
+  return false;
+}
+
+bool statementContainsNewTargetForEval(const Statement& stmt) {
+  if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.node)) {
+    for (const auto& decl : varDecl->declarations) {
+      if (decl.pattern && expressionContainsNewTargetForEval(*decl.pattern)) return true;
+      if (decl.init && expressionContainsNewTargetForEval(*decl.init)) return true;
+    }
+    return false;
+  }
+  if (auto* exprStmt = std::get_if<ExpressionStmt>(&stmt.node)) {
+    return exprStmt->expression && expressionContainsNewTargetForEval(*exprStmt->expression);
+  }
+  if (auto* ret = std::get_if<ReturnStmt>(&stmt.node)) {
+    return ret->argument && expressionContainsNewTargetForEval(*ret->argument);
+  }
+  if (auto* block = std::get_if<BlockStmt>(&stmt.node)) {
+    for (const auto& s : block->body) {
+      if (s && statementContainsNewTargetForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* ifStmt = std::get_if<IfStmt>(&stmt.node)) {
+    if (ifStmt->test && expressionContainsNewTargetForEval(*ifStmt->test)) return true;
+    if (ifStmt->consequent && statementContainsNewTargetForEval(*ifStmt->consequent)) return true;
+    return ifStmt->alternate && statementContainsNewTargetForEval(*ifStmt->alternate);
+  }
+  if (auto* whileStmt = std::get_if<WhileStmt>(&stmt.node)) {
+    if (whileStmt->test && expressionContainsNewTargetForEval(*whileStmt->test)) return true;
+    return whileStmt->body && statementContainsNewTargetForEval(*whileStmt->body);
+  }
+  if (auto* forStmt = std::get_if<ForStmt>(&stmt.node)) {
+    if (forStmt->init && statementContainsNewTargetForEval(*forStmt->init)) return true;
+    if (forStmt->test && expressionContainsNewTargetForEval(*forStmt->test)) return true;
+    if (forStmt->update && expressionContainsNewTargetForEval(*forStmt->update)) return true;
+    return forStmt->body && statementContainsNewTargetForEval(*forStmt->body);
+  }
+  if (auto* withStmt = std::get_if<WithStmt>(&stmt.node)) {
+    if (withStmt->object && expressionContainsNewTargetForEval(*withStmt->object)) return true;
+    return withStmt->body && statementContainsNewTargetForEval(*withStmt->body);
+  }
+  if (auto* forInStmt = std::get_if<ForInStmt>(&stmt.node)) {
+    if (forInStmt->left && statementContainsNewTargetForEval(*forInStmt->left)) return true;
+    if (forInStmt->right && expressionContainsNewTargetForEval(*forInStmt->right)) return true;
+    return forInStmt->body && statementContainsNewTargetForEval(*forInStmt->body);
+  }
+  if (auto* forOfStmt = std::get_if<ForOfStmt>(&stmt.node)) {
+    if (forOfStmt->left && statementContainsNewTargetForEval(*forOfStmt->left)) return true;
+    if (forOfStmt->right && expressionContainsNewTargetForEval(*forOfStmt->right)) return true;
+    return forOfStmt->body && statementContainsNewTargetForEval(*forOfStmt->body);
+  }
+  if (auto* doWhileStmt = std::get_if<DoWhileStmt>(&stmt.node)) {
+    if (doWhileStmt->body && statementContainsNewTargetForEval(*doWhileStmt->body)) return true;
+    return doWhileStmt->test && expressionContainsNewTargetForEval(*doWhileStmt->test);
+  }
+  if (auto* switchStmt = std::get_if<SwitchStmt>(&stmt.node)) {
+    if (switchStmt->discriminant && expressionContainsNewTargetForEval(*switchStmt->discriminant)) return true;
+    for (const auto& c : switchStmt->cases) {
+      if (c.test && expressionContainsNewTargetForEval(*c.test)) return true;
+      for (const auto& s : c.consequent) {
+        if (s && statementContainsNewTargetForEval(*s)) return true;
+      }
+    }
+    return false;
+  }
+  if (auto* label = std::get_if<LabelledStmt>(&stmt.node)) {
+    return label->body && statementContainsNewTargetForEval(*label->body);
+  }
+  if (auto* throwStmt = std::get_if<ThrowStmt>(&stmt.node)) {
+    return throwStmt->argument && expressionContainsNewTargetForEval(*throwStmt->argument);
+  }
+  if (auto* tryStmt = std::get_if<TryStmt>(&stmt.node)) {
+    for (const auto& s : tryStmt->block) {
+      if (s && statementContainsNewTargetForEval(*s)) return true;
+    }
+    if (tryStmt->handler.paramPattern && expressionContainsNewTargetForEval(*tryStmt->handler.paramPattern)) return true;
+    for (const auto& s : tryStmt->handler.body) {
+      if (s && statementContainsNewTargetForEval(*s)) return true;
+    }
+    for (const auto& s : tryStmt->finalizer) {
+      if (s && statementContainsNewTargetForEval(*s)) return true;
+    }
+    return false;
+  }
+  if (auto* exportDefault = std::get_if<ExportDefaultDeclaration>(&stmt.node)) {
+    return exportDefault->declaration && expressionContainsNewTargetForEval(*exportDefault->declaration);
+  }
+  return false;
+}
+
+bool programContainsSuperForEval(const Program& program) {
+  for (const auto& stmt : program.body) {
+    if (stmt && statementContainsSuperForEval(*stmt)) return true;
+  }
+  return false;
+}
+
+bool programContainsSuperCallForEval(const Program& program) {
+  for (const auto& stmt : program.body) {
+    if (stmt && statementContainsSuperCallForEval(*stmt)) return true;
+  }
+  return false;
+}
+
+bool programContainsArgumentsForEval(const Program& program) {
+  for (const auto& stmt : program.body) {
+    if (stmt && statementContainsArgumentsForEval(*stmt)) return true;
+  }
+  return false;
+}
+
+bool programContainsNewTargetForEval(const Program& program) {
+  for (const auto& stmt : program.body) {
+    if (stmt && statementContainsNewTargetForEval(*stmt)) return true;
+  }
+  return false;
+}
+
+void collectTopLevelFunctionDeclarationNames(const Program& program, std::vector<std::string>& names) {
+  for (const auto& stmt : program.body) {
+    if (!stmt) continue;
+    if (auto* funcDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+      if (!funcDecl->id.name.empty()) {
+        names.push_back(funcDecl->id.name);
+      }
+    }
+  }
+}
+
+bool isGlobalObjectExtensible(const GCPtr<Object>& globalObj) {
+  return globalObj && !globalObj->sealed && !globalObj->frozen;
+}
+
+bool isGlobalPropertyConfigurable(const GCPtr<Object>& globalObj, const std::string& name) {
+  return globalObj->properties.find("__non_configurable_" + name) == globalObj->properties.end();
+}
+
+bool isGlobalPropertyWritable(const GCPtr<Object>& globalObj, const std::string& name) {
+  return globalObj->properties.find("__non_writable_" + name) == globalObj->properties.end();
+}
+
+bool isGlobalPropertyEnumerable(const GCPtr<Object>& globalObj, const std::string& name) {
+  return globalObj->properties.find("__non_enum_" + name) == globalObj->properties.end();
+}
+
+bool canDeclareGlobalVarBinding(const GCPtr<Object>& globalObj, const std::string& name) {
+  if (globalObj->properties.find(name) != globalObj->properties.end()) {
+    return true;
+  }
+  return isGlobalObjectExtensible(globalObj);
+}
+
+bool canDeclareGlobalFunctionBinding(const GCPtr<Object>& globalObj,
+                                     const std::string& name,
+                                     bool& shouldResetAttributes) {
+  auto existing = globalObj->properties.find(name);
+  if (existing == globalObj->properties.end()) {
+    shouldResetAttributes = true;
+    return isGlobalObjectExtensible(globalObj);
+  }
+
+  if (isGlobalPropertyConfigurable(globalObj, name)) {
+    shouldResetAttributes = true;
+    return true;
+  }
+
+  shouldResetAttributes = false;
+  return isGlobalPropertyWritable(globalObj, name) &&
+         isGlobalPropertyEnumerable(globalObj, name);
+}
+
+void resetGlobalDataPropertyAttributes(const GCPtr<Object>& globalObj, const std::string& name) {
+  globalObj->properties.erase("__non_writable_" + name);
+  globalObj->properties.erase("__non_enum_" + name);
+  globalObj->properties.erase("__non_configurable_" + name);
+  globalObj->properties.erase("__enum_" + name);
 }
 
 bool defineModuleNamespaceProperty(const GCPtr<Object>& obj,
@@ -605,6 +1670,25 @@ bool Environment::hasLexicalLocal(const std::string& name) const {
   return it != lexicalBindings_.end() && it->second;
 }
 
+bool Environment::deleteLocalMutable(const std::string& name) {
+  auto it = bindings_.find(name);
+  if (it == bindings_.end()) {
+    return false;
+  }
+  if (constants_.find(name) != constants_.end()) {
+    return false;
+  }
+  auto lexIt = lexicalBindings_.find(name);
+  if (lexIt != lexicalBindings_.end() && lexIt->second) {
+    return false;
+  }
+  bindings_.erase(it);
+  constants_.erase(name);
+  lexicalBindings_.erase(name);
+  tdzBindings_.erase(name);
+  return true;
+}
+
 int Environment::deleteFromWithScope(const std::string& name) {
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
   if (withScopeIt != bindings_.end()) {
@@ -637,6 +1721,16 @@ bool Environment::setVar(const std::string& name, const Value& value) {
   return false;
 }
 
+Environment* Environment::resolveBindingEnvironment(const std::string& name) {
+  if (bindings_.find(name) != bindings_.end()) {
+    return this;
+  }
+  if (parent_) {
+    return parent_->resolveBindingEnvironment(name);
+  }
+  return nullptr;
+}
+
 GCPtr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
   // Check if this env has a local binding that shadows the name
   auto it = bindings_.find(name);
@@ -648,6 +1742,9 @@ GCPtr<Object> Environment::resolveWithScopeObject(const std::string& name) const
   if (withScopeIt != bindings_.end() && withScopeIt->second.isObject()) {
     auto obj = withScopeIt->second.getGC<Object>();
     if (lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
+      return obj;
+    }
+    if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
       return obj;
     }
   }
@@ -779,9 +1876,6 @@ GCPtr<Environment> Environment::createGlobal() {
   consoleObj->properties["assert"] = Value(consoleAssertFn);
 
   env->define("console", Value(consoleObj));
-  env->define("undefined", Value(Undefined{}), true);  // non-writable per spec
-  env->define("Infinity", Value(std::numeric_limits<double>::infinity()), true);
-  env->define("NaN", Value(std::numeric_limits<double>::quiet_NaN()), true);
 
   auto evalFn = GarbageCollector::makeGC<Function>();
   evalFn->isNative = true;
@@ -797,8 +1891,10 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!prevInterpreter) {
       return Value(Undefined{});
     }
+    bool isDirectEval = prevInterpreter->inDirectEvalInvocation();
+
     auto evalEnv = env;
-    if (prevInterpreter->inDirectEvalInvocation()) {
+    if (isDirectEval) {
       auto callerEnv = prevInterpreter->getEnvironment();
       if (callerEnv) {
         evalEnv = callerEnv;
@@ -821,39 +1917,300 @@ GCPtr<Environment> Environment::createGlobal() {
     }
 
     // Direct eval inherits strict mode from calling context (ES2020 18.2.1.1)
-    bool inheritStrict = false;
-    if (prevInterpreter->inDirectEvalInvocation() && prevInterpreter->isStrictMode()) {
-      inheritStrict = true;
-    }
+    bool inheritStrict = isDirectEval && prevInterpreter->isStrictMode();
 
     Parser parser(tokens);
     if (inheritStrict) {
       parser.setStrictMode(true);
+    }
+    if (isDirectEval) {
+      auto allowedPrivateNames = prevInterpreter->activePrivateNamesForEval();
+      if (!allowedPrivateNames.empty()) {
+        parser.setAllowedPrivateNames(allowedPrivateNames);
+      }
     }
     auto program = parser.parse();
     if (!program) {
       throw std::runtime_error("SyntaxError: Parse error");
     }
 
-    if (prevInterpreter->inDirectEvalInvocation()) {
-      std::vector<std::string> varNames;
-      for (const auto& stmt : program->body) {
-        if (stmt) {
-          collectVarNamesFromStatement(*stmt, varNames);
+    bool strictEval = inheritStrict || bodyHasUseStrictDirective(program->body);
+
+    auto varEnv = evalEnv;
+    if (isDirectEval) {
+      auto scope = evalEnv;
+      while (scope && !scope->hasLocal("__var_scope__")) {
+        auto parent = scope->getParentPtr();
+        if (!parent) {
+          break;
+        }
+        scope = parent;
+      }
+      if (scope) {
+        varEnv = scope;
+      } else if (evalEnv) {
+        varEnv = evalEnv->getRoot();
+      }
+    } else if (env) {
+      varEnv = env->getRoot();
+    }
+
+    if (isDirectEval) {
+      bool inFieldInitializer = prevInterpreter->inFieldInitializerEvaluation() ||
+                                evalEnv->get("__in_class_field_initializer__").has_value();
+      bool inArrow = prevInterpreter->activeFunctionIsArrow();
+      bool inMethod = (prevInterpreter->activeFunctionHasHomeObject() ||
+                       prevInterpreter->activeFunctionHasSuperClassBinding() ||
+                       evalEnv->hasLocal("__super__"));
+      // Constructor-ness is dynamic (`[[Construct]]` call state), not whether
+      // the active function object is constructable.
+      bool inConstructor = evalEnv->hasLocal("__new_target__");
+      bool allowNewTarget = (!inArrow && (prevInterpreter->hasActiveFunction() ||
+                                          evalEnv->hasLocal("__new_target__")));
+      if (inFieldInitializer) {
+        // Additional eval-in-initializer rules: treat as outside constructor,
+        // inside method, and inside function.
+        inMethod = true;
+        inConstructor = false;
+        allowNewTarget = true;
+      } else if (inArrow) {
+        inMethod = false;
+        inConstructor = false;
+      }
+
+      if (!inMethod && programContainsSuperForEval(*program)) {
+        throw std::runtime_error("SyntaxError: 'super' keyword is not valid here");
+      }
+      if (!inConstructor && programContainsSuperCallForEval(*program)) {
+        throw std::runtime_error("SyntaxError: 'super' keyword is not valid here");
+      }
+      if (inFieldInitializer && programContainsArgumentsForEval(*program)) {
+        throw std::runtime_error("SyntaxError: 'arguments' is not allowed in this context");
+      }
+      if (!allowNewTarget && programContainsNewTargetForEval(*program)) {
+        throw std::runtime_error("SyntaxError: new.target is not allowed in this context");
+      }
+
+      if (prevInterpreter->inParameterInitializerEvaluation() && evalEnv->hasLocal("arguments")) {
+        std::vector<std::string> declaredNames;
+        for (const auto& stmt : program->body) {
+          if (stmt) {
+            collectDeclaredNamesForDirectEval(*stmt, declaredNames);
+          }
+        }
+        for (const auto& name : declaredNames) {
+          if (name == "arguments") {
+            throw std::runtime_error("SyntaxError: Identifier 'arguments' has already been declared");
+          }
         }
       }
-      for (const auto& varName : varNames) {
-        if (evalEnv->isTDZ(varName) || evalEnv->hasLexicalLocal(varName)) {
-          throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
+
+      if (!strictEval) {
+        std::vector<std::string> varNames;
+        for (const auto& stmt : program->body) {
+          if (stmt) {
+            collectVarNamesFromStatement(*stmt, varNames);
+          }
+        }
+        std::vector<std::string> topLevelFnNames;
+        collectTopLevelFunctionDeclarationNames(*program, topLevelFnNames);
+        varNames.insert(varNames.end(), topLevelFnNames.begin(), topLevelFnNames.end());
+        std::unordered_set<std::string> seenNames;
+        for (const auto& varName : varNames) {
+          if (!seenNames.insert(varName).second) {
+            continue;
+          }
+          auto scope = evalEnv;
+          while (scope && scope.get() != varEnv.get()) {
+            // Skip with-scope object environments (cannot contain lexical declarations).
+            if (scope->hasLocal(kWithScopeObjectBinding)) {
+              scope = scope->getParentPtr();
+              continue;
+            }
+            if (scope->hasLexicalLocal(varName)) {
+              throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
+            }
+            scope = scope->getParentPtr();
+          }
+          // Also reject conflicts in the variable environment itself (not just at global scope).
+          // This covers parameter bindings and top-level lexical declarations in sloppy functions.
+          if (varEnv && varEnv->hasLexicalLocal(varName)) {
+            throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
+          }
         }
       }
+    } else {
+      if (programContainsSuperForEval(*program) || programContainsSuperCallForEval(*program)) {
+        throw std::runtime_error("SyntaxError: 'super' keyword is not valid here");
+      }
+      if (programContainsNewTargetForEval(*program)) {
+        throw std::runtime_error("SyntaxError: new.target is not allowed in this context");
+      }
+
+      if (!strictEval && varEnv && !varEnv->getParent()) {
+        std::vector<std::string> varNames;
+        for (const auto& stmt : program->body) {
+          if (stmt) {
+            collectVarNamesFromStatement(*stmt, varNames);
+          }
+        }
+        std::vector<std::string> topLevelFnNames;
+        collectTopLevelFunctionDeclarationNames(*program, topLevelFnNames);
+        varNames.insert(varNames.end(), topLevelFnNames.begin(), topLevelFnNames.end());
+
+        std::unordered_set<std::string> seenNames;
+        for (const auto& varName : varNames) {
+          if (!seenNames.insert(varName).second) {
+            continue;
+          }
+          if (varEnv->hasLexicalLocal(varName)) {
+            throw std::runtime_error("SyntaxError: Identifier '" + varName + "' has already been declared");
+          }
+        }
+      }
+    }
+
+    GCPtr<Environment> execOuterEnv = isDirectEval ? evalEnv : GCPtr<Environment>(nullptr);
+    if (!isDirectEval && env) {
+      execOuterEnv = env->getRoot();
+    }
+    if (!execOuterEnv) {
+      execOuterEnv = varEnv ? varEnv : env;
+    }
+    auto execEnv = execOuterEnv->createChild();
+
+    std::vector<std::string> varScopedNames;
+    for (const auto& stmt : program->body) {
+      if (stmt) {
+        collectVarNamesFromStatement(*stmt, varScopedNames);
+      }
+    }
+    std::vector<std::string> topLevelFnNames;
+    collectTopLevelFunctionDeclarationNames(*program, topLevelFnNames);
+    varScopedNames.insert(varScopedNames.end(), topLevelFnNames.begin(), topLevelFnNames.end());
+
+    struct GlobalFunctionPlan {
+      std::string name;
+      bool resetAttributes = false;
+      bool preserveExistingAttributes = false;
+      bool hadNonWritable = false;
+      bool hadNonEnumerable = false;
+      bool hadNonConfigurable = false;
+      bool hadEnumMarker = false;
+    };
+    struct GlobalVarPlan {
+      std::string name;
+      bool created = false;
+      bool preserveExistingAttributes = false;
+      bool hadNonWritable = false;
+      bool hadNonEnumerable = false;
+      bool hadNonConfigurable = false;
+      bool hadEnumMarker = false;
+    };
+    std::vector<GlobalFunctionPlan> globalFunctionPlans;
+    std::vector<GlobalVarPlan> globalVarPlans;
+    GCPtr<Object> globalObj;
+
+    if (!strictEval && varEnv && !varEnv->getParent()) {
+      auto globalThis = varEnv->get("globalThis");
+      if (globalThis && globalThis->isObject()) {
+        globalObj = globalThis->getGC<Object>();
+
+        std::vector<std::string> topLevelFnNames;
+        collectTopLevelFunctionDeclarationNames(*program, topLevelFnNames);
+        std::unordered_set<std::string> declaredFunctionNames;
+        for (auto it = topLevelFnNames.rbegin(); it != topLevelFnNames.rend(); ++it) {
+          if (!declaredFunctionNames.insert(*it).second) {
+            continue;
+          }
+          bool resetAttrs = true;
+          if (!canDeclareGlobalFunctionBinding(globalObj, *it, resetAttrs)) {
+            throw std::runtime_error("TypeError: Cannot declare global function '" + *it + "'");
+          }
+          GlobalFunctionPlan plan;
+          plan.name = *it;
+          plan.resetAttributes = resetAttrs;
+          if (globalObj->properties.find(*it) != globalObj->properties.end() && !resetAttrs) {
+            plan.preserveExistingAttributes = true;
+            plan.hadNonWritable = globalObj->properties.find("__non_writable_" + *it) != globalObj->properties.end();
+            plan.hadNonEnumerable = globalObj->properties.find("__non_enum_" + *it) != globalObj->properties.end();
+            plan.hadNonConfigurable = globalObj->properties.find("__non_configurable_" + *it) != globalObj->properties.end();
+            plan.hadEnumMarker = globalObj->properties.find("__enum_" + *it) != globalObj->properties.end();
+          }
+          globalFunctionPlans.push_back(plan);
+        }
+
+        std::vector<std::string> declaredVarNames;
+        for (const auto& stmt : program->body) {
+          if (stmt) {
+            collectVarNamesFromStatement(*stmt, declaredVarNames);
+          }
+        }
+        std::unordered_set<std::string> seenVarNames;
+        for (const auto& vn : declaredVarNames) {
+          if (declaredFunctionNames.count(vn) != 0) {
+            continue;
+          }
+          if (!seenVarNames.insert(vn).second) {
+            continue;
+          }
+          bool exists = globalObj->properties.find(vn) != globalObj->properties.end();
+          if (!canDeclareGlobalVarBinding(globalObj, vn)) {
+            throw std::runtime_error("TypeError: Cannot declare global variable '" + vn + "'");
+          }
+          GlobalVarPlan plan;
+          plan.name = vn;
+          plan.created = !exists;
+          if (exists) {
+            plan.preserveExistingAttributes = true;
+            plan.hadNonWritable = globalObj->properties.find("__non_writable_" + vn) != globalObj->properties.end();
+            plan.hadNonEnumerable = globalObj->properties.find("__non_enum_" + vn) != globalObj->properties.end();
+            plan.hadNonConfigurable = globalObj->properties.find("__non_configurable_" + vn) != globalObj->properties.end();
+            plan.hadEnumMarker = globalObj->properties.find("__enum_" + vn) != globalObj->properties.end();
+          }
+          globalVarPlans.push_back(plan);
+        }
+      }
+    }
+
+    if (!strictEval && varEnv) {
+      std::unordered_set<std::string> seeded;
+      for (const auto& name : varScopedNames) {
+        if (!seeded.insert(name).second) {
+          continue;
+        }
+        // For direct eval in function scope, var declarations are instantiated in
+        // the variable environment record (the nearest __var_scope__), and must
+        // not observe bindings in outer environments (Test262 S11.13.1_A6_T1).
+        // For global eval, preserve existing global bindings/properties.
+        bool varExistsInVarEnv = false;
+        if (varEnv->getParent() == nullptr) {
+          varExistsInVarEnv = varEnv->has(name);
+        } else {
+          varExistsInVarEnv = varEnv->hasLocal(name);
+        }
+        if (!varExistsInVarEnv || varEnv->hasLexicalLocal(name)) {
+          continue;
+        }
+        auto existing = varEnv->get(name);
+        if (existing.has_value()) {
+          execEnv->define(name, *existing);
+        }
+      }
+    }
+
+    if (!strictEval && isDirectEval && varEnv && varEnv->getParent()) {
+      execEnv->define("__eval_deletable_bindings__", Value(true), true);
     }
 
     // Move program to heap so functions created during eval can keep AST alive
     auto programPtr = std::make_shared<Program>(std::move(*program));
 
-    Interpreter evalInterpreter(evalEnv);
-    if (inheritStrict) {
+    Interpreter evalInterpreter(execEnv);
+    if (isDirectEval) {
+      evalInterpreter.inheritDirectEvalContextFrom(*prevInterpreter);
+    }
+    if (strictEval) {
       evalInterpreter.setStrictMode(true);
     }
     evalInterpreter.setSourceKeepAlive(programPtr);
@@ -869,11 +2226,73 @@ GCPtr<Environment> Environment::createGlobal() {
         Value err = evalInterpreter.getError();
         evalInterpreter.clearError();
         setGlobalInterpreter(prevInterpreter);
-        throw std::runtime_error(err.toString());
+        throw JsValueException(err);
       }
     } catch (...) {
       setGlobalInterpreter(prevInterpreter);
       throw;
+    }
+
+    if (!strictEval && varEnv) {
+      std::unordered_set<std::string> propagated;
+      for (const auto& name : varScopedNames) {
+        if (!propagated.insert(name).second) {
+          continue;
+        }
+        if (!execEnv->hasLocal(name)) {
+          continue;
+        }
+        auto value = execEnv->get(name);
+        if (!value.has_value()) {
+          continue;
+        }
+        if (varEnv->hasLocal(name)) {
+          varEnv->set(name, *value);
+        } else {
+          varEnv->define(name, *value);
+        }
+      }
+
+      if (globalObj) {
+        for (const auto& plan : globalFunctionPlans) {
+          if (globalObj->properties.find(plan.name) == globalObj->properties.end()) {
+            continue;
+          }
+          if (plan.resetAttributes) {
+            resetGlobalDataPropertyAttributes(globalObj, plan.name);
+            continue;
+          }
+          if (plan.preserveExistingAttributes) {
+            if (plan.hadNonWritable) globalObj->properties["__non_writable_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_writable_" + plan.name);
+            if (plan.hadNonEnumerable) globalObj->properties["__non_enum_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_enum_" + plan.name);
+            if (plan.hadNonConfigurable) globalObj->properties["__non_configurable_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_configurable_" + plan.name);
+            if (plan.hadEnumMarker) globalObj->properties["__enum_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__enum_" + plan.name);
+          }
+        }
+        for (const auto& plan : globalVarPlans) {
+          if (globalObj->properties.find(plan.name) == globalObj->properties.end()) {
+            continue;
+          }
+          if (plan.created) {
+            resetGlobalDataPropertyAttributes(globalObj, plan.name);
+            continue;
+          }
+          if (plan.preserveExistingAttributes) {
+            if (plan.hadNonWritable) globalObj->properties["__non_writable_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_writable_" + plan.name);
+            if (plan.hadNonEnumerable) globalObj->properties["__non_enum_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_enum_" + plan.name);
+            if (plan.hadNonConfigurable) globalObj->properties["__non_configurable_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__non_configurable_" + plan.name);
+            if (plan.hadEnumMarker) globalObj->properties["__enum_" + plan.name] = Value(true);
+            else globalObj->properties.erase("__enum_" + plan.name);
+          }
+        }
+      }
     }
 
     setGlobalInterpreter(prevInterpreter);
@@ -885,10 +2304,23 @@ GCPtr<Environment> Environment::createGlobal() {
   // Symbol constructor
   auto symbolFn = GarbageCollector::makeGC<Function>();
   symbolFn->isNative = true;
+  symbolFn->isConstructor = true;
+  symbolFn->properties["name"] = Value(std::string("Symbol"));
+  symbolFn->properties["length"] = Value(1.0);
+  // Symbol is a constructor whose [[Construct]] always throws (per spec).
+  // Keep it as a constructor so it can be used in `extends`, but prevent `new Symbol()`.
+  symbolFn->properties["__throw_on_new__"] = Value(true);
   symbolFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     std::string description = args.empty() ? "" : args[0].toString();
     return Value(Symbol(description));
   };
+  {
+    auto symbolPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    symbolFn->properties["prototype"] = Value(symbolPrototype);
+    symbolPrototype->properties["constructor"] = Value(symbolFn);
+    symbolPrototype->properties["name"] = Value(std::string("Symbol"));
+  }
   symbolFn->properties["iterator"] = WellKnownSymbols::iterator();
   symbolFn->properties["asyncIterator"] = WellKnownSymbols::asyncIterator();
   symbolFn->properties["toStringTag"] = WellKnownSymbols::toStringTag();
@@ -965,7 +2397,12 @@ GCPtr<Environment> Environment::createGlobal() {
   };
 
   auto isObjectLike = [](const Value& value) -> bool {
-    return value.isObject() || value.isArray() || value.isFunction() || value.isRegex();
+    // Keep this aligned with Interpreter::isObjectLike so builtins using ToPrimitive
+    // (e.g. String(), Number(), BigInt()) behave consistently with the interpreter.
+    return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
+           value.isProxy() || value.isPromise() || value.isGenerator() || value.isClass() ||
+           value.isMap() || value.isSet() || value.isWeakMap() || value.isWeakSet() ||
+           value.isTypedArray() || value.isArrayBuffer() || value.isDataView() || value.isError();
   };
 
   auto callChecked = [](const Value& callee,
@@ -1036,8 +2473,34 @@ GCPtr<Environment> Environment::createGlobal() {
     return {false, Value(Undefined{})};
   };
 
-  auto getProperty = [getObjectProperty, callChecked](const Value& receiver,
-                                                       const std::string& key) -> std::pair<bool, Value> {
+  auto getPropertyFromBag = [getObjectProperty, callChecked](const Value& receiver,
+                                                            OrderedMap<std::string, Value>& bag,
+                                                            const std::string& key) -> std::pair<bool, Value> {
+    std::string getterKey = "__get_" + key;
+    auto getterIt = bag.find(getterKey);
+    if (getterIt != bag.end()) {
+      if (getterIt->second.isFunction()) {
+        return {true, callChecked(getterIt->second, {}, receiver)};
+      }
+      return {true, Value(Undefined{})};
+    }
+
+    auto it = bag.find(key);
+    if (it != bag.end()) {
+      return {true, it->second};
+    }
+
+    auto protoIt = bag.find("__proto__");
+    if (protoIt != bag.end() && protoIt->second.isObject()) {
+      return getObjectProperty(protoIt->second.getGC<Object>(), receiver, key);
+    }
+
+    return {false, Value(Undefined{})};
+  };
+
+  std::function<std::pair<bool, Value>(const Value&, const std::string&)> getProperty;
+  getProperty = [getObjectProperty, getPropertyFromBag, callChecked, &getProperty](const Value& receiver,
+                                                                                  const std::string& key) -> std::pair<bool, Value> {
     if (receiver.isObject()) {
       return getObjectProperty(receiver.getGC<Object>(), receiver, key);
     }
@@ -1064,6 +2527,56 @@ GCPtr<Environment> Environment::createGlobal() {
         return {true, it->second};
       }
       return {false, Value(Undefined{})};
+    }
+    if (receiver.isGenerator()) {
+      auto gen = receiver.getGC<Generator>();
+      return getPropertyFromBag(receiver, gen->properties, key);
+    }
+    if (receiver.isPromise()) {
+      auto p = receiver.getGC<Promise>();
+      return getPropertyFromBag(receiver, p->properties, key);
+    }
+    if (receiver.isClass()) {
+      auto cls = receiver.getGC<Class>();
+      return getPropertyFromBag(receiver, cls->properties, key);
+    }
+    if (receiver.isMap()) {
+      auto m = receiver.getGC<Map>();
+      return getPropertyFromBag(receiver, m->properties, key);
+    }
+    if (receiver.isSet()) {
+      auto s = receiver.getGC<Set>();
+      return getPropertyFromBag(receiver, s->properties, key);
+    }
+    if (receiver.isWeakMap()) {
+      auto m = receiver.getGC<WeakMap>();
+      return getPropertyFromBag(receiver, m->properties, key);
+    }
+    if (receiver.isWeakSet()) {
+      auto s = receiver.getGC<WeakSet>();
+      return getPropertyFromBag(receiver, s->properties, key);
+    }
+    if (receiver.isTypedArray()) {
+      auto ta = receiver.getGC<TypedArray>();
+      return getPropertyFromBag(receiver, ta->properties, key);
+    }
+    if (receiver.isArrayBuffer()) {
+      auto ab = receiver.getGC<ArrayBuffer>();
+      return getPropertyFromBag(receiver, ab->properties, key);
+    }
+    if (receiver.isDataView()) {
+      auto dv = receiver.getGC<DataView>();
+      return getPropertyFromBag(receiver, dv->properties, key);
+    }
+    if (receiver.isError()) {
+      auto err = receiver.getGC<Error>();
+      return getPropertyFromBag(receiver, err->properties, key);
+    }
+    if (receiver.isProxy()) {
+      auto proxy = receiver.getGC<Proxy>();
+      if (proxy->target) {
+        return getProperty(*proxy->target, key);
+      }
     }
     return {false, Value(Undefined{})};
   };
@@ -1301,10 +2814,12 @@ GCPtr<Environment> Environment::createGlobal() {
 
   env->define("BigInt", Value(bigIntFn));
 
-  auto createTypedArrayConstructor = [](TypedArrayType type) {
+  auto createTypedArrayConstructor = [](TypedArrayType type, const std::string& name) {
     auto func = GarbageCollector::makeGC<Function>();
     func->isNative = true;
     func->isConstructor = true;
+    func->properties["name"] = Value(name);
+    func->properties["length"] = Value(1.0);
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
         return Value(GarbageCollector::makeGC<TypedArray>(type, 0));
@@ -1339,25 +2854,33 @@ GCPtr<Environment> Environment::createGlobal() {
 
       return Value(GarbageCollector::makeGC<TypedArray>(type, length));
     };
+    auto prototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    func->properties["prototype"] = Value(prototype);
+    prototype->properties["constructor"] = Value(func);
+    prototype->properties["name"] = Value(name);
     return Value(func);
   };
 
-  env->define("Int8Array", createTypedArrayConstructor(TypedArrayType::Int8));
-  env->define("Uint8Array", createTypedArrayConstructor(TypedArrayType::Uint8));
-  env->define("Uint8ClampedArray", createTypedArrayConstructor(TypedArrayType::Uint8Clamped));
-  env->define("Int16Array", createTypedArrayConstructor(TypedArrayType::Int16));
-  env->define("Uint16Array", createTypedArrayConstructor(TypedArrayType::Uint16));
-  env->define("Float16Array", createTypedArrayConstructor(TypedArrayType::Float16));
-  env->define("Int32Array", createTypedArrayConstructor(TypedArrayType::Int32));
-  env->define("Uint32Array", createTypedArrayConstructor(TypedArrayType::Uint32));
-  env->define("Float32Array", createTypedArrayConstructor(TypedArrayType::Float32));
-  env->define("Float64Array", createTypedArrayConstructor(TypedArrayType::Float64));
-  env->define("BigInt64Array", createTypedArrayConstructor(TypedArrayType::BigInt64));
-  env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64));
+  env->define("Int8Array", createTypedArrayConstructor(TypedArrayType::Int8, "Int8Array"));
+  env->define("Uint8Array", createTypedArrayConstructor(TypedArrayType::Uint8, "Uint8Array"));
+  env->define("Uint8ClampedArray", createTypedArrayConstructor(TypedArrayType::Uint8Clamped, "Uint8ClampedArray"));
+  env->define("Int16Array", createTypedArrayConstructor(TypedArrayType::Int16, "Int16Array"));
+  env->define("Uint16Array", createTypedArrayConstructor(TypedArrayType::Uint16, "Uint16Array"));
+  env->define("Float16Array", createTypedArrayConstructor(TypedArrayType::Float16, "Float16Array"));
+  env->define("Int32Array", createTypedArrayConstructor(TypedArrayType::Int32, "Int32Array"));
+  env->define("Uint32Array", createTypedArrayConstructor(TypedArrayType::Uint32, "Uint32Array"));
+  env->define("Float32Array", createTypedArrayConstructor(TypedArrayType::Float32, "Float32Array"));
+  env->define("Float64Array", createTypedArrayConstructor(TypedArrayType::Float64, "Float64Array"));
+  env->define("BigInt64Array", createTypedArrayConstructor(TypedArrayType::BigInt64, "BigInt64Array"));
+  env->define("BigUint64Array", createTypedArrayConstructor(TypedArrayType::BigUint64, "BigUint64Array"));
 
   // ArrayBuffer constructor
   auto arrayBufferConstructor = GarbageCollector::makeGC<Function>();
   arrayBufferConstructor->isNative = true;
+  arrayBufferConstructor->isConstructor = true;
+  arrayBufferConstructor->properties["name"] = Value(std::string("ArrayBuffer"));
+  arrayBufferConstructor->properties["length"] = Value(1.0);
   arrayBufferConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     size_t length = 0;
     if (!args.empty()) {
@@ -1367,11 +2890,45 @@ GCPtr<Environment> Environment::createGlobal() {
     GarbageCollector::instance().reportAllocation(length);
     return Value(buffer);
   };
+  {
+    auto prototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    arrayBufferConstructor->properties["prototype"] = Value(prototype);
+    prototype->properties["constructor"] = Value(arrayBufferConstructor);
+    prototype->properties["name"] = Value(std::string("ArrayBuffer"));
+  }
   env->define("ArrayBuffer", Value(arrayBufferConstructor));
+
+  // SharedArrayBuffer (ES2017) - backed by ArrayBuffer in this runtime.
+  auto sharedArrayBufferConstructor = GarbageCollector::makeGC<Function>();
+  sharedArrayBufferConstructor->isNative = true;
+  sharedArrayBufferConstructor->isConstructor = true;
+  sharedArrayBufferConstructor->properties["name"] = Value(std::string("SharedArrayBuffer"));
+  sharedArrayBufferConstructor->properties["length"] = Value(1.0);
+  sharedArrayBufferConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    size_t length = 0;
+    if (!args.empty()) {
+      length = static_cast<size_t>(args[0].toNumber());
+    }
+    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length);
+    GarbageCollector::instance().reportAllocation(length);
+    return Value(buffer);
+  };
+  {
+    auto prototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    sharedArrayBufferConstructor->properties["prototype"] = Value(prototype);
+    prototype->properties["constructor"] = Value(sharedArrayBufferConstructor);
+    prototype->properties["name"] = Value(std::string("SharedArrayBuffer"));
+  }
+  env->define("SharedArrayBuffer", Value(sharedArrayBufferConstructor));
 
   // DataView constructor
   auto dataViewConstructor = GarbageCollector::makeGC<Function>();
   dataViewConstructor->isNative = true;
+  dataViewConstructor->isConstructor = true;
+  dataViewConstructor->properties["name"] = Value(std::string("DataView"));
+  dataViewConstructor->properties["length"] = Value(1.0);
   dataViewConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || !args[0].isArrayBuffer()) {
       throw std::runtime_error("TypeError: DataView requires an ArrayBuffer");
@@ -1392,6 +2949,13 @@ GCPtr<Environment> Environment::createGlobal() {
     GarbageCollector::instance().reportAllocation(sizeof(DataView));
     return Value(dataView);
   };
+  {
+    auto prototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    dataViewConstructor->properties["prototype"] = Value(prototype);
+    prototype->properties["constructor"] = Value(dataViewConstructor);
+    prototype->properties["name"] = Value(std::string("DataView"));
+  }
   env->define("DataView", Value(dataViewConstructor));
 
   auto cryptoObj = GarbageCollector::makeGC<Object>();
@@ -2297,11 +3861,18 @@ GCPtr<Environment> Environment::createGlobal() {
 
   auto regExpConstructor = GarbageCollector::makeGC<Function>();
   regExpConstructor->isNative = true;
+  regExpConstructor->isConstructor = true;
+  regExpConstructor->properties["name"] = Value(std::string("RegExp"));
+  regExpConstructor->properties["length"] = Value(2.0);
   regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty()) return Value(Undefined{});
-    std::string pattern = args[0].toString();
+    std::string pattern = args.empty() ? std::string("") : args[0].toString();
     std::string flags = args.size() > 1 ? args[1].toString() : "";
-    return Value(GarbageCollector::makeGC<Regex>(pattern, flags));
+    auto rx = GarbageCollector::makeGC<Regex>(pattern, flags);
+    // lastIndex: writable, non-enumerable, non-configurable
+    rx->properties["lastIndex"] = Value(0.0);
+    rx->properties["__non_enum_lastIndex"] = Value(true);
+    rx->properties["__non_configurable_lastIndex"] = Value(true);
+    return Value(rx);
   };
   regExpConstructor->properties["prototype"] = Value(regExpPrototype);
   env->define("RegExp", Value(regExpConstructor));
@@ -2314,8 +3885,14 @@ GCPtr<Environment> Environment::createGlobal() {
     func->isNative = true;
     func->isConstructor = true;
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
-      std::string message = args.empty() ? "" : args[0].toString();
-      return Value(GarbageCollector::makeGC<Error>(type, message));
+      bool hasMessage = args.size() >= 1 && !args[0].isUndefined();
+      std::string message = hasMessage ? args[0].toString() : "";
+      auto err = GarbageCollector::makeGC<Error>(type, message);
+      if (hasMessage) {
+        err->properties["message"] = Value(message);
+        err->properties["__non_enum_message"] = Value(true);
+      }
+      return Value(err);
     };
     func->properties["__error_type__"] = Value(static_cast<double>(static_cast<int>(type)));
     func->properties["prototype"] = Value(prototype);
@@ -2340,6 +3917,32 @@ GCPtr<Environment> Environment::createGlobal() {
   env->define("URIError", Value(uriErrorCtor));
   env->define("EvalError", Value(evalErrorCtor));
 
+  // AggregateError (ES2021) - minimal constructor/prototype for subclassing tests.
+  {
+    auto aggregateErrorCtor = GarbageCollector::makeGC<Function>();
+    aggregateErrorCtor->isNative = true;
+    aggregateErrorCtor->isConstructor = true;
+    aggregateErrorCtor->properties["name"] = Value(std::string("AggregateError"));
+    aggregateErrorCtor->properties["length"] = Value(2.0);
+    aggregateErrorCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      std::string message;
+      if (args.size() >= 2 && !args[1].isUndefined()) {
+        message = args[1].toString();
+      }
+      return Value(GarbageCollector::makeGC<Error>(ErrorType::Error, message));
+    };
+    auto aggregateErrorProto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    aggregateErrorCtor->properties["prototype"] = Value(aggregateErrorProto);
+    aggregateErrorProto->properties["constructor"] = Value(aggregateErrorCtor);
+    aggregateErrorProto->properties["name"] = Value(std::string("AggregateError"));
+    auto errorProtoIt = errorCtor->properties.find("prototype");
+    if (errorProtoIt != errorCtor->properties.end() && errorProtoIt->second.isObject()) {
+      aggregateErrorProto->properties["__proto__"] = errorProtoIt->second;
+    }
+    env->define("AggregateError", Value(aggregateErrorCtor));
+  }
+
   // Map constructor
   auto mapConstructor = GarbageCollector::makeGC<Function>();
   GarbageCollector::instance().reportAllocation(sizeof(Function));
@@ -2354,11 +3957,24 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!args.empty() && args[0].isArray()) {
       auto entriesArr = args[0].getGC<Array>();
       for (const auto& entryVal : entriesArr->elements) {
+        Value k(Undefined{});
+        Value v(Undefined{});
         if (entryVal.isArray()) {
           auto entryArr = entryVal.getGC<Array>();
-          if (entryArr->elements.size() >= 2) {
-            mapObj->set(entryArr->elements[0], entryArr->elements[1]);
+          if (entryArr->elements.size() >= 1) k = entryArr->elements[0];
+          if (entryArr->elements.size() >= 2) v = entryArr->elements[1];
+          mapObj->set(k, v);
+          continue;
+        }
+        if (entryVal.isObject()) {
+          auto entryObj = entryVal.getGC<Object>();
+          if (auto it0 = entryObj->properties.find("0"); it0 != entryObj->properties.end()) {
+            k = it0->second;
           }
+          if (auto it1 = entryObj->properties.find("1"); it1 != entryObj->properties.end()) {
+            v = it1->second;
+          }
+          mapObj->set(k, v);
         }
       }
     }
@@ -2400,36 +4016,121 @@ GCPtr<Environment> Environment::createGlobal() {
   // WeakMap constructor
   auto weakMapConstructor = GarbageCollector::makeGC<Function>();
   weakMapConstructor->isNative = true;
+  weakMapConstructor->isConstructor = true;
+  weakMapConstructor->properties["name"] = Value(std::string("WeakMap"));
+  weakMapConstructor->properties["length"] = Value(0.0);
   weakMapConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
     auto wm = GarbageCollector::makeGC<WeakMap>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakMap));
     return Value(wm);
   };
+  {
+    auto weakMapPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    weakMapConstructor->properties["prototype"] = Value(weakMapPrototype);
+    weakMapPrototype->properties["constructor"] = Value(weakMapConstructor);
+    weakMapPrototype->properties["name"] = Value(std::string("WeakMap"));
+  }
   env->define("WeakMap", Value(weakMapConstructor));
 
   // WeakSet constructor
   auto weakSetConstructor = GarbageCollector::makeGC<Function>();
   weakSetConstructor->isNative = true;
+  weakSetConstructor->isConstructor = true;
+  weakSetConstructor->properties["name"] = Value(std::string("WeakSet"));
+  weakSetConstructor->properties["length"] = Value(0.0);
   weakSetConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
     auto ws = GarbageCollector::makeGC<WeakSet>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakSet));
     return Value(ws);
   };
+  {
+    auto weakSetPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    weakSetConstructor->properties["prototype"] = Value(weakSetPrototype);
+    weakSetPrototype->properties["constructor"] = Value(weakSetConstructor);
+    weakSetPrototype->properties["name"] = Value(std::string("WeakSet"));
+  }
   env->define("WeakSet", Value(weakSetConstructor));
+
+  // WeakRef (ES2021) - minimal constructor/prototype for subclassing tests.
+  auto weakRefConstructor = GarbageCollector::makeGC<Function>();
+  weakRefConstructor->isNative = true;
+  weakRefConstructor->isConstructor = true;
+  weakRefConstructor->properties["name"] = Value(std::string("WeakRef"));
+  weakRefConstructor->properties["length"] = Value(1.0);
+  weakRefConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto obj = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    obj->properties["__weakref_target__"] = args.empty() ? Value(Undefined{}) : args[0];
+    return Value(obj);
+  };
+  {
+    auto weakRefPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    weakRefConstructor->properties["prototype"] = Value(weakRefPrototype);
+    weakRefPrototype->properties["constructor"] = Value(weakRefConstructor);
+    weakRefPrototype->properties["name"] = Value(std::string("WeakRef"));
+  }
+  env->define("WeakRef", Value(weakRefConstructor));
 
   // Proxy constructor
   auto proxyConstructor = GarbageCollector::makeGC<Function>();
   proxyConstructor->isNative = true;
   proxyConstructor->isConstructor = true;
-  proxyConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  auto isCallableTarget = [](const Value& target) -> bool {
+    if (target.isFunction() || target.isClass()) return true;
+    if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      auto it = obj->properties.find("__callable_object__");
+      return it != obj->properties.end() && it->second.isBool() && it->second.toBool();
+    }
+    if (target.isProxy()) {
+      auto p = target.getGC<Proxy>();
+      return p && p->isCallable;
+    }
+    return false;
+  };
+  proxyConstructor->nativeFunc = [isCallableTarget](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
       // Need target and handler
       return Value(Undefined{});
     }
     auto proxy = GarbageCollector::makeGC<Proxy>(args[0], args[1]);
     GarbageCollector::instance().reportAllocation(sizeof(Proxy));
+    proxy->isCallable = isCallableTarget(args[0]);
     return Value(proxy);
   };
+
+  // Proxy.revocable(target, handler)
+  auto proxyRevocable = GarbageCollector::makeGC<Function>();
+  proxyRevocable->isNative = true;
+  proxyRevocable->nativeFunc = [isCallableTarget](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) {
+      return Value(Undefined{});
+    }
+    auto proxy = GarbageCollector::makeGC<Proxy>(args[0], args[1]);
+    GarbageCollector::instance().reportAllocation(sizeof(Proxy));
+    proxy->isCallable = isCallableTarget(args[0]);
+
+    auto revokeFn = GarbageCollector::makeGC<Function>();
+    revokeFn->isNative = true;
+    revokeFn->nativeFunc = [proxy](const std::vector<Value>&) -> Value {
+      if (proxy) {
+        proxy->revoked = true;
+        if (proxy->target) *proxy->target = Value(Undefined{});
+        if (proxy->handler) *proxy->handler = Value(Undefined{});
+      }
+      return Value(Undefined{});
+    };
+
+    auto result = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    result->properties["proxy"] = Value(proxy);
+    result->properties["revoke"] = Value(revokeFn);
+    return Value(result);
+  };
+  proxyConstructor->properties["revocable"] = Value(proxyRevocable);
   env->define("Proxy", Value(proxyConstructor));
 
   // Reflect object with static methods
@@ -2443,7 +4144,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.size() < 2) return Value(Undefined{});
 
     const Value& target = args[0];
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
 
     if (target.isObject()) {
       auto obj = target.getGC<Object>();
@@ -2478,7 +4179,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.size() < 3) return Value(false);
 
     const Value& target = args[0];
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
     const Value& value = args[2];
 
     if (target.isObject()) {
@@ -2500,7 +4201,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.size() < 2) return Value(false);
 
     const Value& target = args[0];
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
 
     if (target.isObject()) {
       auto obj = target.getGC<Object>();
@@ -2523,7 +4224,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.size() < 2) return Value(false);
 
     const Value& target = args[0];
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
 
     if (target.isObject()) {
       auto obj = target.getGC<Object>();
@@ -2642,6 +4343,14 @@ GCPtr<Environment> Environment::createGlobal() {
   reflectIsExtensible->isNative = true;
   reflectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      auto it = cls->properties.find("__non_extensible__");
+      bool nonExtensible = it != cls->properties.end() &&
+                           it->second.isBool() &&
+                           it->second.toBool();
+      return Value(!nonExtensible);
+    }
     if (args[0].isFunction() || args[0].isArray()) {
       return Value(true);  // Functions and arrays are always extensible
     }
@@ -2660,7 +4369,15 @@ GCPtr<Environment> Environment::createGlobal() {
   auto reflectPreventExtensions = GarbageCollector::makeGC<Function>();
   reflectPreventExtensions->isNative = true;
   reflectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isObject()) {
+    if (args.empty()) {
+      return Value(false);
+    }
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      cls->properties["__non_extensible__"] = Value(true);
+      return Value(true);
+    }
+    if (!args[0].isObject()) {
       return Value(false);
     }
     auto obj = args[0].getGC<Object>();
@@ -2718,7 +4435,7 @@ GCPtr<Environment> Environment::createGlobal() {
   reflectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
 
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
 
     if (args[0].isObject()) {
       auto obj = args[0].getGC<Object>();
@@ -2783,7 +4500,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!args[0].isObject()) return Value(false);
 
     auto obj = args[0].getGC<Object>();
-    std::string prop = args[1].toString();
+    std::string prop = valueToPropertyKey(args[1]);
     if (obj->isModuleNamespace) {
       if (!args[2].isObject()) {
         return Value(false);
@@ -2983,6 +4700,14 @@ GCPtr<Environment> Environment::createGlobal() {
   defineNumberConst("MIN_SAFE_INTEGER", Value(-9007199254740991.0));
   defineNumberConst("EPSILON", Value(2.220446049250313e-16));
 
+  {
+    auto numberPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    numberObj->properties["prototype"] = Value(numberPrototype);
+    numberPrototype->properties["constructor"] = Value(numberObj);
+    numberPrototype->properties["name"] = Value(std::string("Number"));
+  }
+
   env->define("Number", Value(numberObj));
 
   // Boolean constructor
@@ -3000,6 +4725,68 @@ GCPtr<Environment> Environment::createGlobal() {
     Value primitive = toPrimitive(args[0], false);
     return Value(primitive.toBool());
   };
+
+  {
+    auto booleanPrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    booleanObj->properties["prototype"] = Value(booleanPrototype);
+    booleanPrototype->properties["constructor"] = Value(booleanObj);
+    booleanPrototype->properties["name"] = Value(std::string("Boolean"));
+
+    auto boolProtoValueOf = GarbageCollector::makeGC<Function>();
+    GarbageCollector::instance().reportAllocation(sizeof(Function));
+    boolProtoValueOf->isNative = true;
+    boolProtoValueOf->properties["__uses_this_arg__"] = Value(true);
+    boolProtoValueOf->properties["name"] = Value(std::string("valueOf"));
+    boolProtoValueOf->properties["length"] = Value(0.0);
+    boolProtoValueOf->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
+      if (callArgs.empty()) {
+        throw std::runtime_error("TypeError: Boolean.prototype.valueOf requires Boolean");
+      }
+      Value thisArg = callArgs[0];
+      if (thisArg.isBool()) return thisArg;
+      if (thisArg.isObject()) {
+        auto obj = thisArg.getGC<Object>();
+        auto primIt = obj->properties.find("__primitive_value__");
+        if (primIt != obj->properties.end() && primIt->second.isBool()) {
+          return primIt->second;
+        }
+      }
+      throw std::runtime_error("TypeError: Boolean.prototype.valueOf requires Boolean");
+    };
+    booleanPrototype->properties["valueOf"] = Value(boolProtoValueOf);
+    booleanPrototype->properties["__non_enum_valueOf"] = Value(true);
+
+    auto boolProtoToString = GarbageCollector::makeGC<Function>();
+    GarbageCollector::instance().reportAllocation(sizeof(Function));
+    boolProtoToString->isNative = true;
+    boolProtoToString->properties["__uses_this_arg__"] = Value(true);
+    boolProtoToString->properties["name"] = Value(std::string("toString"));
+    boolProtoToString->properties["length"] = Value(0.0);
+    boolProtoToString->nativeFunc = [](const std::vector<Value>& callArgs) -> Value {
+      if (callArgs.empty()) {
+        throw std::runtime_error("TypeError: Boolean.prototype.toString requires Boolean");
+      }
+      Value thisArg = callArgs[0];
+      bool b = false;
+      if (thisArg.isBool()) {
+        b = thisArg.toBool();
+      } else if (thisArg.isObject()) {
+        auto obj = thisArg.getGC<Object>();
+        auto primIt = obj->properties.find("__primitive_value__");
+        if (primIt != obj->properties.end() && primIt->second.isBool()) {
+          b = primIt->second.toBool();
+        } else {
+          throw std::runtime_error("TypeError: Boolean.prototype.toString requires Boolean");
+        }
+      } else {
+        throw std::runtime_error("TypeError: Boolean.prototype.toString requires Boolean");
+      }
+      return Value(std::string(b ? "true" : "false"));
+    };
+    booleanPrototype->properties["toString"] = Value(boolProtoToString);
+    booleanPrototype->properties["__non_enum_toString"] = Value(true);
+  }
   env->define("Boolean", Value(booleanObj));
 
   // Global parseInt and parseFloat (aliases)
@@ -3057,6 +4844,7 @@ GCPtr<Environment> Environment::createGlobal() {
   auto arrayConstructorObj = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   arrayConstructorObj->properties["__callable_object__"] = Value(true);
+  arrayConstructorObj->properties["__constructor_wrapper__"] = Value(true);
   arrayConstructorObj->properties["constructor"] = Value(arrayConstructorFn);
 
   auto arrayPrototype = GarbageCollector::makeGC<Object>();
@@ -3105,6 +4893,62 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(result);
   };
   arrayPrototype->properties["join"] = Value(arrayProtoJoin);
+
+  // Array.prototype.reduce
+  auto arrayProtoReduce = GarbageCollector::makeGC<Function>();
+  arrayProtoReduce->isNative = true;
+  arrayProtoReduce->properties["__uses_this_arg__"] = Value(true);
+  arrayProtoReduce->properties["name"] = Value(std::string("reduce"));
+  arrayProtoReduce->properties["length"] = Value(1.0);
+  arrayProtoReduce->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isArray()) {
+      throw std::runtime_error("TypeError: Array.prototype.reduce called on non-array");
+    }
+    if (args.size() < 2 || !args[1].isFunction()) {
+      throw std::runtime_error("TypeError: Array.prototype.reduce requires a callback function");
+    }
+    auto arr = args[0].getGC<Array>();
+    Value callback = args[1];
+
+    if (!arr || arr->elements.empty()) {
+      if (args.size() >= 3) {
+        return args[2];
+      }
+      throw std::runtime_error("TypeError: Reduce of empty array with no initial value");
+    }
+
+    Value accumulator(Undefined{});
+    size_t start = 0;
+    if (args.size() >= 3) {
+      accumulator = args[2];
+      start = 0;
+    } else {
+      accumulator = arr->elements[0];
+      start = 1;
+    }
+
+    Interpreter* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: Interpreter unavailable");
+    }
+    for (size_t i = start; i < arr->elements.size(); ++i) {
+      std::vector<Value> callArgs = {
+        accumulator,
+        arr->elements[i],
+        Value(static_cast<double>(i)),
+        args[0]
+      };
+      accumulator = interpreter->callForHarness(callback, callArgs, Value(Undefined{}));
+      if (interpreter->hasError()) {
+        Value err = interpreter->getError();
+        interpreter->clearError();
+        throw std::runtime_error(err.toString());
+      }
+    }
+    return accumulator;
+  };
+  arrayPrototype->properties["reduce"] = Value(arrayProtoReduce);
+  arrayPrototype->properties["__non_enum_reduce"] = Value(true);
 
   // Array.prototype[Symbol.iterator] - values iterator
   {
@@ -4402,53 +6246,54 @@ GCPtr<Environment> Environment::createGlobal() {
     GarbageCollector::instance().reportAllocation(sizeof(Promise));
     promise->properties["__constructor__"] = Value(promiseFunc);
 
-    if (!args.empty() && args[0].isFunction()) {
-      auto executor = args[0].getGC<Function>();
+    if (args.empty() || !args[0].isFunction()) {
+      throw std::runtime_error("TypeError: Promise resolver is not a function");
+    }
+    auto executor = args[0].getGC<Function>();
 
-      // Create resolve and reject functions
-      auto resolveFunc = GarbageCollector::makeGC<Function>();
-      resolveFunc->isNative = true;
-      auto promisePtr = promise;
-      resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
-        if (!args.empty()) {
-          promisePtr->resolve(args[0]);
-        } else {
-          promisePtr->resolve(Value(Undefined{}));
-        }
-        return Value(Undefined{});
-      };
+    // Create resolve and reject functions
+    auto resolveFunc = GarbageCollector::makeGC<Function>();
+    resolveFunc->isNative = true;
+    auto promisePtr = promise;
+    resolveFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+      if (!args.empty()) {
+        promisePtr->resolve(args[0]);
+      } else {
+        promisePtr->resolve(Value(Undefined{}));
+      }
+      return Value(Undefined{});
+    };
 
-      auto rejectFunc = GarbageCollector::makeGC<Function>();
-      rejectFunc->isNative = true;
-      rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
-        if (!args.empty()) {
-          promisePtr->reject(args[0]);
-        } else {
-          promisePtr->reject(Value(Undefined{}));
-        }
-        return Value(Undefined{});
-      };
+    auto rejectFunc = GarbageCollector::makeGC<Function>();
+    rejectFunc->isNative = true;
+    rejectFunc->nativeFunc = [promisePtr](const std::vector<Value>& args) -> Value {
+      if (!args.empty()) {
+        promisePtr->reject(args[0]);
+      } else {
+        promisePtr->reject(Value(Undefined{}));
+      }
+      return Value(Undefined{});
+    };
 
-      // Call executor with resolve and reject
-      if (executor->isNative) {
-        try {
-          executor->nativeFunc({Value(resolveFunc), Value(rejectFunc)});
-        } catch (const std::exception& e) {
-          promise->reject(Value(std::string(e.what())));
+    // Call executor with resolve and reject
+    if (executor->isNative) {
+      try {
+        executor->nativeFunc({Value(resolveFunc), Value(rejectFunc)});
+      } catch (const std::exception& e) {
+        promise->reject(Value(std::string(e.what())));
+      }
+    } else {
+      Interpreter* interpreter = getGlobalInterpreter();
+      if (interpreter) {
+        interpreter->clearError();
+        interpreter->callForHarness(Value(executor), {Value(resolveFunc), Value(rejectFunc)}, Value(Undefined{}));
+        if (interpreter->hasError()) {
+          Value err = interpreter->getError();
+          interpreter->clearError();
+          promise->reject(err);
         }
       } else {
-        Interpreter* interpreter = getGlobalInterpreter();
-        if (interpreter) {
-          interpreter->clearError();
-          interpreter->callForHarness(Value(executor), {Value(resolveFunc), Value(rejectFunc)}, Value(Undefined{}));
-          if (interpreter->hasError()) {
-            Value err = interpreter->getError();
-            interpreter->clearError();
-            promise->reject(err);
-          }
-        } else {
-          promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Interpreter unavailable")));
-        }
+        promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, "Interpreter unavailable")));
       }
     }
 
@@ -4456,7 +6301,9 @@ GCPtr<Environment> Environment::createGlobal() {
   };
 
   // Expose Promise as a callable constructor with static methods.
-  promiseFunc->properties = promiseConstructor->properties;
+  for (const auto& [k, v] : promiseConstructor->properties) {
+    promiseFunc->properties[k] = v;
+  }
   env->define("Promise", Value(promiseFunc));
   // Keep intrinsic Promise reachable even if global Promise is overwritten.
   env->define("__intrinsic_Promise__", Value(promiseFunc));
@@ -4477,7 +6324,8 @@ GCPtr<Environment> Environment::createGlobal() {
   jsonStringify->nativeFunc = JSON_stringify;
   jsonObj->properties["stringify"] = Value(jsonStringify);
 
-  env->define("JSON", Value(jsonObj));
+  // Keep intrinsic JSON reachable even if global JSON is deleted/overwritten.
+  env->define("__intrinsic_JSON__", Value(jsonObj));
 
   // Object static methods
   auto objectConstructor = GarbageCollector::makeGC<Function>();
@@ -4555,6 +6403,10 @@ GCPtr<Environment> Environment::createGlobal() {
   objectConstructor->properties["prototype"] = Value(objectPrototype);
   objectPrototype->properties["constructor"] = Value(objectConstructor);
   objectPrototype->properties["__non_enum_constructor"] = Value(true);
+  if (auto hiddenArrayProto = env->get("__array_prototype__");
+      hiddenArrayProto.has_value() && hiddenArrayProto->isObject()) {
+    hiddenArrayProto->getGC<Object>()->properties["__proto__"] = Value(objectPrototype);
+  }
 
   auto objectProtoHasOwnProperty = GarbageCollector::makeGC<Function>();
   objectProtoHasOwnProperty->isNative = true;
@@ -4562,6 +6414,81 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoHasOwnProperty->nativeFunc = Object_hasOwnProperty;
   objectPrototype->properties["hasOwnProperty"] = Value(objectProtoHasOwnProperty);
   objectPrototype->properties["__non_enum_hasOwnProperty"] = Value(true);
+
+  auto objectProtoIsPrototypeOf = GarbageCollector::makeGC<Function>();
+  objectProtoIsPrototypeOf->isNative = true;
+  objectProtoIsPrototypeOf->properties["__uses_this_arg__"] = Value(true);
+  objectProtoIsPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+    if (args.size() < 2) {
+      return Value(false);
+    }
+    Value protoVal = args[0];
+    if (!protoVal.isObject()) {
+      return Value(false);
+    }
+    auto protoObj = protoVal.getGC<Object>();
+
+    Value v = args[1];
+    if (v.isUndefined() || v.isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+
+    auto nextProtoValue = [&](const Value& cur) -> Value {
+      if (cur.isObject()) {
+        auto o = cur.getGC<Object>();
+        auto it = o->properties.find("__proto__");
+        return it != o->properties.end() ? it->second : Value(Undefined{});
+      }
+      if (cur.isFunction()) {
+        auto f = cur.getGC<Function>();
+        auto it = f->properties.find("__proto__");
+        return it != f->properties.end() ? it->second : Value(Undefined{});
+      }
+      if (cur.isArray()) {
+        auto a = cur.getGC<Array>();
+        auto it = a->properties.find("__proto__");
+        return it != a->properties.end() ? it->second : Value(Undefined{});
+      }
+      if (cur.isClass()) {
+        auto c = cur.getGC<Class>();
+        auto it = c->properties.find("__proto__");
+        return it != c->properties.end() ? it->second : Value(Undefined{});
+      }
+      return Value(Undefined{});
+    };
+
+    Value cur = v;
+    int depth = 0;
+    while (depth < 100) {
+      Value p = nextProtoValue(cur);
+      if (p.isUndefined() || p.isNull()) {
+        return Value(false);
+      }
+      if (p.isObject() && p.getGC<Object>().get() == protoObj.get()) {
+        return Value(true);
+      }
+      cur = p;
+      depth++;
+    }
+    return Value(false);
+  };
+  objectPrototype->properties["isPrototypeOf"] = Value(objectProtoIsPrototypeOf);
+  objectPrototype->properties["__non_enum_isPrototypeOf"] = Value(true);
+
+  auto objectProtoValueOf = GarbageCollector::makeGC<Function>();
+  objectProtoValueOf->isNative = true;
+  objectProtoValueOf->properties["__uses_this_arg__"] = Value(true);
+  objectProtoValueOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+    return args[0];
+  };
+  objectPrototype->properties["valueOf"] = Value(objectProtoValueOf);
+  objectPrototype->properties["__non_enum_valueOf"] = Value(true);
 
   auto objectProtoToString = GarbageCollector::makeGC<Function>();
   objectProtoToString->isNative = true;
@@ -4585,6 +6512,30 @@ GCPtr<Environment> Environment::createGlobal() {
       tag = "Array";
     } else if (args[0].isFunction()) {
       tag = "Function";
+    } else if (args[0].isTypedArray()) {
+      auto ta = args[0].getGC<TypedArray>();
+      switch (ta->type) {
+        case TypedArrayType::Int8: tag = "Int8Array"; break;
+        case TypedArrayType::Uint8: tag = "Uint8Array"; break;
+        case TypedArrayType::Uint8Clamped: tag = "Uint8ClampedArray"; break;
+        case TypedArrayType::Int16: tag = "Int16Array"; break;
+        case TypedArrayType::Uint16: tag = "Uint16Array"; break;
+        case TypedArrayType::Int32: tag = "Int32Array"; break;
+        case TypedArrayType::Uint32: tag = "Uint32Array"; break;
+        case TypedArrayType::Float16: tag = "Float16Array"; break;
+        case TypedArrayType::Float32: tag = "Float32Array"; break;
+        case TypedArrayType::Float64: tag = "Float64Array"; break;
+        case TypedArrayType::BigInt64: tag = "BigInt64Array"; break;
+        case TypedArrayType::BigUint64: tag = "BigUint64Array"; break;
+      }
+    } else if (args[0].isArrayBuffer()) {
+      tag = "ArrayBuffer";
+    } else if (args[0].isDataView()) {
+      tag = "DataView";
+    } else if (args[0].isRegex()) {
+      tag = "RegExp";
+    } else if (args[0].isError()) {
+      tag = "Error";
     }
     return Value(std::string("[object ") + tag + "]");
   };
@@ -4598,7 +6549,46 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoPropertyIsEnumerable->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
     Value thisVal = args[0];
-    std::string key = args[1].toString();
+    std::string key = valueToPropertyKey(args[1]);
+
+    if (thisVal.isRegex()) {
+      auto rx = thisVal.getGC<Regex>();
+      if (key == "source" || key == "flags") return Value(true);
+      if (rx->properties.find(key) == rx->properties.end() &&
+          rx->properties.find("__get_" + key) == rx->properties.end()) {
+        return Value(false);
+      }
+      auto neIt = rx->properties.find("__non_enum_" + key);
+      return Value(neIt == rx->properties.end());
+    }
+
+    if (thisVal.isError()) {
+      auto e = thisVal.getGC<Error>();
+      if (e->properties.find(key) == e->properties.end() &&
+          e->properties.find("__get_" + key) == e->properties.end()) {
+        return Value(false);
+      }
+      auto neIt = e->properties.find("__non_enum_" + key);
+      return Value(neIt == e->properties.end());
+    }
+
+    if (thisVal.isTypedArray()) {
+      auto ta = thisVal.getGC<TypedArray>();
+      if (key == "length" || key == "byteLength") return Value(false);
+      if (!key.empty() && std::all_of(key.begin(), key.end(), ::isdigit)) {
+        try {
+          size_t idx = std::stoull(key);
+          if (idx < ta->length) return Value(true);
+        } catch (...) {
+        }
+      }
+      if (ta->properties.find(key) == ta->properties.end() &&
+          ta->properties.find("__get_" + key) == ta->properties.end()) {
+        return Value(false);
+      }
+      auto neIt = ta->properties.find("__non_enum_" + key);
+      return Value(neIt == ta->properties.end());
+    }
 
     if (thisVal.isFunction()) {
       auto fn = thisVal.getGC<Function>();
@@ -4656,11 +6646,29 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     if (thisVal.isArray()) {
       auto arr = thisVal.getGC<Array>();
-      // Check if it's a valid index
-      try {
-        size_t idx = std::stoull(key);
-        if (idx < arr->elements.size()) return Value(true);
-      } catch (...) {}
+      auto isCanonicalArrayIndex = [&](const std::string& s, size_t& outIdx) -> bool {
+        if (s.empty()) return false;
+        if (s.size() > 1 && s[0] == '0') return false;
+        for (unsigned char c : s) {
+          if (std::isdigit(c) == 0) return false;
+        }
+        try {
+          outIdx = static_cast<size_t>(std::stoull(s));
+        } catch (...) {
+          return false;
+        }
+        return true;
+      };
+      size_t idx = 0;
+      if (isCanonicalArrayIndex(key, idx)) {
+        bool exists = idx < arr->elements.size() ||
+                      arr->properties.find(key) != arr->properties.end() ||
+                      arr->properties.find("__get_" + key) != arr->properties.end() ||
+                      arr->properties.find("__set_" + key) != arr->properties.end();
+        if (!exists) return Value(false);
+        auto neIt = arr->properties.find("__non_enum_" + key);
+        return Value(neIt == arr->properties.end());
+      }
       auto it = arr->properties.find(key);
       if (it == arr->properties.end()) return Value(false);
       auto neIt = arr->properties.find("__non_enum_" + key);
@@ -4670,6 +6678,86 @@ GCPtr<Environment> Environment::createGlobal() {
   };
   objectPrototype->properties["propertyIsEnumerable"] = Value(objectProtoPropertyIsEnumerable);
   objectPrototype->properties["__non_enum_propertyIsEnumerable"] = Value(true);
+
+  // Annex B: Object.prototype.__lookupGetter__
+  auto objectProtoLookupGetter = GarbageCollector::makeGC<Function>();
+  objectProtoLookupGetter->isNative = true;
+  objectProtoLookupGetter->properties["__uses_this_arg__"] = Value(true);
+  objectProtoLookupGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(Undefined{});
+    Value current = args[0];
+    std::string key = valueToPropertyKey(args[1]);
+
+    auto getProps = [](const Value& v) -> OrderedMap<std::string, Value>* {
+      if (v.isObject()) return &v.getGC<Object>()->properties;
+      if (v.isArray()) return &v.getGC<Array>()->properties;
+      if (v.isFunction()) return &v.getGC<Function>()->properties;
+      if (v.isClass()) return &v.getGC<Class>()->properties;
+      if (v.isPromise()) return &v.getGC<Promise>()->properties;
+      if (v.isRegex()) return &v.getGC<Regex>()->properties;
+      return nullptr;
+    };
+
+    for (int depth = 0; depth < 64; ++depth) {
+      auto* props = getProps(current);
+      if (!props) break;
+
+      auto getterIt = props->find("__get_" + key);
+      if (getterIt != props->end() && getterIt->second.isFunction()) {
+        return getterIt->second;
+      }
+      if (props->find(key) != props->end()) {
+        return Value(Undefined{});
+      }
+
+      auto protoIt = props->find("__proto__");
+      if (protoIt == props->end() || protoIt->second.isNull()) break;
+      current = protoIt->second;
+    }
+    return Value(Undefined{});
+  };
+  objectPrototype->properties["__lookupGetter__"] = Value(objectProtoLookupGetter);
+  objectPrototype->properties["__non_enum___lookupGetter__"] = Value(true);
+
+  // Annex B: Object.prototype.__lookupSetter__
+  auto objectProtoLookupSetter = GarbageCollector::makeGC<Function>();
+  objectProtoLookupSetter->isNative = true;
+  objectProtoLookupSetter->properties["__uses_this_arg__"] = Value(true);
+  objectProtoLookupSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.size() < 2) return Value(Undefined{});
+    Value current = args[0];
+    std::string key = valueToPropertyKey(args[1]);
+
+    auto getProps = [](const Value& v) -> OrderedMap<std::string, Value>* {
+      if (v.isObject()) return &v.getGC<Object>()->properties;
+      if (v.isArray()) return &v.getGC<Array>()->properties;
+      if (v.isFunction()) return &v.getGC<Function>()->properties;
+      if (v.isClass()) return &v.getGC<Class>()->properties;
+      if (v.isPromise()) return &v.getGC<Promise>()->properties;
+      if (v.isRegex()) return &v.getGC<Regex>()->properties;
+      return nullptr;
+    };
+
+    for (int depth = 0; depth < 64; ++depth) {
+      auto* props = getProps(current);
+      if (!props) break;
+
+      auto setterIt = props->find("__set_" + key);
+      if (setterIt != props->end() && setterIt->second.isFunction()) {
+        return setterIt->second;
+      }
+      if (props->find(key) != props->end()) {
+        return Value(Undefined{});
+      }
+
+      auto protoIt = props->find("__proto__");
+      if (protoIt == props->end() || protoIt->second.isNull()) break;
+      current = protoIt->second;
+    }
+    return Value(Undefined{});
+  };
+  objectPrototype->properties["__lookupSetter__"] = Value(objectProtoLookupSetter);
+  objectPrototype->properties["__non_enum___lookupSetter__"] = Value(true);
 
   // Object.keys
   auto objectKeys = GarbageCollector::makeGC<Function>();
@@ -4711,10 +6799,31 @@ GCPtr<Environment> Environment::createGlobal() {
   objectGetOwnPropertySymbols->isNative = true;
   objectGetOwnPropertySymbols->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto result = GarbageCollector::makeGC<Array>();
-    if (args.empty() || !args[0].isObject()) {
+    if (args.empty()) {
       return Value(result);
     }
-    auto obj = args[0].getGC<Object>();
+    Value target = args[0];
+    OrderedMap<std::string, Value>* props = nullptr;
+    GCPtr<Object> obj;
+    if (target.isObject()) {
+      obj = target.getGC<Object>();
+      props = &obj->properties;
+    } else if (target.isFunction()) {
+      props = &target.getGC<Function>()->properties;
+    } else if (target.isClass()) {
+      props = &target.getGC<Class>()->properties;
+    } else if (target.isArray()) {
+      props = &target.getGC<Array>()->properties;
+    } else if (target.isRegex()) {
+      props = &target.getGC<Regex>()->properties;
+    } else if (target.isPromise()) {
+      props = &target.getGC<Promise>()->properties;
+    } else if (target.isError()) {
+      props = &target.getGC<Error>()->properties;
+    }
+    if (!props) {
+      return Value(result);
+    }
     auto appendSymbolForKey = [&](const std::string& key) {
       if (key == WellKnownSymbols::iteratorKey()) {
         result->elements.push_back(WellKnownSymbols::iterator());
@@ -4726,17 +6835,21 @@ GCPtr<Environment> Environment::createGlobal() {
         result->elements.push_back(WellKnownSymbols::toPrimitive());
       } else if (key == WellKnownSymbols::matchAllKey()) {
         result->elements.push_back(WellKnownSymbols::matchAll());
-      } else if (key.size() >= 8 && key.rfind("Symbol(", 0) == 0 && key.back() == ')') {
-        result->elements.push_back(Value(Symbol(key.substr(7, key.size() - 8))));
+      } else {
+        Symbol symbolValue;
+        if (propertyKeyToSymbol(key, symbolValue)) {
+          result->elements.push_back(Value(symbolValue));
+        }
       }
     };
 
-    if (obj->isModuleNamespace) {
+    if (obj && obj->isModuleNamespace) {
       appendSymbolForKey(WellKnownSymbols::toStringTagKey());
       return Value(result);
     }
 
-    for (const auto& [key, _] : obj->properties) {
+    for (const auto& key : props->orderedKeys()) {
+      if (!isSymbolPropertyKey(key)) continue;
       appendSymbolForKey(key);
     }
     return Value(result);
@@ -4760,7 +6873,7 @@ GCPtr<Environment> Environment::createGlobal() {
   objectHasOwn->isNative = true;
   objectHasOwn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
-    std::string key = args[1].toString();
+    std::string key = valueToPropertyKey(args[1]);
     if (args[0].isObject()) {
       auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
@@ -4802,7 +6915,67 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(Null{});
     }
     if (args[0].isPromise()) {
+      auto p = args[0].getGC<Promise>();
+      if (auto it = p->properties.find("__proto__"); it != p->properties.end()) {
+        return it->second;
+      }
       return Value(promisePrototype);
+    }
+    if (args[0].isTypedArray()) {
+      auto ta = args[0].getGC<TypedArray>();
+      if (auto it = ta->properties.find("__proto__"); it != ta->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isArrayBuffer()) {
+      auto b = args[0].getGC<ArrayBuffer>();
+      if (auto it = b->properties.find("__proto__"); it != b->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isDataView()) {
+      auto v = args[0].getGC<DataView>();
+      if (auto it = v->properties.find("__proto__"); it != v->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isMap()) {
+      auto m = args[0].getGC<Map>();
+      if (auto it = m->properties.find("__proto__"); it != m->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isSet()) {
+      auto s = args[0].getGC<Set>();
+      if (auto it = s->properties.find("__proto__"); it != s->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isWeakMap()) {
+      auto wm = args[0].getGC<WeakMap>();
+      if (auto it = wm->properties.find("__proto__"); it != wm->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isWeakSet()) {
+      auto ws = args[0].getGC<WeakSet>();
+      if (auto it = ws->properties.find("__proto__"); it != ws->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
+    }
+    if (args[0].isRegex()) {
+      auto rx = args[0].getGC<Regex>();
+      if (auto it = rx->properties.find("__proto__"); it != rx->properties.end()) {
+        return it->second;
+      }
+      return Value(Null{});
     }
     if (args[0].isArray()) {
       if (auto arrayCtor = env->get("Array"); arrayCtor && arrayCtor->isObject()) {
@@ -4819,6 +6992,9 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     if (args[0].isError()) {
       auto err = args[0].getGC<Error>();
+      if (auto it = err->properties.find("__proto__"); it != err->properties.end()) {
+        return it->second;
+      }
       std::string ctorName = "Error";
       switch (err->type) {
         case ErrorType::TypeError:
@@ -4888,6 +7064,22 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       return Value(Null{});
     }
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      auto it = cls->properties.find("__proto__");
+      if (it != cls->properties.end()) {
+        return it->second;
+      }
+      // Default: Function.prototype
+      if (auto funcCtor = env->get("Function"); funcCtor && funcCtor->isFunction()) {
+        auto funcFn = std::get<GCPtr<Function>>(funcCtor->data);
+        auto fpIt = funcFn->properties.find("prototype");
+        if (fpIt != funcFn->properties.end()) {
+          return fpIt->second;
+        }
+      }
+      return Value(Null{});
+    }
     if (!args[0].isObject()) {
       return Value(Null{});
     }
@@ -4906,8 +7098,13 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectSetPrototypeOf = GarbageCollector::makeGC<Function>();
   objectSetPrototypeOf->isNative = true;
   objectSetPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2 || !args[0].isObject()) {
+    if (args.size() < 2 || (!args[0].isObject() && !args[0].isClass())) {
       return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      cls->properties["__proto__"] = args[1];
+      return args[0];
     }
     auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
@@ -4925,6 +7122,14 @@ GCPtr<Environment> Environment::createGlobal() {
   objectIsExtensible->isNative = true;
   objectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      auto it = cls->properties.find("__non_extensible__");
+      bool nonExtensible = it != cls->properties.end() &&
+                           it->second.isBool() &&
+                           it->second.toBool();
+      return Value(!nonExtensible);
+    }
     if (args[0].isFunction() || args[0].isArray()) {
       return Value(true);  // Functions and arrays are always extensible
     }
@@ -4942,8 +7147,16 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectPreventExtensions = GarbageCollector::makeGC<Function>();
   objectPreventExtensions->isNative = true;
   objectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isObject()) {
+    if (args.empty()) {
       return args.empty() ? Value(Undefined{}) : args[0];
+    }
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      cls->properties["__non_extensible__"] = Value(true);
+      return args[0];
+    }
+    if (!args[0].isObject()) {
+      return args[0];
     }
     auto obj = args[0].getGC<Object>();
     if (!obj->isModuleNamespace) {
@@ -5063,19 +7276,19 @@ GCPtr<Environment> Environment::createGlobal() {
   objectGetOwnPropertyDescriptor->isNative = true;
   objectGetOwnPropertyDescriptor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2 ||
-        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isClass())) {
+        (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isClass() &&
+         !args[0].isArray() && !args[0].isError())) {
       return Value(Undefined{});
     }
-    std::string key = args[1].toString();
+    std::string key = valueToPropertyKey(args[1]);
 
     auto descriptor = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
 
     if (args[0].isClass()) {
       auto cls = args[0].getGC<Class>();
-      // Internal properties are not visible
-      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
-          key.substr(key.size() - 2) == "__") {
+      // Internal properties are not visible.
+      if (isInternalPropertyKeyForReflection(key)) {
         return Value(Undefined{});
       }
       auto getterIt = cls->properties.find("__get_" + key);
@@ -5101,6 +7314,12 @@ GCPtr<Environment> Environment::createGlobal() {
         descriptor->properties["writable"] = Value(writable);
         descriptor->properties["enumerable"] = Value(false);
         descriptor->properties["configurable"] = Value(true);
+      } else if (key == "prototype") {
+        bool writable = cls->properties.find("__non_writable_prototype") == cls->properties.end();
+        bool configurable = cls->properties.find("__non_configurable_prototype") == cls->properties.end();
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(false);
+        descriptor->properties["configurable"] = Value(configurable);
       } else {
         bool writable = cls->properties.find("__non_writable_" + key) == cls->properties.end();
         bool enumerable = cls->properties.find("__enum_" + key) != cls->properties.end();
@@ -5115,9 +7334,8 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args[0].isFunction()) {
       auto fn = args[0].getGC<Function>();
 
-      // Internal properties are not visible
-      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
-          key.substr(key.size() - 2) == "__") {
+      // Internal properties are not visible.
+      if (isInternalPropertyKeyForReflection(key)) {
         return Value(Undefined{});
       }
 
@@ -5160,6 +7378,133 @@ GCPtr<Environment> Environment::createGlobal() {
         descriptor->properties["enumerable"] = Value(enumerable);
         descriptor->properties["configurable"] = Value(configurable);
       }
+      return Value(descriptor);
+    }
+
+    if (args[0].isArray()) {
+      auto arr = args[0].getGC<Array>();
+      // Internal properties are not visible.
+      if (isInternalPropertyKeyForReflection(key)) {
+        return Value(Undefined{});
+      }
+      // `length` is a special own data property with fixed attributes.
+      if (key == "length") {
+        descriptor->properties["value"] = Value(static_cast<double>(arr->elements.size()));
+        bool writable = arr->properties.find("__non_writable_length") == arr->properties.end();
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(false);
+        descriptor->properties["configurable"] = Value(false);
+        return Value(descriptor);
+      }
+      // Array index properties: consult per-index attribute markers and accessors.
+      auto isCanonicalArrayIndex = [&](const std::string& s, size_t& outIdx) -> bool {
+        if (s.empty()) return false;
+        if (s.size() > 1 && s[0] == '0') return false;  // no leading zeros
+        for (unsigned char c : s) {
+          if (std::isdigit(c) == 0) return false;
+        }
+        try {
+          outIdx = static_cast<size_t>(std::stoull(s));
+        } catch (...) {
+          return false;
+        }
+        // Ignore the 2^32-1 sentinel; keep behavior simple for our tests.
+        return true;
+      };
+      size_t idx = 0;
+      if (isCanonicalArrayIndex(key, idx)) {
+        bool isArgumentsObject = false;
+        auto isArgsIt = arr->properties.find("__is_arguments_object__");
+        if (isArgsIt != arr->properties.end() && isArgsIt->second.isBool() && isArgsIt->second.toBool()) {
+          isArgumentsObject = true;
+        }
+        bool isMappedArgumentsIndex = false;
+        if (isArgumentsObject) {
+          isMappedArgumentsIndex =
+            arr->properties.find("__mapped_arg_index_" + key + "__") != arr->properties.end();
+        }
+        auto getterIt = arr->properties.find("__get_" + key);
+        auto setterIt = arr->properties.find("__set_" + key);
+        bool hasAccessor = getterIt != arr->properties.end() || setterIt != arr->properties.end();
+        bool hasData = idx < arr->elements.size() || arr->properties.find(key) != arr->properties.end();
+        if (!hasAccessor && !hasData) {
+          return Value(Undefined{});
+        }
+
+        if (isMappedArgumentsIndex && getterIt != arr->properties.end() && getterIt->second.isFunction()) {
+          // Mapped arguments exotic objects expose data descriptors for indices.
+          // The value is the current parameter binding (served by our internal getter).
+          auto getterFn = getterIt->second.getGC<Function>();
+          Value v = getterFn->nativeFunc({});
+          descriptor->properties["value"] = v;
+          bool writable = arr->properties.find("__non_writable_" + key) == arr->properties.end();
+          descriptor->properties["writable"] = Value(writable);
+        } else if (hasAccessor) {
+          if (getterIt != arr->properties.end() && getterIt->second.isFunction()) {
+            descriptor->properties["get"] = getterIt->second;
+          }
+          if (setterIt != arr->properties.end() && setterIt->second.isFunction()) {
+            descriptor->properties["set"] = setterIt->second;
+          }
+        } else {
+          if (idx < arr->elements.size()) {
+            descriptor->properties["value"] = arr->elements[idx];
+          } else {
+            descriptor->properties["value"] = arr->properties.at(key);
+          }
+          bool writable = arr->properties.find("__non_writable_" + key) == arr->properties.end();
+          descriptor->properties["writable"] = Value(writable);
+        }
+
+        bool enumerable = arr->properties.find("__non_enum_" + key) == arr->properties.end();
+        bool configurable = arr->properties.find("__non_configurable_" + key) == arr->properties.end();
+        descriptor->properties["enumerable"] = Value(enumerable);
+        descriptor->properties["configurable"] = Value(configurable);
+        return Value(descriptor);
+      }
+      // Regular named properties
+      auto it = arr->properties.find(key);
+      if (it == arr->properties.end()) {
+        return Value(Undefined{});
+      }
+      descriptor->properties["value"] = it->second;
+      bool enumerable = arr->properties.find("__non_enum_" + key) == arr->properties.end();
+      bool configurable = arr->properties.find("__non_configurable_" + key) == arr->properties.end();
+      bool writable = arr->properties.find("__non_writable_" + key) == arr->properties.end();
+      descriptor->properties["writable"] = Value(writable);
+      descriptor->properties["enumerable"] = Value(enumerable);
+      descriptor->properties["configurable"] = Value(configurable);
+      return Value(descriptor);
+    }
+
+    if (args[0].isError()) {
+      auto err = args[0].getGC<Error>();
+      // Internal properties are not visible
+      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
+          key.substr(key.size() - 2) == "__") {
+        return Value(Undefined{});
+      }
+      auto getterIt = err->properties.find("__get_" + key);
+      auto setterIt = err->properties.find("__set_" + key);
+      auto it = err->properties.find(key);
+      if (it == err->properties.end() && getterIt == err->properties.end() && setterIt == err->properties.end()) {
+        return Value(Undefined{});
+      }
+      if (getterIt != err->properties.end() && getterIt->second.isFunction()) {
+        descriptor->properties["get"] = getterIt->second;
+      }
+      if (setterIt != err->properties.end() && setterIt->second.isFunction()) {
+        descriptor->properties["set"] = setterIt->second;
+      }
+      if (it != err->properties.end()) {
+        descriptor->properties["value"] = it->second;
+      }
+      bool writable = err->properties.find("__non_writable_" + key) == err->properties.end();
+      bool enumerable = err->properties.find("__non_enum_" + key) == err->properties.end();
+      bool configurable = err->properties.find("__non_configurable_" + key) == err->properties.end();
+      descriptor->properties["writable"] = Value(writable);
+      descriptor->properties["enumerable"] = Value(enumerable);
+      descriptor->properties["configurable"] = Value(configurable);
       return Value(descriptor);
     }
 
@@ -5220,9 +7565,8 @@ GCPtr<Environment> Environment::createGlobal() {
         descriptor->properties["configurable"] = Value(false);
         return Value(descriptor);
       }
-      // Internal properties are not visible
-      if (key.size() >= 4 && key.substr(0, 2) == "__" &&
-          key.substr(key.size() - 2) == "__") {
+      // Internal properties are not visible.
+      if (isInternalPropertyKeyForReflection(key)) {
         return Value(Undefined{});
       }
 
@@ -5275,9 +7619,15 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(Undefined{});
     }
 
-    descriptor->properties["writable"] = Value(true);
-    descriptor->properties["enumerable"] = Value(true);
-    descriptor->properties["configurable"] = Value(true);
+    if (key == "lastIndex") {
+      descriptor->properties["writable"] = Value(true);
+      descriptor->properties["enumerable"] = Value(false);
+      descriptor->properties["configurable"] = Value(false);
+    } else {
+      descriptor->properties["writable"] = Value(true);
+      descriptor->properties["enumerable"] = Value(true);
+      descriptor->properties["configurable"] = Value(true);
+    }
     return Value(descriptor);
   };
   objectConstructor->properties["getOwnPropertyDescriptor"] = Value(objectGetOwnPropertyDescriptor);
@@ -5327,7 +7677,7 @@ GCPtr<Environment> Environment::createGlobal() {
         (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isArray())) {
       return args.empty() ? Value(Undefined{}) : args[0];
     }
-    std::string key = args[1].toString();
+    std::string key = valueToPropertyKey(args[1]);
 
     if (args[2].isObject()) {
       auto descriptor = args[2].getGC<Object>();
@@ -5363,22 +7713,42 @@ GCPtr<Environment> Environment::createGlobal() {
           return args[0];
         }
 
-        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+        bool hadExistingProperty =
+          (obj->properties.find(key) != obj->properties.end()) ||
+          (obj->properties.find("__get_" + key) != obj->properties.end()) ||
+          (obj->properties.find("__set_" + key) != obj->properties.end());
+
+        auto valueField = readDescriptorField("value");
+        auto getField = readDescriptorField("get");
+        auto setField = readDescriptorField("set");
+        bool hasValueField = valueField.has_value();
+        bool hasGetField = getField.has_value();
+        bool hasSetField = setField.has_value();
+
+        if (hasValueField) {
           obj->properties[key] = *valueField;
         }
 
-        if (auto getField = readDescriptorField("get");
-            getField.has_value() && getField->isFunction()) {
+        if (hasGetField && getField->isFunction()) {
           obj->properties["__get_" + key] = *getField;
         }
 
-        if (auto setField = readDescriptorField("set");
-            setField.has_value() && setField->isFunction()) {
+        if (hasSetField && setField->isFunction()) {
           obj->properties["__set_" + key] = *setField;
         }
 
+        // Defining a new data property with attributes-only descriptor
+        // still creates the property with value `undefined`.
+        if (!hadExistingProperty && !hasValueField && !hasGetField && !hasSetField) {
+          obj->properties[key] = Value(Undefined{});
+        }
+
         // Handle writable descriptor
-        if (auto writableField = readDescriptorField("writable"); writableField.has_value()) {
+        auto writableField = readDescriptorField("writable");
+        auto enumField = readDescriptorField("enumerable");
+        auto configField = readDescriptorField("configurable");
+
+        if (writableField.has_value()) {
           if (!writableField->toBool()) {
             obj->properties["__non_writable_" + key] = Value(true);
           } else {
@@ -5387,7 +7757,7 @@ GCPtr<Environment> Environment::createGlobal() {
         }
 
         // Handle enumerable descriptor
-        if (auto enumField = readDescriptorField("enumerable"); enumField.has_value()) {
+        if (enumField.has_value()) {
           if (!enumField->toBool()) {
             obj->properties["__non_enum_" + key] = Value(true);
           } else {
@@ -5396,11 +7766,27 @@ GCPtr<Environment> Environment::createGlobal() {
         }
 
         // Handle configurable descriptor
-        if (auto configField = readDescriptorField("configurable"); configField.has_value()) {
+        if (configField.has_value()) {
           if (!configField->toBool()) {
             obj->properties["__non_configurable_" + key] = Value(true);
           } else {
             obj->properties.erase("__non_configurable_" + key);
+          }
+        }
+
+        // Defaults: for new properties, unspecified attributes default to false.
+        if (!hadExistingProperty) {
+          bool isAccessorDescriptor = hasGetField || hasSetField;
+          bool isDataDescriptor = !isAccessorDescriptor &&
+                                  (hasValueField || writableField.has_value() || (!hasGetField && !hasSetField));
+          if (isDataDescriptor && !writableField.has_value()) {
+            obj->properties["__non_writable_" + key] = Value(true);
+          }
+          if (!enumField.has_value()) {
+            obj->properties["__non_enum_" + key] = Value(true);
+          }
+          if (!configField.has_value()) {
+            obj->properties["__non_configurable_" + key] = Value(true);
           }
         }
       } else if (args[0].isFunction()) {
@@ -5435,11 +7821,139 @@ GCPtr<Environment> Environment::createGlobal() {
         }
       } else if (args[0].isArray()) {
         auto arr = args[0].getGC<Array>();
-        if (auto valueField = readDescriptorField("value"); valueField.has_value()) {
+        bool isArgumentsObject = false;
+        auto isArgsIt = arr->properties.find("__is_arguments_object__");
+        if (isArgsIt != arr->properties.end() && isArgsIt->second.isBool() && isArgsIt->second.toBool()) {
+          isArgumentsObject = true;
+        }
+        auto isCanonicalArrayIndex = [&](const std::string& s) -> bool {
+          if (s.empty()) return false;
+          if (s.size() > 1 && s[0] == '0') return false;
+          for (unsigned char c : s) {
+            if (std::isdigit(c) == 0) return false;
+          }
+          return true;
+        };
+        bool isIndexKey = isCanonicalArrayIndex(key);
+        bool hadMappedArgumentsBinding =
+          isArgumentsObject && isIndexKey &&
+          (arr->properties.find("__mapped_arg_index_" + key + "__") != arr->properties.end());
+
+        auto valueField = readDescriptorField("value");
+        auto getField = readDescriptorField("get");
+        auto setField = readDescriptorField("set");
+        auto writableField = readDescriptorField("writable");
+        auto enumField = readDescriptorField("enumerable");
+        auto configField = readDescriptorField("configurable");
+
+        bool isAccessorDescriptor = getField.has_value() || setField.has_value();
+        bool makeNonWritable = writableField.has_value() && !writableField->toBool();
+
+        // DefineOwnProperty invariants (minimal): reject invalid redefinitions of
+        // non-configurable properties so Test262's define-failure tests pass.
+        auto sameValue = [](const Value& a, const Value& b) -> bool {
+          if (a.data.index() != b.data.index()) return false;
+          if (a.isNumber() && b.isNumber()) {
+            double x = a.toNumber();
+            double y = b.toNumber();
+            if (std::isnan(x) && std::isnan(y)) return true;
+            if (x == 0.0 && y == 0.0) return std::signbit(x) == std::signbit(y);
+            return x == y;
+          }
+          if (a.isUndefined() && b.isUndefined()) return true;
+          if (a.isNull() && b.isNull()) return true;
+          if (a.isBool() && b.isBool()) return std::get<bool>(a.data) == std::get<bool>(b.data);
+          if (a.isString() && b.isString()) return std::get<std::string>(a.data) == std::get<std::string>(b.data);
+          if (a.isBigInt() && b.isBigInt()) return a.toBigInt() == b.toBigInt();
+          if (a.isSymbol() && b.isSymbol()) return std::get<Symbol>(a.data) == std::get<Symbol>(b.data);
+          // Objects compare by reference identity in SameValue.
+          if (a.isFunction() && b.isFunction()) return a.getGC<Function>().get() == b.getGC<Function>().get();
+          if (a.isArray() && b.isArray()) return a.getGC<Array>().get() == b.getGC<Array>().get();
+          if (a.isObject() && b.isObject()) return a.getGC<Object>().get() == b.getGC<Object>().get();
+          if (a.isClass() && b.isClass()) return a.getGC<Class>().get() == b.getGC<Class>().get();
+          if (a.isRegex() && b.isRegex()) return a.getGC<Regex>().get() == b.getGC<Regex>().get();
+          if (a.isPromise() && b.isPromise()) return a.getGC<Promise>().get() == b.getGC<Promise>().get();
+          return false;
+        };
+
+        bool currentNonConfigurable = arr->properties.find("__non_configurable_" + key) != arr->properties.end();
+        bool currentEnumerable = arr->properties.find("__non_enum_" + key) == arr->properties.end();
+        bool currentWritable = arr->properties.find("__non_writable_" + key) == arr->properties.end();
+        bool currentIsMapped = hadMappedArgumentsBinding;
+        bool currentHasAccessor =
+          arr->properties.find("__get_" + key) != arr->properties.end() ||
+          arr->properties.find("__set_" + key) != arr->properties.end();
+        bool currentIsAccessor = currentHasAccessor && !currentIsMapped;
+
+        auto getCurrentIndexValue = [&]() -> Value {
+          if (currentIsMapped) {
+            auto it = arr->properties.find("__get_" + key);
+            if (it != arr->properties.end() && it->second.isFunction()) {
+              auto fn = it->second.getGC<Function>();
+              return fn->nativeFunc({});
+            }
+          }
+          bool isNumeric = true;
+          size_t idx = 0;
+          try { idx = std::stoul(key); } catch (...) { isNumeric = false; }
+          if (isNumeric && idx < arr->elements.size()) {
+            return arr->elements[idx];
+          }
+          auto it = arr->properties.find(key);
+          if (it != arr->properties.end()) return it->second;
+          return Value(Undefined{});
+        };
+
+        if (currentNonConfigurable) {
+          if (configField.has_value() && configField->toBool()) {
+            throw std::runtime_error("TypeError: Cannot redefine property");
+          }
+          if (enumField.has_value() && enumField->toBool() != currentEnumerable) {
+            throw std::runtime_error("TypeError: Cannot redefine property");
+          }
+          if (currentIsAccessor) {
+            if (valueField.has_value() || writableField.has_value()) {
+              throw std::runtime_error("TypeError: Cannot redefine property");
+            }
+          } else {
+            if (isAccessorDescriptor) {
+              throw std::runtime_error("TypeError: Cannot redefine property");
+            }
+            if (!currentWritable) {
+              if (writableField.has_value() && writableField->toBool()) {
+                throw std::runtime_error("TypeError: Cannot redefine property");
+              }
+              if (valueField.has_value()) {
+                Value cur = getCurrentIndexValue();
+                if (!sameValue(cur, *valueField)) {
+                  throw std::runtime_error("TypeError: Cannot redefine property");
+                }
+              }
+            }
+          }
+        }
+
+        // Arguments exotic object: redefining a mapped index with an accessor removes mapping.
+        if (hadMappedArgumentsBinding && isAccessorDescriptor) {
+          arr->properties.erase("__get_" + key);
+          arr->properties.erase("__set_" + key);
+          arr->properties.erase("__mapped_arg_index_" + key + "__");
+          hadMappedArgumentsBinding = false;
+        }
+
+        if (valueField.has_value()) {
           // For numeric keys, set in elements array; for others, use properties
           bool isNumeric = true;
           size_t idx = 0;
           try { idx = std::stoul(key); } catch (...) { isNumeric = false; }
+          // If this is a mapped arguments index, keep the parameter binding in sync.
+          if (hadMappedArgumentsBinding && isNumeric) {
+            auto setIt = arr->properties.find("__set_" + key);
+            if (setIt != arr->properties.end() && setIt->second.isFunction()) {
+              auto fn = setIt->second.getGC<Function>();
+              fn->nativeFunc({*valueField});
+            }
+          }
           if (isNumeric && idx < arr->elements.size()) {
             arr->elements[idx] = *valueField;
           } else {
@@ -5447,8 +7961,7 @@ GCPtr<Environment> Environment::createGlobal() {
           }
         }
 
-        if (auto getField = readDescriptorField("get");
-            getField.has_value() && getField->isFunction()) {
+        if (getField.has_value() && getField->isFunction()) {
           arr->properties["__get_" + key] = *getField;
           // For numeric indices, ensure elements array covers this index
           // so iteration sees it (getter takes priority over element value)
@@ -5460,13 +7973,12 @@ GCPtr<Environment> Environment::createGlobal() {
           }
         }
 
-        if (auto setField = readDescriptorField("set");
-            setField.has_value() && setField->isFunction()) {
+        if (setField.has_value() && setField->isFunction()) {
           arr->properties["__set_" + key] = *setField;
         }
 
         // Handle writable descriptor
-        if (auto writableField = readDescriptorField("writable"); writableField.has_value()) {
+        if (writableField.has_value()) {
           if (!writableField->toBool()) {
             arr->properties["__non_writable_" + key] = Value(true);
           } else {
@@ -5475,7 +7987,7 @@ GCPtr<Environment> Environment::createGlobal() {
         }
 
         // Handle enumerable descriptor
-        if (auto enumField = readDescriptorField("enumerable"); enumField.has_value()) {
+        if (enumField.has_value()) {
           if (!enumField->toBool()) {
             arr->properties["__non_enum_" + key] = Value(true);
           } else {
@@ -5484,11 +7996,33 @@ GCPtr<Environment> Environment::createGlobal() {
         }
 
         // Handle configurable descriptor
-        if (auto configField = readDescriptorField("configurable"); configField.has_value()) {
+        if (configField.has_value()) {
           if (!configField->toBool()) {
             arr->properties["__non_configurable_" + key] = Value(true);
           } else {
             arr->properties.erase("__non_configurable_" + key);
+          }
+        }
+
+        // Arguments exotic object: certain descriptor changes remove the parameter mapping.
+        if (hadMappedArgumentsBinding) {
+          if (makeNonWritable) {
+            // Snapshot the current mapped value into the actual index property
+            // before removing the mapping (value may have been updated via param assignment).
+            if (!valueField.has_value()) {
+              Value cur = getCurrentIndexValue();
+              bool isNumeric = true;
+              size_t idx = 0;
+              try { idx = std::stoul(key); } catch (...) { isNumeric = false; }
+              if (isNumeric && idx < arr->elements.size()) {
+                arr->elements[idx] = cur;
+              } else if (isNumeric) {
+                arr->properties[key] = cur;
+              }
+            }
+            arr->properties.erase("__mapped_arg_index_" + key + "__");
+            arr->properties.erase("__get_" + key);
+            arr->properties.erase("__set_" + key);
           }
         }
       } else if (args[0].isRegex()) {
@@ -5530,11 +8064,72 @@ GCPtr<Environment> Environment::createGlobal() {
       if (obj->sealed && obj->properties.find(key) == obj->properties.end()) {
         continue;  // Skip new properties on sealed object
       }
-      if (descriptor.isObject()) {
-        auto descObj = descriptor.getGC<Object>();
-        auto valueIt = descObj->properties.find("value");
-        if (valueIt != descObj->properties.end()) {
-          obj->properties[key] = valueIt->second;
+      if (!descriptor.isObject()) {
+        continue;
+      }
+
+      auto descObj = descriptor.getGC<Object>();
+      auto readDescriptorField = [&](const std::string& name) -> std::optional<Value> {
+        auto it = descObj->properties.find(name);
+        if (it != descObj->properties.end()) {
+          return it->second;
+        }
+        if (descObj->shape) {
+          int offset = descObj->shape->getPropertyOffset(name);
+          if (offset >= 0) {
+            Value slotValue;
+            if (descObj->getSlot(offset, slotValue)) {
+              return slotValue;
+            }
+          }
+        }
+        return std::nullopt;
+      };
+
+      bool hadExistingProperty =
+        (obj->properties.find(key) != obj->properties.end()) ||
+        (obj->properties.find("__get_" + key) != obj->properties.end()) ||
+        (obj->properties.find("__set_" + key) != obj->properties.end());
+
+      auto valueField = readDescriptorField("value");
+      auto getField = readDescriptorField("get");
+      auto setField = readDescriptorField("set");
+      bool hasValueField = valueField.has_value();
+      bool hasGetField = getField.has_value();
+      bool hasSetField = setField.has_value();
+
+      if (hasValueField) {
+        obj->properties[key] = *valueField;
+      }
+      if (hasGetField && getField->isFunction()) {
+        obj->properties["__get_" + key] = *getField;
+      }
+      if (hasSetField && setField->isFunction()) {
+        obj->properties["__set_" + key] = *setField;
+      }
+      if (!hadExistingProperty && !hasValueField && !hasGetField && !hasSetField) {
+        obj->properties[key] = Value(Undefined{});
+      }
+
+      if (auto writableField = readDescriptorField("writable"); writableField.has_value()) {
+        if (!writableField->toBool()) {
+          obj->properties["__non_writable_" + key] = Value(true);
+        } else {
+          obj->properties.erase("__non_writable_" + key);
+        }
+      }
+      if (auto enumField = readDescriptorField("enumerable"); enumField.has_value()) {
+        if (!enumField->toBool()) {
+          obj->properties["__non_enum_" + key] = Value(true);
+        } else {
+          obj->properties.erase("__non_enum_" + key);
+        }
+      }
+      if (auto configField = readDescriptorField("configurable"); configField.has_value()) {
+        if (!configField->toBool()) {
+          obj->properties["__non_configurable_" + key] = Value(true);
+        } else {
+          obj->properties.erase("__non_configurable_" + key);
         }
       }
     }
@@ -5549,14 +8144,20 @@ GCPtr<Environment> Environment::createGlobal() {
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Math constants
-  mathObj->properties["PI"] = Value(3.141592653589793);
-  mathObj->properties["E"] = Value(2.718281828459045);
-  mathObj->properties["LN2"] = Value(0.6931471805599453);
-  mathObj->properties["LN10"] = Value(2.302585092994046);
-  mathObj->properties["LOG2E"] = Value(1.4426950408889634);
-  mathObj->properties["LOG10E"] = Value(0.4342944819032518);
-  mathObj->properties["SQRT1_2"] = Value(0.7071067811865476);
-  mathObj->properties["SQRT2"] = Value(1.4142135623730951);
+  auto defineMathConst = [&](const std::string& name, double value) {
+    mathObj->properties[name] = Value(value);
+    mathObj->properties["__non_writable_" + name] = Value(true);
+    mathObj->properties["__non_enum_" + name] = Value(true);
+    mathObj->properties["__non_configurable_" + name] = Value(true);
+  };
+  defineMathConst("PI", 3.141592653589793);
+  defineMathConst("E", 2.718281828459045);
+  defineMathConst("LN2", 0.6931471805599453);
+  defineMathConst("LN10", 2.302585092994046);
+  defineMathConst("LOG2E", 1.4426950408889634);
+  defineMathConst("LOG10E", 0.4342944819032518);
+  defineMathConst("SQRT1_2", 0.7071067811865476);
+  defineMathConst("SQRT2", 1.4142135623730951);
 
   // Math methods
   auto mathAbs = GarbageCollector::makeGC<Function>();
@@ -5717,7 +8318,17 @@ GCPtr<Environment> Environment::createGlobal() {
   dateConstructor->isConstructor = true;
   dateConstructor->properties["name"] = Value(std::string("Date"));
   dateConstructor->properties["length"] = Value(1.0);
-  dateConstructor->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+  // `Date()` called as a function returns a string (not a Date object).
+  // Construction is handled via `__native_construct__` below.
+  dateConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    return Value(std::string("[object Date]"));
+  };
+
+  auto dateConstruct = GarbageCollector::makeGC<Function>();
+  GarbageCollector::instance().reportAllocation(sizeof(Function));
+  dateConstruct->isNative = true;
+  dateConstruct->isConstructor = true;
+  dateConstruct->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
     if (args.size() == 1) {
       Value primitive = toPrimitive(args[0], false);
       if (primitive.isSymbol() || primitive.isBigInt()) {
@@ -5730,6 +8341,15 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     return Date_constructor(args);
   };
+  dateConstructor->properties["__native_construct__"] = Value(dateConstruct);
+
+  {
+    auto datePrototype = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    dateConstructor->properties["prototype"] = Value(datePrototype);
+    datePrototype->properties["constructor"] = Value(dateConstructor);
+    datePrototype->properties["name"] = Value(std::string("Date"));
+  }
 
   // Date static methods
   auto dateNow = GarbageCollector::makeGC<Function>();
@@ -5754,6 +8374,46 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(std::string(""));
     }
     Value primitive = toPrimitive(args[0], true);
+    if (primitive.isNumber()) {
+      double value = primitive.toNumber();
+      if (std::isnan(value)) return Value(std::string("NaN"));
+      if (std::isinf(value)) return Value(std::string(value < 0 ? "-Infinity" : "Infinity"));
+      if (value == 0.0) return Value(std::string("0"));
+
+      double integral = std::trunc(value);
+      if (integral == value) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(0) << value;
+        return Value(oss.str());
+      }
+
+      std::ostringstream oss;
+      oss << std::setprecision(15) << value;
+      std::string out = oss.str();
+      auto expPos = out.find_first_of("eE");
+      if (expPos != std::string::npos) {
+        std::string mantissa = out.substr(0, expPos);
+        std::string exponent = out.substr(expPos + 1);
+        char sign = '\0';
+        size_t idx = 0;
+        if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
+          sign = exponent[0];
+          idx = 1;
+        }
+        while (idx < exponent.size() && exponent[idx] == '0') idx++;
+        std::string expDigits = (idx < exponent.size()) ? exponent.substr(idx) : "0";
+        out = mantissa + "e";
+        if (sign == '-') out += "-";
+        out += expDigits;
+      } else {
+        auto dot = out.find('.');
+        if (dot != std::string::npos) {
+          while (!out.empty() && out.back() == '0') out.pop_back();
+          if (!out.empty() && out.back() == '.') out.pop_back();
+        }
+      }
+      return Value(out);
+    }
     return Value(primitive.toString());
   };
 
@@ -5763,6 +8423,7 @@ GCPtr<Environment> Environment::createGlobal() {
 
   // The constructor itself
   stringConstructorObj->properties["__callable_object__"] = Value(true);
+  stringConstructorObj->properties["__constructor_wrapper__"] = Value(true);
   stringConstructorObj->properties["constructor"] = Value(stringConstructorFn);
 
   // String.fromCharCode
@@ -5918,7 +8579,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (thisValue.isObject()) {
       auto obj = thisValue.getGC<Object>();
       Value toPrimitive = Value(Undefined{});
-      auto toPrimitiveIt = obj->properties.find("Symbol(Symbol.toPrimitive)");
+      auto toPrimitiveIt = obj->properties.find(WellKnownSymbols::toPrimitiveKey());
       if (toPrimitiveIt != obj->properties.end()) {
         toPrimitive = toPrimitiveIt->second;
       } else {
@@ -5989,6 +8650,9 @@ GCPtr<Environment> Environment::createGlobal() {
   stringPrototype->properties["matchAll"] = Value(stringMatchAll);
   stringPrototype->properties["__non_enum_matchAll"] = Value(true);
   stringConstructorObj->properties["prototype"] = Value(stringPrototype);
+  stringPrototype->properties["constructor"] = Value(stringConstructorObj);
+  stringPrototype->properties["__non_enum_constructor"] = Value(true);
+  stringPrototype->properties["__proto__"] = Value(objectPrototype);
 
   // For simplicity, we can make the Object callable by storing the function
   env->define("String", Value(stringConstructorObj));
@@ -6005,11 +8669,28 @@ GCPtr<Environment> Environment::createGlobal() {
   for (const auto& [name, value] : env->bindings_) {
     globalThisObj->properties[name] = value;
   }
+  // Expose selected intrinsics as configurable global properties.
+  // (We keep the intrinsic itself off `globalThis` to avoid leaking internal names.)
+  if (auto intrinsicJSON = env->get("__intrinsic_JSON__")) {
+    globalThisObj->properties["JSON"] = *intrinsicJSON;
+    globalThisObj->properties.erase("__intrinsic_JSON__");
+  }
+  // Immutable global properties (not declarative bindings).
+  globalThisObj->properties["undefined"] = Value(Undefined{});
+  globalThisObj->properties["Infinity"] = Value(std::numeric_limits<double>::infinity());
+  globalThisObj->properties["NaN"] = Value(std::numeric_limits<double>::quiet_NaN());
+  const char* immutableGlobalNames[] = {"undefined", "Infinity", "NaN"};
+  for (const char* name : immutableGlobalNames) {
+    globalThisObj->properties[std::string("__non_writable_") + name] = Value(true);
+    globalThisObj->properties[std::string("__non_configurable_") + name] = Value(true);
+    globalThisObj->properties[std::string("__non_enum_") + name] = Value(true);
+  }
 
   // Define globalThis pointing to the global object
   env->define("globalThis", Value(globalThisObj));
   // 'this' at global scope should be globalThis
   env->define("this", Value(globalThisObj));
+  env->define("__var_scope__", Value(true), true);
 
   // Also add globalThis to itself
   globalThisObj->properties["globalThis"] = Value(globalThisObj);
@@ -6707,6 +9388,17 @@ GCPtr<Environment> Environment::createGlobal() {
   functionPrototype->properties["__proto__"] = Value(objectPrototype);
   functionPrototype->properties["__callable_object__"] = Value(true);
 
+  auto fpToString = GarbageCollector::makeGC<Function>();
+  fpToString->isNative = true;
+  fpToString->properties["name"] = Value(std::string("toString"));
+  fpToString->properties["length"] = Value(0.0);
+  fpToString->properties["__uses_this_arg__"] = Value(true);
+  fpToString->nativeFunc = [](const std::vector<Value>&) -> Value {
+    return Value(std::string("[Function]"));
+  };
+  functionPrototype->properties["toString"] = Value(fpToString);
+  functionPrototype->properties["__non_enum_toString"] = Value(true);
+
   // Function.prototype.call - uses __uses_this_arg__ so args[0] = this (the function to call)
   auto fpCall = GarbageCollector::makeGC<Function>();
   fpCall->isNative = true;
@@ -6788,10 +9480,20 @@ GCPtr<Environment> Environment::createGlobal() {
   fpBind->properties["__uses_this_arg__"] = Value(true);
   fpBind->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // args[0] = this (the function to bind), args[1] = boundThis, args[2+] = bound args
-    if (args.empty() || !args[0].isFunction()) {
+    if (args.empty() || (!args[0].isFunction() && !args[0].isClass())) {
       throw std::runtime_error("TypeError: Function.prototype.bind called on non-function");
     }
-    auto targetFn = args[0].getGC<Function>();
+    Value target = args[0];
+    GCPtr<Function> targetFn;
+    GCPtr<Class> targetCls;
+    bool targetIsConstructor = false;
+    if (target.isFunction()) {
+      targetFn = target.getGC<Function>();
+      targetIsConstructor = targetFn && targetFn->isConstructor;
+    } else if (target.isClass()) {
+      targetCls = target.getGC<Class>();
+      targetIsConstructor = true;
+    }
     Value boundThis = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> boundArgs;
     if (args.size() > 2) {
@@ -6799,9 +9501,35 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     auto boundFn = GarbageCollector::makeGC<Function>();
     boundFn->isNative = true;
-    std::string targetName = targetFn->properties.count("name") ? targetFn->properties["name"].toString() : "";
+    boundFn->isConstructor = targetIsConstructor;
+    boundFn->properties["__bound_target__"] = target;
+    boundFn->properties["__bound_this__"] = boundThis;
+    auto boundArgsArr = GarbageCollector::makeGC<Array>();
+    boundArgsArr->elements = boundArgs;
+    boundFn->properties["__bound_args__"] = Value(boundArgsArr);
+
+    std::string targetName;
+    if (targetFn) {
+      targetName = targetFn->properties.count("name") ? targetFn->properties["name"].toString() : "";
+    } else if (targetCls) {
+      auto it = targetCls->properties.find("name");
+      if (it != targetCls->properties.end() && it->second.isString()) {
+        targetName = it->second.toString();
+      } else {
+        targetName = targetCls->name;
+      }
+    }
     boundFn->properties["name"] = Value(std::string("bound " + targetName));
-    boundFn->nativeFunc = [targetFn, boundThis, boundArgs](const std::vector<Value>& callArgs) -> Value {
+    boundFn->nativeFunc = [target, boundThis, boundArgs](const std::vector<Value>& callArgs) -> Value {
+      // [[Call]] of a bound function: call target with boundThis and boundArgs + callArgs.
+      // Bound class constructors are not callable without 'new'.
+      if (target.isClass()) {
+        throw std::runtime_error("TypeError: Class constructor cannot be invoked without 'new'");
+      }
+      auto targetFn = target.getGC<Function>();
+      if (!targetFn) {
+        throw std::runtime_error("TypeError: Bound target is not callable");
+      }
       std::vector<Value> finalArgs = boundArgs;
       finalArgs.insert(finalArgs.end(), callArgs.begin(), callArgs.end());
       if (targetFn->isNative) {
@@ -6825,6 +9553,20 @@ GCPtr<Environment> Environment::createGlobal() {
   functionPrototype->properties["bind"] = Value(fpBind);
   functionPrototype->properties["__non_enum_bind"] = Value(true);
 
+  // %FunctionPrototype%.caller / .arguments are restricted in strict mode and
+  // for classes. Model as ThrowTypeError accessors.
+  auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+  throwTypeErrorAccessor->isNative = true;
+  throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+  };
+  functionPrototype->properties["__get_caller"] = Value(throwTypeErrorAccessor);
+  functionPrototype->properties["__set_caller"] = Value(throwTypeErrorAccessor);
+  functionPrototype->properties["__get_arguments"] = Value(throwTypeErrorAccessor);
+  functionPrototype->properties["__set_arguments"] = Value(throwTypeErrorAccessor);
+  functionPrototype->properties["__non_enum_caller"] = Value(true);
+  functionPrototype->properties["__non_enum_arguments"] = Value(true);
+
   functionPrototype->properties["constructor"] = Value(functionConstructor);
   functionPrototype->properties["__non_enum_constructor"] = Value(true);
   functionConstructor->properties["prototype"] = Value(functionPrototype);
@@ -6841,15 +9583,12 @@ GCPtr<Environment> Environment::createGlobal() {
   
   // %GeneratorFunction.prototype% inherits from Function.prototype
   generatorFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
-  auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
-  throwTypeErrorAccessor->isNative = true;
-  throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
-    throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
-  };
   generatorFunctionPrototype->properties["__get_caller"] = Value(throwTypeErrorAccessor);
   generatorFunctionPrototype->properties["__set_caller"] = Value(throwTypeErrorAccessor);
   generatorFunctionPrototype->properties["__get_arguments"] = Value(throwTypeErrorAccessor);
   generatorFunctionPrototype->properties["__set_arguments"] = Value(throwTypeErrorAccessor);
+  generatorFunctionPrototype->properties["__non_enum_caller"] = Value(true);
+  generatorFunctionPrototype->properties["__non_enum_arguments"] = Value(true);
   // %GeneratorFunction.prototype.prototype% is %GeneratorPrototype%
   generatorFunctionPrototype->properties["prototype"] = Value(generatorPrototype);
   // %GeneratorPrototype% inherits from Object.prototype
@@ -6862,7 +9601,119 @@ GCPtr<Environment> Environment::createGlobal() {
   }
   // %GeneratorPrototype%.constructor is %GeneratorFunction.prototype%
   generatorPrototype->properties["constructor"] = Value(generatorFunctionPrototype);
-  
+
+  // GeneratorFunction constructor (not a global binding; reachable via
+  // Object.getPrototypeOf(function*(){}).constructor)
+  auto generatorFunctionConstructor = GarbageCollector::makeGC<Function>();
+  generatorFunctionConstructor->isNative = true;
+  generatorFunctionConstructor->isConstructor = true;
+  generatorFunctionConstructor->properties["name"] = Value(std::string("GeneratorFunction"));
+  generatorFunctionConstructor->properties["length"] = Value(1.0);
+  // %GeneratorFunction% inherits from %Function%.
+  generatorFunctionConstructor->properties["__proto__"] = Value(functionPrototype);
+  generatorFunctionConstructor->nativeFunc = [env, generatorFunctionPrototype, generatorPrototype](const std::vector<Value>& args) -> Value {
+    std::vector<std::string> params;
+    std::string body;
+
+    if (!args.empty()) {
+      for (size_t i = 0; i + 1 < args.size(); ++i) {
+        params.push_back(args[i].toString());
+      }
+      body = args.back().toString();
+    }
+
+    std::string source = "function* anonymous(";
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (i > 0) source += ",";
+      source += params[i];
+    }
+    source += ") {\n";
+    source += body;
+    source += "\n}";
+
+    Lexer lexer(source);
+    auto tokens = lexer.tokenize();
+    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
+      if (tokens[i].type == TokenType::Import &&
+          !tokens[i].escaped &&
+          tokens[i + 1].type == TokenType::Dot &&
+          tokens[i + 2].type == TokenType::Identifier &&
+          !tokens[i + 2].escaped &&
+          tokens[i + 2].value == "meta") {
+        throw std::runtime_error("SyntaxError: Cannot use import.meta outside a module");
+      }
+    }
+    Parser parser(tokens);
+    auto program = parser.parse();
+    if (!program || program->body.empty()) {
+      throw std::runtime_error("SyntaxError: Function constructor parse error");
+    }
+
+    auto compiledProgram = std::make_shared<Program>(std::move(*program));
+    auto* fnDecl = std::get_if<FunctionDeclaration>(&compiledProgram->body[0]->node);
+    if (!fnDecl || !fnDecl->isGenerator) {
+      throw std::runtime_error("SyntaxError: Function constructor parse error");
+    }
+
+    auto fn = GarbageCollector::makeGC<Function>();
+    fn->isNative = false;
+    fn->isAsync = fnDecl->isAsync;
+    fn->isGenerator = fnDecl->isGenerator;
+    fn->isConstructor = false;
+    fn->closure = env;
+
+    auto hasUseStrictDirective = [](const std::vector<StmtPtr>& bodyStmts) -> bool {
+      for (const auto& stmt : bodyStmts) {
+        if (!stmt) break;
+        auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
+        if (!exprStmt || !exprStmt->expression) break;
+        auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node);
+        if (!str) break;
+        if (str->value == "use strict") return true;
+      }
+      return false;
+    };
+    fn->isStrict = hasUseStrictDirective(fnDecl->body);
+
+    for (const auto& param : fnDecl->params) {
+      FunctionParam funcParam;
+      funcParam.name = param.name.name;
+      if (param.defaultValue) {
+        funcParam.defaultValue = std::shared_ptr<void>(
+          const_cast<Expression*>(param.defaultValue.get()),
+          [](void*) {});
+      }
+      fn->params.push_back(funcParam);
+    }
+    if (fnDecl->restParam.has_value()) {
+      fn->restParam = fnDecl->restParam->name;
+    }
+    fn->body = std::shared_ptr<void>(
+      const_cast<std::vector<StmtPtr>*>(&fnDecl->body),
+      [](void*) {});
+    fn->astOwner = compiledProgram;
+    fn->properties["name"] = Value(std::string("anonymous"));
+    fn->properties["length"] = Value(static_cast<double>(fn->params.size()));
+
+    // Generator functions have a `.prototype` that is the generator object prototype.
+    auto genProtoObj = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    genProtoObj->properties["__proto__"] = Value(generatorPrototype);
+    fn->properties["prototype"] = Value(genProtoObj);
+    fn->properties["__non_enum_prototype"] = Value(true);
+    fn->properties["__non_configurable_prototype"] = Value(true);
+
+    // %GeneratorFunction.prototype% as [[Prototype]] of generator function objects.
+    fn->properties["__proto__"] = Value(generatorFunctionPrototype);
+
+    return Value(fn);
+  };
+
+  // Wire: GeneratorFunction.prototype and .constructor
+  generatorFunctionConstructor->properties["prototype"] = Value(generatorFunctionPrototype);
+  generatorFunctionPrototype->properties["constructor"] = Value(generatorFunctionConstructor);
+  generatorFunctionPrototype->properties["__non_enum_constructor"] = Value(true);
+
   // Store these in environment for internal use
   env->define("__generator_function_prototype__", Value(generatorFunctionPrototype));
   env->define("__generator_prototype__", Value(generatorPrototype));
@@ -6924,14 +9775,20 @@ Environment* Environment::getRoot() {
 }
 
 GCPtr<Object> Environment::getGlobal() const {
-  auto globalObj = GarbageCollector::makeGC<Object>();
-  GarbageCollector::instance().reportAllocation(sizeof(Object));
-
   // Walk up to the root environment
   const Environment* current = this;
   while (current->parent_) {
     current = current->parent_.get();
   }
+
+  // Use the live global object when available.
+  auto globalThisIt = current->bindings_.find("globalThis");
+  if (globalThisIt != current->bindings_.end() && globalThisIt->second.isObject()) {
+    return globalThisIt->second.getGC<Object>();
+  }
+
+  auto globalObj = GarbageCollector::makeGC<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
 
   // Add all global bindings to the object
   for (const auto& [name, value] : current->bindings_) {

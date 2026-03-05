@@ -11,7 +11,56 @@
 
 namespace lightjs {
 
-// String.prototype.charAt (Unicode-aware)
+namespace {
+
+size_t utf16Length(const std::string& str) {
+    size_t units = 0;
+    size_t byteIndex = 0;
+    while (byteIndex < str.length()) {
+        uint32_t codePoint = unicode::decodeUTF8(str, byteIndex);
+        units += (codePoint > 0xFFFF) ? 2 : 1;
+    }
+    return units;
+}
+
+bool utf16CodeUnitAt(const std::string& str, size_t targetIndex, uint16_t& outUnit) {
+    size_t utf16Index = 0;
+    size_t byteIndex = 0;
+    while (byteIndex < str.length()) {
+        uint32_t codePoint = unicode::decodeUTF8(str, byteIndex);
+        if (codePoint <= 0xFFFF) {
+            if (utf16Index == targetIndex) {
+                outUnit = static_cast<uint16_t>(codePoint);
+                return true;
+            }
+            utf16Index++;
+            continue;
+        }
+
+        uint32_t v = codePoint - 0x10000;
+        uint16_t high = static_cast<uint16_t>(0xD800 + ((v >> 10) & 0x3FF));
+        uint16_t low = static_cast<uint16_t>(0xDC00 + (v & 0x3FF));
+        if (utf16Index == targetIndex) {
+            outUnit = high;
+            return true;
+        }
+        utf16Index++;
+        if (utf16Index == targetIndex) {
+            outUnit = low;
+            return true;
+        }
+        utf16Index++;
+    }
+    return false;
+}
+
+} // namespace
+
+size_t String_utf16Length(const std::string& str) {
+    return utf16Length(str);
+}
+
+// String.prototype.charAt (UTF-16 code unit based)
 Value String_charAt(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.charAt called on non-string");
@@ -24,14 +73,18 @@ Value String_charAt(const std::vector<Value>& args) {
         index = static_cast<int>(std::get<double>(args[1].data));
     }
 
-    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
+    if (index < 0) {
         return Value(std::string(""));
     }
 
-    return Value(unicode::charAt(str, index));
+    uint16_t codeUnit = 0;
+    if (!utf16CodeUnitAt(str, static_cast<size_t>(index), codeUnit)) {
+        return Value(std::string(""));
+    }
+    return Value(unicode::encodeUTF8(codeUnit));
 }
 
-// String.prototype.charCodeAt (Unicode-aware, returns UTF-16 code unit)
+// String.prototype.charCodeAt (UTF-16 code unit based)
 Value String_charCodeAt(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.charCodeAt called on non-string");
@@ -44,17 +97,18 @@ Value String_charCodeAt(const std::vector<Value>& args) {
         index = static_cast<int>(std::get<double>(args[1].data));
     }
 
-    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
+    if (index < 0) {
         return Value(std::numeric_limits<double>::quiet_NaN());
     }
 
-    uint32_t codePoint = unicode::codePointAt(str, index);
-    // For BMP characters, return the code point directly
-    // For non-BMP, this returns the full code point (JavaScript would use surrogate pairs)
-    return Value(static_cast<double>(codePoint));
+    uint16_t codeUnit = 0;
+    if (!utf16CodeUnitAt(str, static_cast<size_t>(index), codeUnit)) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+    return Value(static_cast<double>(codeUnit));
 }
 
-// String.prototype.codePointAt (full Unicode code point)
+// String.prototype.codePointAt (full Unicode code point using UTF-16 indexing)
 Value String_codePointAt(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.codePointAt called on non-string");
@@ -67,11 +121,24 @@ Value String_codePointAt(const std::vector<Value>& args) {
         index = static_cast<int>(std::get<double>(args[1].data));
     }
 
-    if (index < 0 || index >= static_cast<int>(unicode::utf8Length(str))) {
+    if (index < 0) {
         return Value(Undefined{});
     }
 
-    uint32_t codePoint = unicode::codePointAt(str, index);
+    uint16_t first = 0;
+    if (!utf16CodeUnitAt(str, static_cast<size_t>(index), first)) {
+        return Value(Undefined{});
+    }
+
+    uint32_t codePoint = first;
+    if (first >= 0xD800 && first <= 0xDBFF) {
+        uint16_t second = 0;
+        if (utf16CodeUnitAt(str, static_cast<size_t>(index + 1), second) &&
+            second >= 0xDC00 && second <= 0xDFFF) {
+            codePoint = 0x10000 + (((static_cast<uint32_t>(first) - 0xD800) << 10) |
+                                   (static_cast<uint32_t>(second) - 0xDC00));
+        }
+    }
     return Value(static_cast<double>(codePoint));
 }
 

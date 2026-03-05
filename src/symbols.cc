@@ -8,7 +8,7 @@ const Value& WellKnownSymbols::iterator() {
 }
 
 const std::string& WellKnownSymbols::iteratorKey() {
-  static const std::string key = WellKnownSymbols::iterator().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::iterator());
   return key;
 }
 
@@ -18,7 +18,7 @@ const Value& WellKnownSymbols::asyncIterator() {
 }
 
 const std::string& WellKnownSymbols::asyncIteratorKey() {
-  static const std::string key = WellKnownSymbols::asyncIterator().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::asyncIterator());
   return key;
 }
 
@@ -28,7 +28,7 @@ const Value& WellKnownSymbols::toStringTag() {
 }
 
 const std::string& WellKnownSymbols::toStringTagKey() {
-  static const std::string key = WellKnownSymbols::toStringTag().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::toStringTag());
   return key;
 }
 
@@ -38,7 +38,7 @@ const Value& WellKnownSymbols::toPrimitive() {
 }
 
 const std::string& WellKnownSymbols::toPrimitiveKey() {
-  static const std::string key = WellKnownSymbols::toPrimitive().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::toPrimitive());
   return key;
 }
 
@@ -48,7 +48,7 @@ const Value& WellKnownSymbols::matchAll() {
 }
 
 const std::string& WellKnownSymbols::matchAllKey() {
-  static const std::string key = WellKnownSymbols::matchAll().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::matchAll());
   return key;
 }
 
@@ -58,7 +58,7 @@ const Value& WellKnownSymbols::unscopables() {
 }
 
 const std::string& WellKnownSymbols::unscopablesKey() {
-  static const std::string key = WellKnownSymbols::unscopables().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::unscopables());
   return key;
 }
 
@@ -67,7 +67,7 @@ const Value& WellKnownSymbols::hasInstance() {
   return s;
 }
 const std::string& WellKnownSymbols::hasInstanceKey() {
-  static const std::string key = WellKnownSymbols::hasInstance().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::hasInstance());
   return key;
 }
 
@@ -76,7 +76,7 @@ const Value& WellKnownSymbols::species() {
   return s;
 }
 const std::string& WellKnownSymbols::speciesKey() {
-  static const std::string key = WellKnownSymbols::species().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::species());
   return key;
 }
 
@@ -85,7 +85,7 @@ const Value& WellKnownSymbols::isConcatSpreadable() {
   return s;
 }
 const std::string& WellKnownSymbols::isConcatSpreadableKey() {
-  static const std::string key = WellKnownSymbols::isConcatSpreadable().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::isConcatSpreadable());
   return key;
 }
 
@@ -94,7 +94,7 @@ const Value& WellKnownSymbols::match() {
   return s;
 }
 const std::string& WellKnownSymbols::matchKey() {
-  static const std::string key = WellKnownSymbols::match().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::match());
   return key;
 }
 
@@ -103,7 +103,7 @@ const Value& WellKnownSymbols::replace() {
   return s;
 }
 const std::string& WellKnownSymbols::replaceKey() {
-  static const std::string key = WellKnownSymbols::replace().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::replace());
   return key;
 }
 
@@ -112,7 +112,7 @@ const Value& WellKnownSymbols::search() {
   return s;
 }
 const std::string& WellKnownSymbols::searchKey() {
-  static const std::string key = WellKnownSymbols::search().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::search());
   return key;
 }
 
@@ -121,7 +121,7 @@ const Value& WellKnownSymbols::split() {
   return s;
 }
 const std::string& WellKnownSymbols::splitKey() {
-  static const std::string key = WellKnownSymbols::split().toString();
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::split());
   return key;
 }
 

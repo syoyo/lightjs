@@ -114,10 +114,10 @@ private:
   Test262Metadata parseMetadata(const std::string& source) {
     Test262Metadata metadata;
     auto trim = [](std::string s) {
-      while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
+      while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) {
         s.erase(0, 1);
       }
-      while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
+      while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) {
         s.pop_back();
       }
       return s;
@@ -302,11 +302,13 @@ private:
         "tail-call-optimization",
         "async-iteration",
         "async-disposable-stack",
+        "explicit-resource-management",
         "decorators",
         "import-defer",
         "source-phase-imports",
         "source-phase-imports-module-source",
         "import-attributes",
+        "regexp-modifiers",
         "regexp-v-flag",
         "regexp-unicode-property-escapes",
       };

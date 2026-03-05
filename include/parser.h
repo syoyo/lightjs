@@ -14,6 +14,9 @@ public:
 
   std::optional<Program> parse();
   void setStrictMode(bool strict) { strictMode_ = strict; }
+  void setAllowedPrivateNames(const std::set<std::string>& names) {
+    allowedPrivateNames_ = names;
+  }
 
 private:
   std::vector<Token> tokens_;
@@ -21,13 +24,20 @@ private:
   bool isModule_ = false;
   bool strictMode_ = false;
   bool error_ = false;  // Set on syntax errors to abort parsing
+  std::set<std::string> allowedPrivateNames_;
   bool inSingleStatementPosition_ = false;  // True when parsing body of for/while/if/etc.
   int superCallDisallowDepth_ = 0;
+  int loopDepth_ = 0;
+  int switchDepth_ = 0;
   int functionDepth_ = 0;
+  int returnDisallowDepth_ = 0;  // Disallow `return` even if nested in a function (e.g. class static blocks)
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
   std::vector<bool> awaitContextStack_;
   std::vector<bool> yieldContextStack_;
+  // Expression grammar in classic `for (init; test; update)` uses ExpressionNoIn
+  // to avoid ambiguity with `for-in`.
+  bool allowIn_ = true;
   size_t arrowDestructureTempCounter_ = 0;
   std::set<std::string> iterationLabels_;  // Labels wrapping iteration statements (for continue validation)
   std::set<std::string> activeLabels_;      // All active labels (for break validation)

@@ -5,6 +5,8 @@
 
 namespace lightjs {
 
+size_t String_utf16Length(const std::string& str);
+
 // String prototype methods
 Value String_charAt(const std::vector<Value>& args);
 Value String_charCodeAt(const std::vector<Value>& args);

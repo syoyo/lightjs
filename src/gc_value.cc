@@ -128,10 +128,18 @@ void Map::getReferences(std::vector<GCObject*>& refs) const {
         addValueReferences(key, refs);
         addValueReferences(value, refs);
     }
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
 }
 
 void Set::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& value : values) {
+        addValueReferences(value, refs);
+    }
+    for (const auto& [key, value] : properties) {
+        (void)key;
         addValueReferences(value, refs);
     }
 }
@@ -224,6 +232,10 @@ void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
     for (const auto& [key, value] : entries) {
         addValueReferences(value, refs);
     }
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
 }
 
 // WeakSet implementation
@@ -276,6 +288,39 @@ bool WeakSet::deleteValue(const Value& value) {
 void WeakSet::getReferences(std::vector<GCObject*>& refs) const {
     // WeakSet uses weak references, so we don't add them to refs
     // This allows the GC to collect objects in the WeakSet
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+}
+
+void Error::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+}
+
+void ArrayBuffer::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+}
+
+void DataView::getReferences(std::vector<GCObject*>& refs) const {
+    if (buffer) refs.push_back(buffer.get());
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
+}
+
+void TypedArray::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& [key, value] : properties) {
+        (void)key;
+        addValueReferences(value, refs);
+    }
 }
 
 } // namespace lightjs

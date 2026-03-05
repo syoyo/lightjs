@@ -1,7 +1,13 @@
 #include "lexer.h"
 #include "string_table.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <cctype>
+#if USE_SIMPLE_REGEX
+#include "simple_regex.h"
+#else
+#include <regex>
+#endif
 #include <stdexcept>
 
 namespace lightjs {
@@ -127,10 +133,65 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"true", TokenType::True},
   {"false", TokenType::False},
   {"null", TokenType::Null},
-  {"undefined", TokenType::Undefined},
 };
 
-Lexer::Lexer(std::string_view source) : source_(source) {}
+Lexer::Lexer(std::string_view source) {
+  // Normalize source line terminators to '\n' so the lexer/parser can treat
+  // CR, CRLF, LS, and PS consistently (required by Test262).
+  owned_source_.reserve(source.size());
+  for (size_t i = 0; i < source.size(); i++) {
+    unsigned char c = static_cast<unsigned char>(source[i]);
+    if (c == '\r') {
+      // CRLF -> LF
+      if (i + 1 < source.size() && source[i + 1] == '\n') {
+        i++;
+      }
+      owned_source_.push_back('\n');
+      continue;
+    }
+    if (c == 0xE2 && i + 2 < source.size() &&
+        static_cast<unsigned char>(source[i + 1]) == 0x80) {
+      unsigned char third = static_cast<unsigned char>(source[i + 2]);
+      if (third == 0xA8 || third == 0xA9) {
+        // U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR
+        owned_source_.push_back('\n');
+        i += 2;
+        continue;
+      }
+    }
+    owned_source_.push_back(static_cast<char>(c));
+  }
+  source_ = std::string_view(owned_source_);
+}
+
+void Lexer::skipHashbangAtStart() {
+  // Hashbang comments are only recognized at the start of the source text,
+  // optionally preceded by a UTF-8 BOM.
+  //
+  // https://tc39.es/ecma262/#sec-hashbang-comments
+  if (pos_ != 0) {
+    return;
+  }
+
+  // Consume BOM if present (UTF-8: EF BB BF). This matches skipWhitespace()'s
+  // behavior, but we need to do it here so that `#!` immediately after the BOM
+  // is treated as a HashbangComment rather than as a private identifier error.
+  if (source_.size() >= 3 &&
+      static_cast<unsigned char>(source_[0]) == 0xEF &&
+      static_cast<unsigned char>(source_[1]) == 0xBB &&
+      static_cast<unsigned char>(source_[2]) == 0xBF) {
+    advance();
+    advance();
+    advance();
+  }
+
+  if (!isAtEnd() && current() == '#' && peek() == '!') {
+    // Skip "#!" and then the rest of the line.
+    advance();
+    advance();
+    skipLineComment();
+  }
+}
 
 uint32_t Lexer::readUnicodeEscape(const std::string& errMsg) {
   uint32_t codepoint = 0;
@@ -202,6 +263,9 @@ void Lexer::skipWhitespace() {
         advance();
         advance();
         advance();
+        // Treat Unicode line/paragraph separators as line terminators.
+        line_++;
+        column_ = 1;
       } else {
         break;
       }
@@ -277,11 +341,28 @@ std::optional<Token> Lexer::readNumber() {
     if (!isAtEnd() && (current() == '+' || current() == '-')) {
       advance();
     }
-    if (isAtEnd() || !isDigit(current())) {
-      throwSyntaxError("Invalid exponent in numeric literal");
+    bool sawDigit = false;
+    bool prevSeparator = false;
+    while (!isAtEnd()) {
+      char c = current();
+      if (isDigit(c)) {
+        sawDigit = true;
+        prevSeparator = false;
+        advance();
+        continue;
+      }
+      if (c == '_') {
+        if (!sawDigit || prevSeparator || !isDigit(peek())) {
+          throwSyntaxError("Invalid exponent in numeric literal");
+        }
+        prevSeparator = true;
+        advance();
+        continue;
+      }
+      break;
     }
-    while (!isAtEnd() && isDigit(current())) {
-      advance();
+    if (!sawDigit || prevSeparator) {
+      throwSyntaxError("Invalid exponent in numeric literal");
     }
   };
 
@@ -291,8 +372,28 @@ std::optional<Token> Lexer::readNumber() {
     if (isAtEnd() || !isDigit(current())) {
       throwSyntaxError("Invalid numeric literal");
     }
-    while (!isAtEnd() && isDigit(current())) {
-      advance();
+    bool sawDigit = false;
+    bool prevSeparator = false;
+    while (!isAtEnd()) {
+      char c = current();
+      if (isDigit(c)) {
+        sawDigit = true;
+        prevSeparator = false;
+        advance();
+        continue;
+      }
+      if (c == '_') {
+        if (!sawDigit || prevSeparator || !isDigit(peek())) {
+          throwSyntaxError("Invalid numeric separator in literal");
+        }
+        prevSeparator = true;
+        advance();
+        continue;
+      }
+      break;
+    }
+    if (!sawDigit || prevSeparator) {
+      throwSyntaxError("Invalid numeric separator in literal");
     }
     consumeExponent();
     if (!isAtEnd() && current() == 'n') {
@@ -382,14 +483,57 @@ std::optional<Token> Lexer::readNumber() {
     throwSyntaxError("Invalid numeric separator in literal");
   }
 
+  // Decimal integer literals cannot use separators immediately after a leading zero.
+  if (pos_ > start + 1 && source_[start] == '0') {
+    bool allDigitsOrSeparators = true;
+    bool hasSeparator = false;
+    for (size_t i = start + 1; i < pos_; ++i) {
+      char c = source_[i];
+      if (c == '_') {
+        hasSeparator = true;
+      } else if (!isDigit(c)) {
+        allDigitsOrSeparators = false;
+        break;
+      }
+    }
+    if (allDigitsOrSeparators && hasSeparator) {
+      throwSyntaxError("Invalid numeric separator in literal");
+    }
+  }
+
   bool hasDot = false;
   bool hasExponent = false;
 
-  if (!isAtEnd() && current() == '.' && isDigit(peek())) {
+  if (!isAtEnd() && current() == '.') {
+    if (peek() == '_') {
+      throwSyntaxError("Invalid numeric separator in literal");
+    }
     hasDot = true;
     advance();
-    while (!isAtEnd() && isDigit(current())) {
-      advance();
+    if (!isAtEnd() && isDigit(current())) {
+      bool sawFractionDigit = false;
+      bool prevFractionSeparator = false;
+      while (!isAtEnd()) {
+        char c = current();
+        if (isDigit(c)) {
+          sawFractionDigit = true;
+          prevFractionSeparator = false;
+          advance();
+          continue;
+        }
+        if (c == '_') {
+          if (!sawFractionDigit || prevFractionSeparator || !isDigit(peek())) {
+            throwSyntaxError("Invalid numeric separator in literal");
+          }
+          prevFractionSeparator = true;
+          advance();
+          continue;
+        }
+        break;
+      }
+      if (!sawFractionDigit || prevFractionSeparator) {
+        throwSyntaxError("Invalid numeric separator in literal");
+      }
     }
   }
 
@@ -427,11 +571,17 @@ std::optional<Token> Lexer::readString(char quote) {
 
   std::string str;
   while (!isAtEnd() && current() != quote) {
+    if (current() == '\n') {
+      throw std::runtime_error("SyntaxError: Unterminated string literal");
+    }
     if (current() == '\\') {
       advance();
       if (!isAtEnd()) {
         char c = current();
         switch (c) {
+          case '\n':
+            // LineContinuation: backslash + line terminator is removed from string value
+            break;
           case 'n': str += '\n'; break;
           case 't': str += '\t'; break;
           case 'r': str += '\r'; break;
@@ -498,6 +648,26 @@ std::optional<Token> Lexer::readString(char quote) {
             appendUtf8(str, codepoint);
             continue;
           }
+          case 'x': {
+            advance();  // consume 'x'
+            if (isAtEnd()) {
+              throw std::runtime_error("Invalid hexadecimal escape in string");
+            }
+            int hi = hexDigitValue(current());
+            if (hi < 0) {
+              throw std::runtime_error("Invalid hexadecimal escape in string");
+            }
+            advance();
+            if (isAtEnd()) {
+              throw std::runtime_error("Invalid hexadecimal escape in string");
+            }
+            int lo = hexDigitValue(current());
+            if (lo < 0) {
+              throw std::runtime_error("Invalid hexadecimal escape in string");
+            }
+            str += static_cast<char>((hi << 4) | lo);
+            break;
+          }
           default: str += c; break;
         }
         advance();
@@ -508,9 +678,10 @@ std::optional<Token> Lexer::readString(char quote) {
     }
   }
 
-  if (!isAtEnd()) {
-    advance();
+  if (isAtEnd()) {
+    throw std::runtime_error("SyntaxError: Unterminated string literal");
   }
+  advance();  // closing quote
 
   // Intern string literals for memory efficiency (especially for object keys)
   // Only intern small strings (< 256 chars) to avoid memory bloat
@@ -527,29 +698,21 @@ std::optional<Token> Lexer::readTemplateLiteral() {
   uint32_t startColumn = column_;
   advance(); // skip opening backtick
 
-  // For now, treat the entire template as a string with ${} markers
-  // The parser will need to parse the interpolation expressions
+  // Keep the template content in *raw source form* (backslashes preserved).
+  // The parser/interpreter will compute cooked/raw values for each quasi.
   std::string content;
   while (!isAtEnd() && current() != '`') {
     if (current() == '\\') {
-      advance();
-      if (!isAtEnd()) {
-        char c = current();
-        switch (c) {
-          case 'n': content += '\n'; break;
-          case 't': content += '\t'; break;
-          case 'r': content += '\r'; break;
-          case '\\': content += '\\'; break;
-          case '`': content += '`'; break;
-          case '$': content += '$'; break;
-          default: content += c; break;
-        }
-        advance();
-      }
-    } else {
+      // Copy backslash + next char verbatim so `${` can be escaped as `\${`.
       content += current();
       advance();
+      if (isAtEnd()) break;
+      content += current();
+      advance();
+      continue;
     }
+    content += current();
+    advance();
   }
 
   if (!isAtEnd()) {
@@ -635,32 +798,86 @@ std::optional<Token> Lexer::readRegex() {
   advance();
 
   std::string pattern;
-  while (!isAtEnd() && current() != '/') {
-    if (current() == '\\') {
-      pattern += current();
-      advance();
-      if (!isAtEnd()) {
-        pattern += current();
-        advance();
-      }
-    } else if (current() == '\n') {
-      return std::nullopt;
-    } else {
-      pattern += current();
-      advance();
+  bool inCharClass = false;
+  while (!isAtEnd()) {
+    char c = current();
+    if (c == '\n') {
+      throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
     }
+    if (c == '\\') {
+      pattern += c;
+      advance();
+      if (isAtEnd()) {
+        throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
+      }
+      pattern += current();
+      advance();
+      continue;
+    }
+    if (c == '[') {
+      inCharClass = true;
+      pattern += c;
+      advance();
+      continue;
+    }
+    if (c == ']' && inCharClass) {
+      inCharClass = false;
+      pattern += c;
+      advance();
+      continue;
+    }
+    if (c == '/' && !inCharClass) {
+      break;
+    }
+    pattern += c;
+    advance();
   }
 
-  if (isAtEnd()) {
-    return std::nullopt;
+  if (isAtEnd() || current() != '/') {
+    throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
   }
 
-  advance();
+  advance();  // closing '/'
 
   std::string flags;
-  while (!isAtEnd() && isAlpha(current())) {
-    flags += current();
+  std::unordered_set<char> seen;
+  auto isAsciiLetter = [](char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+  };
+  while (!isAtEnd() && isAsciiLetter(current())) {
+    char f = current();
+    if (seen.count(f)) {
+      throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+    }
+    // Only accept known ASCII flag letters.
+    if (!(f == 'g' || f == 'i' || f == 'm' || f == 's' || f == 'u' || f == 'y' ||
+          f == 'd' || f == 'v')) {
+      throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+    }
+    seen.insert(f);
+    flags += f;
     advance();
+  }
+
+  // Validate pattern+flags early so Test262 negative regexp-literal parse tests
+  // are handled as SyntaxError during lexing/parsing (not deferred to runtime).
+  // This is intentionally conservative: we validate using the same backend we
+  // use at runtime (std::regex or simple_regex).
+  try {
+#if USE_SIMPLE_REGEX
+    bool caseInsensitive = flags.find('i') != std::string::npos;
+    simple_regex::Regex tmp(pattern, caseInsensitive);
+    (void)tmp;
+#else
+    std::regex::flag_type options = std::regex::ECMAScript;
+    if (flags.find('i') != std::string::npos) {
+      options |= std::regex::icase;
+    }
+    std::regex tmp(pattern, options);
+    (void)tmp;
+#endif
+  } catch (...) {
+    throw std::runtime_error("SyntaxError: Invalid regular expression");
   }
 
   std::string value = pattern + "||" + flags;
@@ -707,6 +924,8 @@ bool Lexer::expectsRegex(TokenType type) {
 
 std::vector<Token> Lexer::tokenize() {
   std::vector<Token> tokens;
+
+  skipHashbangAtStart();
 
   while (!isAtEnd()) {
     skipWhitespace();

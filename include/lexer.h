@@ -14,6 +14,7 @@ public:
   std::vector<Token> tokenize();
 
 private:
+  std::string owned_source_;
   std::string_view source_;
   size_t pos_ = 0;
   uint32_t line_ = 1;
@@ -27,6 +28,7 @@ private:
   void skipWhitespace();
   void skipLineComment();
   void skipBlockComment();
+  void skipHashbangAtStart();
 
   std::optional<Token> readNumber();
   std::optional<Token> readString(char quote);
