@@ -294,6 +294,8 @@ std::string Value::toString() const {
     } else if constexpr (std::is_same_v<T, bool>) {
       return arg ? "true" : "false";
     } else if constexpr (std::is_same_v<T, double>) {
+      if (std::isnan(arg)) return "NaN";
+      if (std::isinf(arg)) return arg > 0 ? "Infinity" : "-Infinity";
       std::ostringstream oss;
       oss << arg;
       return oss.str();

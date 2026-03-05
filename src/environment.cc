@@ -4606,9 +4606,31 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty()) return Value(std::numeric_limits<double>::quiet_NaN());
     std::string str = args[0].toString();
 
-    // Trim whitespace
-    size_t start = str.find_first_not_of(" \t\n\r\f\v");
-    if (start == std::string::npos) {
+    // Trim leading whitespace (including Unicode whitespace per spec)
+    size_t start = 0;
+    while (start < str.size()) {
+      unsigned char c = str[start];
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+        start++;
+      } else if (c == 0xC2 && start + 1 < str.size() && (unsigned char)str[start+1] == 0xA0) {
+        start += 2;  // NBSP U+00A0 (UTF-8: C2 A0)
+      } else if (c == 0xE2 && start + 2 < str.size()) {
+        unsigned char c2 = str[start+1], c3 = str[start+2];
+        if (c2 == 0x80 && (c3 >= 0x80 && c3 <= 0x8A)) { start += 3; }      // U+2000-U+200A
+        else if (c2 == 0x80 && (c3 == 0xA8 || c3 == 0xA9 || c3 == 0xAF)) { start += 3; }  // U+2028/2029/202F
+        else if (c2 == 0x81 && c3 == 0x9F) { start += 3; }                  // U+205F
+        else break;
+      } else if (c == 0xE3 && start + 2 < str.size() &&
+                 (unsigned char)str[start+1] == 0x80 && (unsigned char)str[start+2] == 0x80) {
+        start += 3;  // U+3000
+      } else if (c == 0xEF && start + 2 < str.size() &&
+                 (unsigned char)str[start+1] == 0xBB && (unsigned char)str[start+2] == 0xBF) {
+        start += 3;  // U+FEFF
+      } else {
+        break;
+      }
+    }
+    if (start >= str.size()) {
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
     str = str.substr(start);
@@ -4617,10 +4639,27 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
 
+    // Handle Infinity/+Infinity/-Infinity explicitly (case-sensitive per spec)
+    if (str.substr(0, 8) == "Infinity" || str.substr(0, 9) == "+Infinity") {
+      return Value(std::numeric_limits<double>::infinity());
+    }
+    if (str.substr(0, 9) == "-Infinity") {
+      return Value(-std::numeric_limits<double>::infinity());
+    }
+    // Reject non-spec infinity variants (inf, INFINITY, etc.)
+    if ((str[0] == 'i' || str[0] == 'I') && str.substr(0, 3) != "Inf") {
+      return Value(std::numeric_limits<double>::quiet_NaN());
+    }
+
     try {
       size_t idx;
       double result = std::stod(str, &idx);
       if (idx == 0) {
+        return Value(std::numeric_limits<double>::quiet_NaN());
+      }
+      // std::stod may parse "inf"/"INF" etc - reject non-spec Infinity
+      if (std::isinf(result) && str.substr(0, 8) != "Infinity" &&
+          str.substr(0, 9) != "+Infinity" && str.substr(0, 9) != "-Infinity") {
         return Value(std::numeric_limits<double>::quiet_NaN());
       }
       return Value(result);
@@ -6872,8 +6911,10 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectHasOwn = GarbageCollector::makeGC<Function>();
   objectHasOwn->isNative = true;
   objectHasOwn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2) return Value(false);
-    std::string key = valueToPropertyKey(args[1]);
+    if (args.empty() || args[0].isNull() || args[0].isUndefined()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+    std::string key = args.size() > 1 ? valueToPropertyKey(args[1]) : "undefined";
     if (args[0].isObject()) {
       auto obj = args[0].getGC<Object>();
       if (obj->isModuleNamespace) {
@@ -6892,17 +6933,38 @@ GCPtr<Environment> Environment::createGlobal() {
         }
         return Value(true);
       }
-      return Value(obj->properties.find(key) != obj->properties.end());
+      if (obj->properties.find(key) != obj->properties.end()) return Value(true);
+      if (obj->properties.find("__get_" + key) != obj->properties.end()) return Value(true);
+      if (obj->properties.find("__set_" + key) != obj->properties.end()) return Value(true);
+      return Value(false);
     }
     if (args[0].isArray()) {
       auto arr = args[0].getGC<Array>();
       // Check numeric index
-      try {
-        size_t idx = std::stoul(key);
-        return Value(idx < arr->elements.size());
-      } catch (...) {
-        return Value(false);
+      bool isNum = !key.empty() && std::all_of(key.begin(), key.end(), ::isdigit);
+      if (isNum) {
+        try {
+          size_t idx = std::stoul(key);
+          if (idx < arr->elements.size()) return Value(true);
+        } catch (...) {}
       }
+      // Check named properties (including symbol keys)
+      if (arr->properties.find(key) != arr->properties.end()) return Value(true);
+      if (arr->properties.find("__get_" + key) != arr->properties.end()) return Value(true);
+      if (arr->properties.find("__set_" + key) != arr->properties.end()) return Value(true);
+      return Value(false);
+    }
+    if (args[0].isFunction()) {
+      auto fn = args[0].getGC<Function>();
+      if (fn->properties.find(key) != fn->properties.end()) return Value(true);
+      if (fn->properties.find("__get_" + key) != fn->properties.end()) return Value(true);
+      if (fn->properties.find("__set_" + key) != fn->properties.end()) return Value(true);
+      return Value(false);
+    }
+    if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      if (cls->properties.find(key) != cls->properties.end()) return Value(true);
+      return Value(false);
     }
     return Value(false);
   };
@@ -7224,9 +7286,9 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectIs = GarbageCollector::makeGC<Function>();
   objectIs->isNative = true;
   objectIs->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2) return Value(false);
-    const Value& a = args[0];
-    const Value& b = args[1];
+    // Missing args are treated as undefined
+    Value a = args.size() > 0 ? args[0] : Value(Undefined{});
+    Value b = args.size() > 1 ? args[1] : Value(Undefined{});
 
     // Check for same type
     if (a.data.index() != b.data.index()) return Value(false);
@@ -7235,16 +7297,13 @@ GCPtr<Environment> Environment::createGlobal() {
     if (a.isNumber() && b.isNumber()) {
       double x = a.toNumber();
       double y = b.toNumber();
-      // NaN is equal to NaN in Object.is
       if (std::isnan(x) && std::isnan(y)) return Value(true);
-      // +0 and -0 are different in Object.is
       if (x == 0 && y == 0) {
         return Value(std::signbit(x) == std::signbit(y));
       }
       return Value(x == y);
     }
 
-    // For other types, use regular equality
     if (a.isUndefined() && b.isUndefined()) return Value(true);
     if (a.isNull() && b.isNull()) return Value(true);
     if (a.isBool() && b.isBool()) {
@@ -7252,6 +7311,12 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     if (a.isString() && b.isString()) {
       return Value(std::get<std::string>(a.data) == std::get<std::string>(b.data));
+    }
+    if (a.isBigInt() && b.isBigInt()) {
+      return Value(a.toBigInt() == b.toBigInt());
+    }
+    if (a.isSymbol() && b.isSymbol()) {
+      return Value(std::get<Symbol>(a.data) == std::get<Symbol>(b.data));
     }
     // For objects, check reference equality
     if (a.isObject() && b.isObject()) {
@@ -7265,6 +7330,18 @@ GCPtr<Environment> Environment::createGlobal() {
     if (a.isFunction() && b.isFunction()) {
       return Value(a.getGC<Function>().get() ==
                    b.getGC<Function>().get());
+    }
+    if (a.isClass() && b.isClass()) {
+      return Value(a.getGC<Class>().get() ==
+                   b.getGC<Class>().get());
+    }
+    if (a.isPromise() && b.isPromise()) {
+      return Value(a.getGC<Promise>().get() ==
+                   b.getGC<Promise>().get());
+    }
+    if (a.isRegex() && b.isRegex()) {
+      return Value(a.getGC<Regex>().get() ==
+                   b.getGC<Regex>().get());
     }
 
     return Value(false);
