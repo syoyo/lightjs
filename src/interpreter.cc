@@ -1660,11 +1660,11 @@ Task Interpreter::evaluate(const Statement& stmt) {
   } else if (auto* node = std::get_if<BreakStmt>(&stmt.node)) {
     flow_.type = ControlFlow::Type::Break;
     flow_.label = node->label;
-    LIGHTJS_RETURN(Value(Undefined{}));
+    LIGHTJS_RETURN(Value(Empty{}));
   } else if (auto* node = std::get_if<ContinueStmt>(&stmt.node)) {
     flow_.type = ControlFlow::Type::Continue;
     flow_.label = node->label;
-    LIGHTJS_RETURN(Value(Undefined{}));
+    LIGHTJS_RETURN(Value(Empty{}));
   } else if (auto* labelNode = std::get_if<LabelledStmt>(&stmt.node)) {
     // Set pending label so the next iteration statement can consume matching continues
     auto prevLabel = pendingIterationLabel_;
@@ -1674,9 +1674,13 @@ Task Interpreter::evaluate(const Statement& stmt) {
     LIGHTJS_RUN_TASK(task, labelResult);
     pendingIterationLabel_ = prevLabel;
     // If break targets this label, consume it
+    // Spec: set stmtResult to NormalCompletion(UpdateEmpty(stmtResult.[[Value]], undefined))
     if (flow_.type == ControlFlow::Type::Break && flow_.label == labelNode->label) {
       flow_.type = ControlFlow::Type::None;
       flow_.label.clear();
+      if (labelResult.isEmpty()) {
+        labelResult = Value(Undefined{});
+      }
     }
     LIGHTJS_RETURN(labelResult);
   } else if (auto* node = std::get_if<ThrowStmt>(&stmt.node)) {
@@ -16115,14 +16119,21 @@ Task Interpreter::evaluateIf(const IfStmt& stmt) {
   if (testTask.result().toBool()) {
     auto consTask = evaluate(*stmt.consequent);
     LIGHTJS_RUN_TASK_VOID(consTask);
-    LIGHTJS_RETURN(consTask.result());
+    // Spec: Return Completion(UpdateEmpty(stmtCompletion, undefined))
+    Value result = consTask.result();
+    if (result.isEmpty()) result = Value(Undefined{});
+    LIGHTJS_RETURN(result);
   } else if (stmt.alternate) {
     auto altTask = evaluate(*stmt.alternate);
     LIGHTJS_RUN_TASK_VOID(altTask);
-    LIGHTJS_RETURN(altTask.result());
+    // Spec: Return Completion(UpdateEmpty(stmtCompletion, undefined))
+    Value result = altTask.result();
+    if (result.isEmpty()) result = Value(Undefined{});
+    LIGHTJS_RETURN(result);
   }
 
-  LIGHTJS_RETURN(Value(Empty{}));
+  // Spec: if no else and condition is false, return NormalCompletion(undefined)
+  LIGHTJS_RETURN(Value(Undefined{}));
 }
 
 Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
@@ -16138,8 +16149,14 @@ Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
       break;
     }
 
+    Value bodyResult;
     auto bodyTask = evaluate(*stmt.body);
-  LIGHTJS_RUN_TASK(bodyTask, result);
+  LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+
+    // UpdateEmpty: only update V when body result is not empty
+    if (!bodyResult.isEmpty()) {
+      result = bodyResult;
+    }
 
     if (flow_.type == ControlFlow::Type::Break) {
       if (flow_.breakCompletionValue.has_value()) {
@@ -16288,10 +16305,13 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
   { auto _t = evaluate(*stmt.body); LIGHTJS_RUN_TASK(_t, result); }
 
   // Per spec: Return Completion(UpdateEmpty(C, undefined))
+  if (result.isEmpty()) {
+    result = Value(Undefined{});
+  }
+
   // When body completes with break/continue, carry the UpdateEmpty'd value
   if (flow_.type == ControlFlow::Type::Break ||
       flow_.type == ControlFlow::Type::Continue) {
-    // The result is the UpdateEmpty'd value from the body
     // Propagate it through breakCompletionValue for the enclosing loop
     flow_.breakCompletionValue = result;
   }
@@ -16364,8 +16384,14 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
       }
     }
 
+    Value bodyResult;
     auto bodyTask = evaluate(*stmt.body);
-  LIGHTJS_RUN_TASK(bodyTask, result);
+  LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+
+    // UpdateEmpty: only update V when body result is not empty
+    if (!bodyResult.isEmpty()) {
+      result = bodyResult;
+    }
 
     if (flow_.type == ControlFlow::Type::Break) {
       if (flow_.breakCompletionValue.has_value()) {
@@ -16410,8 +16436,14 @@ Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
   pendingIterationLabel_.clear();
 
   do {
+    Value bodyResult;
     auto bodyTask = evaluate(*stmt.body);
-  LIGHTJS_RUN_TASK(bodyTask, result);
+  LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+
+    // UpdateEmpty: only update V when body result is not empty
+    if (!bodyResult.isEmpty()) {
+      result = bodyResult;
+    }
 
     if (flow_.type == ControlFlow::Type::Break) {
       // Use try/finally completion value if available (spec UpdateEmpty)
@@ -16680,8 +16712,14 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       auto loopEnv = env_;  // Save loop environment
       assignKey(key);
 
+      Value bodyResult;
       auto bodyTask = evaluate(*stmt.body);
-  LIGHTJS_RUN_TASK(bodyTask, result);
+  LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+
+      // UpdateEmpty: only update V when body result is not empty
+      if (!bodyResult.isEmpty()) {
+        result = bodyResult;
+      }
 
       if (isLetOrConst) env_ = loopEnv;  // Restore to loop scope
 
@@ -16720,8 +16758,12 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     for (const auto& key : keys) {
       auto loopEnv = env_;
       assignKey(key);
+      Value bodyResult;
       auto bodyTask = evaluate(*stmt.body);
-      LIGHTJS_RUN_TASK(bodyTask, result);
+      LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+      if (!bodyResult.isEmpty()) {
+        result = bodyResult;
+      }
       if (isLetOrConst) env_ = loopEnv;
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -16756,8 +16798,12 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     for (const auto& key : keys) {
       auto loopEnv = env_;
       assignKey(key);
+      Value bodyResult;
       auto bodyTask = evaluate(*stmt.body);
-      LIGHTJS_RUN_TASK(bodyTask, result);
+      LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+      if (!bodyResult.isEmpty()) {
+        result = bodyResult;
+      }
       if (isLetOrConst) env_ = loopEnv;
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -16785,8 +16831,12 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     for (const auto& key : keys) {
       auto loopEnv = env_;
       assignKey(key);
+      Value bodyResult;
       auto bodyTask = evaluate(*stmt.body);
-      LIGHTJS_RUN_TASK(bodyTask, result);
+      LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+      if (!bodyResult.isEmpty()) {
+        result = bodyResult;
+      }
       if (isLetOrConst) env_ = loopEnv;
       if (flow_.type == ControlFlow::Type::Break) {
         if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
@@ -17120,8 +17170,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       }
     }
 
+    Value bodyResult;
     auto bodyTask = evaluate(*stmt.body);
-    LIGHTJS_RUN_TASK(bodyTask, result);
+    LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+
+    // UpdateEmpty: only update V when body result is not empty
+    if (!bodyResult.isEmpty()) {
+      result = bodyResult;
+    }
 
     // Restore to outer loop env
     env_ = outerEnv;
@@ -17234,11 +17290,7 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 
         // UpdateEmpty semantics (ES spec 13.12.9):
         // Update V when R.[[value]] is not empty.
-        // Normal completion always updates V.
-        // Abrupt completion only updates V if it carries a non-empty value.
-        if (flow_.type == ControlFlow::Type::None) {
-          result = stmtResult;
-        } else if (!stmtResult.isUndefined()) {
+        if (!stmtResult.isEmpty()) {
           result = stmtResult;
         }
 
@@ -17265,9 +17317,7 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 
         // UpdateEmpty semantics (ES spec 13.12.9):
         // Update V when R.[[value]] is not empty.
-        if (flow_.type == ControlFlow::Type::None) {
-          result = stmtResult;
-        } else if (!stmtResult.isUndefined()) {
+        if (!stmtResult.isEmpty()) {
           result = stmtResult;
         }
 
@@ -17292,8 +17342,12 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   Value result = Value(Undefined{});
 
   for (const auto& s : stmt.block) {
+    Value stmtResult;
     auto task = evaluate(*s);
-  LIGHTJS_RUN_TASK(task, result);
+  LIGHTJS_RUN_TASK(task, stmtResult);
+    if (!stmtResult.isEmpty()) {
+      result = stmtResult;
+    }
 
     if (flow_.type == ControlFlow::Type::Throw && stmt.hasHandler) {
       // Per spec: create catch parameter environment
@@ -17318,8 +17372,12 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       env_ = catchBlockEnv;
 
       for (const auto& catchStmt : stmt.handler.body) {
+        Value catchResult;
         auto catchTask = evaluate(*catchStmt);
-  LIGHTJS_RUN_TASK(catchTask, result);
+  LIGHTJS_RUN_TASK(catchTask, catchResult);
+        if (!catchResult.isEmpty()) {
+          result = catchResult;
+        }
         if (flow_.type != ControlFlow::Type::None) {
           break;
         }
@@ -17352,9 +17410,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       Value finalResult;
       LIGHTJS_RUN_TASK(finalTask, finalResult);
       // UpdateEmpty semantics: track last non-empty completion value
-      if (flow_.type == ControlFlow::Type::None) {
-        finallyValue = finalResult;
-      } else if (!finalResult.isUndefined()) {
+      if (!finalResult.isEmpty()) {
         finallyValue = finalResult;
       }
       if (flow_.type != ControlFlow::Type::None) {

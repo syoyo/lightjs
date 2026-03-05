@@ -7530,6 +7530,24 @@ GCPtr<Environment> Environment::createGlobal() {
 
     if (args[0].isObject()) {
       auto obj = args[0].getGC<Object>();
+
+      // __proto__ in properties is the prototype chain link, not an own property.
+      // Own __proto__ is stored as __own_prop___proto__ (from computed/defineProperty).
+      if (key == "__proto__") {
+        auto ownIt = obj->properties.find("__own_prop___proto__");
+        if (ownIt == obj->properties.end()) {
+          return Value(Undefined{});
+        }
+        descriptor->properties["value"] = ownIt->second;
+        bool writable = obj->properties.find("__non_writable___own_prop___proto__") == obj->properties.end();
+        bool enumerable = obj->properties.find("__non_enum___own_prop___proto__") == obj->properties.end();
+        bool configurable = obj->properties.find("__non_configurable___own_prop___proto__") == obj->properties.end();
+        descriptor->properties["writable"] = Value(writable);
+        descriptor->properties["enumerable"] = Value(enumerable);
+        descriptor->properties["configurable"] = Value(configurable);
+        return Value(descriptor);
+      }
+
       if (obj->isModuleNamespace) {
         if (key == WellKnownSymbols::toStringTagKey()) {
           descriptor->properties["value"] = Value(std::string("Module"));
