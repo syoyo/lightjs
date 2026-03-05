@@ -7761,6 +7761,15 @@ GCPtr<Environment> Environment::createGlobal() {
           obj->properties[key] = Value(Undefined{});
         }
 
+        // Ensure accessor-only properties have a visible key for enumeration.
+        // The getter/setter takes priority in member access, so this placeholder
+        // value is only used for property enumeration (for-in, Object.keys, etc.).
+        if (!hadExistingProperty && !hasValueField && (hasGetField || hasSetField)) {
+          if (obj->properties.find(key) == obj->properties.end()) {
+            obj->properties[key] = Value(Undefined{});
+          }
+        }
+
         // Handle writable descriptor
         auto writableField = readDescriptorField("writable");
         auto enumField = readDescriptorField("enumerable");
@@ -7993,6 +8002,13 @@ GCPtr<Environment> Environment::createGlobal() {
 
         if (setField.has_value() && setField->isFunction()) {
           arr->properties["__set_" + key] = *setField;
+        }
+
+        // Ensure non-index accessor-only properties have a visible key for enumeration.
+        if (!isIndexKey && !valueField.has_value() && (getField.has_value() || setField.has_value())) {
+          if (arr->properties.find(key) == arr->properties.end()) {
+            arr->properties[key] = Value(Undefined{});
+          }
         }
 
         // Handle writable descriptor

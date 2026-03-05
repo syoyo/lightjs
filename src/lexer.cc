@@ -711,6 +711,96 @@ std::optional<Token> Lexer::readTemplateLiteral() {
       advance();
       continue;
     }
+    // Handle ${...} expression interpolations - must track nesting to handle
+    // nested template literals inside expressions like `foo ${`bar ${x} baz`}`
+    if (current() == '$' && pos_ + 1 < source_.size() && source_[pos_ + 1] == '{') {
+      content += '$';
+      advance();
+      content += '{';
+      advance();
+      // Track brace depth and nested template literals
+      int braceDepth = 1;
+      while (!isAtEnd() && braceDepth > 0) {
+        if (current() == '`') {
+          // Nested template literal - read it recursively into content
+          content += '`';
+          advance();
+          while (!isAtEnd() && current() != '`') {
+            if (current() == '\\') {
+              content += current();
+              advance();
+              if (isAtEnd()) break;
+              content += current();
+              advance();
+              continue;
+            }
+            if (current() == '$' && pos_ + 1 < source_.size() && source_[pos_ + 1] == '{') {
+              content += '$';
+              advance();
+              content += '{';
+              advance();
+              // Nested expression in nested template
+              int innerBraceDepth = 1;
+              while (!isAtEnd() && innerBraceDepth > 0) {
+                if (current() == '{') innerBraceDepth++;
+                else if (current() == '}') innerBraceDepth--;
+                if (innerBraceDepth > 0) {
+                  content += current();
+                  advance();
+                }
+              }
+              if (!isAtEnd()) {
+                content += '}';
+                advance();
+              }
+              continue;
+            }
+            content += current();
+            advance();
+          }
+          if (!isAtEnd()) {
+            content += '`';
+            advance();
+          }
+          continue;
+        }
+        if (current() == '\'') {
+          // Single-quoted string
+          content += current();
+          advance();
+          while (!isAtEnd() && current() != '\'') {
+            if (current() == '\\') { content += current(); advance(); if (isAtEnd()) break; }
+            content += current();
+            advance();
+          }
+          if (!isAtEnd()) { content += current(); advance(); }
+          continue;
+        }
+        if (current() == '"') {
+          // Double-quoted string
+          content += current();
+          advance();
+          while (!isAtEnd() && current() != '"') {
+            if (current() == '\\') { content += current(); advance(); if (isAtEnd()) break; }
+            content += current();
+            advance();
+          }
+          if (!isAtEnd()) { content += current(); advance(); }
+          continue;
+        }
+        if (current() == '{') braceDepth++;
+        else if (current() == '}') braceDepth--;
+        if (braceDepth > 0) {
+          content += current();
+          advance();
+        }
+      }
+      if (!isAtEnd()) {
+        content += '}';
+        advance();
+      }
+      continue;
+    }
     content += current();
     advance();
   }

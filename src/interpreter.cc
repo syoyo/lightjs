@@ -16695,7 +16695,8 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
       auto current = *objPtr;
       int depth = 0;
       while (current && depth < 50) {
-        if (current->properties.count(key) && !current->properties.count("__non_enum_" + key)) {
+        if ((current->properties.count(key) || current->properties.count("__get_" + key) || current->properties.count("__set_" + key)) &&
+            !current->properties.count("__non_enum_" + key)) {
           exists = true;
           break;
         }
@@ -16746,13 +16747,22 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     for (size_t i = 0; i < (*arrPtr)->elements.size(); ++i) {
       keys.push_back(std::to_string(i));
     }
-    // Add named properties
-    for (const auto& [key, _] : (*arrPtr)->properties) {
-      if (isInternalProp(key)) continue;
-      if (isMetaProp(key)) continue;
-      if (isSymbolPropertyKey(key)) continue;
-      if ((*arrPtr)->properties.count("__non_enum_" + key)) continue;
-      keys.push_back(key);
+    // Add named properties in insertion order
+    {
+      std::vector<std::string> namedKeys;
+      for (const auto& key : (*arrPtr)->properties.orderedKeys()) {
+        if (isInternalProp(key)) continue;
+        if (isMetaProp(key)) continue;
+        if (isSymbolPropertyKey(key)) continue;
+        // Skip numeric indices already added above
+        bool isNum = !key.empty() && std::all_of(key.begin(), key.end(), ::isdigit);
+        if (isNum) continue;
+        namedKeys.push_back(key);
+      }
+      for (const auto& key : namedKeys) {
+        if ((*arrPtr)->properties.count("__non_enum_" + key)) continue;
+        keys.push_back(key);
+      }
     }
 
     for (const auto& key : keys) {

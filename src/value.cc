@@ -1041,35 +1041,85 @@ GCPtr<Promise> Promise::rejected(const Value& reason) {
 
 static bool isInternalProperty(const std::string& key);
 
-// Object static methods implementation
-Value Object_keys(const std::vector<Value>& args) {
-  if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = GarbageCollector::makeGC<Array>();
-    return Value(emptyArray);
+// Helper: check if key is an array index (non-negative integer < 2^32 - 1)
+static bool isArrayIndex(const std::string& key, uint32_t& out) {
+  if (key.empty()) return false;
+  if (key.size() > 1 && key[0] == '0') return false;
+  for (char c : key) {
+    if (c < '0' || c > '9') return false;
   }
+  try {
+    unsigned long long parsed = std::stoull(key);
+    if (parsed >= static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) return false;
+    out = static_cast<uint32_t>(parsed);
+    return true;
+  } catch (...) { return false; }
+}
 
-  auto obj = args[0].getGC<Object>();
-  auto result = GarbageCollector::makeGC<Array>();
-
-  if (obj->isModuleNamespace) {
-    for (const auto& key : obj->moduleExportNames) {
-      auto getterIt = obj->properties.find("__get_" + key);
-      if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-        auto getter = getterIt->second.getGC<Function>();
-        if (getter && getter->isNative) {
-          getter->nativeFunc({});
-        }
-      }
-      result->elements.push_back(Value(key));
-    }
-    return Value(result);
-  }
-
-  for (const auto& key : obj->properties.orderedKeys()) {
-    // Skip internal, non-enumerable, and Symbol-keyed properties
+// Sort keys per OrdinaryOwnPropertyKeys: integer indices ascending, then
+// string keys in insertion order (orderedKeys preserves insertion order).
+static std::vector<std::string> sortOwnPropertyKeys(
+    const std::vector<std::string>& orderedKeys) {
+  std::vector<std::pair<uint32_t, std::string>> indexKeys;
+  std::vector<std::string> stringKeys;
+  for (const auto& key : orderedKeys) {
     if (isInternalProperty(key)) continue;
     if (isSymbolPropertyKey(key)) continue;
-    if (obj->properties.count("__non_enum_" + key)) continue;
+    uint32_t idx;
+    if (isArrayIndex(key, idx)) {
+      indexKeys.push_back({idx, key});
+    } else {
+      stringKeys.push_back(key);
+    }
+  }
+  std::sort(indexKeys.begin(), indexKeys.end(),
+    [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<std::string> result;
+  result.reserve(indexKeys.size() + stringKeys.size());
+  for (const auto& [_, key] : indexKeys) result.push_back(key);
+  for (const auto& key : stringKeys) result.push_back(key);
+  return result;
+}
+
+// Object static methods implementation
+// Helper to get the OrderedMap properties from any object-like value
+static OrderedMap<std::string, Value>* getPropertiesMap(const Value& val) {
+  if (val.isObject()) return &val.getGC<Object>()->properties;
+  if (val.isFunction()) return &val.getGC<Function>()->properties;
+  if (val.isArray()) return &val.getGC<Array>()->properties;
+  if (val.isClass()) return &val.getGC<Class>()->properties;
+  if (val.isPromise()) return &val.getGC<Promise>()->properties;
+  if (val.isRegex()) return &val.getGC<Regex>()->properties;
+  return nullptr;
+}
+
+Value Object_keys(const std::vector<Value>& args) {
+  auto result = GarbageCollector::makeGC<Array>();
+  if (args.empty()) return Value(result);
+
+  // Handle Object with module namespace
+  if (args[0].isObject()) {
+    auto obj = args[0].getGC<Object>();
+    if (obj->isModuleNamespace) {
+      for (const auto& key : obj->moduleExportNames) {
+        auto getterIt = obj->properties.find("__get_" + key);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          auto getter = getterIt->second.getGC<Function>();
+          if (getter && getter->isNative) {
+            getter->nativeFunc({});
+          }
+        }
+        result->elements.push_back(Value(key));
+      }
+      return Value(result);
+    }
+  }
+
+  auto* props = getPropertiesMap(args[0]);
+  if (!props) return Value(result);
+
+  for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
+    if (props->count("__non_enum_" + key)) continue;
     result->elements.push_back(Value(key));
   }
 
@@ -1077,20 +1127,14 @@ Value Object_keys(const std::vector<Value>& args) {
 }
 
 Value Object_values(const std::vector<Value>& args) {
-  if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = GarbageCollector::makeGC<Array>();
-    return Value(emptyArray);
-  }
-
-  auto obj = args[0].getGC<Object>();
   auto result = GarbageCollector::makeGC<Array>();
+  if (args.empty()) return Value(result);
+  auto* props = getPropertiesMap(args[0]);
+  if (!props) return Value(result);
 
-  for (const auto& key : obj->properties.orderedKeys()) {
-    // Skip internal, non-enumerable, and Symbol-keyed properties
-    if (isInternalProperty(key)) continue;
-    if (isSymbolPropertyKey(key)) continue;
-    if (obj->properties.count("__non_enum_" + key)) continue;
-    auto it = obj->properties.find(key);
+  for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
+    if (props->count("__non_enum_" + key)) continue;
+    auto it = props->find(key);
     result->elements.push_back(it->second);
   }
 
@@ -1098,20 +1142,14 @@ Value Object_values(const std::vector<Value>& args) {
 }
 
 Value Object_entries(const std::vector<Value>& args) {
-  if (args.empty() || !args[0].isObject()) {
-    auto emptyArray = GarbageCollector::makeGC<Array>();
-    return Value(emptyArray);
-  }
-
-  auto obj = args[0].getGC<Object>();
   auto result = GarbageCollector::makeGC<Array>();
+  if (args.empty()) return Value(result);
+  auto* props = getPropertiesMap(args[0]);
+  if (!props) return Value(result);
 
-  for (const auto& key : obj->properties.orderedKeys()) {
-    // Skip internal, non-enumerable, and Symbol-keyed properties
-    if (isInternalProperty(key)) continue;
-    if (isSymbolPropertyKey(key)) continue;
-    if (obj->properties.count("__non_enum_" + key)) continue;
-    auto it = obj->properties.find(key);
+  for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
+    if (props->count("__non_enum_" + key)) continue;
+    auto it = props->find(key);
     auto entry = GarbageCollector::makeGC<Array>();
     entry->elements.push_back(Value(key));
     entry->elements.push_back(it->second);
@@ -1515,14 +1553,42 @@ Value Object_create(const std::vector<Value>& args) {
 
   if (args.size() > 1 && args[1].isObject()) {
     // Add properties from the properties descriptor object
+    // Use orderedKeys() for spec-compliant property creation order
     auto props = args[1].getGC<Object>();
-    for (const auto& [key, descriptor] : props->properties) {
-      if (descriptor.isObject()) {
-        auto desc = descriptor.getGC<Object>();
-        auto valueIt = desc->properties.find("value");
-        if (valueIt != desc->properties.end()) {
-          newObj->properties[key] = valueIt->second;
-        }
+    for (const auto& key : props->properties.orderedKeys()) {
+      // Skip internal property markers
+      if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") continue;
+      if (key.rfind("__non_writable_", 0) == 0 || key.rfind("__non_enum_", 0) == 0 ||
+          key.rfind("__non_configurable_", 0) == 0 || key.rfind("__enum_", 0) == 0 ||
+          key.rfind("__get_", 0) == 0 || key.rfind("__set_", 0) == 0) continue;
+      auto descIt = props->properties.find(key);
+      if (descIt == props->properties.end() || !descIt->second.isObject()) continue;
+      auto desc = std::get<GCPtr<Object>>(descIt->second.data);
+      auto valueIt = desc->properties.find("value");
+      auto getIt = desc->properties.find("get");
+      auto setIt = desc->properties.find("set");
+      if (valueIt != desc->properties.end()) {
+        newObj->properties[key] = valueIt->second;
+      } else if (getIt != desc->properties.end() || setIt != desc->properties.end()) {
+        newObj->properties[key] = Value(Undefined{});
+      }
+      if (getIt != desc->properties.end() && getIt->second.isFunction()) {
+        newObj->properties["__get_" + key] = getIt->second;
+      }
+      if (setIt != desc->properties.end() && setIt->second.isFunction()) {
+        newObj->properties["__set_" + key] = setIt->second;
+      }
+      auto writableIt = desc->properties.find("writable");
+      if (writableIt != desc->properties.end() && !writableIt->second.toBool()) {
+        newObj->properties["__non_writable_" + key] = Value(true);
+      }
+      auto enumIt = desc->properties.find("enumerable");
+      if (enumIt != desc->properties.end() && !enumIt->second.toBool()) {
+        newObj->properties["__non_enum_" + key] = Value(true);
+      }
+      auto configIt = desc->properties.find("configurable");
+      if (configIt != desc->properties.end() && !configIt->second.toBool()) {
+        newObj->properties["__non_configurable_" + key] = Value(true);
       }
     }
   }
