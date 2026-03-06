@@ -246,6 +246,7 @@ bool isIdentifierNameToken(TokenType type) {
     case TokenType::Super:
     case TokenType::Get:
     case TokenType::Set:
+    case TokenType::Enum:
       return true;
     default:
       return false;
@@ -2660,6 +2661,16 @@ StmtPtr Parser::parseVarDeclaration() {
     // Parse pattern (identifier, array pattern, or object pattern)
     ExprPtr pattern = parsePattern();
     if (!pattern) {
+      return nullptr;
+    }
+
+    // 'this' is not a valid BindingIdentifier
+    auto* checkNode = &pattern->node;
+    if (auto* ap = std::get_if<AssignmentPattern>(checkNode)) {
+      if (ap->left) checkNode = &ap->left->node;
+    }
+    if (std::holds_alternative<ThisExpr>(*checkNode)) {
+      error_ = true;
       return nullptr;
     }
 
@@ -5492,12 +5503,13 @@ ExprPtr Parser::parseAssignment() {
   };
 
   // Case 0: async arrow functions
-  if (match(TokenType::Async)) {
+  if (match(TokenType::Async) && !current().escaped) {
     size_t savedPos = pos_;
+    uint32_t asyncLine = current().line;
     advance();  // async
 
-    // async x => ...
-    if (isIdentifierLikeToken(current().type)) {
+    // async x => ... (no line terminator between async and identifier)
+    if (isIdentifierLikeToken(current().type) && current().line == asyncLine) {
       auto paramName = current().value;
       advance();
       if (match(TokenType::Arrow) && tokens_[pos_ - 1].line == current().line) {
@@ -5527,7 +5539,7 @@ ExprPtr Parser::parseAssignment() {
         return std::make_unique<Expression>(std::move(func));
       }
       pos_ = savedPos;
-    } else if (match(TokenType::LeftParen)) {
+    } else if (match(TokenType::LeftParen) && current().line == asyncLine) {
       // async (...) => ...
       int prevFunctionDepth = functionDepth_;
       int prevAsyncDepth = asyncFunctionDepth_;
@@ -7120,18 +7132,21 @@ ExprPtr Parser::parsePrimary() {
 
   if (match(TokenType::True)) {
     const Token& tok = current();
+    if (tok.escaped) { error_ = true; return nullptr; }
     advance();
     return makeExpr(BoolLiteral{true}, tok);
   }
 
   if (match(TokenType::False)) {
     const Token& tok = current();
+    if (tok.escaped) { error_ = true; return nullptr; }
     advance();
     return makeExpr(BoolLiteral{false}, tok);
   }
 
   if (match(TokenType::Null)) {
     const Token& tok = current();
+    if (tok.escaped) { error_ = true; return nullptr; }
     advance();
     return makeExpr(NullLiteral{}, tok);
   }
@@ -7305,6 +7320,7 @@ ExprPtr Parser::parsePrimary() {
   }
 
   if (match(TokenType::This)) {
+    if (current().escaped) { error_ = true; return nullptr; }
     advance();
     return std::make_unique<Expression>(ThisExpr{});
   }
@@ -9036,7 +9052,15 @@ ExprPtr Parser::parseNewExpression() {
   if (match(TokenType::Dot) &&
       peek().type == TokenType::Identifier &&
       peek().value == "target") {
+    if (newTok.escaped) {
+      error_ = true;
+      return nullptr;
+    }
     advance();  // .
+    if (current().escaped) {
+      error_ = true;
+      return nullptr;
+    }
     advance();  // target
     return makeExpr(MetaProperty{"new", "target"}, newTok);
   }

@@ -28,8 +28,10 @@ bool isDisallowedIdentifierCodePoint(uint32_t codepoint) {
   // Treat some code points as never-valid in identifiers. This matches existing
   // non-escaped identifier scanning which breaks on these sequences.
   return codepoint == 0x00A0 ||  // NO-BREAK SPACE
+         codepoint == 0x180E ||  // MONGOLIAN VOWEL SEPARATOR (Cf, not ID_Start/ID_Continue)
          codepoint == 0x2028 ||  // LINE SEPARATOR
          codepoint == 0x2029 ||  // PARAGRAPH SEPARATOR
+         codepoint == 0x2E2F ||  // VERTICAL TILDE (not ID_Start/ID_Continue)
          codepoint == 0xFEFF;    // BOM
 }
 
@@ -131,6 +133,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"super", TokenType::Super},
   {"get", TokenType::Get},
   {"set", TokenType::Set},
+  {"enum", TokenType::Enum},
   {"true", TokenType::True},
   {"false", TokenType::False},
   {"null", TokenType::Null},
@@ -920,6 +923,16 @@ std::optional<Token> Lexer::readIdentifier() {
           static_cast<unsigned char>(peek(2)) == 0xBF) {
         break;  // U+FEFF BOM
       }
+      // U+2E2F VERTICAL TILDE is not ID_Start/ID_Continue (UTF-8: E2 B8 AF)
+      if (c == 0xE2 && static_cast<unsigned char>(peek()) == 0xB8 &&
+          static_cast<unsigned char>(peek(2)) == 0xAF) {
+        break;
+      }
+      // U+180E MONGOLIAN VOWEL SEPARATOR (UTF-8: E1 A0 8E)
+      if (c == 0xE1 && static_cast<unsigned char>(peek()) == 0xA0 &&
+          static_cast<unsigned char>(peek(2)) == 0x8E) {
+        break;
+      }
       ident.push_back(current());
       advance();
       first = false;
@@ -943,6 +956,10 @@ std::optional<Token> Lexer::readIdentifier() {
     }
 
     break;
+  }
+
+  if (ident.empty()) {
+    return std::nullopt;  // No valid identifier chars consumed
   }
 
   std::string_view identView(ident);
@@ -1158,6 +1175,8 @@ std::vector<Token> Lexer::tokenize() {
       }
       if (auto token = readIdentifier()) {
         tokens.push_back(*token);
+      } else {
+        throw std::runtime_error("SyntaxError: Unexpected token");
       }
       continue;
     }

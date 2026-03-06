@@ -30,6 +30,7 @@ private:
   int loopDepth_ = 0;
   int switchDepth_ = 0;
   int functionDepth_ = 0;
+  int newTargetDepth_ = 0;  // Depth of non-arrow functions (for new.target validation)
   int returnDisallowDepth_ = 0;  // Disallow `return` even if nested in a function (e.g. class static blocks)
   int staticBlockDepth_ = 0;
   int asyncFunctionDepth_ = 0;

@@ -64,6 +64,7 @@ enum class TokenType {
   Super,
   Get,
   Set,
+  Enum,  // Future reserved word
 
   Plus,
   Minus,

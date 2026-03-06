@@ -17916,6 +17916,11 @@ Task Interpreter::evaluateSwitch(const SwitchStmt& stmt) {
 Task Interpreter::evaluateTry(const TryStmt& stmt) {
   auto prevFlow = flow_;
   Value result = Value(Undefined{});
+  auto envBeforeTry = env_;
+
+  // Create block scope for try block (let/const should be scoped here)
+  auto tryBlockEnv = env_->createChild();
+  env_ = tryBlockEnv;
 
   for (const auto& s : stmt.block) {
     Value stmtResult;
@@ -17926,6 +17931,9 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
     }
 
     if (flow_.type == ControlFlow::Type::Throw && stmt.hasHandler) {
+      // Restore environment to before the try block
+      env_ = envBeforeTry;
+
       // Per spec: create catch parameter environment
       auto catchParamEnv = env_->createChild();
       auto prevEnv = env_;
@@ -17968,6 +17976,11 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
     }
   }
 
+  // Restore environment after try block (unwind try block scope)
+  if (env_ == tryBlockEnv) {
+    env_ = envBeforeTry;
+  }
+
   if (stmt.hasFinalizer) {
     // In generators, yield should NOT trigger finally — only run finally on
     // return/throw/normal completion, not on yield suspension
@@ -17981,6 +17994,9 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
     flow_.label.clear();
 
     Value finallyValue = Value(Undefined{});
+    auto finallyEnv = env_->createChild();
+    auto envBeforeFinally = env_;
+    env_ = finallyEnv;
     for (const auto& finalStmt : stmt.finalizer) {
       auto finalTask = evaluate(*finalStmt);
       Value finalResult;
@@ -17993,6 +18009,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
         break;
       }
     }
+    env_ = envBeforeFinally;
 
     // If finally block produced its own control flow, it overrides try/catch's
     // and its completion value replaces the try/catch result
