@@ -52,7 +52,7 @@ void writeFileSync(const std::string& path, const Value& data) {
     }
     // Handle TypedArray data
     else if (auto* typedArray = std::get_if<GCPtr<TypedArray>>(&data.data)) {
-      for (size_t i = 0; i < (*typedArray)->length; i++) {
+      for (size_t i = 0; i < (*typedArray)->currentLength(); i++) {
         file.put(static_cast<char>((*typedArray)->getElement(i)));
       }
     }

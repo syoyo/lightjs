@@ -58,7 +58,9 @@ Value wasm_js::createWebAssemblyGlobal() {
         const auto& bufferArg = args[0];
         if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
             auto typedArray = bufferArg.getGC<TypedArray>();
-            wasmBytes = typedArray->buffer;
+            const auto& bytes = typedArray->storage();
+            wasmBytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset + typedArray->currentByteLength()));
         } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
             auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;
@@ -207,7 +209,9 @@ Value wasm_js::createWebAssemblyGlobal() {
         const auto& bufferArg = args[0];
         if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
             auto typedArray = bufferArg.getGC<TypedArray>();
-            wasmBytes = typedArray->buffer;
+            const auto& bytes = typedArray->storage();
+            wasmBytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset + typedArray->currentByteLength()));
         } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
             auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;
@@ -242,7 +246,9 @@ Value wasm_js::createWebAssemblyGlobal() {
         const auto& bufferArg = args[0];
         if (std::holds_alternative<GCPtr<TypedArray>>(bufferArg.data)) {
             auto typedArray = bufferArg.getGC<TypedArray>();
-            wasmBytes = typedArray->buffer;
+            const auto& bytes = typedArray->storage();
+            wasmBytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset),
+                             bytes.begin() + static_cast<std::ptrdiff_t>(typedArray->byteOffset + typedArray->currentByteLength()));
         } else if (std::holds_alternative<GCPtr<ArrayBuffer>>(bufferArg.data)) {
             auto arrayBuffer = bufferArg.getGC<ArrayBuffer>();
             wasmBytes = arrayBuffer->data;

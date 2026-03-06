@@ -225,6 +225,7 @@ bool isIdentifierNameToken(TokenType type) {
     case TokenType::Case:
     case TokenType::Break:
     case TokenType::Continue:
+    case TokenType::Debugger:
     case TokenType::Try:
     case TokenType::Catch:
     case TokenType::Finally:
@@ -369,7 +370,8 @@ bool hasDuplicateBoundNames(const Expression& pattern) {
   return false;
 }
 
-bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body) {
+bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body, bool* hasLegacyEscapeBeforeStrict = nullptr) {
+  bool sawLegacy = false;
   for (const auto& stmt : body) {
     if (!stmt) break;
     auto* exprStmt = std::get_if<ExpressionStmt>(&stmt->node);
@@ -378,8 +380,10 @@ bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body) {
     }
     if (auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node)) {
       if (str->value == "use strict") {
+        if (hasLegacyEscapeBeforeStrict) *hasLegacyEscapeBeforeStrict = sawLegacy;
         return true;
       }
+      if (str->hasLegacyEscape) sawLegacy = true;
       continue;
     }
     break;
@@ -2316,6 +2320,7 @@ std::optional<Program> Parser::parse() {
   Program program;
   program.isModule = isModule_;
   bool inDirectivePrologue = true;
+  bool prologueHadLegacyEscape = false;
   while (!match(TokenType::EndOfFile)) {
     if (auto stmt = parseStatement(true)) {
       if (inDirectivePrologue) {
@@ -2324,8 +2329,15 @@ std::optional<Program> Parser::parse() {
           if (exprStmt->expression) {
             if (auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node)) {
               isDirectiveString = true;
+              if (str->hasLegacyEscape) {
+                prologueHadLegacyEscape = true;
+              }
               if (str->value == "use strict") {
                 strictMode_ = true;
+                if (prologueHadLegacyEscape) {
+                  error_ = true;
+                  return std::nullopt;
+                }
               }
             }
           }
@@ -2474,6 +2486,18 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
       }
       // In non-strict mode, 'let' can be an identifier expression.
       if (!strictMode_) {
+        if (inSingleStatementPosition_ &&
+            current().line != peek().line) {
+          if (peek().type == TokenType::LeftBracket) {
+            return nullptr;
+          }
+          const Token& tok = current();
+          advance();
+          if (!consumeSemicolonOrASI()) {
+            return nullptr;
+          }
+          return std::make_unique<Statement>(ExpressionStmt{makeExpr(Identifier{"let"}, tok)});
+        }
         auto nextType = peek().type;
         // In single-statement positions (for/while/if body), LexicalDeclarations
         // are not allowed, so 'let' is always an identifier.
@@ -2564,9 +2588,19 @@ StmtPtr Parser::parseStatement(bool allowModuleItem) {
       consumeSemicolon();
       return makeStmt(ContinueStmt{label}, tok);
     }
+    case TokenType::Debugger: {
+      const Token& tok = current();
+      advance();
+      consumeSemicolon();
+      return makeStmt(DebuggerStmt{}, tok);
+    }
     case TokenType::Throw: {
       const Token& tok = current();
       advance();
+      if (current().line != tok.line) {
+        error_ = true;
+        return nullptr;
+      }
       auto argument = parseExpression();
       if (!argument) {
         return nullptr;
@@ -2718,10 +2752,14 @@ StmtPtr Parser::parseFunctionDeclaration() {
       }
     } nameGuard{this};
 
-    if (!isIdentifierLikeToken(current().type)) {
+    if (!isIdentifierLikeToken(current().type) &&
+        !(match(TokenType::Yield) && !strictMode_)) {
       return nullptr;
     }
     name = current().value;
+    if (staticBlockDepth_ > 0 && name == "await") {
+      return nullptr;
+    }
     advance();
   }
 
@@ -2882,13 +2920,20 @@ StmtPtr Parser::parseFunctionDeclaration() {
   if (isGenerator) {
     ++generatorFunctionDepth_;
   }
-  // Save and reset labels (labels don't cross function boundaries)
+  // Break/continue/labels do not cross function boundaries.
   auto savedIterationLabels = std::move(iterationLabels_);
   iterationLabels_.clear();
   auto savedActiveLabels = std::move(activeLabels_);
   activeLabels_.clear();
+  int savedLoopDepth = loopDepth_;
+  loopDepth_ = 0;
+  int savedSwitchDepth = switchDepth_;
+  switchDepth_ = 0;
+  int savedStaticBlockDepth = staticBlockDepth_;
+  staticBlockDepth_ = 0;
   // Pre-scan for 'use strict' directive before parsing body
   bool savedStrict = strictMode_;
+  parsingFunctionBody_ = true;
   if (!strictMode_ && match(TokenType::LeftBrace)) {
     // Peek at first statement: check for "use strict" string literal (after the '{')
     auto peekPos = pos_ + 1;
@@ -2898,7 +2943,11 @@ StmtPtr Parser::parseFunctionDeclaration() {
     }
   }
   auto block = parseBlockStatement();
+  parsingFunctionBody_ = false;
   strictMode_ = savedStrict;
+  staticBlockDepth_ = savedStaticBlockDepth;
+  switchDepth_ = savedSwitchDepth;
+  loopDepth_ = savedLoopDepth;
   iterationLabels_ = std::move(savedIterationLabels);
   activeLabels_ = std::move(savedActiveLabels);
   if (isGenerator) {
@@ -2919,8 +2968,13 @@ StmtPtr Parser::parseFunctionDeclaration() {
     return nullptr;
   }
 
-  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
+  bool hadLegacyEscapeBeforeStrict = false;
+  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body, &hadLegacyEscapeBeforeStrict);
   bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
+  if (hasUseStrictDirective && hadLegacyEscapeBeforeStrict) {
+    error_ = true;
+    return nullptr;
+  }
   if (strictFunctionCode && (name == "eval" || name == "arguments")) {
     return nullptr;
   }
@@ -3091,19 +3145,33 @@ StmtPtr Parser::parseClassDeclaration() {
       method.key.name.clear();
       advance();  // consume 'static'
 
-      // Static blocks use StatementList[~Yield, +Await, ~Return] and have early errors
-      // (ContainsAwait/ContainsArguments/duplicate LexicallyDeclaredNames/lex-var conflicts).
+      // Static blocks are control-flow boundaries for break/continue/labels, and
+      // use StatementList[~Yield, +Await, ~Return].
       ++superCallDisallowDepth_;
       ++returnDisallowDepth_;
       awaitContextStack_.push_back(true);
       yieldContextStack_.push_back(false);
+      ++staticBlockDepth_;
+      auto savedStaticIterationLabels = std::move(iterationLabels_);
+      iterationLabels_.clear();
+      auto savedStaticActiveLabels = std::move(activeLabels_);
+      activeLabels_.clear();
+      int savedStaticLoopDepth = loopDepth_;
+      loopDepth_ = 0;
+      int savedStaticSwitchDepth = switchDepth_;
+      switchDepth_ = 0;
 
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          switchDepth_ = savedStaticSwitchDepth;
+          loopDepth_ = savedStaticLoopDepth;
+          activeLabels_ = std::move(savedStaticActiveLabels);
+          iterationLabels_ = std::move(savedStaticIterationLabels);
           yieldContextStack_.pop_back();
           awaitContextStack_.pop_back();
+          --staticBlockDepth_;
           --returnDisallowDepth_;
           --superCallDisallowDepth_;
           return nullptr;
@@ -3112,8 +3180,13 @@ StmtPtr Parser::parseClassDeclaration() {
       }
       expect(TokenType::RightBrace);
 
+      switchDepth_ = savedStaticSwitchDepth;
+      loopDepth_ = savedStaticLoopDepth;
+      activeLabels_ = std::move(savedStaticActiveLabels);
+      iterationLabels_ = std::move(savedStaticIterationLabels);
       yieldContextStack_.pop_back();
       awaitContextStack_.pop_back();
+      --staticBlockDepth_;
       --returnDisallowDepth_;
       --superCallDisallowDepth_;
 
@@ -3430,13 +3503,27 @@ StmtPtr Parser::parseClassDeclaration() {
       if (method.isGenerator) {
         ++generatorFunctionDepth_;
       }
-      // Save and reset iteration labels (labels don't cross function boundaries)
+      // Break/continue/labels do not cross function boundaries.
       auto savedIterLabelsMethod = std::move(iterationLabels_);
       iterationLabels_.clear();
+      auto savedActiveLabelsMethod = std::move(activeLabels_);
+      activeLabels_.clear();
+      int savedLoopDepthMethod = loopDepth_;
+      loopDepth_ = 0;
+      int savedSwitchDepthMethod = switchDepth_;
+      switchDepth_ = 0;
+      int savedStaticBlockDepthMethod = staticBlockDepth_;
+      staticBlockDepth_ = 0;
+      parsingFunctionBody_ = true;
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          parsingFunctionBody_ = false;
+          staticBlockDepth_ = savedStaticBlockDepthMethod;
+          switchDepth_ = savedSwitchDepthMethod;
+          loopDepth_ = savedLoopDepthMethod;
+          activeLabels_ = std::move(savedActiveLabelsMethod);
           iterationLabels_ = std::move(savedIterLabelsMethod);
           if (method.isGenerator) {
             --generatorFunctionDepth_;
@@ -3454,6 +3541,11 @@ StmtPtr Parser::parseClassDeclaration() {
         }
         method.body.push_back(std::move(stmt));
       }
+      parsingFunctionBody_ = false;
+      staticBlockDepth_ = savedStaticBlockDepthMethod;
+      switchDepth_ = savedSwitchDepthMethod;
+      loopDepth_ = savedLoopDepthMethod;
+      activeLabels_ = std::move(savedActiveLabelsMethod);
       iterationLabels_ = std::move(savedIterLabelsMethod);
       expect(TokenType::RightBrace);
       if (method.isGenerator) {
@@ -3578,7 +3670,9 @@ StmtPtr Parser::parseReturnStatement() {
   expect(TokenType::Return);
 
   ExprPtr argument = nullptr;
-  if (!match(TokenType::Semicolon) && !match(TokenType::EndOfFile)) {
+  if (!match(TokenType::Semicolon) &&
+      !match(TokenType::EndOfFile) &&
+      current().line == startTok.line) {
     argument = parseAssignment();
     if (!argument) {
       return nullptr;
@@ -3614,9 +3708,24 @@ StmtPtr Parser::parseIfStatement() {
   }
 
   // let/const/class are not allowed as the body of an if statement
-  if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+  if (match(TokenType::Const) || match(TokenType::Class)) {
     error_ = true;
     return nullptr;
+  }
+  if (match(TokenType::Let)) {
+    if (peek().type == TokenType::LeftBracket) {
+      error_ = true;
+      return nullptr;
+    }
+    if (strictMode_) {
+      error_ = true;
+      return nullptr;
+    }
+    if (peek().line == current().line &&
+        (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+      error_ = true;
+      return nullptr;
+    }
   }
   if (match(TokenType::Async) && peek().type == TokenType::Function) {
     error_ = true;
@@ -3629,15 +3738,19 @@ StmtPtr Parser::parseIfStatement() {
   if (!consequent) {
     return nullptr;
   }
-  // Check for labeled function declarations in body (forbidden in strict mode + always for labeled)
+  // Check statement-position function declaration restrictions.
   {
     const Statement* check = consequent.get();
+    bool isLabelledFunction = false;
     while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+      isLabelledFunction = true;
       check = lab->body.get();
     }
-    if (std::get_if<FunctionDeclaration>(&check->node) && strictMode_) {
-      error_ = true;
-      return nullptr;
+    if (auto* fn = std::get_if<FunctionDeclaration>(&check->node)) {
+      if (isLabelledFunction || fn->isGenerator || strictMode_) {
+        error_ = true;
+        return nullptr;
+      }
     }
   }
   StmtPtr alternate = nullptr;
@@ -3645,9 +3758,24 @@ StmtPtr Parser::parseIfStatement() {
   if (match(TokenType::Else)) {
     advance();
     // let/const/class are not allowed as the body of an else clause
-    if (match(TokenType::Let) || match(TokenType::Const) || match(TokenType::Class)) {
+    if (match(TokenType::Const) || match(TokenType::Class)) {
       error_ = true;
       return nullptr;
+    }
+    if (match(TokenType::Let)) {
+      if (peek().type == TokenType::LeftBracket) {
+        error_ = true;
+        return nullptr;
+      }
+      if (strictMode_) {
+        error_ = true;
+        return nullptr;
+      }
+      if (peek().line == current().line &&
+          (peek().type == TokenType::Identifier || peek().type == TokenType::LeftBrace)) {
+        error_ = true;
+        return nullptr;
+      }
     }
     if (match(TokenType::Async) && peek().type == TokenType::Function) {
       error_ = true;
@@ -3660,15 +3788,19 @@ StmtPtr Parser::parseIfStatement() {
     if (!alternate) {
       return nullptr;
     }
-    // Function declarations in statement position are a SyntaxError in strict mode.
+    // Check statement-position function declaration restrictions.
     {
       const Statement* check = alternate.get();
+      bool isLabelledFunction = false;
       while (auto* lab = std::get_if<LabelledStmt>(&check->node)) {
+        isLabelledFunction = true;
         check = lab->body.get();
       }
-      if (std::get_if<FunctionDeclaration>(&check->node) && strictMode_) {
-        error_ = true;
-        return nullptr;
+      if (auto* fn = std::get_if<FunctionDeclaration>(&check->node)) {
+        if (isLabelledFunction || fn->isGenerator || strictMode_) {
+          error_ = true;
+          return nullptr;
+        }
       }
     }
   }
@@ -3968,6 +4100,7 @@ StmtPtr Parser::parseForStatement() {
   } else if (match(TokenType::Identifier) || match(TokenType::Async) ||
              match(TokenType::Of) || match(TokenType::PrivateIdentifier) ||
              match(TokenType::This)) {
+    bool startsWithAsync = match(TokenType::Async);
     advance();
     // Skip member expressions (x.y, x[y], etc.)
     while (match(TokenType::Dot) || match(TokenType::LeftBracket)) {
@@ -3993,8 +4126,10 @@ StmtPtr Parser::parseForStatement() {
       isForInOrOf = true;
       isForOf = false;
     } else if (match(TokenType::Of)) {
-      isForInOrOf = true;
-      isForOf = true;
+      if (!(startsWithAsync && peek().type == TokenType::Arrow)) {
+        isForInOrOf = true;
+        isForOf = true;
+      }
     }
   }
 
@@ -4125,7 +4260,10 @@ StmtPtr Parser::parseForStatement() {
             // We need to check if the original token was literally 'async'
             // (not an escape sequence like \u0061sync)
             // Since parseMember already consumed it, check if the token before 'of' was escaped
-            if (pos_ >= 2 && tokens_[pos_ - 1].type == TokenType::Async && !tokens_[pos_ - 1].escaped) {
+            if (!isAwait &&
+                pos_ >= 2 &&
+                tokens_[pos_ - 1].type == TokenType::Async &&
+                !tokens_[pos_ - 1].escaped) {
               return nullptr;
             }
           }
@@ -4618,6 +4756,8 @@ StmtPtr Parser::parseSwitchStatement() {
 
 StmtPtr Parser::parseBlockStatement() {
   expect(TokenType::LeftBrace);
+  bool isFunctionBody = parsingFunctionBody_;
+  parsingFunctionBody_ = false;
 
   // Declarations are allowed inside blocks, so clear single-statement flag
   bool prevSingleStmt = inSingleStatementPosition_;
@@ -4656,11 +4796,13 @@ StmtPtr Parser::parseBlockStatement() {
   // 2. No overlap between lexical and var-declared names.
   {
     std::vector<std::string> lexicalNames;
-    if (!collectStatementListLexicalNames(body, lexicalNames, /*includeFunctionDeclarations*/ true)) {
+    if (!collectStatementListLexicalNames(body, lexicalNames,
+                                          /*includeFunctionDeclarations*/ !isFunctionBody)) {
       return nullptr;
     }
     std::vector<std::string> varNames;
-    collectStatementListVarNames(body, varNames, /*includeFunctionDeclarations*/ false);
+    collectStatementListVarNames(body, varNames,
+                                 /*includeFunctionDeclarations*/ isFunctionBody);
     if (hasNameCollision(lexicalNames, varNames)) {
       return nullptr;
     }
@@ -5264,13 +5406,24 @@ ExprPtr Parser::parseExpression() {
 
 ExprPtr Parser::parseAssignment() {
   auto parseArrowBodyInto = [&](FunctionExpr& func) -> bool {
-    // Save and reset labels (labels don't cross function boundaries)
+    // Break/continue/labels do not cross function boundaries.
     auto savedIterLabels = std::move(iterationLabels_);
     iterationLabels_.clear();
     auto savedActLabels = std::move(activeLabels_);
     activeLabels_.clear();
+    int savedLoopDepth = loopDepth_;
+    loopDepth_ = 0;
+    int savedSwitchDepth = switchDepth_;
+    switchDepth_ = 0;
+    int savedStaticBlockDepth = staticBlockDepth_;
+    staticBlockDepth_ = 0;
     if (match(TokenType::LeftBrace)) {
+      parsingFunctionBody_ = true;
       auto blockStmt = parseBlockStatement();
+      parsingFunctionBody_ = false;
+      staticBlockDepth_ = savedStaticBlockDepth;
+      switchDepth_ = savedSwitchDepth;
+      loopDepth_ = savedLoopDepth;
       iterationLabels_ = std::move(savedIterLabels);
       activeLabels_ = std::move(savedActLabels);
       if (!blockStmt) {
@@ -5284,6 +5437,9 @@ ExprPtr Parser::parseAssignment() {
     }
 
     auto expr = parseAssignment();
+    staticBlockDepth_ = savedStaticBlockDepth;
+    switchDepth_ = savedSwitchDepth;
+    loopDepth_ = savedLoopDepth;
     iterationLabels_ = std::move(savedIterLabels);
     activeLabels_ = std::move(savedActLabels);
     if (!expr) {
@@ -5299,8 +5455,13 @@ ExprPtr Parser::parseAssignment() {
                                    bool hasDuplicateParams,
                                    bool hasYieldExpressionInParams,
                                    const std::vector<std::string>& boundParamNames) -> bool {
-    bool hasUseStrictDirective = hasUseStrictDirectiveInBody(func.body);
+    bool hadLegacyEscapeBeforeStrict = false;
+    bool hasUseStrictDirective = hasUseStrictDirectiveInBody(func.body, &hadLegacyEscapeBeforeStrict);
     bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
+    if (hasUseStrictDirective && hadLegacyEscapeBeforeStrict) {
+      error_ = true;
+      return false;
+    }
     if (hasUseStrictDirective && hasNonSimpleParams) {
       return false;
     }
@@ -5336,7 +5497,7 @@ ExprPtr Parser::parseAssignment() {
     advance();  // async
 
     // async x => ...
-    if (match(TokenType::Identifier)) {
+    if (isIdentifierLikeToken(current().type)) {
       auto paramName = current().value;
       advance();
       if (match(TokenType::Arrow) && tokens_[pos_ - 1].line == current().line) {
@@ -6522,7 +6683,9 @@ ExprPtr Parser::parseCall() {
       }
       // Tagged template call: tag`...`
       std::vector<ExprPtr> args;
+      inTaggedTemplate_ = true;
       auto templateArg = parsePrimary();
+      inTaggedTemplate_ = false;
       if (!templateArg) {
         return nullptr;
       }
@@ -6692,8 +6855,9 @@ ExprPtr Parser::parseMemberSuffix(ExprPtr expr, bool inOptionalChain) {
         return nullptr;
       }
       std::vector<ExprPtr> args;
+      inTaggedTemplate_ = true;
       auto templateArg = parsePrimary();
-      if (!templateArg) {
+      inTaggedTemplate_ = false;      if (!templateArg) {
         return nullptr;
       }
       if (auto* templateLiteral = std::get_if<TemplateLiteral>(&templateArg->node)) {
@@ -6745,9 +6909,15 @@ ExprPtr Parser::parsePrimary() {
 
   if (match(TokenType::String)) {
     const Token& tok = current();
+    if (tok.hasLegacyEscape && strictMode_) {
+      error_ = true;
+      return nullptr;
+    }
     std::string value = tok.value;
     advance();
-    return makeExpr(StringLiteral{value}, tok);
+    auto strLit = StringLiteral{value};
+    strLit.hasLegacyEscape = tok.hasLegacyEscape;
+    return makeExpr(strLit, tok);
   }
 
   if (match(TokenType::TemplateLiteral)) {
@@ -6924,6 +7094,16 @@ ExprPtr Parser::parsePrimary() {
       }
     }
     quasis.push_back(TemplateElement{currentRawQuasi, cookQuasi(currentRawQuasi)});
+
+    // In non-tagged templates, invalid escape sequences are SyntaxError
+    if (!inTaggedTemplate_) {
+      for (const auto& q : quasis) {
+        if (!q.cooked.has_value()) {
+          error_ = true;
+          return nullptr;
+        }
+      }
+    }
 
     return makeExpr(TemplateLiteral{std::move(quasis), std::move(expressions)}, tok);
   }
@@ -7389,8 +7569,10 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
 
-          bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body);
+          bool hadLegacyEscape7571 = false;
+          bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body, &hadLegacyEscape7571);
           bool strictAccessorCode = strictMode_ || hasUseStrictDirective;
+          if (hasUseStrictDirective && hadLegacyEscape7571) { error_ = true; return nullptr; }
           if (!isGetter) {
             if (params.empty()) {
               return nullptr;
@@ -7520,8 +7702,10 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
 
-          bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body);
+          bool hadLegacyEscape7702 = false;
+          bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body, &hadLegacyEscape7702);
           bool strictAccessorCode = strictMode_ || hasUseStrictDirective;
+          if (hasUseStrictDirective && hadLegacyEscape7702) { error_ = true; return nullptr; }
           if (!isGetter) {
             if (params.empty()) {
               return nullptr;
@@ -7811,8 +7995,10 @@ ExprPtr Parser::parseObjectExpression() {
           return nullptr;
         }
 
-        bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body);
+        bool hadLegacyEscape7993 = false;
+        bool hasUseStrictDirective = hasUseStrictDirectiveInBody(body, &hadLegacyEscape7993);
         bool strictMethodCode = strictMode_ || hasUseStrictDirective;
+        if (hasUseStrictDirective && hadLegacyEscape7993) { error_ = true; return nullptr; }
         if (strictMethodCode && hasRestrictedParamNames) {
           return nullptr;
         }
@@ -7951,6 +8137,12 @@ ExprPtr Parser::parseFunctionExpression() {
       advance();
     }
   }
+  if ((isGenerator && name == "yield") || (isAsync && name == "await")) {
+    return nullptr;
+  }
+  if (staticBlockDepth_ > 0 && name == "await") {
+    return nullptr;
+  }
 
   ++functionDepth_;
   awaitContextStack_.push_back(isAsync);
@@ -7978,6 +8170,12 @@ ExprPtr Parser::parseFunctionExpression() {
       advance();
       if (isIdentifierLikeToken(current().type)) {
         restParam = Identifier{current().value};
+        if (isGenerator && restParam->name == "yield") {
+          return nullptr;
+        }
+        if (isAsync && restParam->name == "await") {
+          return nullptr;
+        }
         if (!seenParamNames.insert(restParam->name).second) {
           hasDuplicateParams = true;
         }
@@ -7994,6 +8192,12 @@ ExprPtr Parser::parseFunctionExpression() {
         std::vector<std::string> names;
         collectBoundNames(*pattern, names);
         for (auto& name : names) {
+          if (isGenerator && name == "yield") {
+            return nullptr;
+          }
+          if (isAsync && name == "await") {
+            return nullptr;
+          }
           boundParamNames.push_back(name);
           if (!seenParamNames.insert(name).second) {
             hasDuplicateParams = true;
@@ -8022,6 +8226,12 @@ ExprPtr Parser::parseFunctionExpression() {
     Parameter param;
     if (isIdentifierLikeToken(current().type)) {
       param.name = Identifier{current().value};
+      if (isGenerator && param.name.name == "yield") {
+        return nullptr;
+      }
+      if (isAsync && param.name.name == "await") {
+        return nullptr;
+      }
       boundParamNames.push_back(param.name.name);
       if (!seenParamNames.insert(param.name.name).second) {
         hasDuplicateParams = true;
@@ -8036,6 +8246,12 @@ ExprPtr Parser::parseFunctionExpression() {
         advance();
         param.defaultValue = parseAssignment();
         if (!param.defaultValue) return nullptr;
+        if (isGenerator && expressionContainsYield(*param.defaultValue)) {
+          return nullptr;
+        }
+        if (isAsync && expressionContainsAwaitLike(*param.defaultValue)) {
+          return nullptr;
+        }
         if (expressionContainsSuper(*param.defaultValue)) {
           hasSuperInParams = true;
         }
@@ -8047,6 +8263,12 @@ ExprPtr Parser::parseFunctionExpression() {
       if (auto* assignPat = std::get_if<AssignmentPattern>(&pattern->node)) {
         param.defaultValue = std::move(assignPat->right);
         if (!param.defaultValue) return nullptr;
+        if (isGenerator && expressionContainsYield(*param.defaultValue)) {
+          return nullptr;
+        }
+        if (isAsync && expressionContainsAwaitLike(*param.defaultValue)) {
+          return nullptr;
+        }
         if (expressionContainsSuper(*param.defaultValue)) {
           hasSuperInParams = true;
         }
@@ -8057,6 +8279,12 @@ ExprPtr Parser::parseFunctionExpression() {
       std::vector<std::string> names;
       collectBoundNames(*pattern, names);
       for (auto& name2 : names) {
+        if (isGenerator && name2 == "yield") {
+          return nullptr;
+        }
+        if (isAsync && name2 == "await") {
+          return nullptr;
+        }
         boundParamNames.push_back(name2);
         if (!seenParamNames.insert(name2).second) {
           hasDuplicateParams = true;
@@ -8095,12 +8323,23 @@ ExprPtr Parser::parseFunctionExpression() {
   if (isGenerator) {
     ++generatorFunctionDepth_;
   }
-  // Save and reset labels (labels don't cross function boundaries)
+  // Break/continue/labels do not cross function boundaries.
   auto savedIterationLabels2 = std::move(iterationLabels_);
   iterationLabels_.clear();
   auto savedActiveLabels2 = std::move(activeLabels_);
   activeLabels_.clear();
+  int savedLoopDepth2 = loopDepth_;
+  loopDepth_ = 0;
+  int savedSwitchDepth2 = switchDepth_;
+  switchDepth_ = 0;
+  int savedStaticBlockDepth2 = staticBlockDepth_;
+  staticBlockDepth_ = 0;
+  parsingFunctionBody_ = true;
   auto block = parseBlockStatement();
+  parsingFunctionBody_ = false;
+  staticBlockDepth_ = savedStaticBlockDepth2;
+  switchDepth_ = savedSwitchDepth2;
+  loopDepth_ = savedLoopDepth2;
   iterationLabels_ = std::move(savedIterationLabels2);
   activeLabels_ = std::move(savedActiveLabels2);
   if (isGenerator) {
@@ -8120,8 +8359,10 @@ ExprPtr Parser::parseFunctionExpression() {
     return nullptr;
   }
 
-  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body);
+  bool hadLegacyEscape8355 = false;
+  bool hasUseStrictDirective = hasUseStrictDirectiveInBody(blockStmt->body, &hadLegacyEscape8355);
   bool strictFunctionCode = strictMode_ || hasUseStrictDirective;
+  if (hasUseStrictDirective && hadLegacyEscape8355) { error_ = true; return nullptr; }
   if (strictFunctionCode && (!name.empty() && (name == "eval" || name == "arguments"))) {
     return nullptr;
   }
@@ -8291,13 +8532,27 @@ ExprPtr Parser::parseClassExpression() {
       ++returnDisallowDepth_;
       awaitContextStack_.push_back(true);
       yieldContextStack_.push_back(false);
+      ++staticBlockDepth_;
+      auto savedStaticIterationLabels = std::move(iterationLabels_);
+      iterationLabels_.clear();
+      auto savedStaticActiveLabels = std::move(activeLabels_);
+      activeLabels_.clear();
+      int savedStaticLoopDepth = loopDepth_;
+      loopDepth_ = 0;
+      int savedStaticSwitchDepth = switchDepth_;
+      switchDepth_ = 0;
 
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          switchDepth_ = savedStaticSwitchDepth;
+          loopDepth_ = savedStaticLoopDepth;
+          activeLabels_ = std::move(savedStaticActiveLabels);
+          iterationLabels_ = std::move(savedStaticIterationLabels);
           yieldContextStack_.pop_back();
           awaitContextStack_.pop_back();
+          --staticBlockDepth_;
           --returnDisallowDepth_;
           --superCallDisallowDepth_;
           return nullptr;
@@ -8306,8 +8561,13 @@ ExprPtr Parser::parseClassExpression() {
       }
       expect(TokenType::RightBrace);
 
+      switchDepth_ = savedStaticSwitchDepth;
+      loopDepth_ = savedStaticLoopDepth;
+      activeLabels_ = std::move(savedStaticActiveLabels);
+      iterationLabels_ = std::move(savedStaticIterationLabels);
       yieldContextStack_.pop_back();
       awaitContextStack_.pop_back();
+      --staticBlockDepth_;
       --returnDisallowDepth_;
       --superCallDisallowDepth_;
 
@@ -8616,13 +8876,27 @@ ExprPtr Parser::parseClassExpression() {
       if (method.isGenerator) {
         ++generatorFunctionDepth_;
       }
-      // Save and reset iteration labels (labels don't cross function boundaries)
+      // Break/continue/labels do not cross function boundaries.
       auto savedIterLabelsMethod = std::move(iterationLabels_);
       iterationLabels_.clear();
+      auto savedActiveLabelsMethod = std::move(activeLabels_);
+      activeLabels_.clear();
+      int savedLoopDepthMethod = loopDepth_;
+      loopDepth_ = 0;
+      int savedSwitchDepthMethod = switchDepth_;
+      switchDepth_ = 0;
+      int savedStaticBlockDepthMethod = staticBlockDepth_;
+      staticBlockDepth_ = 0;
+      parsingFunctionBody_ = true;
       expect(TokenType::LeftBrace);
       while (!match(TokenType::RightBrace) && !match(TokenType::EndOfFile)) {
         auto stmt = parseStatement();
         if (!stmt) {
+          parsingFunctionBody_ = false;
+          staticBlockDepth_ = savedStaticBlockDepthMethod;
+          switchDepth_ = savedSwitchDepthMethod;
+          loopDepth_ = savedLoopDepthMethod;
+          activeLabels_ = std::move(savedActiveLabelsMethod);
           iterationLabels_ = std::move(savedIterLabelsMethod);
           if (method.isGenerator) {
             --generatorFunctionDepth_;
@@ -8640,6 +8914,11 @@ ExprPtr Parser::parseClassExpression() {
         }
         method.body.push_back(std::move(stmt));
       }
+      parsingFunctionBody_ = false;
+      staticBlockDepth_ = savedStaticBlockDepthMethod;
+      switchDepth_ = savedSwitchDepthMethod;
+      loopDepth_ = savedLoopDepthMethod;
+      activeLabels_ = std::move(savedActiveLabelsMethod);
       iterationLabels_ = std::move(savedIterLabelsMethod);
       expect(TokenType::RightBrace);
       if (method.isGenerator) {

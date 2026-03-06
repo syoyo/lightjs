@@ -31,10 +31,13 @@ private:
   int switchDepth_ = 0;
   int functionDepth_ = 0;
   int returnDisallowDepth_ = 0;  // Disallow `return` even if nested in a function (e.g. class static blocks)
+  int staticBlockDepth_ = 0;
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
   std::vector<bool> awaitContextStack_;
   std::vector<bool> yieldContextStack_;
+  bool parsingFunctionBody_ = false;
+  bool inTaggedTemplate_ = false;  // True when parsing a tagged template literal
   // Expression grammar in classic `for (init; test; update)` uses ExpressionNoIn
   // to avoid ambiguity with `for-in`.
   bool allowIn_ = true;

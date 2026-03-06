@@ -302,6 +302,9 @@ void Error::getReferences(std::vector<GCObject*>& refs) const {
 }
 
 void ArrayBuffer::getReferences(std::vector<GCObject*>& refs) const {
+    for (const auto& view : views) {
+        if (view) refs.push_back(view.get());
+    }
     for (const auto& [key, value] : properties) {
         (void)key;
         addValueReferences(value, refs);
@@ -317,6 +320,7 @@ void DataView::getReferences(std::vector<GCObject*>& refs) const {
 }
 
 void TypedArray::getReferences(std::vector<GCObject*>& refs) const {
+    if (viewedBuffer) refs.push_back(viewedBuffer.get());
     for (const auto& [key, value] : properties) {
         (void)key;
         addValueReferences(value, refs);

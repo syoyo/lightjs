@@ -300,7 +300,6 @@ private:
       Test262Metadata metadata = parseMetadata(testCode);
       static const std::vector<std::string> kUnsupportedFeatures = {
         "tail-call-optimization",
-        "async-iteration",
         "async-disposable-stack",
         "explicit-resource-management",
         "decorators",

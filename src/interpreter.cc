@@ -749,10 +749,13 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
       return {true, it->second};
     }
 
-    // Walk prototype chain (__proto__) through Objects.
+    // Walk the prototype chain through any object-like value.
     auto protoIt = bag.find("__proto__");
-    if (protoIt == bag.end() || !protoIt->second.isObject()) {
+    if (protoIt == bag.end() || !isObjectLike(protoIt->second)) {
       return {false, Value(Undefined{})};
+    }
+    if (!protoIt->second.isObject()) {
+      return getPropertyForPrimitive(protoIt->second, key);
     }
     auto current = protoIt->second.getGC<Object>();
     int depth = 0;
@@ -773,8 +776,11 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
         return {true, foundIt->second};
       }
       auto nextProto = current->properties.find("__proto__");
-      if (nextProto == current->properties.end() || !nextProto->second.isObject()) {
+      if (nextProto == current->properties.end() || !isObjectLike(nextProto->second)) {
         break;
+      }
+      if (!nextProto->second.isObject()) {
+        return getPropertyForPrimitive(nextProto->second, key);
       }
       current = nextProto->second.getGC<Object>();
     }
@@ -806,10 +812,50 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
       }
 
       auto protoIt = current->properties.find("__proto__");
-      if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
+      if (protoIt == current->properties.end() || !isObjectLike(protoIt->second)) {
         break;
       }
+      if (!protoIt->second.isObject()) {
+        return getPropertyForPrimitive(protoIt->second, key);
+      }
       current = protoIt->second.getGC<Object>();
+    }
+    return {false, Value(Undefined{})};
+  }
+
+  if (receiver.isArray()) {
+    auto arr = receiver.getGC<Array>();
+    if (key == "length") {
+      return {true, Value(static_cast<double>(arr->elements.size()))};
+    }
+
+    auto getterIt = arr->properties.find("__get_" + key);
+    if (getterIt != arr->properties.end()) {
+      if (getterIt->second.isFunction()) {
+        return {true, callFunction(getterIt->second, {}, receiver)};
+      }
+      return {true, Value(Undefined{})};
+    }
+    if (arr->properties.find("__set_" + key) != arr->properties.end()) {
+      return {true, Value(Undefined{})};
+    }
+
+    size_t index = 0;
+    if (parseArrayIndex(key, index) && index < arr->elements.size()) {
+      return {true, arr->elements[index]};
+    }
+
+    auto it = arr->properties.find(key);
+    if (it != arr->properties.end()) {
+      return {true, it->second};
+    }
+
+    auto protoIt = arr->properties.find("__proto__");
+    if (protoIt != arr->properties.end() && isObjectLike(protoIt->second)) {
+      if (protoIt->second.isObject()) {
+        return getFromPropertyBag(protoIt->second.getGC<Object>()->properties);
+      }
+      return getPropertyForPrimitive(protoIt->second, key);
     }
     return {false, Value(Undefined{})};
   }
@@ -861,7 +907,23 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
 
   if (receiver.isError()) {
     auto err = receiver.getGC<Error>();
-    return getFromPropertyBag(err->properties);
+    auto result = getFromPropertyBag(err->properties);
+    if (result.first) {
+      return result;
+    }
+    if (key == "name") {
+      return {true, Value(err->getName())};
+    }
+    if (key == "message") {
+      return {true, Value(err->message)};
+    }
+    if (key == "constructor") {
+      if (auto ctor = env_->get(err->getName())) {
+        return {true, *ctor};
+      }
+      return {true, Value(Undefined{})};
+    }
+    return {false, Value(Undefined{})};
   }
 
   if (receiver.isFunction()) {
@@ -1130,6 +1192,14 @@ Task Interpreter::evaluate(const Statement& stmt) {
 
     // Handle superclass
     if (node->superClass) {
+      struct StrictModeScopeGuard {
+        Interpreter* interpreter;
+        bool previous;
+        ~StrictModeScopeGuard() {
+          interpreter->strictMode_ = previous;
+        }
+      } strictModeScopeGuard{this, strictMode_};
+      strictMode_ = true;
       auto superTask = evaluate(*node->superClass);
       Value superVal;
       LIGHTJS_RUN_TASK(superTask, superVal);
@@ -1665,6 +1735,9 @@ Task Interpreter::evaluate(const Statement& stmt) {
     flow_.type = ControlFlow::Type::Continue;
     flow_.label = node->label;
     LIGHTJS_RETURN(Value(Empty{}));
+  } else if (auto* node = std::get_if<DebuggerStmt>(&stmt.node)) {
+    (void)node;
+    LIGHTJS_RETURN(Value(Empty{}));
   } else if (auto* labelNode = std::get_if<LabelledStmt>(&stmt.node)) {
     // Set pending label so the next iteration statement can consume matching continues
     auto prevLabel = pendingIterationLabel_;
@@ -1721,16 +1794,16 @@ Task Interpreter::evaluate(const Expression& expr) {
                  formatError("Cannot access '" + node->name + "' before initialization", expr.loc));
       LIGHTJS_RETURN(Value(Undefined{}));
     }
-    if (auto withObj = env_->resolveWithScopeObject(node->name)) {
-      auto [found, withValue] = getPropertyForPrimitive(Value(withObj), node->name);
+    if (auto withScopeValue = env_->resolveWithScopeValue(node->name)) {
+      auto withValue = env_->getWithScopeBindingValue(*withScopeValue, node->name, strictMode_);
       if (hasError()) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
-      if (found) {
-        LIGHTJS_RETURN(withValue);
+      if (withValue.has_value()) {
+        LIGHTJS_RETURN(*withValue);
       }
     }
-    if (auto val = env_->get(node->name)) {
+    if (auto val = env_->getIgnoringWith(node->name)) {
       if (val->isModuleBinding()) {
         const auto& binding = std::get<ModuleBinding>(val->data);
         auto module = binding.module.lock();
@@ -2081,6 +2154,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
   auto rightTask = evaluate(*expr.right);
   Value right;
   LIGHTJS_RUN_TASK(rightTask, right);
+  if (flow_.type != ControlFlow::Type::None || hasError()) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
 
   // Check for throw flow from operand evaluation
   if (flow_.type == ControlFlow::Type::Throw) {
@@ -4355,7 +4431,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
 
-    GCPtr<Object> withScopeTarget = env_->resolveWithScopeObject(id->name);
+    auto withScopeTarget = env_->resolveWithScopeValue(id->name);
     Environment* bindingTargetEnv = withScopeTarget ? nullptr : env_->resolveBindingEnvironment(id->name);
     GCPtr<Object> globalPropertyTarget;
     if (!withScopeTarget && !bindingTargetEnv) {
@@ -4372,20 +4448,42 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     auto putIdentifierValue = [&](const Value& value, bool allowCreateGlobal) -> bool {
-      auto assignToObjectBinding = [&](const GCPtr<Object>& target) -> bool {
-        auto setterIt = target->properties.find("__set_" + id->name);
-        bool hasSetter = setterIt != target->properties.end() && setterIt->second.isFunction();
-        bool hasGetter = target->properties.count("__get_" + id->name) > 0;
+      if (withScopeTarget) {
+        if (env_->setWithScopeBindingValue(*withScopeTarget, id->name, value, strictMode_)) {
+          return true;
+        }
+        if (!hasError() && strictMode_) {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        }
+        return false;
+      }
+      if (bindingTargetEnv) {
+        if (bindingTargetEnv->set(id->name, value)) {
+          return true;
+        }
+        if (bindingTargetEnv->isConst(id->name)) {
+          throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
+          return false;
+        }
+        if (strictMode_ && bindingTargetEnv->isSilentImmutable(id->name)) {
+          throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
+          return false;
+        }
+      }
+      if (globalPropertyTarget) {
+        auto setterIt = globalPropertyTarget->properties.find("__set_" + id->name);
+        bool hasSetter = setterIt != globalPropertyTarget->properties.end() && setterIt->second.isFunction();
+        bool hasGetter = globalPropertyTarget->properties.count("__get_" + id->name) > 0;
         bool stillExists =
-          target->properties.count(id->name) > 0 ||
-          target->properties.count("__get_" + id->name) > 0 ||
-          target->properties.count("__set_" + id->name) > 0;
+          globalPropertyTarget->properties.count(id->name) > 0 ||
+          globalPropertyTarget->properties.count("__get_" + id->name) > 0 ||
+          globalPropertyTarget->properties.count("__set_" + id->name) > 0;
 
         if (!stillExists && strictMode_) {
           throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
           return false;
         }
-        if (target->properties.count("__non_writable_" + id->name) > 0) {
+        if (globalPropertyTarget->properties.count("__non_writable_" + id->name) > 0) {
           if (strictMode_) {
             throwError(ErrorType::TypeError,
                        "Cannot assign to read only property '" + id->name + "'");
@@ -4402,27 +4500,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
           return true;
         }
         if (hasSetter) {
-          callFunction(setterIt->second, {value}, Value(target));
+          callFunction(setterIt->second, {value}, Value(globalPropertyTarget));
           return !hasError();
         }
-        target->properties[id->name] = value;
+        globalPropertyTarget->properties[id->name] = value;
         return true;
-      };
-
-      if (withScopeTarget) {
-        return assignToObjectBinding(withScopeTarget);
-      }
-      if (bindingTargetEnv) {
-        if (bindingTargetEnv->set(id->name, value)) {
-          return true;
-        }
-        if (bindingTargetEnv->isConst(id->name)) {
-          throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
-          return false;
-        }
-      }
-      if (globalPropertyTarget) {
-        return assignToObjectBinding(globalPropertyTarget);
       }
       if (env_->set(id->name, value)) {
         return true;
@@ -4491,8 +4573,20 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     Value current;
-    { auto task = evaluate(*expr.left); LIGHTJS_RUN_TASK(task, current); }
-    if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+    if (withScopeTarget) {
+      auto currentValue = env_->getWithScopeBindingValue(*withScopeTarget, id->name, strictMode_);
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+      if (!currentValue.has_value()) {
+        if (strictMode_) {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      current = *currentValue;
+    } else {
+      { auto task = evaluate(*expr.left); LIGHTJS_RUN_TASK(task, current); }
+      if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+    }
 
     Value right;
     { auto task = evaluate(*expr.right); LIGHTJS_RUN_TASK(task, right); }
@@ -4521,8 +4615,11 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
   if (auto* member = std::get_if<MemberExpr>(&expr.left->node)) {
     auto objTask = evaluate(*member->object);
-  Value obj;
-  LIGHTJS_RUN_TASK(objTask, obj);
+    Value obj;
+    LIGHTJS_RUN_TASK(objTask, obj);
+    if (flow_.type != ControlFlow::Type::None || hasError()) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     bool isSuperTarget = member->object &&
                          std::holds_alternative<SuperExpr>(member->object->node);
     Value superReceiver = Value(Undefined{});
@@ -5785,18 +5882,57 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
       throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
       LIGHTJS_RETURN(Value(Undefined{}));
     }
+    if (env_->isSilentImmutable(id->name)) {
+      if (strictMode_) {
+        throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      // Non-strict: evaluate the operand but discard the update
+      auto val = env_->get(id->name);
+      Value currentVal = val.value_or(Value(Undefined{}));
+      Value oldValue, newValue;
+      applyNumericUpdate(currentVal, oldValue, newValue);
+      LIGHTJS_RETURN(expr.prefix ? newValue : oldValue);
+    }
 
     // Capture with-scope target early so PutValue uses the original
     // object environment reference even if getters mutate bindings.
-    GCPtr<Object> withScopeTarget = env_->resolveWithScopeObject(id->name);
+    auto withScopeTarget = env_->resolveWithScopeValue(id->name);
+    GCPtr<Object> globalPropertyTarget;
+    if (!withScopeTarget && !env_->resolveBindingEnvironment(id->name)) {
+      auto rootEnv = env_->getRoot();
+      auto globalThisVal = rootEnv->get("globalThis");
+      if (globalThisVal && globalThisVal->isObject()) {
+        auto globalObj = globalThisVal->getGC<Object>();
+        if (globalObj->properties.count(id->name) > 0 ||
+            globalObj->properties.count("__get_" + id->name) > 0 ||
+            globalObj->properties.count("__set_" + id->name) > 0) {
+          globalPropertyTarget = globalObj;
+        }
+      }
+    }
     if (hasError()) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     Value currentValue;
-    { auto _t = evaluate(*expr.argument); LIGHTJS_RUN_TASK(_t, currentValue); }
-    if (hasError()) {
-      LIGHTJS_RETURN(Value(Undefined{}));
+    if (withScopeTarget) {
+      auto withValue = env_->getWithScopeBindingValue(*withScopeTarget, id->name, strictMode_);
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (!withValue.has_value()) {
+        if (strictMode_) {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      currentValue = *withValue;
+    } else {
+      { auto _t = evaluate(*expr.argument); LIGHTJS_RUN_TASK(_t, currentValue); }
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
     }
 
     Value oldValue;
@@ -5806,31 +5942,51 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
     }
 
     if (withScopeTarget) {
-      auto setterIt = withScopeTarget->properties.find("__set_" + id->name);
-      if (setterIt != withScopeTarget->properties.end() && setterIt->second.isFunction()) {
-        callFunction(setterIt->second, {newValue}, Value(withScopeTarget));
+      if (!env_->setWithScopeBindingValue(*withScopeTarget, id->name, newValue, strictMode_)) {
+        if (!hasError() && strictMode_) {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+    } else if (globalPropertyTarget) {
+      auto setterIt = globalPropertyTarget->properties.find("__set_" + id->name);
+      bool hasSetter = setterIt != globalPropertyTarget->properties.end() && setterIt->second.isFunction();
+      bool hasGetter = globalPropertyTarget->properties.count("__get_" + id->name) > 0;
+      bool stillExists =
+        globalPropertyTarget->properties.count(id->name) > 0 ||
+        globalPropertyTarget->properties.count("__get_" + id->name) > 0 ||
+        globalPropertyTarget->properties.count("__set_" + id->name) > 0;
+
+      if (!stillExists) {
+        if (strictMode_) {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (globalPropertyTarget->properties.count("__non_writable_" + id->name) > 0) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError,
+                     "Cannot assign to read only property '" + id->name + "'");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (hasGetter && !hasSetter) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError,
+                     "Cannot set property " + id->name + " which has only a getter");
+        }
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      if (hasSetter) {
+        callFunction(setterIt->second, {newValue}, Value(globalPropertyTarget));
         if (hasError()) {
           LIGHTJS_RETURN(Value(Undefined{}));
         }
       } else {
-        bool stillExists =
-          withScopeTarget->properties.count(id->name) > 0 ||
-          withScopeTarget->properties.count("__get_" + id->name) > 0 ||
-          withScopeTarget->properties.count("__set_" + id->name) > 0;
-
-        if (!stillExists && strictMode_) {
-          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
-          LIGHTJS_RETURN(Value(Undefined{}));
-        }
-        if (withScopeTarget->properties.count("__non_writable_" + id->name)) {
-          if (strictMode_) {
-            throwError(ErrorType::TypeError,
-                       "Cannot assign to read only property '" + id->name + "'");
-            LIGHTJS_RETURN(Value(Undefined{}));
-          }
-        } else {
-          withScopeTarget->properties[id->name] = newValue;
-        }
+        globalPropertyTarget->properties[id->name] = newValue;
+      }
+      if (hasError()) {
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
     } else if (!env_->set(id->name, newValue)) {
       if (strictMode_) {
@@ -6182,14 +6338,49 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       thisValue = lastMemberBase_;
     }
   } else {
-    { auto _t = evaluate(*expr.callee); LIGHTJS_RUN_TASK(_t, callee); }
-    if (flow_.type != ControlFlow::Type::None) {
-      LIGHTJS_RETURN(Value(Undefined{}));
-    }
     if (auto* id = std::get_if<Identifier>(&expr.callee->node)) {
-      auto withBaseObj = env_->resolveWithScopeObject(id->name);
-      if (withBaseObj) {
-        thisValue = Value(withBaseObj);
+      auto withBaseValue = env_->resolveWithScopeValue(id->name);
+      if (withBaseValue) {
+        auto withValue = env_->getWithScopeBindingValue(*withBaseValue, id->name, strictMode_);
+        if (flow_.type != ControlFlow::Type::None) {
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        if (withValue.has_value()) {
+          callee = *withValue;
+          thisValue = *withBaseValue;
+        } else {
+          throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+      } else {
+        auto val = env_->getIgnoringWith(id->name);
+        if (val.has_value()) {
+          callee = *val;
+        } else {
+          bool foundNamedExpression = false;
+          for (auto it = activeNamedExpressionStack_.rbegin();
+               it != activeNamedExpressionStack_.rend();
+               ++it) {
+            const auto& fn = *it;
+            auto nameIt = fn->properties.find("name");
+            if (nameIt != fn->properties.end() &&
+                nameIt->second.isString() &&
+                nameIt->second.toString() == id->name) {
+              callee = Value(fn);
+              foundNamedExpression = true;
+              break;
+            }
+          }
+          if (!foundNamedExpression) {
+            throwError(ErrorType::ReferenceError, "'" + id->name + "' is not defined");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        }
+      }
+    } else {
+      { auto _t = evaluate(*expr.callee); LIGHTJS_RUN_TASK(_t, callee); }
+      if (flow_.type != ControlFlow::Type::None) {
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
     }
   }
@@ -6268,13 +6459,13 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
 
   // Handle super() calls as construction (ES2020: super() calls [[Construct]])
   if (std::holds_alternative<SuperExpr>(expr.callee->node)) {
-    // super() uses the super *constructor*, not the super base used for super.prop.
-    // Compute from the current constructor's [[Prototype]] so Object.setPrototypeOf(C, ...)
-    // is observed (Test262: call-proto-not-ctor.js, realm.js).
+    // super() uses the current constructor's [[Prototype]], not newTarget's.
+    // That preserves nested derived-constructor behavior while still observing
+    // dynamic prototype changes (e.g. Object.setPrototypeOf(C, ...)).
     bool resolvedSuperCtor = false;
-    if (auto nt = env_->get("__new_target__")) {
-      if (nt->isClass()) {
-        auto cls = nt->getGC<Class>();
+    if (auto currentCtor = env_->get("__current_constructor__")) {
+      if (currentCtor->isClass()) {
+        auto cls = currentCtor->getGC<Class>();
         auto protoIt = cls->properties.find("__proto__");
         if (protoIt != cls->properties.end()) {
           callee = protoIt->second;
@@ -6294,7 +6485,6 @@ Task Interpreter::evaluateCall(const CallExpr& expr) {
       hasSuperCalledSlot = true;
       superAlreadyCalled = superCalled->toBool();
     }
-
     Value newTarget = Value(Undefined{});
     if (auto nt = env_->get("__new_target__")) {
       newTarget = *nt;
@@ -6426,6 +6616,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   auto objTask = evaluate(*expr.object);
   Value obj;
   LIGHTJS_RUN_TASK(objTask, obj);
+
+  // Propagate errors (e.g. ReferenceError from undeclared variable)
+  if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
 
   // Optional chaining: if object is null or undefined, return undefined.
   // This check must happen before evaluating computed keys to preserve short-circuiting.
@@ -6842,6 +7035,37 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto bufferPtr = obj.getGC<ArrayBuffer>();
     if (propName == "byteLength") {
       LIGHTJS_RETURN(Value(static_cast<double>(bufferPtr->byteLength)));
+    }
+    if (propName == "maxByteLength") {
+      LIGHTJS_RETURN(Value(static_cast<double>(bufferPtr->maxByteLength)));
+    }
+    if (propName == "resizable") {
+      LIGHTJS_RETURN(Value(bufferPtr->resizable));
+    }
+    if (propName == "resize") {
+      auto resizeFn = GarbageCollector::makeGC<Function>();
+      resizeFn->isNative = true;
+      resizeFn->properties["__uses_this_arg__"] = Value(true);
+      resizeFn->properties["__throw_on_new__"] = Value(true);
+      resizeFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isArrayBuffer()) {
+          throw std::runtime_error("TypeError: ArrayBuffer.prototype.resize called on non-ArrayBuffer");
+        }
+        auto thisBuf = args[0].getGC<ArrayBuffer>();
+        size_t newByteLength = 0;
+        if (args.size() > 1) {
+          double sizeNum = args[1].toNumber();
+          if (std::isnan(sizeNum) || std::isinf(sizeNum) || sizeNum < 0) {
+            throw std::runtime_error("RangeError: Invalid ArrayBuffer resize length");
+          }
+          newByteLength = static_cast<size_t>(sizeNum);
+        }
+        if (!thisBuf->resize(newByteLength)) {
+          throw std::runtime_error("RangeError: Invalid ArrayBuffer resize length");
+        }
+        return Value(Undefined{});
+      };
+      LIGHTJS_RETURN(Value(resizeFn));
     }
     if (propName == "slice") {
       auto sliceFn = GarbageCollector::makeGC<Function>();
@@ -7591,7 +7815,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       int depth = 0;
       while (depth < 50) {
         auto protoIt = proto->properties.find("__proto__");
-        if (protoIt == proto->properties.end() || !protoIt->second.isObject()) break;
+        if (protoIt == proto->properties.end() || !isObjectLike(protoIt->second)) break;
+        if (!protoIt->second.isObject()) {
+          auto [found, value] = getPropertyForPrimitive(protoIt->second, propName);
+          if (found) {
+            LIGHTJS_RETURN(value);
+          }
+          break;
+        }
         proto = protoIt->second.getGC<Object>();
         depth++;
         // Check getter on prototype
@@ -7750,9 +7981,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         if (receiver.isTypedArray()) {
           auto ta = receiver.getGC<TypedArray>();
-          if (key == "length" || key == "byteLength") return Value(true);
+          if (key == "length" || key == "byteLength" || key == "buffer" || key == "byteOffset") {
+            return Value(true);
+          }
           size_t idx = 0;
-          if (parseArrayIndex(key, idx) && idx < ta->length) return Value(true);
+          if (parseArrayIndex(key, idx) && idx < ta->currentLength()) return Value(true);
           return Value(ta->properties.count(key) > 0);
         }
         if (receiver.isArrayBuffer()) {
@@ -7819,9 +8052,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         if (receiver.isTypedArray()) {
           auto ta = receiver.getGC<TypedArray>();
-          if (key == "length" || key == "byteLength") return Value(false);
+          if (key == "length" || key == "byteLength" || key == "buffer" || key == "byteOffset") {
+            return Value(false);
+          }
           size_t idx = 0;
-          if (parseArrayIndex(key, idx) && idx < ta->length) return Value(true);
+          if (parseArrayIndex(key, idx) && idx < ta->currentLength()) return Value(true);
           if (ta->properties.count(key) == 0) return Value(false);
           return Value(isEnumerableForMarkers(ta->properties));
         }
@@ -8008,14 +8243,27 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
         Value returnValue = args.empty() ? Value(Undefined{}) : args[0];
+        bool isAsyncGenerator = genPtr->function && genPtr->function->isAsync;
+        auto wrapAsyncResult = [isAsyncGenerator](const Value& settledValue, bool reject) -> Value {
+          if (!isAsyncGenerator) {
+            return settledValue;
+          }
+          auto promise = GarbageCollector::makeGC<Promise>();
+          if (reject) {
+            promise->reject(settledValue);
+          } else {
+            promise->resolve(settledValue);
+          }
+          return Value(promise);
+        };
 
         if (genPtr->state == GeneratorState::Completed) {
-          return makeIteratorResult(returnValue, true);
+          return wrapAsyncResult(makeIteratorResult(returnValue, true), false);
         }
         if (genPtr->state == GeneratorState::SuspendedStart) {
           genPtr->state = GeneratorState::Completed;
           genPtr->currentValue = std::make_shared<Value>(returnValue);
-          return makeIteratorResult(returnValue, true);
+          return wrapAsyncResult(makeIteratorResult(returnValue, true), false);
         }
 
         // SuspendedYield: resume execution to run finally blocks
@@ -8023,7 +8271,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
         // If a finally block yielded, the generator is still suspended
         if (genPtr->state == GeneratorState::SuspendedYield) {
-          return step;  // Return the yielded value with done:false
+          return wrapAsyncResult(step, false);
+        }
+
+        if (this->flow_.type == ControlFlow::Type::Throw) {
+          Value rejection = this->flow_.value;
+          if (isAsyncGenerator) {
+            this->clearError();
+          }
+          return wrapAsyncResult(rejection, true);
         }
 
         // Generator completed (normally or via finally return)
@@ -8032,12 +8288,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           resultValue = *genPtr->currentValue;
         }
 
-        if (genPtr->function && genPtr->function->isAsync) {
-          auto promise = GarbageCollector::makeGC<Promise>();
-          promise->resolve(makeIteratorResult(resultValue, true));
-          return Value(promise);
-        }
-        return makeIteratorResult(resultValue, true);
+        return wrapAsyncResult(makeIteratorResult(resultValue, true), false);
       };
       LIGHTJS_RETURN(Value(fn));
     }
@@ -8047,10 +8298,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [genPtr, this](const std::vector<Value>& args) -> Value {
         Value throwValue = args.empty() ? Value(GarbageCollector::makeGC<Error>(ErrorType::Error, "Generator error")) : args[0];
+        bool isAsyncGenerator = genPtr->function && genPtr->function->isAsync;
 
         if (genPtr->state == GeneratorState::Completed ||
             genPtr->state == GeneratorState::SuspendedStart) {
           genPtr->state = GeneratorState::Completed;
+          if (isAsyncGenerator) {
+            auto promise = GarbageCollector::makeGC<Promise>();
+            promise->reject(throwValue);
+            return Value(promise);
+          }
           // Re-throw: set flow to Throw so caller sees it
           this->flow_.type = ControlFlow::Type::Throw;
           this->flow_.value = throwValue;
@@ -9381,13 +9638,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
   if (obj.isTypedArray()) {
     auto taPtr = obj.getGC<TypedArray>();
     if (propName == "length") {
-      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->length)));
+      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->currentLength())));
+    }
+    if (propName == "buffer" && taPtr->viewedBuffer) {
+      LIGHTJS_RETURN(Value(taPtr->viewedBuffer));
+    }
+    if (propName == "byteOffset") {
+      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->byteOffset)));
     }
     if (propName == "byteLength") {
-      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->buffer.size())));
+      LIGHTJS_RETURN(Value(static_cast<double>(taPtr->currentByteLength())));
     }
     size_t idx = 0;
-    if (parseArrayIndex(propName, idx) && idx < taPtr->length) {
+    if (parseArrayIndex(propName, idx) && idx < taPtr->currentLength()) {
       if (taPtr->type == TypedArrayType::BigInt64 || taPtr->type == TypedArrayType::BigUint64) {
         LIGHTJS_RETURN(Value(BigInt(taPtr->getBigIntElement(idx))));
       } else {
@@ -10491,6 +10754,8 @@ Value Interpreter::runGeneratorNext(const GCPtr<Generator>& genPtr,
   if (genPtr->function && genPtr->context) {
     auto prevEnv = env_;
     env_ = genPtr->context;
+    auto prevActiveFunction = activeFunction_;
+    activeFunction_ = genPtr->function;
     auto prevPrivateOwnerClass = activePrivateOwnerClass_;
     if (auto ownerClassIt = genPtr->function->properties.find("__private_owner_class__");
         ownerClassIt != genPtr->function->properties.end() && ownerClassIt->second.isClass()) {
@@ -10499,10 +10764,12 @@ Value Interpreter::runGeneratorNext(const GCPtr<Generator>& genPtr,
     struct PrivateOwnerClassGuard {
       Interpreter* interpreter;
       GCPtr<Class> previousOwnerClass;
+      GCPtr<Function> previousActiveFunction;
       ~PrivateOwnerClassGuard() {
         interpreter->activePrivateOwnerClass_ = previousOwnerClass;
+        interpreter->activeFunction_ = previousActiveFunction;
       }
-    } privateOwnerClassGuard{this, prevPrivateOwnerClass};
+    } privateOwnerClassGuard{this, prevPrivateOwnerClass, prevActiveFunction};
 
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(genPtr->function->body);
     
@@ -10537,6 +10804,20 @@ Value Interpreter::runGeneratorNext(const GCPtr<Generator>& genPtr,
       genPtr->state = GeneratorState::SuspendedYield;
       genPtr->currentValue = std::make_shared<Value>(flow_.value);
       bool yieldIsIterResult = flow_.yieldIsIteratorResult;
+      bool yieldSkipsAsyncAwait = flow_.yieldSkipsAsyncAwait;
+      if (genPtr->function && genPtr->function->isAsync &&
+          !yieldIsIterResult && !yieldSkipsAsyncAwait) {
+        Value awaitedValue = awaitValue(*genPtr->currentValue);
+        if (flow_.type == ControlFlow::Type::Throw) {
+          Value thrownValue = flow_.value;
+          flow_ = prevFlow;
+          env_ = prevEnv;
+          flow_.type = ControlFlow::Type::Throw;
+          flow_.value = thrownValue;
+          return Value(Undefined{});
+        }
+        genPtr->currentValue = std::make_shared<Value>(awaitedValue);
+      }
       flow_ = prevFlow;
       env_ = prevEnv;
       if (yieldIsIterResult) {
@@ -10569,6 +10850,89 @@ Value Interpreter::runGeneratorNext(const GCPtr<Generator>& genPtr,
 
   genPtr->state = GeneratorState::Completed;
   return makeIteratorResult(Value(Undefined{}), true);
+}
+
+Value Interpreter::awaitValue(const Value& input) {
+  Value val = input;
+
+  if (!val.isPromise() && isObjectLike(val)) {
+    auto [foundThen, thenValue] = getPropertyForPrimitive(val, "then");
+    if (hasError()) {
+      return Value(Undefined{});
+    }
+    if (foundThen && thenValue.isFunction()) {
+      auto promise = GarbageCollector::makeGC<Promise>();
+
+      auto resolveFunc = GarbageCollector::makeGC<Function>();
+      resolveFunc->isNative = true;
+      resolveFunc->properties["length"] = Value(1.0);
+      resolveFunc->properties["name"] = Value(std::string(""));
+      resolveFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promise->resolve(args[0]);
+        } else {
+          promise->resolve(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      auto rejectFunc = GarbageCollector::makeGC<Function>();
+      rejectFunc->isNative = true;
+      rejectFunc->properties["length"] = Value(1.0);
+      rejectFunc->properties["name"] = Value(std::string(""));
+      rejectFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
+        if (!args.empty()) {
+          promise->reject(args[0]);
+        } else {
+          promise->reject(Value(Undefined{}));
+        }
+        return Value(Undefined{});
+      };
+
+      callFunction(thenValue, {Value(resolveFunc), Value(rejectFunc)}, val);
+      if (hasError()) {
+        Value err = getError();
+        clearError();
+        promise->reject(err);
+      }
+
+      val = Value(promise);
+    }
+  }
+
+  if (val.isPromise()) {
+    auto promise = val.getGC<Promise>();
+    if (promise->state == PromiseState::Pending) {
+      auto& loop = EventLoopContext::instance().getLoop();
+      constexpr size_t kMaxAwaitTicks = 10000;
+      size_t ticks = 0;
+      while (promise->state == PromiseState::Pending &&
+             loop.hasPendingWork() &&
+             ticks < kMaxAwaitTicks) {
+        loop.runOnce();
+        ticks++;
+      }
+    }
+
+    if (promise->state == PromiseState::Fulfilled) {
+      return promise->result;
+    }
+    if (promise->state == PromiseState::Rejected) {
+      flow_.type = ControlFlow::Type::Throw;
+      flow_.value = promise->result;
+      return Value(Undefined{});
+    }
+    return Value(Undefined{});
+  }
+
+  if (!suppressMicrotasks_) {
+    auto& loop = EventLoopContext::instance().getLoop();
+    if (loop.pendingMicrotaskCount() > 0) {
+      loop.runOnce();
+    }
+  }
+
+  return val;
 }
 
 std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value& iterable) {
@@ -10919,10 +11283,23 @@ Value Interpreter::iteratorNext(IteratorRecord& record) {
       return callFunction(record.nextMethod, {}, record.iteratorValue);
     }
     case IteratorRecord::Kind::TypedArray: {
-      if (!record.typedArray || record.index >= record.typedArray->length) {
+      if (!record.typedArray) {
         return makeIteratorResult(Value(Undefined{}), true);
       }
-      Value value = record.typedArray->getElement(record.index++);
+      if (record.typedArray->isOutOfBounds()) {
+        throwError(ErrorType::TypeError, "TypedArray is out of bounds");
+        return Value(Undefined{});
+      }
+      if (record.index >= record.typedArray->currentLength()) {
+        return makeIteratorResult(Value(Undefined{}), true);
+      }
+      Value value;
+      if (record.typedArray->type == TypedArrayType::BigInt64 ||
+          record.typedArray->type == TypedArrayType::BigUint64) {
+        value = Value(BigInt(record.typedArray->getBigIntElement(record.index++)));
+      } else {
+        value = Value(record.typedArray->getElement(record.index++));
+      }
       return makeIteratorResult(value, false);
     }
   }
@@ -11080,6 +11457,18 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       argumentsArray->elements = currentArgs;
       // Mark as an arguments object (internal, non-observable via builtins).
       argumentsArray->properties["__is_arguments_object__"] = Value(true);
+      if (func->isStrict) {
+        auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+        throwTypeErrorAccessor->isNative = true;
+        throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+          throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+        };
+        argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
+        argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+      } else {
+        argumentsArray->properties["callee"] = callee;
+      }
+      argumentsArray->properties["__non_enum_callee"] = Value(true);
 
       // Mapped/unmapped arguments objects are iterable and expose Array's @@iterator
       // as an own, non-enumerable property (ES2015 9.4.4.7).
@@ -11272,6 +11661,12 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     auto genEnv = func->closure;
     genEnv = genEnv->createChild();
     genEnv->define("__var_scope__", Value(true), true);
+    if (pushNamedExpr) {
+      auto nameIt2 = func->properties.find("name");
+      if (nameIt2 != func->properties.end() && nameIt2->second.isString()) {
+        genEnv->defineImmutableNFE(nameIt2->second.toString(), Value(func));
+      }
+    }
     auto prevEnv2 = env_;
     bool prevStrict2 = strictMode_;
     auto prevFlow2 = flow_;
@@ -11359,6 +11754,12 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     env_ = func->closure;
     env_ = env_->createChild();
     env_->define("__var_scope__", Value(true), true);
+    if (pushNamedExpr) {
+      auto nameIt2 = func->properties.find("name");
+      if (nameIt2 != func->properties.end() && nameIt2->second.isString()) {
+        env_->defineImmutableNFE(nameIt2->second.toString(), Value(func));
+      }
+    }
 
     flow_.reset();
     bindParameters(env_);
@@ -11619,6 +12020,14 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     env_ = func->closure;
     env_ = env_->createChild();
     env_->define("__var_scope__", Value(true), true);
+    // Named function expression: bind the name as an immutable const
+    // so assignments to it are silently ignored (non-strict) or throw (strict)
+    if (pushNamedExpr) {
+      auto nameIt2 = func->properties.find("name");
+      if (nameIt2 != func->properties.end() && nameIt2->second.isString()) {
+        env_->defineImmutableNFE(nameIt2->second.toString(), Value(func));
+      }
+    }
     bindParameters(env_);
     if (flow_.type == ControlFlow::Type::Throw) {
       break;
@@ -12288,6 +12697,8 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
       }
     }
     func->properties["prototype"] = Value(proto);
+    func->properties["__non_enum_prototype"] = Value(true);
+    func->properties["__non_configurable_prototype"] = Value(true);
   } else {
     func->isConstructor = false;
   }
@@ -12314,82 +12725,7 @@ Task Interpreter::evaluateAwait(const AwaitExpr& expr) {
   auto task = evaluate(*expr.argument);
   Value val;
   LIGHTJS_RUN_TASK(task, val);
-
-  if (!val.isPromise() && isObjectLike(val)) {
-    auto [foundThen, thenValue] = getPropertyForPrimitive(val, "then");
-    if (hasError()) {
-      LIGHTJS_RETURN(Value(Undefined{}));
-    }
-    if (foundThen && thenValue.isFunction()) {
-      auto promise = GarbageCollector::makeGC<Promise>();
-
-      auto resolveFunc = GarbageCollector::makeGC<Function>();
-      resolveFunc->isNative = true;
-      resolveFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
-        if (!args.empty()) {
-          promise->resolve(args[0]);
-        } else {
-          promise->resolve(Value(Undefined{}));
-        }
-        return Value(Undefined{});
-      };
-
-      auto rejectFunc = GarbageCollector::makeGC<Function>();
-      rejectFunc->isNative = true;
-      rejectFunc->nativeFunc = [promise](const std::vector<Value>& args) -> Value {
-        if (!args.empty()) {
-          promise->reject(args[0]);
-        } else {
-          promise->reject(Value(Undefined{}));
-        }
-        return Value(Undefined{});
-      };
-
-      callFunction(thenValue, {Value(resolveFunc), Value(rejectFunc)}, val);
-      if (hasError()) {
-        Value err = getError();
-        clearError();
-        promise->reject(err);
-      }
-
-      val = Value(promise);
-    }
-  }
-
-  if (val.isPromise()) {
-    auto promise = val.getGC<Promise>();
-    if (promise->state == PromiseState::Pending) {
-      // TinyJS models await synchronously; drive pending microtasks until settled.
-      auto& loop = EventLoopContext::instance().getLoop();
-      constexpr size_t kMaxAwaitTicks = 10000;
-      size_t ticks = 0;
-      while (promise->state == PromiseState::Pending &&
-             loop.hasPendingWork() &&
-             ticks < kMaxAwaitTicks) {
-        loop.runOnce();
-        ticks++;
-      }
-    }
-
-    if (promise->state == PromiseState::Fulfilled) {
-      LIGHTJS_RETURN(promise->result);
-    } else if (promise->state == PromiseState::Rejected) {
-      flow_.type = ControlFlow::Type::Throw;
-      flow_.value = promise->result;
-      LIGHTJS_RETURN(Value(Undefined{}));
-    }
-    LIGHTJS_RETURN(Value(Undefined{}));
-  }
-
-  // Await on non-Promise values still yields to queued microtasks.
-  if (!suppressMicrotasks_) {
-    auto& loop = EventLoopContext::instance().getLoop();
-    if (loop.pendingMicrotaskCount() > 0) {
-      loop.runOnce();
-    }
-  }
-
-  LIGHTJS_RETURN(val);
+  LIGHTJS_RETURN(awaitValue(val));
 }
 
 Task Interpreter::evaluateYield(const YieldExpr& expr) {
@@ -12410,6 +12746,8 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
   }
 
   if (expr.delegate) {
+    bool isAsyncGeneratorDelegation =
+      activeFunction_ && activeFunction_->isGenerator && activeFunction_->isAsync;
     auto iterRecOpt = getIterator(yieldedValue);
     if (!iterRecOpt) {
       // Propagate any abrupt completion produced by GetIterator.
@@ -12474,6 +12812,12 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
           if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
           if (returnMethod.isUndefined()) {
             // No return method: propagate Return completion.
+            if (isAsyncGeneratorDelegation) {
+              receivedValue = awaitValue(receivedValue);
+              if (flow_.type == ControlFlow::Type::Throw) {
+                LIGHTJS_RETURN(Value(Undefined{}));
+              }
+            }
             flow_.type = ControlFlow::Type::Return;
             flow_.value = receivedValue;
             LIGHTJS_RETURN(Value(Undefined{}));
@@ -12530,10 +12874,21 @@ Task Interpreter::evaluateYield(const YieldExpr& expr) {
         LIGHTJS_RETURN(value);
       }
 
-      // Delegation continues: yield the iterator result object itself (no eager
-      // access of `.value`).
-      flow_.setYieldIteratorResult(innerResult);
-      co_await YieldAwaiter{innerResult};
+      if (isAsyncGeneratorDelegation) {
+        Value value = Value(Undefined{});
+        auto [foundValue, valueVal] = getPropertyForPrimitive(innerResult, "value");
+        if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
+        if (foundValue) {
+          value = valueVal;
+        }
+        flow_.setYieldWithoutAsyncAwait(value);
+        co_await YieldAwaiter{value};
+      } else {
+        // Delegation continues: yield the iterator result object itself (no eager
+        // access of `.value`).
+        flow_.setYieldIteratorResult(innerResult);
+        co_await YieldAwaiter{innerResult};
+      }
 
       resumeMode = flow_.takeResumeMode();
       if (resumeMode == ControlFlow::ResumeMode::None) {
@@ -12687,7 +13042,7 @@ Value Interpreter::getPrototypeFromConstructorValue(const Value& ctorValue) {
   if (!found) {
     return Value(Undefined{});
   }
-  if (proto.isObject() || proto.isNull()) {
+  if (isObjectLike(proto) || proto.isNull()) {
     return proto;
   }
   return Value(Undefined{});
@@ -12736,7 +13091,7 @@ Value Interpreter::getOrdinaryCreatePrototypeFromNewTarget(const Value& newTarge
   if (isObjectLike(newTargetValue)) {
     auto [found, proto] = getPropertyForPrimitive(newTargetValue, "prototype");
     if (hasError()) return Value(Undefined{});
-    if (found && proto.isObject()) return proto;
+    if (found && (isObjectLike(proto) || proto.isNull())) return proto;
   }
   return getIntrinsicObjectPrototypeForCtor(newTargetValue);
 }
@@ -13075,7 +13430,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     };
 
     auto setProtoOnValue = [&](Value& targetVal, const Value& protoVal) {
-      if (!protoVal.isObject() && !protoVal.isNull()) return;
+      if (!isObjectLike(protoVal) && !protoVal.isNull()) return;
       auto setProto = [&](const auto& container) {
         container->properties["__proto__"] = protoVal;
       };
@@ -13282,6 +13637,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       // Bind 'this' to the new instance
       env_->define("this", Value(instance));
       env_->define("__new_target__", effectiveNewTarget);
+      env_->define("__current_constructor__", callee, true);
 
       // Bind super constructor + super base separately.
       bool extendsNull = false;
@@ -13322,6 +13678,15 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       auto argumentsArray = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       argumentsArray->elements = args;
+      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+      throwTypeErrorAccessor->isNative = true;
+      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+        throw std::runtime_error(
+          "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+      };
+      argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__non_enum_callee"] = Value(true);
       env_->define("arguments", Value(argumentsArray));
 
       // Bind parameters
@@ -13650,7 +14015,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       // Many internal objects (TypedArray, ArrayBuffer, Error, etc.) are not plain Objects,
       // so ensure they get the correct prototype for subclassing.
       Value protoFromNewTarget = getPrototypeFromConstructorValue(effectiveNewTarget);
-      if (protoFromNewTarget.isObject() || protoFromNewTarget.isNull()) {
+      if (isObjectLike(protoFromNewTarget) || protoFromNewTarget.isNull()) {
         setProtoOnValue(constructed, protoFromNewTarget);
       }
       setConstructorTag(constructed);
@@ -13663,7 +14028,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
     // OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%")
     Value protoForInstance = getOrdinaryCreatePrototypeFromNewTarget(effectiveNewTarget);
-    if (protoForInstance.isObject()) {
+    if (isObjectLike(protoForInstance)) {
       instance->properties["__proto__"] = protoForInstance;
     } else if (auto objectCtor = env_->getRoot()->get("Object")) {
       Value objectProto = getPrototypeFromConstructorValue(*objectCtor);
@@ -13686,6 +14051,18 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     auto argumentsArray = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
     argumentsArray->elements = args;
+    if (func->isStrict) {
+      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+      throwTypeErrorAccessor->isNative = true;
+      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+        throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+      };
+      argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+    } else {
+      argumentsArray->properties["callee"] = callee;
+    }
+    argumentsArray->properties["__non_enum_callee"] = Value(true);
     env_->define("arguments", Value(argumentsArray));
 
     // Bind parameters
@@ -13943,7 +14320,15 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
   cls->lexicalParentClass = activePrivateOwnerClass_;
 
   // Handle superclass
-    if (expr.superClass) {
+  if (expr.superClass) {
+      struct StrictModeScopeGuard {
+        Interpreter* interpreter;
+        bool previous;
+        ~StrictModeScopeGuard() {
+          interpreter->strictMode_ = previous;
+        }
+      } strictModeScopeGuard{this, strictMode_};
+      strictMode_ = true;
       auto superTask = evaluate(*expr.superClass);
       Value superVal;
       LIGHTJS_RUN_TASK(superTask, superVal);
@@ -14533,6 +14918,9 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
     auto objTask = evaluate(*member->object);
     Value objVal = Value(Undefined{});
     LIGHTJS_RUN_TASK(objTask, objVal);
+    if (flow_.type == ControlFlow::Type::Throw) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
 
     std::string prop;
     if (member->computed) {
@@ -14664,22 +15052,112 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       LIGHTJS_RETURN(Value(Undefined{}));
     }
 
-    if (objVal.isObject()) {
-      auto obj = objVal.getGC<Object>();
-      auto setterIt = obj->properties.find("__set_" + prop);
-      if (setterIt != obj->properties.end() && setterIt->second.isFunction()) {
-        callFunction(setterIt->second, {value}, objVal);
-      } else {
-        obj->properties[prop] = value;
+    auto setMemberLike = [&](auto&& self,
+                             const Value& base,
+                             const Value& receiver,
+                             const std::string& key,
+                             const Value& assigned) -> bool {
+      if (base.isObject()) {
+        auto obj = base.getGC<Object>();
+        auto setterIt = obj->properties.find("__set_" + key);
+        if (setterIt != obj->properties.end() && setterIt->second.isFunction()) {
+          callFunction(setterIt->second, {assigned}, receiver);
+          return !hasError();
+        }
+        auto getterIt = obj->properties.find("__get_" + key);
+        if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
+          return false;
+        }
+        if (obj->properties.count(key)) {
+          if (receiver.isObject()) {
+            receiver.getGC<Object>()->properties[key] = assigned;
+            return true;
+          }
+          if (receiver.isArray()) {
+            receiver.getGC<Array>()->properties[key] = assigned;
+            return true;
+          }
+          return false;
+        }
+        auto protoIt = obj->properties.find("__proto__");
+        if (protoIt != obj->properties.end() &&
+            (protoIt->second.isObject() || protoIt->second.isArray())) {
+          return self(self, protoIt->second, receiver, key, assigned);
+        }
+        if (receiver.isObject()) {
+          receiver.getGC<Object>()->properties[key] = assigned;
+          return true;
+        }
+        if (receiver.isArray()) {
+          receiver.getGC<Array>()->properties[key] = assigned;
+          return true;
+        }
+        return false;
       }
-    } else if (objVal.isArray()) {
-      auto arr = objVal.getGC<Array>();
-      if (member->computed) {
-        size_t idx = static_cast<size_t>(std::stod(prop));
-        if (idx < arr->elements.size()) {
-          arr->elements[idx] = value;
+
+      if (base.isArray()) {
+        auto arr = base.getGC<Array>();
+        auto setterIt = arr->properties.find("__set_" + key);
+        if (setterIt != arr->properties.end() && setterIt->second.isFunction()) {
+          callFunction(setterIt->second, {assigned}, receiver);
+          return !hasError();
+        }
+        auto getterIt = arr->properties.find("__get_" + key);
+        if (getterIt != arr->properties.end() && getterIt->second.isFunction()) {
+          return false;
+        }
+        size_t index = 0;
+        if (parseArrayIndex(key, index)) {
+          if (index < arr->elements.size()) {
+            if (receiver.isArray()) {
+              auto recvArr = receiver.getGC<Array>();
+              if (index >= recvArr->elements.size()) {
+                recvArr->elements.resize(index + 1, Value(Undefined{}));
+              }
+              recvArr->elements[index] = assigned;
+              return true;
+            }
+            return false;
+          }
+        } else if (arr->properties.count(key)) {
+          if (receiver.isArray()) {
+            receiver.getGC<Array>()->properties[key] = assigned;
+            return true;
+          }
+          if (receiver.isObject()) {
+            receiver.getGC<Object>()->properties[key] = assigned;
+            return true;
+          }
+          return false;
+        }
+        auto protoIt = arr->properties.find("__proto__");
+        if (protoIt != arr->properties.end() &&
+            (protoIt->second.isObject() || protoIt->second.isArray())) {
+          return self(self, protoIt->second, receiver, key, assigned);
+        }
+        if (receiver.isArray()) {
+          auto recvArr = receiver.getGC<Array>();
+          if (parseArrayIndex(key, index)) {
+            if (index >= recvArr->elements.size()) {
+              recvArr->elements.resize(index + 1, Value(Undefined{}));
+            }
+            recvArr->elements[index] = assigned;
+          } else {
+            recvArr->properties[key] = assigned;
+          }
+          return true;
+        }
+        if (receiver.isObject()) {
+          receiver.getGC<Object>()->properties[key] = assigned;
+          return true;
         }
       }
+      return false;
+    };
+
+    setMemberLike(setMemberLike, objVal, objVal, prop, value);
+    if (hasError()) {
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
   } else if (auto* arrayPat = std::get_if<ArrayPattern>(&pattern.node)) {
     // Array destructuring - null/undefined are not iterable
@@ -14822,6 +15300,35 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       if (needed > 0 && !genExhausted && !hasRest &&
           gen->state != GeneratorState::Completed) {
         iteratorClose(genRecord);
+      }
+    } else if (value.isTypedArray()) {
+      auto iterOpt = getIterator(value);
+      if (!iterOpt.has_value()) {
+        throwError(ErrorType::TypeError, value.toString() + " is not iterable");
+        LIGHTJS_RETURN(Value(Undefined{}));
+      }
+      IteratorRecord iterRec = *iterOpt;
+      arr = GarbageCollector::makeGC<Array>();
+      size_t needed = arrayPat->elements.size();
+      bool hasRest = (arrayPat->rest != nullptr);
+      bool exhausted = false;
+      for (size_t i = 0; i < needed || hasRest; ++i) {
+        Value stepResult = iteratorNext(iterRec);
+        if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
+        if (!stepResult.isObject()) { exhausted = true; break; }
+        auto stepObj = stepResult.getGC<Object>();
+        auto doneIt2 = stepObj->properties.find("done");
+        if (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool()) {
+          exhausted = true;
+          break;
+        }
+        auto valIt = stepObj->properties.find("value");
+        arr->elements.push_back(valIt != stepObj->properties.end() ? valIt->second : Value(Undefined{}));
+        if (i >= needed && !hasRest) break;
+      }
+      if (needed > 0 && !hasRest && !exhausted) {
+        iteratorClose(iterRec);
+        if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
       }
     } else if (value.isObject()) {
       // Check for Symbol.iterator on objects
@@ -15197,12 +15704,10 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
       }
 
       Value propValue;
-      auto getterIt = obj->properties.find("__get_" + keyName);
-      if (getterIt != obj->properties.end() && getterIt->second.isFunction()) {
-        propValue = callFunction(getterIt->second, {}, value);
-        if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
-      } else if (obj->properties.count(keyName)) {
-        propValue = obj->properties[keyName];
+      auto [foundProp, fetchedPropValue] = getPropertyForPrimitive(value, keyName);
+      if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
+      if (foundProp) {
+        propValue = fetchedPropValue;
       }
       if (hasMemberTarget && propValue.isUndefined() && defaultExpr) {
         auto defaultTask = evaluate(*defaultExpr);
@@ -15659,6 +16164,19 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
     GarbageCollector::instance().reportAllocation(sizeof(Array));
     argumentsArray->elements = args;
     argumentsArray->properties["__is_arguments_object__"] = Value(true);
+    if (func->isStrict) {
+      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+      throwTypeErrorAccessor->isNative = true;
+      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+        throw std::runtime_error(
+          "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+      };
+      argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+    } else {
+      argumentsArray->properties["callee"] = Value(func);
+    }
+    argumentsArray->properties["__non_enum_callee"] = Value(true);
     env_->define("arguments", Value(argumentsArray));
   }
 
@@ -15790,12 +16308,12 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
   for (const auto& declarator : decl.declarations) {
     // Per spec (13.3.2.4): ResolveBinding BEFORE evaluating initializer.
     // For var declarations in with-scope, capture the with-scope object first.
-    GCPtr<Object> preResolvedWithObj;
+    std::optional<Value> preResolvedWithValue;
     std::string preResolvedName;
     if (decl.kind == VarDeclaration::Kind::Var && declarator.init) {
       if (auto* id = std::get_if<Identifier>(&declarator.pattern->node)) {
-        preResolvedWithObj = env_->resolveWithScopeObject(id->name);
-        if (preResolvedWithObj) {
+        preResolvedWithValue = env_->resolveWithScopeValue(id->name);
+        if (preResolvedWithValue) {
           preResolvedName = id->name;
         }
       }
@@ -15863,8 +16381,8 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     }
 
     // If binding was pre-resolved to a with-scope object, write there directly (PutValue)
-    if (preResolvedWithObj && !preResolvedName.empty()) {
-      preResolvedWithObj->properties[preResolvedName] = value;
+    if (preResolvedWithValue && !preResolvedName.empty()) {
+      env_->setWithScopeBindingValue(*preResolvedWithValue, preResolvedName, value, false);
       continue;
     }
 
@@ -15875,7 +16393,7 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     bool useSet = (decl.kind == VarDeclaration::Kind::Var);
     { auto t = bindDestructuringPattern(*declarator.pattern, value, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
   }
-  LIGHTJS_RETURN(Value(Undefined{}));
+  LIGHTJS_RETURN(Value(Empty{}));
 }
 
 // Recursively collect var declarations from a statement and hoist them
@@ -16029,6 +16547,8 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
     }
   }
   func->properties["prototype"] = Value(proto);
+  func->properties["__non_enum_prototype"] = Value(true);
+  func->properties["__non_configurable_prototype"] = Value(true);
 
   // Set __proto__ to Function.prototype or GeneratorFunction.prototype
   std::string funcProtoName = func->isGenerator ? "__generator_function_prototype__" : "Function";
@@ -16115,6 +16635,9 @@ Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
 Task Interpreter::evaluateIf(const IfStmt& stmt) {
   auto testTask = evaluate(*stmt.test);
   LIGHTJS_RUN_TASK_VOID(testTask);
+  if (flow_.type != ControlFlow::Type::None) {
+    LIGHTJS_RETURN(Value(Undefined{}));
+  }
 
   if (testTask.result().toBool()) {
     auto consTask = evaluate(*stmt.consequent);
@@ -16205,7 +16728,7 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
 
   auto prevEnv = env_;
   env_ = env_->createChild();
-  if (scopeValue.isObject() || scopeValue.isProxy()) {
+  if (isObjectLike(scopeValue) || scopeValue.isProxy()) {
     env_->define("__with_scope_object__", scopeValue);
   }
   struct EnvRestoreGuard {
@@ -16256,7 +16779,7 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
     return protoIt->second.getGC<Object>();
   };
 
-  if (scopeValue.isObject() || scopeValue.isProxy()) {
+  if (isObjectLike(scopeValue) || scopeValue.isProxy()) {
     // Keep with-object property resolution dynamic via __with_scope_object__.
     // Copying properties into lexical bindings breaks unscopables semantics.
   } else if (scopeValue.isPromise()) {
@@ -16827,6 +17350,48 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
     }
   }
 
+  // Iterate over typed array indices and enumerable own properties.
+  else if (auto* taPtr = std::get_if<GCPtr<TypedArray>>(&obj.data)) {
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < (*taPtr)->currentLength(); ++i) {
+      keys.push_back(std::to_string(i));
+    }
+    for (const auto& key : (*taPtr)->properties.orderedKeys()) {
+      if (isInternalProp(key)) continue;
+      if (isMetaProp(key)) continue;
+      if (isSymbolPropertyKey(key)) continue;
+      bool isNum = !key.empty() && std::all_of(key.begin(), key.end(), ::isdigit);
+      if (isNum) continue;
+      if ((*taPtr)->properties.count("__non_enum_" + key)) continue;
+      keys.push_back(key);
+    }
+
+    for (const auto& key : keys) {
+      auto loopEnv = env_;
+      assignKey(key);
+      Value bodyResult;
+      auto bodyTask = evaluate(*stmt.body);
+      LIGHTJS_RUN_TASK(bodyTask, bodyResult);
+      if (!bodyResult.isEmpty()) {
+        result = bodyResult;
+      }
+      if (isLetOrConst) env_ = loopEnv;
+      if (flow_.type == ControlFlow::Type::Break) {
+        if (flow_.label.empty()) flow_.type = ControlFlow::Type::None;
+        break;
+      } else if (flow_.type == ControlFlow::Type::Continue) {
+        if (flow_.label.empty() || (!myLabel.empty() && flow_.label == myLabel)) {
+          flow_.type = ControlFlow::Type::None;
+          flow_.label.clear();
+        } else {
+          break;
+        }
+      } else if (flow_.type != ControlFlow::Type::None) {
+        break;
+      }
+    }
+  }
+
   // Iterate over class constructor properties.
   else if (auto* clsPtr = std::get_if<GCPtr<Class>>(&obj.data)) {
     std::vector<std::string> keys;
@@ -17120,6 +17685,24 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     auto outerEnv = env_;
     env_ = iterEnv;
 
+    auto handleAbruptBindingCompletion = [&]() -> bool {
+      if (flow_.type == ControlFlow::Type::None ||
+          flow_.type == ControlFlow::Type::Yield) {
+        return false;
+      }
+      if (flow_.type == ControlFlow::Type::Throw) {
+        // Per spec IteratorClose step 5: original throw completion always wins.
+        auto savedFlow = flow_;
+        flow_.type = ControlFlow::Type::None;
+        iteratorClose(iterator);
+        flow_ = savedFlow;
+      } else {
+        iteratorClose(iterator);
+      }
+      env_ = prevEnv;
+      return true;
+    };
+
     // Assign value to LHS
     if (lhsType == ForOfLHS::SimpleVar) {
       if (isConst) {
@@ -17141,13 +17724,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       }
     } else if (lhsType == ForOfLHS::DestructuringVar) {
       { auto t = bindDestructuringPattern(*lhsPattern, currentValue, isConst); LIGHTJS_RUN_TASK_VOID(t); }
-      if (flow_.type == ControlFlow::Type::Throw) {
-        // Per spec IteratorClose step 5: original throw completion always wins
-        auto savedFlow = flow_;
-        flow_.type = ControlFlow::Type::None;
-        iteratorClose(iterator);
-        flow_ = savedFlow;  // Always restore original throw (spec step 5)
-        env_ = prevEnv;
+      if (handleAbruptBindingCompletion()) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
     } else if (lhsType == ForOfLHS::ExpressionTarget && lhsExpr) {
@@ -17155,26 +17732,14 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       if (std::get_if<ArrayPattern>(&lhsExpr->node) || std::get_if<ObjectPattern>(&lhsExpr->node)) {
         // Destructuring assignment (for ({a, b} of ...) or for ([a, b] of ...))
         { auto t = bindDestructuringPattern(*lhsExpr, currentValue, false, true); LIGHTJS_RUN_TASK_VOID(t); }
-        if (flow_.type == ControlFlow::Type::Throw) {
-          // Per spec IteratorClose step 5: original throw completion always wins
-          auto savedFlow = flow_;
-          flow_.type = ControlFlow::Type::None;
-          iteratorClose(iterator);
-          flow_ = savedFlow;  // Always restore original throw (spec step 5)
-          env_ = prevEnv;
+        if (handleAbruptBindingCompletion()) {
           LIGHTJS_RETURN(Value(Undefined{}));
         }
       } else if (auto* member = std::get_if<MemberExpr>(& lhsExpr->node)) {
         (void)member;
         auto t = bindDestructuringPattern(*lhsExpr, currentValue, false, true);
         LIGHTJS_RUN_TASK_VOID(t);
-        // If assignment (via setter) threw, close iterator and propagate
-        if (flow_.type == ControlFlow::Type::Throw) {
-          auto savedFlow = flow_;
-          flow_.type = ControlFlow::Type::None;
-          iteratorClose(iterator);
-          flow_ = savedFlow;  // Original throw wins (spec step 5)
-          env_ = prevEnv;
+        if (handleAbruptBindingCompletion()) {
           LIGHTJS_RETURN(Value(Undefined{}));
         }
       }
@@ -17213,8 +17778,9 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       auto savedFlow = flow_;
       flow_.type = ControlFlow::Type::None;
       iteratorClose(iterator);
-      // If iteratorClose didn't throw, restore original throw
-      if (flow_.type == ControlFlow::Type::None) {
+      // AsyncIteratorClose preserves the original throw completion even if
+      // retrieving/calling `return` also throws.
+      if (stmt.isAwait || flow_.type == ControlFlow::Type::None) {
         flow_ = savedFlow;
       }
       break;

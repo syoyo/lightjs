@@ -357,15 +357,33 @@ struct Proxy : public GCObject {
 struct ArrayBuffer : public GCObject {
   std::vector<uint8_t> data;
   size_t byteLength;
+  size_t maxByteLength;
+  bool resizable;
+  std::vector<GCPtr<TypedArray>> views;
   OrderedMap<std::string, Value> properties;
 
-  ArrayBuffer(size_t length) : byteLength(length) {
+  ArrayBuffer(size_t length, size_t maxLength = 0)
+    : byteLength(length),
+      maxByteLength(maxLength == 0 ? length : maxLength),
+      resizable(maxLength != 0 && maxLength != length) {
     data.resize(length, 0);
   }
 
   // Constructor from existing data
   ArrayBuffer(const std::vector<uint8_t>& sourceData)
-    : data(sourceData), byteLength(sourceData.size()) {}
+    : data(sourceData),
+      byteLength(sourceData.size()),
+      maxByteLength(sourceData.size()),
+      resizable(false) {}
+
+  bool resize(size_t newByteLength) {
+    if (!resizable || newByteLength > maxByteLength) {
+      return false;
+    }
+    data.resize(newByteLength, 0);
+    byteLength = newByteLength;
+    return true;
+  }
 
   // GCObject interface
   const char* typeName() const override { return "ArrayBuffer"; }
@@ -493,14 +511,24 @@ inline float float16_to_float32(uint16_t value) {
 struct TypedArray : public GCObject {
   TypedArrayType type;
   std::vector<uint8_t> buffer;
+  GCPtr<ArrayBuffer> viewedBuffer;
   size_t byteOffset;
   size_t length;
+  bool lengthTracking;
   OrderedMap<std::string, Value> properties;
 
   TypedArray(TypedArrayType t, size_t len)
-    : type(t), byteOffset(0), length(len) {
+    : type(t), byteOffset(0), length(len), lengthTracking(false) {
     buffer.resize(len * elementSize());
   }
+
+  TypedArray(TypedArrayType t, GCPtr<ArrayBuffer> backing, size_t offset,
+             size_t len, bool isLengthTracking = false)
+    : type(t),
+      viewedBuffer(backing),
+      byteOffset(offset),
+      length(len),
+      lengthTracking(isLengthTracking) {}
 
   size_t elementSize() const {
     switch (type) {
@@ -528,6 +556,12 @@ struct TypedArray : public GCObject {
   void setElement(size_t index, double value);
   int64_t getBigIntElement(size_t index) const;
   void setBigIntElement(size_t index, int64_t value);
+  bool isView() const { return static_cast<bool>(viewedBuffer); }
+  bool isOutOfBounds() const;
+  size_t currentLength() const;
+  size_t currentByteLength() const;
+  std::vector<uint8_t>& storage();
+  const std::vector<uint8_t>& storage() const;
 
   // Bulk operations (SIMD-accelerated when USE_SIMD=1)
   // Copy elements from another TypedArray with type conversion

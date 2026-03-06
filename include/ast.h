@@ -40,6 +40,7 @@ struct BigIntLiteral {
 
 struct StringLiteral {
   std::string value;
+  bool hasLegacyEscape = false;
 };
 
 struct TemplateElement {
@@ -404,6 +405,8 @@ struct ContinueStmt {
   std::string label;
 };
 
+struct DebuggerStmt {};
+
 struct LabelledStmt {
   std::string label;
   StmtPtr body;
@@ -480,6 +483,7 @@ struct Statement {
     SwitchStmt,
     BreakStmt,
     ContinueStmt,
+    DebuggerStmt,
     LabelledStmt,
     ThrowStmt,
     TryStmt,

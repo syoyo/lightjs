@@ -353,6 +353,9 @@ private:
     // Internal: `yield*` needs to yield iterator result objects directly (i.e.
     // without wrapping in `{ value, done: false }`).
     bool yieldIsIteratorResult = false;
+    // Internal: async-generator delegated `yield*` values should bypass the
+    // plain `yield` Await step in runGeneratorNext.
+    bool yieldSkipsAsyncAwait = false;
     // Completion value from try/finally override for break/continue.
     // Set when finally block produces break/continue to carry the UpdateEmpty'd value.
     std::optional<Value> breakCompletionValue;
@@ -365,18 +368,28 @@ private:
       resumeValue = Value(Undefined{});
       breakCompletionValue = std::nullopt;
       yieldIsIteratorResult = false;
+      yieldSkipsAsyncAwait = false;
     }
 
     void setYield(const Value& v) {
       type = Type::Yield;
       value = v;
       yieldIsIteratorResult = false;
+      yieldSkipsAsyncAwait = false;
+    }
+
+    void setYieldWithoutAsyncAwait(const Value& v) {
+      type = Type::Yield;
+      value = v;
+      yieldIsIteratorResult = false;
+      yieldSkipsAsyncAwait = true;
     }
 
     void setYieldIteratorResult(const Value& iterResult) {
       type = Type::Yield;
       value = iterResult;
       yieldIsIteratorResult = true;
+      yieldSkipsAsyncAwait = false;
     }
 
     void prepareResume(ResumeMode mode, const Value& v) {
@@ -435,6 +448,7 @@ private:
   Value runGeneratorNext(const GCPtr<Generator>& generator,
                          ControlFlow::ResumeMode mode = ControlFlow::ResumeMode::None,
                          const Value& resumeValue = Value(Undefined{}));
+  Value awaitValue(const Value& value);
   std::optional<IteratorRecord> getIterator(const Value& iterable);
   Value iteratorNext(IteratorRecord& record);
   void iteratorClose(IteratorRecord& record);

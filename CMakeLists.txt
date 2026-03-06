@@ -356,6 +356,7 @@ if(LIGHTJS_BUILD_TESTS)
 
   # Memory limit test
   add_lightjs_test(memory_limit_test tests/memory_limit_test.cc)
+  add_lightjs_test(global_accessor_update_test tests/global_accessor_update_test.cc)
 
   # Debug tests (not added to CTest suite)
   add_executable(debug_test tests/debug_test.cc)

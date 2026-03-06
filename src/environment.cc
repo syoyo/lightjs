@@ -67,6 +67,28 @@ constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_sourc
 constexpr const char* kImportPhaseDeferSentinel = "__lightjs_import_phase_defer__";
 constexpr const char* kWithScopeObjectBinding = "__with_scope_object__";
 
+size_t typedArrayElementSize(TypedArrayType type) {
+  switch (type) {
+    case TypedArrayType::Int8:
+    case TypedArrayType::Uint8:
+    case TypedArrayType::Uint8Clamped:
+      return 1;
+    case TypedArrayType::Int16:
+    case TypedArrayType::Uint16:
+    case TypedArrayType::Float16:
+      return 2;
+    case TypedArrayType::Int32:
+    case TypedArrayType::Uint32:
+    case TypedArrayType::Float32:
+      return 4;
+    case TypedArrayType::Float64:
+    case TypedArrayType::BigInt64:
+    case TypedArrayType::BigUint64:
+      return 8;
+  }
+  return 1;
+}
+
 bool isInternalPropertyKeyForReflection(const std::string& key) {
   // Hide LightJS internal bookkeeping keys from reflection APIs.
   // Do NOT hide arbitrary "__user__" property names: Test262 relies on them.
@@ -113,47 +135,466 @@ bool isVisibleWithIdentifier(const std::string& name) {
   return true;
 }
 
-bool isBlockedByUnscopables(const GCPtr<Object>& bindings, const std::string& name) {
-  if (!bindings || !isVisibleWithIdentifier(name)) {
+bool isObjectLikeValue(const Value& value) {
+  return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
+         value.isProxy() || value.isPromise() || value.isGenerator() || value.isClass() ||
+         value.isMap() || value.isSet() || value.isWeakMap() || value.isWeakSet() ||
+         value.isTypedArray() || value.isArrayBuffer() || value.isDataView() || value.isError();
+}
+
+Value propertyKeyValueForName(const std::string& name) {
+  if (name == WellKnownSymbols::unscopablesKey()) {
+    return WellKnownSymbols::unscopables();
+  }
+  return Value(name);
+}
+
+bool parseArrayIndexKey(const std::string& key, size_t& index) {
+  if (key.empty()) {
     return false;
   }
+  if (key.size() > 1 && key[0] == '0') {
+    return false;
+  }
+  for (unsigned char ch : key) {
+    if (!std::isdigit(ch)) {
+      return false;
+    }
+  }
+  try {
+    size_t pos = 0;
+    unsigned long long parsed = std::stoull(key, &pos);
+    if (pos != key.size() || parsed > std::numeric_limits<size_t>::max()) {
+      return false;
+    }
+    index = static_cast<size_t>(parsed);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
 
-  const auto& unscopablesKey = WellKnownSymbols::unscopablesKey();
-  Value unscopablesValue(Undefined{});
-  auto unscopablesGetterIt = bindings->properties.find("__get_" + unscopablesKey);
-  if (unscopablesGetterIt != bindings->properties.end() &&
-      unscopablesGetterIt->second.isFunction()) {
-    if (auto* interpreter = getGlobalInterpreter()) {
-      unscopablesValue = interpreter->callForHarness(unscopablesGetterIt->second, {}, Value(bindings));
-      if (interpreter->hasError()) {
-        return true;
+std::optional<Value> getPrototypeValue(const Value& receiver) {
+  if (receiver.isObject()) {
+    auto obj = receiver.getGC<Object>();
+    auto it = obj->properties.find("__proto__");
+    if (it != obj->properties.end()) return it->second;
+  } else if (receiver.isArray()) {
+    auto arr = receiver.getGC<Array>();
+    auto it = arr->properties.find("__proto__");
+    if (it != arr->properties.end()) return it->second;
+  } else if (receiver.isFunction()) {
+    auto fn = receiver.getGC<Function>();
+    auto it = fn->properties.find("__proto__");
+    if (it != fn->properties.end()) return it->second;
+  } else if (receiver.isRegex()) {
+    auto regex = receiver.getGC<Regex>();
+    auto it = regex->properties.find("__proto__");
+    if (it != regex->properties.end()) return it->second;
+  } else if (receiver.isPromise()) {
+    auto p = receiver.getGC<Promise>();
+    auto it = p->properties.find("__proto__");
+    if (it != p->properties.end()) return it->second;
+  } else if (receiver.isGenerator()) {
+    auto gen = receiver.getGC<Generator>();
+    auto it = gen->properties.find("__proto__");
+    if (it != gen->properties.end()) return it->second;
+  } else if (receiver.isClass()) {
+    auto cls = receiver.getGC<Class>();
+    auto it = cls->properties.find("__proto__");
+    if (it != cls->properties.end()) return it->second;
+  } else if (receiver.isMap()) {
+    auto map = receiver.getGC<Map>();
+    auto it = map->properties.find("__proto__");
+    if (it != map->properties.end()) return it->second;
+  } else if (receiver.isSet()) {
+    auto set = receiver.getGC<Set>();
+    auto it = set->properties.find("__proto__");
+    if (it != set->properties.end()) return it->second;
+  } else if (receiver.isWeakMap()) {
+    auto wm = receiver.getGC<WeakMap>();
+    auto it = wm->properties.find("__proto__");
+    if (it != wm->properties.end()) return it->second;
+  } else if (receiver.isWeakSet()) {
+    auto ws = receiver.getGC<WeakSet>();
+    auto it = ws->properties.find("__proto__");
+    if (it != ws->properties.end()) return it->second;
+  } else if (receiver.isTypedArray()) {
+    auto ta = receiver.getGC<TypedArray>();
+    auto it = ta->properties.find("__proto__");
+    if (it != ta->properties.end()) return it->second;
+  } else if (receiver.isArrayBuffer()) {
+    auto ab = receiver.getGC<ArrayBuffer>();
+    auto it = ab->properties.find("__proto__");
+    if (it != ab->properties.end()) return it->second;
+  } else if (receiver.isDataView()) {
+    auto dv = receiver.getGC<DataView>();
+    auto it = dv->properties.find("__proto__");
+    if (it != dv->properties.end()) return it->second;
+  } else if (receiver.isError()) {
+    auto err = receiver.getGC<Error>();
+    auto it = err->properties.find("__proto__");
+    if (it != err->properties.end()) return it->second;
+  }
+  return std::nullopt;
+}
+
+bool isTypedArrayNumericName(const std::string& name) {
+  size_t index = 0;
+  if (parseArrayIndexKey(name, index)) {
+    return true;
+  }
+  return name == "NaN" || name == "-0" || name == "Infinity" || name == "-Infinity";
+}
+
+// Check if a property exists on an object without invoking getters.
+// This implements [[HasOwnProperty]] / [[GetOwnProperty]] existence check
+// without triggering accessor side effects.
+bool hasOwnPropertyNoInvoke(const Value& receiver, const std::string& name) {
+  if (receiver.isObject()) {
+    auto obj = receiver.getGC<Object>();
+    if (obj->properties.count("__get_" + name) > 0) return true;
+    if (obj->properties.count("__set_" + name) > 0) return true;
+    return obj->properties.count(name) > 0;
+  }
+  if (receiver.isArray()) {
+    auto arr = receiver.getGC<Array>();
+    if (name == "length") return true;
+    if (arr->properties.count("__get_" + name) > 0) return true;
+    if (arr->properties.count("__set_" + name) > 0) return true;
+    size_t index = 0;
+    if (parseArrayIndexKey(name, index) && index < arr->elements.size()) return true;
+    return arr->properties.count(name) > 0;
+  }
+  if (receiver.isFunction()) {
+    auto fn = receiver.getGC<Function>();
+    if (fn->properties.count("__get_" + name) > 0) return true;
+    if (fn->properties.count("__set_" + name) > 0) return true;
+    return fn->properties.count(name) > 0;
+  }
+  return false;
+}
+
+// Forward declarations
+bool hasPropertyLike(const Value& receiver, const std::string& name);
+
+// Check property existence without invoking getters, walking prototype chain.
+bool hasPropertyNoInvoke(const Value& receiver, const std::string& name) {
+  if (receiver.isProxy()) {
+    // For Proxy, delegate to hasPropertyLike which handles traps
+    return hasPropertyLike(receiver, name);
+  }
+  if (hasOwnPropertyNoInvoke(receiver, name)) {
+    return true;
+  }
+  auto proto = getPrototypeValue(receiver);
+  if (!proto.has_value() || proto->isNull() || proto->isUndefined() || !isObjectLikeValue(*proto)) {
+    return false;
+  }
+  return hasPropertyNoInvoke(*proto, name);
+}
+
+std::pair<bool, Value> getOwnPropertyLike(const Value& receiver,
+                                          const std::string& name,
+                                          const Value& accessReceiver) {
+  auto* interpreter = getGlobalInterpreter();
+  auto callGetter = [&](const Value& getter) -> Value {
+    if (!interpreter) {
+      return Value(Undefined{});
+    }
+    return interpreter->callForHarness(getter, {}, accessReceiver);
+  };
+
+  if (receiver.isObject()) {
+    auto obj = receiver.getGC<Object>();
+    auto getterIt = obj->properties.find("__get_" + name);
+    if (getterIt != obj->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (obj->properties.find("__set_" + name) != obj->properties.end()) {
+      return {true, Value(Undefined{})};
+    }
+    auto it = obj->properties.find(name);
+    if (it != obj->properties.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  }
+  if (receiver.isArray()) {
+    auto arr = receiver.getGC<Array>();
+    if (name == "length") return {true, Value(static_cast<double>(arr->elements.size()))};
+    auto getterIt = arr->properties.find("__get_" + name);
+    if (getterIt != arr->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (arr->properties.find("__set_" + name) != arr->properties.end()) return {true, Value(Undefined{})};
+    size_t index = 0;
+    if (parseArrayIndexKey(name, index) && index < arr->elements.size()) {
+      return {true, arr->elements[index]};
+    }
+    auto it = arr->properties.find(name);
+    if (it != arr->properties.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  }
+  if (receiver.isTypedArray()) {
+    auto ta = receiver.getGC<TypedArray>();
+    if (name == "length") return {true, Value(static_cast<double>(ta->currentLength()))};
+    if (name == "byteLength") return {true, Value(static_cast<double>(ta->currentByteLength()))};
+    if (name == "byteOffset") return {true, Value(static_cast<double>(ta->byteOffset))};
+    if (name == "buffer" && ta->viewedBuffer) return {true, Value(ta->viewedBuffer)};
+    auto getterIt = ta->properties.find("__get_" + name);
+    if (getterIt != ta->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (ta->properties.find("__set_" + name) != ta->properties.end()) return {true, Value(Undefined{})};
+    size_t index = 0;
+    if (parseArrayIndexKey(name, index) && index < ta->currentLength()) {
+      if (ta->type == TypedArrayType::BigInt64 || ta->type == TypedArrayType::BigUint64) {
+        return {true, Value(BigInt(ta->getBigIntElement(index)))};
+      }
+      return {true, Value(ta->getElement(index))};
+    }
+    auto it = ta->properties.find(name);
+    if (it != ta->properties.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  }
+  if (receiver.isFunction()) {
+    auto fn = receiver.getGC<Function>();
+    auto getterIt = fn->properties.find("__get_" + name);
+    if (getterIt != fn->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (fn->properties.find("__set_" + name) != fn->properties.end()) return {true, Value(Undefined{})};
+    auto it = fn->properties.find(name);
+    if (it != fn->properties.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  }
+  if (receiver.isRegex()) {
+    auto regex = receiver.getGC<Regex>();
+    auto getterIt = regex->properties.find("__get_" + name);
+    if (getterIt != regex->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (regex->properties.find("__set_" + name) != regex->properties.end()) return {true, Value(Undefined{})};
+    auto it = regex->properties.find(name);
+    if (it != regex->properties.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  }
+  if (receiver.isError()) {
+    auto err = receiver.getGC<Error>();
+    auto getterIt = err->properties.find("__get_" + name);
+    if (getterIt != err->properties.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (err->properties.find("__set_" + name) != err->properties.end()) return {true, Value(Undefined{})};
+    auto it = err->properties.find(name);
+    if (it != err->properties.end()) return {true, it->second};
+    if (name == "name") return {true, Value(err->getName())};
+    if (name == "message") return {true, Value(err->message)};
+    return {false, Value(Undefined{})};
+  }
+  auto getFromBag = [&](const OrderedMap<std::string, Value>& bag) -> std::pair<bool, Value> {
+    auto getterIt = bag.find("__get_" + name);
+    if (getterIt != bag.end()) {
+      if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
+      return {true, Value(Undefined{})};
+    }
+    if (bag.find("__set_" + name) != bag.end()) return {true, Value(Undefined{})};
+    auto it = bag.find(name);
+    if (it != bag.end()) return {true, it->second};
+    return {false, Value(Undefined{})};
+  };
+  if (receiver.isPromise()) return getFromBag(receiver.getGC<Promise>()->properties);
+  if (receiver.isGenerator()) return getFromBag(receiver.getGC<Generator>()->properties);
+  if (receiver.isClass()) return getFromBag(receiver.getGC<Class>()->properties);
+  if (receiver.isMap()) return getFromBag(receiver.getGC<Map>()->properties);
+  if (receiver.isSet()) return getFromBag(receiver.getGC<Set>()->properties);
+  if (receiver.isWeakMap()) return getFromBag(receiver.getGC<WeakMap>()->properties);
+  if (receiver.isWeakSet()) return getFromBag(receiver.getGC<WeakSet>()->properties);
+  if (receiver.isArrayBuffer()) return getFromBag(receiver.getGC<ArrayBuffer>()->properties);
+  if (receiver.isDataView()) return getFromBag(receiver.getGC<DataView>()->properties);
+  return {false, Value(Undefined{})};
+}
+
+std::pair<bool, Value> getPropertyLike(const Value& receiver,
+                                       const std::string& name,
+                                       const Value& originalReceiver) {
+  auto* interpreter = getGlobalInterpreter();
+  if (receiver.isProxy()) {
+    auto proxy = receiver.getGC<Proxy>();
+    if (proxy->handler && proxy->handler->isObject()) {
+      auto handlerObj = proxy->handler->getGC<Object>();
+      auto getIt = handlerObj->properties.find("get");
+      if (getIt != handlerObj->properties.end() && getIt->second.isFunction()) {
+        if (!proxy->target) {
+          return {true, Value(Undefined{})};
+        }
+        Value result = interpreter
+          ? interpreter->callForHarness(getIt->second,
+                                        {*proxy->target, propertyKeyValueForName(name), originalReceiver},
+                                        Value(handlerObj))
+          : Value(Undefined{});
+        return {true, result};
       }
     }
-  } else {
-    auto unscopablesIt = bindings->properties.find(unscopablesKey);
-    if (unscopablesIt != bindings->properties.end()) {
-      unscopablesValue = unscopablesIt->second;
+    if (proxy->target) {
+      return getPropertyLike(*proxy->target, name, originalReceiver);
     }
+    return {false, Value(Undefined{})};
   }
-  if (!unscopablesValue.isObject()) {
+
+  auto [found, value] = getOwnPropertyLike(receiver, name, originalReceiver);
+  if (found) {
+    return {true, value};
+  }
+
+  auto proto = getPrototypeValue(receiver);
+  if (!proto.has_value() || proto->isNull() || proto->isUndefined() || !isObjectLikeValue(*proto)) {
+    return {false, Value(Undefined{})};
+  }
+  return getPropertyLike(*proto, name, originalReceiver);
+}
+
+bool hasPropertyLike(const Value& receiver, const std::string& name) {
+  auto* interpreter = getGlobalInterpreter();
+  if (receiver.isProxy()) {
+    auto proxy = receiver.getGC<Proxy>();
+    if (proxy->handler && proxy->handler->isObject()) {
+      auto handlerObj = proxy->handler->getGC<Object>();
+      auto hasIt = handlerObj->properties.find("has");
+      if (hasIt != handlerObj->properties.end() && hasIt->second.isFunction()) {
+        if (!proxy->target || !interpreter) {
+          return false;
+        }
+        Value result = interpreter->callForHarness(
+          hasIt->second, {*proxy->target, propertyKeyValueForName(name)}, Value(handlerObj));
+        return !interpreter->hasError() && result.toBool();
+      }
+    }
+    if (proxy->target) {
+      return hasPropertyLike(*proxy->target, name);
+    }
     return false;
   }
 
-  std::unordered_set<Object*> visited;
-  auto current = unscopablesValue.getGC<Object>();
-  int depth = 0;
-  while (current && depth < 64 && visited.insert(current.get()).second) {
-    auto it = current->properties.find(name);
-    if (it != current->properties.end()) {
-      return it->second.toBool();
-    }
-    auto protoIt = current->properties.find("__proto__");
-    if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
-      break;
-    }
-    current = protoIt->second.getGC<Object>();
-    depth++;
+  if (hasOwnPropertyNoInvoke(receiver, name)) {
+    return true;
   }
+  if (interpreter && interpreter->hasError()) {
+    return false;
+  }
+  auto proto = getPrototypeValue(receiver);
+  if (!proto.has_value() || proto->isNull() || proto->isUndefined() || !isObjectLikeValue(*proto)) {
+    return false;
+  }
+  return hasPropertyLike(*proto, name);
+}
+
+bool isBlockedByUnscopables(const Value& bindings, const std::string& name) {
+  if (!isVisibleWithIdentifier(name)) {
+    return false;
+  }
+  auto [foundUnscopables, unscopablesValue] =
+    getPropertyLike(bindings, WellKnownSymbols::unscopablesKey(), bindings);
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return false;
+  }
+  if (!foundUnscopables || (!unscopablesValue.isObject() && !unscopablesValue.isProxy())) {
+    return false;
+  }
+  auto [foundBlocked, blocked] = getPropertyLike(unscopablesValue, name, unscopablesValue);
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return false;
+  }
+  return foundBlocked && blocked.toBool();
+}
+
+bool setPropertyLike(const Value& receiver, const std::string& name, const Value& value) {
+  auto* interpreter = getGlobalInterpreter();
+  if (receiver.isProxy()) {
+    auto proxy = receiver.getGC<Proxy>();
+    if (proxy->handler && proxy->handler->isObject()) {
+      auto handlerObj = proxy->handler->getGC<Object>();
+      auto setIt = handlerObj->properties.find("set");
+      if (setIt != handlerObj->properties.end() && setIt->second.isFunction()) {
+        if (!proxy->target || !interpreter) {
+          return false;
+        }
+        Value result = interpreter->callForHarness(
+          setIt->second, {*proxy->target, propertyKeyValueForName(name), value, receiver}, Value(handlerObj));
+        return !interpreter->hasError() && result.toBool();
+      }
+    }
+    if (proxy->target) {
+      return setPropertyLike(*proxy->target, name, value);
+    }
+    return false;
+  }
+  auto setOnBag = [&](auto& bag) -> bool {
+    auto setterIt = bag.find("__set_" + name);
+    if (setterIt != bag.end() && setterIt->second.isFunction()) {
+      if (!interpreter) {
+        return false;
+      }
+      interpreter->callForHarness(setterIt->second, {value}, receiver);
+      return !interpreter->hasError();
+    }
+    if (bag.count("__non_writable_" + name)) {
+      return false;
+    }
+    bag[name] = value;
+    return true;
+  };
+
+  if (receiver.isObject()) {
+    auto obj = receiver.getGC<Object>();
+    auto proto = getPrototypeValue(receiver);
+    if (proto.has_value() && isObjectLikeValue(*proto)) {
+      if (proto->isTypedArray() && isTypedArrayNumericName(name)) {
+        return false;
+      }
+    }
+    return setOnBag(obj->properties);
+  }
+
+  if (receiver.isArray()) {
+    auto arr = receiver.getGC<Array>();
+    if (name == "length") {
+      return false;
+    }
+    size_t index = 0;
+    if (parseArrayIndexKey(name, index)) {
+      auto setterIt = arr->properties.find("__set_" + name);
+      if (setterIt != arr->properties.end() && setterIt->second.isFunction()) {
+        if (!interpreter) {
+          return false;
+        }
+        interpreter->callForHarness(setterIt->second, {value}, receiver);
+        return !interpreter->hasError();
+      }
+      if (index >= arr->elements.size()) {
+        arr->elements.resize(index + 1, Value(Undefined{}));
+      }
+      arr->elements[index] = value;
+      return true;
+    }
+    return setOnBag(arr->properties);
+  }
+
+  if (receiver.isFunction()) {
+    auto fn = receiver.getGC<Function>();
+    return setOnBag(fn->properties);
+  }
+
+  if (receiver.isClass()) {
+    auto cls = receiver.getGC<Class>();
+    return setOnBag(cls->properties);
+  }
+
   return false;
 }
 
@@ -161,97 +602,40 @@ std::optional<Value> lookupWithScopeProperty(const Value& scopeValue, const std:
   if (!isVisibleWithIdentifier(name)) {
     return std::nullopt;
   }
-
-  Value lookupScope = scopeValue;
-  if (scopeValue.isProxy()) {
-    auto proxyPtr = scopeValue.getGC<Proxy>();
-    if (!proxyPtr->target || !proxyPtr->target->isObject()) {
-      return std::nullopt;
-    }
-    lookupScope = *proxyPtr->target;
-    if (proxyPtr->handler && proxyPtr->handler->isObject()) {
-      auto handlerObj = proxyPtr->handler->getGC<Object>();
-      auto hasIt = handlerObj->properties.find("has");
-      if (hasIt != handlerObj->properties.end() && hasIt->second.isFunction()) {
-        if (auto* interpreter = getGlobalInterpreter()) {
-          Value hasResult = interpreter->callForHarness(
-            hasIt->second, {*proxyPtr->target, Value(name)}, Value(handlerObj));
-          if (interpreter->hasError()) {
-            return std::nullopt;
-          }
-          if (!hasResult.toBool()) {
-            return std::nullopt;
-          }
-        }
-      }
-    }
-  }
-  if (!lookupScope.isObject()) {
+  if (!hasPropertyLike(scopeValue, name)) {
     return std::nullopt;
   }
-
-  std::unordered_set<Object*> visited;
-  auto bindings = lookupScope.getGC<Object>();
-  auto current = bindings;
-  int depth = 0;
-  while (current && depth < 64 && visited.insert(current.get()).second) {
-    auto it = current->properties.find(name);
-    if (it != current->properties.end()) {
-      if (isBlockedByUnscopables(bindings, name)) {
-        return std::nullopt;
-      }
-      return it->second;
-    }
-    auto getterIt = current->properties.find("__get_" + name);
-    if (getterIt != current->properties.end()) {
-      if (isBlockedByUnscopables(bindings, name)) {
-        return std::nullopt;
-      }
-      return Value(Undefined{});
-    }
-    auto setterIt = current->properties.find("__set_" + name);
-    if (setterIt != current->properties.end()) {
-      if (isBlockedByUnscopables(bindings, name)) {
-        return std::nullopt;
-      }
-      return Value(Undefined{});
-    }
-    auto protoIt = current->properties.find("__proto__");
-    if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
-      break;
-    }
-    current = protoIt->second.getGC<Object>();
-    depth++;
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  if (isBlockedByUnscopables(scopeValue, name)) {
+    return std::nullopt;
+  }
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return std::nullopt;
+  }
+  auto [found, value] = getPropertyLike(scopeValue, name, scopeValue);
+  if (!found) {
+    return Value(Undefined{});
+  }
+  return value;
 }
 
-bool setWithScopeProperty(const Value& scopeValue, const std::string& name, const Value& value) {
-  if (!isVisibleWithIdentifier(name) || !scopeValue.isObject()) {
+bool setWithScopeProperty(const Value& scopeValue,
+                          const std::string& name,
+                          const Value& value,
+                          bool strict) {
+  if (!isVisibleWithIdentifier(name)) {
     return false;
   }
-
-  auto receiver = scopeValue.getGC<Object>();
-  if (isBlockedByUnscopables(receiver, name)) {
+  bool stillExists = hasPropertyLike(scopeValue, name);
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
     return false;
   }
-  std::unordered_set<Object*> visited;
-  auto current = receiver;
-  int depth = 0;
-  while (current && depth < 64 && visited.insert(current.get()).second) {
-    auto it = current->properties.find(name);
-    if (it != current->properties.end()) {
-      receiver->properties[name] = value;
-      return true;
-    }
-    auto protoIt = current->properties.find("__proto__");
-    if (protoIt == current->properties.end() || !protoIt->second.isObject()) {
-      break;
-    }
-    current = protoIt->second.getGC<Object>();
-    depth++;
+  if (!stillExists && strict) {
+    return false;
   }
-  return false;
+  return setPropertyLike(scopeValue, name, value);
 }
 
 bool deleteWithScopeProperty(const Value& scopeValue, const std::string& name) {
@@ -1535,6 +1919,11 @@ void Environment::define(const std::string& name, const Value& value, bool isCon
   }
 }
 
+void Environment::defineImmutableNFE(const std::string& name, const Value& value) {
+  bindings_[name] = value;
+  silentImmutables_[name] = true;
+}
+
 void Environment::defineLexical(const std::string& name, const Value& value, bool isConst) {
   bindings_[name] = value;
   tdzBindings_.erase(name);
@@ -1574,9 +1963,11 @@ std::optional<Value> Environment::get(const std::string& name) const {
   }
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
   if (withScopeIt != bindings_.end()) {
-    auto withValue = lookupWithScopeProperty(withScopeIt->second, name);
-    if (withValue.has_value()) {
-      return withValue;
+    if (auto scopeValue = resolveWithScopeValue(name)) {
+      auto withValue = getWithScopeBindingValue(*scopeValue, name, false);
+      if (withValue.has_value()) {
+        return withValue;
+      }
     }
   }
   if (parent_) {
@@ -1588,6 +1979,45 @@ std::optional<Value> Environment::get(const std::string& name) const {
   auto globalIt = bindings_.find("globalThis");
   if (globalIt != bindings_.end() && globalIt->second.isObject()) {
     auto globalObj = globalIt->second.getGC<Object>();
+    auto getterIt = globalObj->properties.find("__get_" + name);
+    if (getterIt != globalObj->properties.end() && getterIt->second.isFunction()) {
+      if (auto* interpreter = getGlobalInterpreter()) {
+        return interpreter->callForHarness(getterIt->second, {}, Value(globalObj));
+      }
+      return Value(Undefined{});
+    }
+    if (globalObj->properties.find("__set_" + name) != globalObj->properties.end()) {
+      return Value(Undefined{});
+    }
+    auto propIt = globalObj->properties.find(name);
+    if (propIt != globalObj->properties.end()) {
+      return propIt->second;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<Value> Environment::getIgnoringWith(const std::string& name) const {
+  auto it = bindings_.find(name);
+  if (it != bindings_.end()) {
+    return it->second;
+  }
+  if (parent_) {
+    return parent_->getIgnoringWith(name);
+  }
+  auto globalIt = bindings_.find("globalThis");
+  if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+    auto globalObj = globalIt->second.getGC<Object>();
+    auto getterIt = globalObj->properties.find("__get_" + name);
+    if (getterIt != globalObj->properties.end() && getterIt->second.isFunction()) {
+      if (auto* interpreter = getGlobalInterpreter()) {
+        return interpreter->callForHarness(getterIt->second, {}, Value(globalObj));
+      }
+      return Value(Undefined{});
+    }
+    if (globalObj->properties.find("__set_" + name) != globalObj->properties.end()) {
+      return Value(Undefined{});
+    }
     auto propIt = globalObj->properties.find(name);
     if (propIt != globalObj->properties.end()) {
       return propIt->second;
@@ -1599,6 +2029,9 @@ std::optional<Value> Environment::get(const std::string& name) const {
 bool Environment::set(const std::string& name, const Value& value) {
   auto it = bindings_.find(name);
   if (it != bindings_.end()) {
+    if (silentImmutables_.find(name) != silentImmutables_.end()) {
+      return false;  // silently ignore writes to NFE name bindings
+    }
     if (constants_.find(name) != constants_.end()) {
       return false;
     }
@@ -1615,10 +2048,10 @@ bool Environment::set(const std::string& name, const Value& value) {
     }
     return true;
   }
-  auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
-  if (withScopeIt != bindings_.end() &&
-      setWithScopeProperty(withScopeIt->second, name, value)) {
-    return true;
+  if (auto scopeValue = resolveWithScopeValue(name)) {
+    if (setWithScopeProperty(*scopeValue, name, value, false)) {
+      return true;
+    }
   }
   if (parent_) {
     return parent_->set(name, value);
@@ -1644,7 +2077,7 @@ bool Environment::has(const std::string& name) const {
   }
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
   if (withScopeIt != bindings_.end() &&
-      lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
+      resolveWithScopeValue(name).has_value()) {
     return true;
   }
   if (parent_) {
@@ -1731,25 +2164,70 @@ Environment* Environment::resolveBindingEnvironment(const std::string& name) {
   return nullptr;
 }
 
-GCPtr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
-  // Check if this env has a local binding that shadows the name
+std::optional<Value> Environment::resolveWithScopeValue(const std::string& name) const {
   auto it = bindings_.find(name);
   if (it != bindings_.end()) {
-    return nullptr;  // Name is a local binding, not in with-scope
+    return std::nullopt;
   }
-  // Check with-scope object
   auto withScopeIt = bindings_.find(kWithScopeObjectBinding);
-  if (withScopeIt != bindings_.end() && withScopeIt->second.isObject()) {
-    auto obj = withScopeIt->second.getGC<Object>();
-    if (lookupWithScopeProperty(withScopeIt->second, name).has_value()) {
-      return obj;
-    }
-    if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
-      return obj;
+  if (withScopeIt != bindings_.end()) {
+    if (hasPropertyLike(withScopeIt->second, name)) {
+      if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+        return withScopeIt->second;
+      }
+      if (!isBlockedByUnscopables(withScopeIt->second, name)) {
+        if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+          return withScopeIt->second;
+        }
+        return withScopeIt->second;
+      }
+      if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+        return withScopeIt->second;
+      }
     }
   }
   if (parent_) {
-    return parent_->resolveWithScopeObject(name);
+    return parent_->resolveWithScopeValue(name);
+  }
+  return std::nullopt;
+}
+
+std::optional<Value> Environment::getWithScopeBindingValue(const Value& scopeValue,
+                                                           const std::string& name,
+                                                           bool strict) const {
+  if (!hasPropertyLike(scopeValue, name)) {
+    if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+      return std::nullopt;
+    }
+    if (strict) {
+      return std::nullopt;
+    }
+    return Value(Undefined{});
+  }
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return std::nullopt;
+  }
+  auto [found, value] = getPropertyLike(scopeValue, name, scopeValue);
+  if (auto* interpreter = getGlobalInterpreter(); interpreter && interpreter->hasError()) {
+    return std::nullopt;
+  }
+  if (!found) {
+    return Value(Undefined{});
+  }
+  return value;
+}
+
+bool Environment::setWithScopeBindingValue(const Value& scopeValue,
+                                           const std::string& name,
+                                           const Value& value,
+                                           bool strict) const {
+  return setWithScopeProperty(scopeValue, name, value, strict);
+}
+
+GCPtr<Object> Environment::resolveWithScopeObject(const std::string& name) const {
+  auto scopeValue = resolveWithScopeValue(name);
+  if (scopeValue && scopeValue->isObject()) {
+    return scopeValue->getGC<Object>();
   }
   return nullptr;
 }
@@ -1760,6 +2238,16 @@ bool Environment::isConst(const std::string& name) const {
   }
   if (parent_) {
     return parent_->isConst(name);
+  }
+  return false;
+}
+
+bool Environment::isSilentImmutable(const std::string& name) const {
+  if (silentImmutables_.find(name) != silentImmutables_.end()) {
+    return true;
+  }
+  if (parent_) {
+    return parent_->isSilentImmutable(name);
   }
   return false;
 }
@@ -2499,8 +2987,8 @@ GCPtr<Environment> Environment::createGlobal() {
   };
 
   std::function<std::pair<bool, Value>(const Value&, const std::string&)> getProperty;
-  getProperty = [getObjectProperty, getPropertyFromBag, callChecked, &getProperty](const Value& receiver,
-                                                                                  const std::string& key) -> std::pair<bool, Value> {
+  getProperty = [env, getObjectProperty, getPropertyFromBag, callChecked, &getProperty](const Value& receiver,
+                                                                                         const std::string& key) -> std::pair<bool, Value> {
     if (receiver.isObject()) {
       return getObjectProperty(receiver.getGC<Object>(), receiver, key);
     }
@@ -2570,7 +3058,23 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     if (receiver.isError()) {
       auto err = receiver.getGC<Error>();
-      return getPropertyFromBag(receiver, err->properties, key);
+      auto result = getPropertyFromBag(receiver, err->properties, key);
+      if (result.first) {
+        return result;
+      }
+      if (key == "name") {
+        return {true, Value(err->getName())};
+      }
+      if (key == "message") {
+        return {true, Value(err->message)};
+      }
+      if (key == "constructor") {
+        if (auto ctor = env->get(err->getName())) {
+          return {true, *ctor};
+        }
+        return {true, Value(Undefined{})};
+      }
+      return {false, Value(Undefined{})};
     }
     if (receiver.isProxy()) {
       auto proxy = receiver.getGC<Proxy>();
@@ -2820,9 +3324,47 @@ GCPtr<Environment> Environment::createGlobal() {
     func->isConstructor = true;
     func->properties["name"] = Value(name);
     func->properties["length"] = Value(1.0);
+    func->properties["BYTES_PER_ELEMENT"] = Value(static_cast<double>(typedArrayElementSize(type)));
     func->nativeFunc = [type](const std::vector<Value>& args) -> Value {
       if (args.empty()) {
         return Value(GarbageCollector::makeGC<TypedArray>(type, 0));
+      }
+
+      if (args[0].isArrayBuffer()) {
+        auto buffer = args[0].getGC<ArrayBuffer>();
+        size_t elementSize = typedArrayElementSize(type);
+        size_t byteOffset = 0;
+        if (args.size() > 1 && !args[1].isUndefined()) {
+          double offsetNum = args[1].toNumber();
+          if (std::isnan(offsetNum) || std::isinf(offsetNum) || offsetNum < 0) {
+            throw std::runtime_error("RangeError: Invalid typed array offset");
+          }
+          byteOffset = static_cast<size_t>(offsetNum);
+        }
+        if (byteOffset % elementSize != 0) {
+          throw std::runtime_error("RangeError: Invalid typed array offset");
+        }
+
+        bool lengthTracking = args.size() <= 2 || args[2].isUndefined();
+        size_t length = 0;
+        if (!lengthTracking) {
+          double lengthNum = args[2].toNumber();
+          if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
+            throw std::runtime_error("RangeError: Invalid typed array length");
+          }
+          length = static_cast<size_t>(lengthNum);
+          if (length > (std::numeric_limits<size_t>::max() - byteOffset) / elementSize ||
+              byteOffset + length * elementSize > buffer->byteLength) {
+            throw std::runtime_error("RangeError: Invalid typed array length");
+          }
+        } else if (byteOffset <= buffer->byteLength) {
+          length = (buffer->byteLength - byteOffset) / elementSize;
+        }
+
+        auto typedArray =
+          GarbageCollector::makeGC<TypedArray>(type, buffer, byteOffset, length, lengthTracking);
+        buffer->views.push_back(typedArray);
+        return Value(typedArray);
       }
 
       // Check if first argument is an array
@@ -2859,6 +3401,7 @@ GCPtr<Environment> Environment::createGlobal() {
     func->properties["prototype"] = Value(prototype);
     prototype->properties["constructor"] = Value(func);
     prototype->properties["name"] = Value(name);
+    prototype->properties["BYTES_PER_ELEMENT"] = Value(static_cast<double>(typedArrayElementSize(type)));
     return Value(func);
   };
 
@@ -2886,7 +3429,19 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!args.empty()) {
       length = static_cast<size_t>(args[0].toNumber());
     }
-    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length);
+    size_t maxByteLength = length;
+    if (args.size() > 1 && args[1].isObject()) {
+      auto options = args[1].getGC<Object>();
+      auto maxIt = options->properties.find("maxByteLength");
+      if (maxIt != options->properties.end() && !maxIt->second.isUndefined()) {
+        double maxNum = maxIt->second.toNumber();
+        if (std::isnan(maxNum) || std::isinf(maxNum) || maxNum < static_cast<double>(length)) {
+          throw std::runtime_error("RangeError: Invalid maxByteLength");
+        }
+        maxByteLength = static_cast<size_t>(maxNum);
+      }
+    }
+    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length, maxByteLength);
     GarbageCollector::instance().reportAllocation(length);
     return Value(buffer);
   };
@@ -2910,7 +3465,19 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!args.empty()) {
       length = static_cast<size_t>(args[0].toNumber());
     }
-    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length);
+    size_t maxByteLength = length;
+    if (args.size() > 1 && args[1].isObject()) {
+      auto options = args[1].getGC<Object>();
+      auto maxIt = options->properties.find("maxByteLength");
+      if (maxIt != options->properties.end() && !maxIt->second.isUndefined()) {
+        double maxNum = maxIt->second.toNumber();
+        if (std::isnan(maxNum) || std::isinf(maxNum) || maxNum < static_cast<double>(length)) {
+          throw std::runtime_error("RangeError: Invalid maxByteLength");
+        }
+        maxByteLength = static_cast<size_t>(maxNum);
+      }
+    }
+    auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length, maxByteLength);
     GarbageCollector::instance().reportAllocation(length);
     return Value(buffer);
   };
@@ -3040,11 +3607,12 @@ GCPtr<Environment> Environment::createGlobal() {
     auto typedArray = args[0].getGC<TypedArray>();
     std::random_device rd;
     std::mt19937 gen(rd());
+    auto& bytes = typedArray->storage();
 
     // Fill buffer with random bytes
     std::uniform_int_distribution<uint32_t> dis(0, 255);
-    for (size_t i = 0; i < typedArray->buffer.size(); ++i) {
-      typedArray->buffer[i] = static_cast<uint8_t>(dis(gen));
+    for (size_t i = 0; i < typedArray->currentByteLength(); ++i) {
+      bytes[typedArray->byteOffset + i] = static_cast<uint8_t>(dis(gen));
     }
 
     return args[0];  // Return the same array
@@ -4181,11 +4749,52 @@ GCPtr<Environment> Environment::createGlobal() {
     const Value& target = args[0];
     std::string prop = valueToPropertyKey(args[1]);
     const Value& value = args[2];
+    const Value& receiver = args.size() > 3 ? args[3] : target;
 
     if (target.isObject()) {
       auto obj = target.getGC<Object>();
       if (obj->isModuleNamespace) {
         return Value(false);
+      }
+      if (receiver.isProxy()) {
+        auto proxy = receiver.getGC<Proxy>();
+        if (proxy->handler && proxy->handler->isObject()) {
+          auto handlerObj = proxy->handler->getGC<Object>();
+          Interpreter* interpreter = getGlobalInterpreter();
+
+          auto getOwnPropertyDescriptorIt = handlerObj->properties.find("getOwnPropertyDescriptor");
+          if (getOwnPropertyDescriptorIt != handlerObj->properties.end() &&
+              getOwnPropertyDescriptorIt->second.isFunction() &&
+              interpreter && proxy->target) {
+            interpreter->callForHarness(
+              getOwnPropertyDescriptorIt->second,
+              {*proxy->target, Value(prop)},
+              Value(handlerObj));
+            if (interpreter->hasError()) {
+              Value err = interpreter->getError();
+              interpreter->clearError();
+              throw std::runtime_error(err.toString());
+            }
+          }
+
+          auto definePropertyIt = handlerObj->properties.find("defineProperty");
+          if (definePropertyIt != handlerObj->properties.end() &&
+              definePropertyIt->second.isFunction() &&
+              interpreter && proxy->target) {
+            auto descriptor = GarbageCollector::makeGC<Object>();
+            descriptor->properties["value"] = value;
+            Value result = interpreter->callForHarness(
+              definePropertyIt->second,
+              {*proxy->target, Value(prop), Value(descriptor)},
+              Value(handlerObj));
+            if (interpreter->hasError()) {
+              Value err = interpreter->getError();
+              interpreter->clearError();
+              throw std::runtime_error(err.toString());
+            }
+            return Value(result.toBool());
+          }
+        }
       }
       obj->properties[prop] = value;
       return Value(true);
@@ -5000,18 +5609,21 @@ GCPtr<Environment> Environment::createGlobal() {
       if (args.empty() || !args[0].isArray()) {
         return Value(Undefined{});
       }
-      auto arr = args[0].getGC<Array>();
+      Value arrayValue = args[0];
       auto iterObj = GarbageCollector::makeGC<Object>();
       auto indexPtr = std::make_shared<size_t>(0);
       auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
-      nextFn->nativeFunc = [arr, indexPtr](const std::vector<Value>&) -> Value {
+      nextFn->nativeFunc = [arrayValue, indexPtr](const std::vector<Value>&) -> Value {
+        auto arr = arrayValue.getGC<Array>();
         auto result = GarbageCollector::makeGC<Object>();
         if (*indexPtr >= arr->elements.size()) {
           result->properties["value"] = Value(Undefined{});
           result->properties["done"] = Value(true);
         } else {
-          result->properties["value"] = arr->elements[*indexPtr];
+          std::string indexKey = std::to_string(*indexPtr);
+          auto [found, value] = getOwnPropertyLike(arrayValue, indexKey, arrayValue);
+          result->properties["value"] = found ? value : Value(Undefined{});
           result->properties["done"] = Value(false);
           (*indexPtr)++;
         }
@@ -6458,6 +7070,34 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoIsPrototypeOf->isNative = true;
   objectProtoIsPrototypeOf->properties["__uses_this_arg__"] = Value(true);
   objectProtoIsPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto isObjectLikeValue = [](const Value& value) -> bool {
+      return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
+             value.isPromise() || value.isGenerator() || value.isClass() ||
+             value.isMap() || value.isSet() || value.isWeakMap() ||
+             value.isWeakSet() || value.isTypedArray() || value.isArrayBuffer() ||
+             value.isDataView() || value.isError() || value.isProxy();
+    };
+    auto sameReference = [](const Value& a, const Value& b) -> bool {
+      if (a.data.index() != b.data.index()) return false;
+      if (a.isObject()) return a.getGC<Object>().get() == b.getGC<Object>().get();
+      if (a.isArray()) return a.getGC<Array>().get() == b.getGC<Array>().get();
+      if (a.isFunction()) return a.getGC<Function>().get() == b.getGC<Function>().get();
+      if (a.isRegex()) return a.getGC<Regex>().get() == b.getGC<Regex>().get();
+      if (a.isProxy()) return a.getGC<Proxy>().get() == b.getGC<Proxy>().get();
+      if (a.isPromise()) return a.getGC<Promise>().get() == b.getGC<Promise>().get();
+      if (a.isGenerator()) return a.getGC<Generator>().get() == b.getGC<Generator>().get();
+      if (a.isClass()) return a.getGC<Class>().get() == b.getGC<Class>().get();
+      if (a.isMap()) return a.getGC<Map>().get() == b.getGC<Map>().get();
+      if (a.isSet()) return a.getGC<Set>().get() == b.getGC<Set>().get();
+      if (a.isWeakMap()) return a.getGC<WeakMap>().get() == b.getGC<WeakMap>().get();
+      if (a.isWeakSet()) return a.getGC<WeakSet>().get() == b.getGC<WeakSet>().get();
+      if (a.isTypedArray()) return a.getGC<TypedArray>().get() == b.getGC<TypedArray>().get();
+      if (a.isArrayBuffer()) return a.getGC<ArrayBuffer>().get() == b.getGC<ArrayBuffer>().get();
+      if (a.isDataView()) return a.getGC<DataView>().get() == b.getGC<DataView>().get();
+      if (a.isError()) return a.getGC<Error>().get() == b.getGC<Error>().get();
+      return false;
+    };
+
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
     }
@@ -6465,10 +7105,9 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(false);
     }
     Value protoVal = args[0];
-    if (!protoVal.isObject()) {
+    if (!isObjectLikeValue(protoVal)) {
       return Value(false);
     }
-    auto protoObj = protoVal.getGC<Object>();
 
     Value v = args[1];
     if (v.isUndefined() || v.isNull()) {
@@ -6506,7 +7145,7 @@ GCPtr<Environment> Environment::createGlobal() {
       if (p.isUndefined() || p.isNull()) {
         return Value(false);
       }
-      if (p.isObject() && p.getGC<Object>().get() == protoObj.get()) {
+      if (sameReference(p, protoVal)) {
         return Value(true);
       }
       cur = p;
@@ -6613,11 +7252,11 @@ GCPtr<Environment> Environment::createGlobal() {
 
     if (thisVal.isTypedArray()) {
       auto ta = thisVal.getGC<TypedArray>();
-      if (key == "length" || key == "byteLength") return Value(false);
+      if (key == "length" || key == "byteLength" || key == "buffer" || key == "byteOffset") return Value(false);
       if (!key.empty() && std::all_of(key.begin(), key.end(), ::isdigit)) {
         try {
           size_t idx = std::stoull(key);
-          if (idx < ta->length) return Value(true);
+          if (idx < ta->currentLength()) return Value(true);
         } catch (...) {
         }
       }

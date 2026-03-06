@@ -113,6 +113,7 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
   {"try", TokenType::Try},
   {"catch", TokenType::Catch},
   {"finally", TokenType::Finally},
+  {"debugger", TokenType::Debugger},
   {"throw", TokenType::Throw},
   {"new", TokenType::New},
   {"this", TokenType::This},
@@ -136,8 +137,8 @@ static const std::unordered_map<std::string_view, TokenType> keywords = {
 };
 
 Lexer::Lexer(std::string_view source) {
-  // Normalize source line terminators to '\n' so the lexer/parser can treat
-  // CR, CRLF, LS, and PS consistently (required by Test262).
+  // Normalize CR and CRLF to LF.  U+2028/U+2029 are kept as-is because
+  // ES2019 allows them inside string literals (json-superset).
   owned_source_.reserve(source.size());
   for (size_t i = 0; i < source.size(); i++) {
     unsigned char c = static_cast<unsigned char>(source[i]);
@@ -148,16 +149,6 @@ Lexer::Lexer(std::string_view source) {
       }
       owned_source_.push_back('\n');
       continue;
-    }
-    if (c == 0xE2 && i + 2 < source.size() &&
-        static_cast<unsigned char>(source[i + 1]) == 0x80) {
-      unsigned char third = static_cast<unsigned char>(source[i + 2]);
-      if (third == 0xA8 || third == 0xA9) {
-        // U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR
-        owned_source_.push_back('\n');
-        i += 2;
-        continue;
-      }
     }
     owned_source_.push_back(static_cast<char>(c));
   }
@@ -256,9 +247,16 @@ void Lexer::skipWhitespace() {
       // U+00A0 NO-BREAK SPACE
       advance();
       advance();
+    } else if (c == 0xE1 && static_cast<unsigned char>(peek()) == 0x9A &&
+               static_cast<unsigned char>(peek(2)) == 0x80) {
+      // U+1680 OGHAM SPACE MARK
+      advance(); advance(); advance();
     } else if (c == 0xE2 && static_cast<unsigned char>(peek()) == 0x80) {
       unsigned char third = static_cast<unsigned char>(peek(2));
-      if (third == 0xA8 || third == 0xA9) {
+      if (third >= 0x80 && third <= 0x8A) {
+        // U+2000-U+200A: EN QUAD through HAIR SPACE
+        advance(); advance(); advance();
+      } else if (third == 0xA8 || third == 0xA9) {
         // U+2028 LINE SEPARATOR or U+2029 PARAGRAPH SEPARATOR
         advance();
         advance();
@@ -266,9 +264,20 @@ void Lexer::skipWhitespace() {
         // Treat Unicode line/paragraph separators as line terminators.
         line_++;
         column_ = 1;
+      } else if (third == 0xAF) {
+        // U+202F NARROW NO-BREAK SPACE
+        advance(); advance(); advance();
       } else {
         break;
       }
+    } else if (c == 0xE2 && static_cast<unsigned char>(peek()) == 0x81 &&
+               static_cast<unsigned char>(peek(2)) == 0x9F) {
+      // U+205F MEDIUM MATHEMATICAL SPACE
+      advance(); advance(); advance();
+    } else if (c == 0xE3 && static_cast<unsigned char>(peek()) == 0x80 &&
+               static_cast<unsigned char>(peek(2)) == 0x80) {
+      // U+3000 IDEOGRAPHIC SPACE
+      advance(); advance(); advance();
     } else if (c == 0xEF && static_cast<unsigned char>(peek()) == 0xBB &&
                static_cast<unsigned char>(peek(2)) == 0xBF) {
       // U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)
@@ -283,6 +292,13 @@ void Lexer::skipWhitespace() {
 
 void Lexer::skipLineComment() {
   while (!isAtEnd() && current() != '\n') {
+    // U+2028/U+2029 are also line terminators
+    unsigned char c = static_cast<unsigned char>(current());
+    if (c == 0xE2 && pos_ + 2 < source_.size() &&
+        static_cast<unsigned char>(peek()) == 0x80) {
+      unsigned char third = static_cast<unsigned char>(peek(2));
+      if (third == 0xA8 || third == 0xA9) break;
+    }
     advance();
   }
 }
@@ -570,21 +586,55 @@ std::optional<Token> Lexer::readString(char quote) {
   advance();
 
   std::string str;
+  bool hasLegacyEscape = false;
   while (!isAtEnd() && current() != quote) {
-    if (current() == '\n') {
+    if (current() == '\n' || current() == '\r') {
       throw std::runtime_error("SyntaxError: Unterminated string literal");
     }
     if (current() == '\\') {
       advance();
       if (!isAtEnd()) {
+        unsigned char uc = static_cast<unsigned char>(current());
+        // LineContinuation with U+2028/U+2029
+        if (uc == 0xE2 && pos_ + 2 < source_.size() &&
+            static_cast<unsigned char>(peek()) == 0x80) {
+          unsigned char third = static_cast<unsigned char>(peek(2));
+          if (third == 0xA8 || third == 0xA9) {
+            advance(); advance(); advance();
+            continue;
+          }
+        }
         char c = current();
         switch (c) {
+          case '\r':
+            // LineContinuation: backslash + CR (optionally followed by LF)
+            if (!isAtEnd() && peek() == '\n') {
+              advance();  // skip the LF after CR
+            }
+            break;
           case '\n':
             // LineContinuation: backslash + line terminator is removed from string value
             break;
           case 'n': str += '\n'; break;
           case 't': str += '\t'; break;
           case 'r': str += '\r'; break;
+          case 'b': str += '\b'; break;
+          case 'f': str += '\f'; break;
+          case 'v': str += '\v'; break;
+          case '0':
+            // \0 is null character, but \00-\07 are legacy octal
+            if (!isAtEnd() && peek() >= '0' && peek() <= '7') {
+              // Legacy octal - handle below in default
+              hasLegacyEscape = true;
+              goto handle_default_escape;
+            }
+            // \08 and \09: \0 (null) followed by literal '8' or '9'
+            // But in strict mode, \0 followed by any digit is legacy
+            if (!isAtEnd() && (peek() == '8' || peek() == '9')) {
+              hasLegacyEscape = true;
+            }
+            str += '\0';
+            break;
           case '\\': str += '\\'; break;
           case '"': str += '"'; break;
           case '\'': str += '\''; break;
@@ -665,10 +715,37 @@ std::optional<Token> Lexer::readString(char quote) {
             if (lo < 0) {
               throw std::runtime_error("Invalid hexadecimal escape in string");
             }
-            str += static_cast<char>((hi << 4) | lo);
+            appendUtf8(str, static_cast<uint32_t>((hi << 4) | lo));
             break;
           }
-          default: str += c; break;
+          default:
+          handle_default_escape:
+            if (c >= '0' && c <= '7') {
+              // Legacy octal escape sequence
+              if (c >= '1') hasLegacyEscape = true;
+              int val = c - '0';
+              if (!isAtEnd() && peek() >= '0' && peek() <= '7') {
+                advance();
+                val = val * 8 + (current() - '0');
+                if (c <= '3' && !isAtEnd() && peek() >= '0' && peek() <= '7') {
+                  advance();
+                  val = val * 8 + (current() - '0');
+                }
+              }
+              if (c == '0' && val == 0) {
+                str += '\0';
+              } else {
+                hasLegacyEscape = true;
+                appendUtf8(str, static_cast<uint32_t>(val));
+              }
+            } else if (c == '8' || c == '9') {
+              // Legacy non-octal decimal escape \8 \9
+              hasLegacyEscape = true;
+              str += c;
+            } else {
+              str += c;
+            }
+            break;
         }
         advance();
       }
@@ -687,10 +764,14 @@ std::optional<Token> Lexer::readString(char quote) {
   // Only intern small strings (< 256 chars) to avoid memory bloat
   if (str.length() < 256) {
     auto internedStr = StringTable::instance().intern(str);
-    return Token(TokenType::String, internedStr, startLine, startColumn);
+    auto tok = Token(TokenType::String, internedStr, startLine, startColumn);
+    tok.hasLegacyEscape = hasLegacyEscape;
+    return tok;
   }
 
-  return Token(TokenType::String, str, startLine, startColumn);
+  auto tok = Token(TokenType::String, str, startLine, startColumn);
+  tok.hasLegacyEscape = hasLegacyEscape;
+  return tok;
 }
 
 std::optional<Token> Lexer::readTemplateLiteral() {

@@ -46,6 +46,7 @@ enum class TokenType {
   Try,
   Catch,
   Finally,
+  Debugger,
   Throw,
   New,
   This,
@@ -140,6 +141,7 @@ struct Token {
   uint32_t line;
   uint32_t column;
   bool escaped;
+  bool hasLegacyEscape = false;  // octal escapes (\1-\7) or \8 \9
 
   Token() : type(TokenType::Error), line(0), column(0), escaped(false) {}
   Token(TokenType t, std::string_view v, uint32_t l, uint32_t c)
