@@ -231,6 +231,18 @@ private:
         pos_++; // Skip opening brace
 
         auto obj = GarbageCollector::makeGC<Object>();
+        // Set Object.prototype as __proto__
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+            auto env = interp->getEnvironment();
+            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+                auto objFn = objCtor->getGC<Function>();
+                auto protoIt = objFn->properties.find("prototype");
+                if (protoIt != objFn->properties.end()) {
+                    obj->properties["__proto__"] = protoIt->second;
+                }
+            }
+        }
         skipWhitespace();
 
         if (pos_ < str_.size() && str_[pos_] == '}') {
@@ -259,7 +271,15 @@ private:
 
             // Parse value
             Value value = parseValue();
-            obj->properties[key] = value;
+            if (key == "__proto__") {
+                // JSON.parse must treat __proto__ as a regular data property
+                // (not a prototype setter) per ES spec §24.5.1
+                // Store value as own property data, keep real __proto__ as Object.prototype
+                obj->properties["__own_prop___proto__"] = value;
+                // Don't set obj->properties["__proto__"] = value which would change the prototype
+            } else {
+                obj->properties[key] = value;
+            }
 
             skipWhitespace();
             if (pos_ >= str_.size()) {
@@ -286,7 +306,7 @@ private:
         }
         pos_++; // Skip opening bracket
 
-        auto arr = GarbageCollector::makeGC<Array>();
+        auto arr = makeArrayWithPrototype();
         skipWhitespace();
 
         if (pos_ < str_.size() && str_[pos_] == ']') {
@@ -371,8 +391,15 @@ private:
     Value callToJSON(const Value& value, const std::string& key) {
         auto* interp = getGlobalInterpreter();
         if (!interp) return value;
-        // Use getPropertyForExternal to check prototype chain too
+        // Step 2a: Let toJSON be ? Get(value, "toJSON") — may invoke getter
         auto [found, toJSON] = interp->getPropertyForExternal(value, "toJSON");
+        // Check if the Get itself threw (e.g. getter throws)
+        if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw std::runtime_error(err.toString());
+        }
+        // Step 2b: If IsCallable(toJSON), call it
         if (found && toJSON.isFunction()) {
             Value result = interp->callForHarness(toJSON, {Value(key)}, value);
             if (interp->hasError()) {
@@ -430,11 +457,12 @@ private:
 
     // Returns true if value was written, false if it should be omitted
     bool serializeValue(const Value& holder, const std::string& key, Value value) {
-        // Step 1: call toJSON
+        // ES spec §24.5.2.1 SerializeJSONProperty:
+        // Step 2: If Type(value) is Object or BigInt, call toJSON
         value = callToJSON(value, key);
-        // Step 2: apply replacer
+        // Step 3: apply replacer
         value = applyReplacer(holder, key, value);
-        // Unwrap primitive wrappers
+        // Step 4: Unwrap primitive wrappers (Number/String/Boolean/BigInt objects)
         value = unwrapPrimitive(value);
 
         if (value.isUndefined() || value.isFunction() || value.isClass() || value.isSymbol()) {
@@ -771,8 +799,19 @@ public:
         indent_ = "";
         stack_.clear();
 
-        // Wrap in a holder object for the replacer
+        // Wrap in a holder object for the replacer (with Object.prototype)
         auto holder = GarbageCollector::makeGC<Object>();
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+            auto env = interp->getEnvironment();
+            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+                auto objFn = objCtor->getGC<Function>();
+                auto protoIt = objFn->properties.find("prototype");
+                if (protoIt != objFn->properties.end()) {
+                    holder->properties["__proto__"] = protoIt->second;
+                }
+            }
+        }
         holder->properties[""] = value;
         Value holderVal(holder);
 
@@ -786,30 +825,15 @@ public:
 // Internalize JSON property (reviver walk) per ES spec §24.5.1.1
 static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
                                       const std::string& name, const Value& reviverFn) {
-    // Step 1: Let val be Get(holder, name)
+    // Step 1: Let val be ? Get(holder, name) — uses prototype chain
     Value val;
-    if (holder.isObject()) {
-        auto obj = holder.getGC<Object>();
-        auto it = obj->properties.find(name);
-        val = (it != obj->properties.end()) ? it->second : Value(Undefined{});
-    } else if (holder.isArray()) {
-        auto arr = holder.getGC<Array>();
-        bool isIndex = false;
-        size_t idx = 0;
-        if (!name.empty()) {
-            bool allDigits = true;
-            for (char c : name) if (c < '0' || c > '9') { allDigits = false; break; }
-            if (allDigits) {
-                try { idx = std::stoull(name); isIndex = true; } catch (...) {}
-            }
-        }
-        if (isIndex && idx < arr->elements.size()) {
-            val = arr->elements[idx];
-        } else {
-            auto it = arr->properties.find(name);
-            val = (it != arr->properties.end()) ? it->second : Value(Undefined{});
-        }
+    auto [found, propVal] = interp->getPropertyForExternal(holder, name);
+    if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw std::runtime_error(err.toString());
     }
+    val = found ? propVal : Value(Undefined{});
 
     // Step 2: If val is an Object, walk its properties
     if (val.isObject()) {
@@ -845,20 +869,45 @@ static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
 
         for (const auto& key : orderedKeys) {
             Value newElement = internalizeJSONProperty(interp, val, key, reviverFn);
+            if (interp->hasError()) {
+                Value err = interp->getError();
+                interp->clearError();
+                throw std::runtime_error(err.toString());
+            }
             if (newElement.isUndefined()) {
-                obj->properties.erase(key);
+                // ES spec: [[Delete]](key) — silently fails for non-configurable
+                bool isNonConfigurable = (obj->properties.find("__non_configurable_" + key) != obj->properties.end());
+                if (!isNonConfigurable) {
+                    obj->properties.erase(key);
+                }
             } else {
-                obj->properties[key] = newElement;
+                // ES spec: CreateDataProperty — silently fails for non-configurable
+                bool isNonConfigurable = (obj->properties.find("__non_configurable_" + key) != obj->properties.end());
+                if (!isNonConfigurable) {
+                    obj->properties[key] = newElement;
+                }
             }
         }
     } else if (val.isArray()) {
         auto arr = val.getGC<Array>();
         for (size_t i = 0; i < arr->elements.size(); i++) {
-            Value newElement = internalizeJSONProperty(interp, val, std::to_string(i), reviverFn);
+            std::string idxStr = std::to_string(i);
+            Value newElement = internalizeJSONProperty(interp, val, idxStr, reviverFn);
+            if (interp->hasError()) {
+                Value err = interp->getError();
+                interp->clearError();
+                throw std::runtime_error(err.toString());
+            }
+            // Check non-configurable on array properties
+            bool isNonConfigurable = (arr->properties.find("__non_configurable_" + idxStr) != arr->properties.end());
             if (newElement.isUndefined()) {
-                arr->elements[i] = Value(Undefined{});
+                if (!isNonConfigurable) {
+                    arr->elements[i] = Value(Undefined{});
+                }
             } else {
-                arr->elements[i] = newElement;
+                if (!isNonConfigurable) {
+                    arr->elements[i] = newElement;
+                }
             }
         }
     }
@@ -904,8 +953,16 @@ Value JSON_parse(const std::vector<Value>& args) {
     if (args.size() > 1 && args[1].isFunction()) {
         Interpreter* interp = getGlobalInterpreter();
         if (interp) {
-            // Create wrapper object { "": result }
+            // Create wrapper object { "": result } with Object.prototype
             auto wrapper = GarbageCollector::makeGC<Object>();
+            auto env = interp->getEnvironment();
+            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+                auto objFn = objCtor->getGC<Function>();
+                auto protoIt = objFn->properties.find("prototype");
+                if (protoIt != objFn->properties.end()) {
+                    wrapper->properties["__proto__"] = protoIt->second;
+                }
+            }
             wrapper->properties[""] = result;
             result = internalizeJSONProperty(interp, Value(wrapper), "", args[1]);
         }
@@ -1062,23 +1119,14 @@ Value JSON_stringify(const std::vector<Value>& args) {
     // Top-level: apply replacer to val first via the holder
     // The stringifier handles this internally
 
-    try {
-        std::string result = stringifier.stringify(val);
-        if (result.empty() && (val.isUndefined() || val.isFunction() || val.isClass() || val.isSymbol())) {
-            return Value(Undefined{});
-        }
-        // Check if stringifier returned empty due to replacer returning undefined
-        if (result.empty()) {
-            return Value(Undefined{});
-        }
-        return Value(result);
-    } catch (const std::runtime_error& e) {
-        std::string msg = e.what();
-        if (msg.find("TypeError") != std::string::npos) {
-            throw; // re-throw TypeError (BigInt, circular)
-        }
+    std::string result = stringifier.stringify(val);
+    if (result.empty() && (val.isUndefined() || val.isFunction() || val.isClass() || val.isSymbol())) {
         return Value(Undefined{});
     }
+    if (result.empty()) {
+        return Value(Undefined{});
+    }
+    return Value(result);
 }
 
 } // namespace lightjs
