@@ -2890,6 +2890,12 @@ GCPtr<Environment> Environment::createGlobal() {
     return result;
   };
   evalFn->properties["__is_intrinsic_eval__"] = Value(true);
+  evalFn->properties["name"] = Value(std::string("eval"));
+  evalFn->properties["__non_writable_name"] = Value(true);
+  evalFn->properties["__non_enum_name"] = Value(true);
+  evalFn->properties["length"] = Value(1.0);
+  evalFn->properties["__non_writable_length"] = Value(true);
+  evalFn->properties["__non_enum_length"] = Value(true);
   env->define("eval", Value(evalFn));
 
   // Symbol constructor

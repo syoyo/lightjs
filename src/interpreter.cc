@@ -8675,7 +8675,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           trimFn->nativeFunc = [str](const std::vector<Value>&) -> Value {
             return Value(stripESWhitespace(str));
           };
-          LIGHTJS_RETURN(Value(trimFn));
+          setNativeFnProps(trimFn, "trim", 0);
+      LIGHTJS_RETURN(Value(trimFn));
         }
       } else if (prim.isNumber()) {
         double num = prim.toNumber();
@@ -10733,13 +10734,21 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       includesFn->isNative = true;
       includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(false);
+        // ES spec: throw TypeError if searchString is a RegExp
+        if (args[0].isRegex()) {
+          throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
+        }
         std::string searchStr = args[0].toString();
         size_t position = 0;
-        if (args.size() > 1) {
-          position = static_cast<size_t>(args[1].toNumber());
+        if (args.size() > 1 && !args[1].isUndefined()) {
+          double pos = args[1].toNumber();
+          if (std::isnan(pos) || pos < 0) pos = 0;
+          if (pos > static_cast<double>(str.length())) return Value(false);
+          position = static_cast<size_t>(pos);
         }
         return Value(str.find(searchStr, position) != std::string::npos);
       };
+      setNativeFnProps(includesFn, "includes", 1);
       LIGHTJS_RETURN(Value(includesFn));
     }
 
@@ -10756,6 +10765,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
+      setNativeFnProps(repeatFn, "repeat", 1);
       LIGHTJS_RETURN(Value(repeatFn));
     }
 
@@ -10778,6 +10788,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         result = result.substr(0, padLength) + str;
         return Value(result);
       };
+      setNativeFnProps(padStartFn, "padStart", 1);
       LIGHTJS_RETURN(Value(padStartFn));
     }
 
@@ -10800,6 +10811,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         result = result.substr(0, targetLength);
         return Value(result);
       };
+      setNativeFnProps(padEndFn, "padEnd", 1);
       LIGHTJS_RETURN(Value(padEndFn));
     }
 
@@ -10809,6 +10821,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripESWhitespace(str));
       };
+      setNativeFnProps(trimFn, "trim", 0);
       LIGHTJS_RETURN(Value(trimFn));
     }
 
@@ -10818,6 +10831,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripLeadingESWhitespace(str));
       };
+      setNativeFnProps(trimStartFn, "trimStart", 0);
       LIGHTJS_RETURN(Value(trimStartFn));
     }
 
@@ -10827,6 +10841,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripTrailingESWhitespace(str));
       };
+      setNativeFnProps(trimEndFn, "trimEnd", 0);
       LIGHTJS_RETURN(Value(trimEndFn));
     }
 
@@ -10891,11 +10906,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(true);
+        if (args[0].isRegex()) {
+          throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+        }
         std::string searchStr = args[0].toString();
         size_t position = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : 0;
         if (position > str.length()) return Value(false);
         return Value(str.compare(position, searchStr.length(), searchStr) == 0);
       };
+      setNativeFnProps(fn, "startsWith", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10904,12 +10923,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(true);
+        if (args[0].isRegex()) {
+          throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+        }
         std::string searchStr = args[0].toString();
         size_t endPos = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : str.length();
         if (endPos > str.length()) endPos = str.length();
         if (searchStr.length() > endPos) return Value(false);
         return Value(str.compare(endPos - searchStr.length(), searchStr.length(), searchStr) == 0);
       };
+      setNativeFnProps(fn, "endsWith", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10921,6 +10944,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         // Full Unicode normalization (NFC, NFD, etc.) is complex
         return Value(str);
       };
+      setNativeFnProps(fn, "normalize", 0);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10933,6 +10957,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         int result = str.compare(other);
         return Value(static_cast<double>(result < 0 ? -1 : (result > 0 ? 1 : 0)));
       };
+      setNativeFnProps(fn, "localeCompare", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10953,6 +10978,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
+      setNativeFnProps(fn, "concat", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10973,6 +10999,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
       };
+      setNativeFnProps(fn, "indexOf", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -10994,6 +11021,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
       };
+      setNativeFnProps(fn, "lastIndexOf", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11022,6 +11050,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
       };
+      setNativeFnProps(fn, "search", 1);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11052,6 +11081,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
         return Value(Null{});
       };
+      setNativeFnProps(matchFn, "match", 1);
       LIGHTJS_RETURN(Value(matchFn));
     }
 
@@ -11150,6 +11180,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           return Value(result);
         }
       };
+      setNativeFnProps(replaceFn, "replace", 2);
       LIGHTJS_RETURN(Value(replaceFn));
     }
 
@@ -11169,6 +11200,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
+      setNativeFnProps(replaceAllFn, "replaceAll", 2);
       LIGHTJS_RETURN(Value(replaceAllFn));
     }
 
@@ -11187,6 +11219,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result);
       };
+      setNativeFnProps(repeatFn, "repeat", 1);
       LIGHTJS_RETURN(Value(repeatFn));
     }
 
@@ -11216,6 +11249,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(result + str);
       };
+      setNativeFnProps(padStartFn, "padStart", 1);
       LIGHTJS_RETURN(Value(padStartFn));
     }
 
@@ -11244,6 +11278,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         return Value(str + result);
       };
+      setNativeFnProps(padEndFn, "padEnd", 1);
       LIGHTJS_RETURN(Value(padEndFn));
     }
 
@@ -11253,6 +11288,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripESWhitespace(str));
       };
+      setNativeFnProps(trimFn, "trim", 0);
       LIGHTJS_RETURN(Value(trimFn));
     }
 
@@ -11262,6 +11298,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripLeadingESWhitespace(str));
       };
+      setNativeFnProps(trimStartFn, "trimStart", 0);
       LIGHTJS_RETURN(Value(trimStartFn));
     }
 
@@ -11271,6 +11308,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripTrailingESWhitespace(str));
       };
+      setNativeFnProps(trimEndFn, "trimEnd", 0);
       LIGHTJS_RETURN(Value(trimEndFn));
     }
 
@@ -11295,6 +11333,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (start > end) std::swap(start, end);
         return Value(str.substr(start, end - start));
       };
+      setNativeFnProps(fn, "substring", 2);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11319,6 +11358,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (start >= end) return Value(std::string(""));
         return Value(str.substr(start, end - start));
       };
+      setNativeFnProps(fn, "slice", 2);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11340,6 +11380,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         if (start >= len || length <= 0) return Value(std::string(""));
         return Value(str.substr(start, length));
       };
+      setNativeFnProps(fn, "substr", 2);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11351,6 +11392,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         std::transform(result.begin(), result.end(), result.begin(), ::toupper);
         return Value(result);
       };
+      setNativeFnProps(fn, propName, 0);
       LIGHTJS_RETURN(Value(fn));
     }
 
@@ -11362,6 +11404,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         std::transform(result.begin(), result.end(), result.begin(), ::tolower);
         return Value(result);
       };
+      setNativeFnProps(fn, propName, 0);
       LIGHTJS_RETURN(Value(fn));
     }
 
