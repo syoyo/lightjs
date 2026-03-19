@@ -44,9 +44,22 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Math` | 325 | 327 | 99.4% |
 | `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
-| `built-ins/JSON` | 115 | 165 | 69.7% |
+| `built-ins/JSON` | 125 | 165 | 75.8% |
 
 Unit tests: 346/346 passing.
+
+#### Changes (2026-03-20 #3)
+
+10 JSON tests fixed (115→125/165), 0 regressions:
+
+- **JSON.parse `__proto__`** (`src/json.cc`): treat `__proto__` as regular data property via `__own_prop___proto__` marker, without modifying prototype chain.
+- **JSON.parse prototype chain** (`src/json.cc`): objects get `Object.prototype`, arrays use `makeArrayWithPrototype()`, enabling `hasOwnProperty` and other inherited methods on parsed values.
+- **JSON.parse reviver wrapper** (`src/json.cc`): wrapper object gets `Object.prototype`, proper `""` key data property.
+- **JSON.parse reviver non-configurable** (`src/json.cc`): delete/create silently fail for non-configurable properties per OrdinaryDelete/CreateDataProperty spec.
+- **JSON.parse reviver Get** (`src/json.cc`): use `getPropertyForExternal` for proper prototype chain lookup during reviver walk.
+- **JSON.stringify toJSON abrupt** (`src/json.cc`): check `hasError()` after `getPropertyForExternal` to propagate getter errors.
+- **JSON.stringify wrapper** (`src/json.cc`): wrapper object gets `Object.prototype`.
+- **JSON.stringify error propagation** (`src/json.cc`): remove try/catch that swallowed non-TypeError exceptions.
 
 #### Changes (2026-03-20 #2)
 
@@ -348,7 +361,7 @@ REPL debugging commands:
 **Status:** `language` 98.2%, expanding to `built-ins`
 
 Next targets for `built-ins` scope (by priority):
-- **JSON** (69.7%): `JSON.rawJSON`/`JSON.isRawJSON` (14 tests), Proxy-dependent tests, reviver edge cases
+- **JSON** (75.8%): 40 remaining failures — `JSON.rawJSON`/`JSON.isRawJSON` (14), Proxy-dependent (15), ES2024 reviver context/source (5), BigInt `this` boxing (2), array element deletion prototype chain (1), other edge cases (3)
 - **Math** (99.4%): `Math.sumPrecise` rounding correction (1 test), `Math.f16round` value conversion (1 test)
 - **Number** (99.7%): `proto-from-ctor-realm` (1 remaining failure, requires multi-realm support)
 - **Boolean** (98.0%): `proto-from-ctor-realm` (1 remaining failure)
