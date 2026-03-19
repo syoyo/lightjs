@@ -1949,6 +1949,7 @@ void gatherAsyncTransitiveDependencies(const std::string& modulePath,
 static std::shared_ptr<ModuleLoader> g_moduleLoader;
 static Interpreter* g_interpreter = nullptr;
 static Value g_arrayPrototype;
+static Value g_objectPrototype;
 
 void setGlobalModuleLoader(std::shared_ptr<ModuleLoader> loader) {
   g_moduleLoader = loader;
@@ -1977,6 +1978,19 @@ GCPtr<Array> makeArrayWithPrototype() {
     arr->properties["__proto__"] = g_arrayPrototype;
   }
   return arr;
+}
+
+void setGlobalObjectPrototype(const Value& proto) {
+  g_objectPrototype = proto;
+}
+
+GCPtr<Object> makeObjectWithPrototype() {
+  auto obj = GarbageCollector::makeGC<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  if (!g_objectPrototype.isUndefined()) {
+    obj->properties["__proto__"] = g_objectPrototype;
+  }
+  return obj;
 }
 
 Environment::Environment(Environment* parent)
@@ -16246,6 +16260,7 @@ GCPtr<Environment> Environment::createGlobal() {
   objectPrototype->properties["constructor"] = Value(objectConstructor);
   objectPrototype->properties["__non_enum_constructor"] = Value(true);
   env->define("__object_prototype__", Value(objectPrototype));
+  setGlobalObjectPrototype(Value(objectPrototype));
   // Set JSON/Reflect [[Prototype]] to Object.prototype (defined earlier but before objectPrototype)
   if (auto jsonVal = env->get("__intrinsic_JSON__"); jsonVal && jsonVal->isObject()) {
     jsonVal->getGC<Object>()->properties["__proto__"] = Value(objectPrototype);
@@ -18327,8 +18342,7 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
     }
-    auto result = GarbageCollector::makeGC<Object>();
-    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto result = makeObjectWithPrototype();
 
     // Handle string primitives: enumerate indices + length
     if (args[0].isString()) {

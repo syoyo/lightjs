@@ -230,19 +230,7 @@ private:
         }
         pos_++; // Skip opening brace
 
-        auto obj = GarbageCollector::makeGC<Object>();
-        // Set Object.prototype as __proto__
-        auto* interp = getGlobalInterpreter();
-        if (interp) {
-            auto env = interp->getEnvironment();
-            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
-                auto objFn = objCtor->getGC<Function>();
-                auto protoIt = objFn->properties.find("prototype");
-                if (protoIt != objFn->properties.end()) {
-                    obj->properties["__proto__"] = protoIt->second;
-                }
-            }
-        }
+        auto obj = makeObjectWithPrototype();
         skipWhitespace();
 
         if (pos_ < str_.size() && str_[pos_] == '}') {
@@ -800,18 +788,7 @@ public:
         stack_.clear();
 
         // Wrap in a holder object for the replacer (with Object.prototype)
-        auto holder = GarbageCollector::makeGC<Object>();
-        auto* interp = getGlobalInterpreter();
-        if (interp) {
-            auto env = interp->getEnvironment();
-            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
-                auto objFn = objCtor->getGC<Function>();
-                auto protoIt = objFn->properties.find("prototype");
-                if (protoIt != objFn->properties.end()) {
-                    holder->properties["__proto__"] = protoIt->second;
-                }
-            }
-        }
+        auto holder = makeObjectWithPrototype();
         holder->properties[""] = value;
         Value holderVal(holder);
 
@@ -954,15 +931,7 @@ Value JSON_parse(const std::vector<Value>& args) {
         Interpreter* interp = getGlobalInterpreter();
         if (interp) {
             // Create wrapper object { "": result } with Object.prototype
-            auto wrapper = GarbageCollector::makeGC<Object>();
-            auto env = interp->getEnvironment();
-            if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
-                auto objFn = objCtor->getGC<Function>();
-                auto protoIt = objFn->properties.find("prototype");
-                if (protoIt != objFn->properties.end()) {
-                    wrapper->properties["__proto__"] = protoIt->second;
-                }
-            }
+            auto wrapper = makeObjectWithPrototype();
             wrapper->properties[""] = result;
             result = internalizeJSONProperty(interp, Value(wrapper), "", args[1]);
         }

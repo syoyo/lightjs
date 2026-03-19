@@ -18,6 +18,8 @@ Interpreter* getGlobalInterpreter();
 void setGlobalArrayPrototype(const Value& proto);
 Value getGlobalArrayPrototype();
 GCPtr<Array> makeArrayWithPrototype();
+void setGlobalObjectPrototype(const Value& proto);
+GCPtr<Object> makeObjectWithPrototype();
 class Environment : public GCObject, public std::enable_shared_from_this<Environment> {
 public:
   Environment() = default;
