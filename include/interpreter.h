@@ -325,6 +325,9 @@ public:
   // Unlike eval, this uses proper GlobalDeclarationInstantiation semantics.
   Value runScriptInGlobalScope(const std::string& source);
 
+  // Run generator.next() - public wrapper for native code that needs to iterate generators
+  Value generatorNext(const Value& generatorVal, const Value& resumeValue = Value(Undefined{}));
+
   // Public ToPrimitive for native code (ES spec ToPrimitive)
   Value toPrimitive(const Value& input, bool preferString) {
     return toPrimitiveValue(input, preferString);

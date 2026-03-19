@@ -10907,6 +10907,9 @@ GCPtr<Environment> Environment::createGlobal() {
       if (prim.isSymbol()) {
         throw std::runtime_error("TypeError: Cannot convert a Symbol value to a number");
       }
+      if (prim.isBigInt()) {
+        throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
+      }
       return prim.toNumber();
     };
 

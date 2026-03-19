@@ -2196,7 +2196,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
       if (rawKey.rfind("__get_", 0) == 0 || rawKey.rfind("__set_", 0) == 0) {
         exposed = rawKey.substr(6);
       }
-      if (!exposed.empty() && seen.insert(exposed).second) {
+      if (seen.insert(exposed).second) {
         keys.push_back(exposed);
       }
     }
@@ -2306,7 +2306,7 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     if (rawKey.rfind("__get_", 0) == 0 || rawKey.rfind("__set_", 0) == 0) {
       exposed = rawKey.substr(6);
     }
-    if (!exposed.empty() && seen.insert(exposed).second) {
+    if (seen.insert(exposed).second) {
       keys.push_back(exposed);
     }
   }

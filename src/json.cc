@@ -17,8 +17,14 @@ private:
     size_t pos_;
 
     void skipWhitespace() {
-        while (pos_ < str_.size() && std::isspace(str_[pos_])) {
-            pos_++;
+        // JSON spec: only SP, HT, LF, CR are valid whitespace
+        while (pos_ < str_.size()) {
+            char ch = str_[pos_];
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+                pos_++;
+            } else {
+                break;
+            }
         }
     }
 
@@ -361,29 +367,20 @@ private:
         }
     }
 
-    // Call toJSON if present (ES spec: GetV checks prototype chain for primitives too)
+    // Call toJSON if present and callable (ES spec §24.5.2 step 2)
     Value callToJSON(const Value& value, const std::string& key) {
         auto* interp = getGlobalInterpreter();
         if (!interp) return value;
-        // For objects, check own properties first
-        if (value.isObject()) {
-            auto obj = value.getGC<Object>();
-            auto it = obj->properties.find("toJSON");
-            if (it != obj->properties.end() && it->second.isFunction()) {
-                return interp->callForHarness(it->second, {Value(key)}, value);
+        // Use getPropertyForExternal to check prototype chain too
+        auto [found, toJSON] = interp->getPropertyForExternal(value, "toJSON");
+        if (found && toJSON.isFunction()) {
+            Value result = interp->callForHarness(toJSON, {Value(key)}, value);
+            if (interp->hasError()) {
+                Value err = interp->getError();
+                interp->clearError();
+                throw std::runtime_error(err.toString());
             }
-        } else if (value.isArray()) {
-            auto arr = value.getGC<Array>();
-            auto it = arr->properties.find("toJSON");
-            if (it != arr->properties.end() && it->second.isFunction()) {
-                return interp->callForHarness(it->second, {Value(key)}, value);
-            }
-        } else if (value.isBigInt()) {
-            // Check BigInt.prototype.toJSON via property lookup
-            auto [found, toJSON] = interp->getPropertyForExternal(value, "toJSON");
-            if (found && toJSON.isFunction()) {
-                return interp->callForHarness(toJSON, {Value(key)}, value);
-            }
+            return result;
         }
         return value;
     }
@@ -464,29 +461,107 @@ private:
         } else if (value.isObject() || value.isError()) {
             checkCircular(value);
             serializeObject(value);
+        } else if (value.isRegex() || value.isMap() || value.isSet() ||
+                   value.isProxy() || value.isWeakMap() || value.isWeakSet()) {
+            // Non-callable object types serialize as plain objects
+            out_ << "{}";
         } else {
             out_ << "null";
         }
         return true;
     }
 
+    // Decode a UTF-8 code point from str starting at pos. Returns the code point
+    // and advances pos past the sequence. Returns -1 on invalid sequence.
+    static int32_t decodeUTF8(const std::string& str, size_t& pos) {
+        unsigned char ch = static_cast<unsigned char>(str[pos]);
+        if (ch < 0x80) { pos++; return ch; }
+        int32_t cp = 0;
+        int extra = 0;
+        if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+        else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
+        else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
+        else { pos++; return -1; }
+        if (pos + extra >= str.size()) { pos++; return -1; }
+        for (int i = 0; i < extra; i++) {
+            pos++;
+            unsigned char cont = static_cast<unsigned char>(str[pos]);
+            if ((cont & 0xC0) != 0x80) return -1;
+            cp = (cp << 6) | (cont & 0x3F);
+        }
+        pos++;
+        return cp;
+    }
+
+    void writeEscapedCodePoint(std::ostringstream& os, int32_t cp) {
+        // ES spec: unpaired surrogates get \uXXXX escaped
+        // Supplementary plane chars (>= 0x10000) get output as UTF-8 directly
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << cp;
+            os << std::dec;
+        } else if (cp < 0x20) {
+            os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << cp;
+            os << std::dec;
+        } else if (cp < 0x80) {
+            os << static_cast<char>(cp);
+        } else {
+            // Encode as UTF-8
+            if (cp <= 0x7FF) {
+                os << static_cast<char>(0xC0 | (cp >> 6));
+                os << static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp <= 0xFFFF) {
+                os << static_cast<char>(0xE0 | (cp >> 12));
+                os << static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                os << static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                os << static_cast<char>(0xF0 | (cp >> 18));
+                os << static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                os << static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                os << static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+    }
+
     void stringifyString(const std::string& str) {
         out_ << '"';
-        for (unsigned char ch : str) {
+        size_t i = 0;
+        while (i < str.size()) {
+            unsigned char ch = static_cast<unsigned char>(str[i]);
             switch (ch) {
-                case '"': out_ << "\\\""; break;
-                case '\\': out_ << "\\\\"; break;
-                case '\b': out_ << "\\b"; break;
-                case '\f': out_ << "\\f"; break;
-                case '\n': out_ << "\\n"; break;
-                case '\r': out_ << "\\r"; break;
-                case '\t': out_ << "\\t"; break;
+                case '"': out_ << "\\\""; i++; break;
+                case '\\': out_ << "\\\\"; i++; break;
+                case '\b': out_ << "\\b"; i++; break;
+                case '\f': out_ << "\\f"; i++; break;
+                case '\n': out_ << "\\n"; i++; break;
+                case '\r': out_ << "\\r"; i++; break;
+                case '\t': out_ << "\\t"; i++; break;
                 default:
-                    if (ch < 32) {
-                        out_ << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
-                        out_ << std::dec; // reset to decimal
+                    if (ch < 0x80) {
+                        if (ch < 32) {
+                            out_ << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
+                            out_ << std::dec;
+                        } else {
+                            out_ << (char)ch;
+                        }
+                        i++;
                     } else {
-                        out_ << (char)ch;
+                        // Multi-byte UTF-8 - decode to get the code point
+                        size_t start = i;
+                        int32_t cp = decodeUTF8(str, i);
+                        if (cp < 0) {
+                            // Invalid UTF-8 - output raw byte
+                            out_ << str[start];
+                        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                            // Lone surrogate encoded in UTF-8 (CESU-8 style)
+                            // ES spec: escape as \uXXXX
+                            out_ << "\\u" << std::hex << std::setfill('0') << std::setw(4) << cp;
+                            out_ << std::dec;
+                        } else {
+                            // Valid multi-byte character - output as-is
+                            for (size_t j = start; j < i; j++) {
+                                out_ << str[j];
+                            }
+                        }
                     }
                     break;
             }
@@ -578,9 +653,18 @@ private:
         }
 
         for (const auto& key : keys) {
-            auto it = props->find(key);
-            if (it == props->end()) continue;
-            Value val = it->second;
+            // ES spec: Get(holder, key) - invoke getters, return undefined for missing
+            Value val = Value(Undefined{});
+            auto* interp = getGlobalInterpreter();
+            if (interp) {
+                auto [found, propVal] = interp->getPropertyForExternal(objVal, key);
+                if (found) val = propVal;
+                // If not found (e.g. deleted during getter), val stays undefined
+            } else {
+                auto it = props->find(key);
+                if (it == props->end()) continue;
+                val = it->second;
+            }
             // Try to serialize - serializeValue handles omission
             std::ostringstream saved;
             saved << out_.str();
@@ -633,21 +717,39 @@ private:
 
     void stringifyStringTo(std::ostringstream& os, const std::string& str) {
         os << '"';
-        for (unsigned char ch : str) {
+        size_t i = 0;
+        while (i < str.size()) {
+            unsigned char ch = static_cast<unsigned char>(str[i]);
             switch (ch) {
-                case '"': os << "\\\""; break;
-                case '\\': os << "\\\\"; break;
-                case '\b': os << "\\b"; break;
-                case '\f': os << "\\f"; break;
-                case '\n': os << "\\n"; break;
-                case '\r': os << "\\r"; break;
-                case '\t': os << "\\t"; break;
+                case '"': os << "\\\""; i++; break;
+                case '\\': os << "\\\\"; i++; break;
+                case '\b': os << "\\b"; i++; break;
+                case '\f': os << "\\f"; i++; break;
+                case '\n': os << "\\n"; i++; break;
+                case '\r': os << "\\r"; i++; break;
+                case '\t': os << "\\t"; i++; break;
                 default:
-                    if (ch < 32) {
-                        os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
-                        os << std::dec;
+                    if (ch < 0x80) {
+                        if (ch < 32) {
+                            os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
+                            os << std::dec;
+                        } else {
+                            os << (char)ch;
+                        }
+                        i++;
                     } else {
-                        os << (char)ch;
+                        size_t start = i;
+                        int32_t cp = decodeUTF8(str, i);
+                        if (cp < 0) {
+                            os << str[start];
+                        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                            os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << cp;
+                            os << std::dec;
+                        } else {
+                            for (size_t j = start; j < i; j++) {
+                                os << str[j];
+                            }
+                        }
                     }
                     break;
             }
@@ -681,6 +783,90 @@ public:
     }
 };
 
+// Internalize JSON property (reviver walk) per ES spec §24.5.1.1
+static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
+                                      const std::string& name, const Value& reviverFn) {
+    // Step 1: Let val be Get(holder, name)
+    Value val;
+    if (holder.isObject()) {
+        auto obj = holder.getGC<Object>();
+        auto it = obj->properties.find(name);
+        val = (it != obj->properties.end()) ? it->second : Value(Undefined{});
+    } else if (holder.isArray()) {
+        auto arr = holder.getGC<Array>();
+        bool isIndex = false;
+        size_t idx = 0;
+        if (!name.empty()) {
+            bool allDigits = true;
+            for (char c : name) if (c < '0' || c > '9') { allDigits = false; break; }
+            if (allDigits) {
+                try { idx = std::stoull(name); isIndex = true; } catch (...) {}
+            }
+        }
+        if (isIndex && idx < arr->elements.size()) {
+            val = arr->elements[idx];
+        } else {
+            auto it = arr->properties.find(name);
+            val = (it != arr->properties.end()) ? it->second : Value(Undefined{});
+        }
+    }
+
+    // Step 2: If val is an Object, walk its properties
+    if (val.isObject()) {
+        auto obj = val.getGC<Object>();
+        // Collect keys in proper order: numeric indices ascending, then string keys
+        std::vector<std::pair<uint32_t, std::string>> indexKeys;
+        std::vector<std::string> stringKeys;
+        for (const auto& key : obj->properties.orderedKeys()) {
+            if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
+            if (isSymbolPropertyKey(key)) continue;
+            bool isIdx = false;
+            if (!key.empty() && key[0] >= '0' && key[0] <= '9') {
+                bool allDigits = true;
+                for (char c : key) if (c < '0' || c > '9') { allDigits = false; break; }
+                if (allDigits && (key.size() == 1 || key[0] != '0')) {
+                    try {
+                        unsigned long long parsed = std::stoull(key);
+                        if (parsed < 4294967295ULL) {
+                            indexKeys.push_back({static_cast<uint32_t>(parsed), key});
+                            isIdx = true;
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (!isIdx) stringKeys.push_back(key);
+        }
+        std::sort(indexKeys.begin(), indexKeys.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        std::vector<std::string> orderedKeys;
+        for (const auto& [_, k] : indexKeys) orderedKeys.push_back(k);
+        for (const auto& k : stringKeys) orderedKeys.push_back(k);
+
+        for (const auto& key : orderedKeys) {
+            Value newElement = internalizeJSONProperty(interp, val, key, reviverFn);
+            if (newElement.isUndefined()) {
+                obj->properties.erase(key);
+            } else {
+                obj->properties[key] = newElement;
+            }
+        }
+    } else if (val.isArray()) {
+        auto arr = val.getGC<Array>();
+        for (size_t i = 0; i < arr->elements.size(); i++) {
+            Value newElement = internalizeJSONProperty(interp, val, std::to_string(i), reviverFn);
+            if (newElement.isUndefined()) {
+                arr->elements[i] = Value(Undefined{});
+            } else {
+                arr->elements[i] = newElement;
+            }
+        }
+    }
+
+    // Step 3: Call reviver(name, val)
+    return interp->callForHarness(reviverFn, {Value(name), val}, holder);
+}
+
 // JSON object implementation
 Value JSON_parse(const std::vector<Value>& args) {
     if (args.empty()) {
@@ -691,11 +877,41 @@ Value JSON_parse(const std::vector<Value>& args) {
     if (args[0].isString()) {
         jsonStr = std::get<std::string>(args[0].data);
     } else {
-        jsonStr = args[0].toString();
+        // ES spec: ToString(text) - call toString() method for objects
+        Interpreter* interp = getGlobalInterpreter();
+        if (interp && (args[0].isObject() || args[0].isArray())) {
+            auto [found, toStringFn] = interp->getPropertyForExternal(args[0], "toString");
+            if (found && toStringFn.isFunction()) {
+                Value result = interp->callForHarness(toStringFn, {}, args[0]);
+                if (interp->hasError()) {
+                    Value err = interp->getError();
+                    interp->clearError();
+                    throw std::runtime_error(err.toString());
+                }
+                jsonStr = result.toString();
+            } else {
+                jsonStr = args[0].toString();
+            }
+        } else {
+            jsonStr = args[0].toString();
+        }
     }
 
     JSONParser parser(jsonStr);
-    return parser.parse();
+    Value result = parser.parse();
+
+    // Apply reviver if provided
+    if (args.size() > 1 && args[1].isFunction()) {
+        Interpreter* interp = getGlobalInterpreter();
+        if (interp) {
+            // Create wrapper object { "": result }
+            auto wrapper = GarbageCollector::makeGC<Object>();
+            wrapper->properties[""] = result;
+            result = internalizeJSONProperty(interp, Value(wrapper), "", args[1]);
+        }
+    }
+
+    return result;
 }
 
 Value JSON_stringify(const std::vector<Value>& args) {

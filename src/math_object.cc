@@ -483,126 +483,244 @@ done:
     return Value(result);
 }
 
+// Two-sum: exact computation of a + b = hi + lo where hi = fl(a+b)
+static inline void twoSum(double a, double b, double& hi, double& lo) {
+    hi = a + b;
+    double v = hi - a;
+    lo = (a - (hi - v)) + (b - v);
+}
+
+// Maximally precise summation using Shewchuk algorithm with overflow prevention.
+static Value shewchukSum(const std::vector<double>& numbers) {
+    bool hasInf = false, hasNegInf = false, hasNaN = false;
+    bool allNegZeroOrZero = true;
+    bool hasPositiveZero = false;
+
+    for (double val : numbers) {
+        if (std::isnan(val)) { hasNaN = true; allNegZeroOrZero = false; }
+        else if (val == std::numeric_limits<double>::infinity()) { hasInf = true; allNegZeroOrZero = false; }
+        else if (val == -std::numeric_limits<double>::infinity()) { hasNegInf = true; allNegZeroOrZero = false; }
+        else if (val != 0.0) { allNegZeroOrZero = false; }
+        else if (!std::signbit(val)) { hasPositiveZero = true; }
+    }
+    if (hasInf && hasNegInf) return Value(std::numeric_limits<double>::quiet_NaN());
+    if (hasNaN) return Value(std::numeric_limits<double>::quiet_NaN());
+    if (hasInf) return Value(std::numeric_limits<double>::infinity());
+    if (hasNegInf) return Value(-std::numeric_limits<double>::infinity());
+
+    // Sort values by magnitude descending, then interleave pos/neg
+    // to minimize intermediate overflow in Shewchuk algorithm
+    std::vector<double> pos, neg;
+    for (double val : numbers) {
+        if (!std::isfinite(val) || val == 0.0) continue;
+        if (val > 0) pos.push_back(val);
+        else neg.push_back(-val);
+    }
+    std::sort(pos.begin(), pos.end(), std::greater<double>());
+    std::sort(neg.begin(), neg.end(), std::greater<double>());
+
+    // Interleave: alternate pos/neg, picking the larger magnitude first
+    // This ensures consecutive values tend to cancel rather than overflow
+    std::vector<double> ordered;
+    ordered.reserve(pos.size() + neg.size());
+    size_t pi = 0, ni = 0;
+    while (pi < pos.size() || ni < neg.size()) {
+        // Always alternate: add one pos, then one neg
+        if (pi < pos.size()) ordered.push_back(pos[pi++]);
+        if (ni < neg.size()) ordered.push_back(-neg[ni++]);
+    }
+
+    std::vector<double> partials;
+    for (double x : ordered) {
+        size_t i = 0;
+        for (size_t j = 0; j < partials.size(); j++) {
+            double y = partials[j];
+            double hi, lo;
+            if (std::abs(x) < std::abs(y)) std::swap(x, y);
+            twoSum(x, y, hi, lo);
+            if (lo != 0.0) partials[i++] = lo;
+            x = hi;
+        }
+        partials.resize(i);
+        if (std::isfinite(x)) {
+            partials.push_back(x);
+        } else {
+            // Overflow in intermediate sum
+            return Value(x);
+        }
+    }
+    if (partials.empty()) {
+        if (numbers.empty() || (allNegZeroOrZero && !hasPositiveZero)) {
+            return Value(-0.0);
+        }
+        return Value(0.0);
+    }
+
+    // Sum the partials with correct rounding (CPython fsum algorithm)
+    size_t n = partials.size();
+    double hi = partials[n - 1];
+    double lo = 0.0;
+    int roundingIdx = -1;
+
+    if (n >= 2) {
+        for (int i = static_cast<int>(n) - 2; i >= 0; i--) {
+            double x = hi;
+            double y = partials[i];
+            hi = x + y;
+            lo = y - (hi - x);
+            if (lo != 0.0) {
+                roundingIdx = i;
+                break;
+            }
+        }
+    }
+
+    double sum;
+    if (lo != 0.0 && roundingIdx > 0) {
+        // Check if we need rounding correction:
+        // If lo and the next lower partial have the same sign,
+        // and hi + lo rounds to hi, we need to adjust
+        double nextPartial = partials[roundingIdx - 1];
+        // Test if lo is at the midpoint between two consecutive doubles
+        // and the tiebreaker should go in the direction of nextPartial
+        double y = lo * 2.0;
+        double x = hi + y;
+        if (x == hi + lo + lo) {
+            // x rounded the same way - check if we're at a tie
+            double yr = x - hi;
+            if (yr == y && // no rounding occurred
+                ((lo < 0.0 && nextPartial < 0.0) || (lo > 0.0 && nextPartial > 0.0))) {
+                // Correction needed
+                // hi rounds to the wrong direction
+                sum = x;
+            } else {
+                sum = hi + lo;
+            }
+        } else {
+            sum = hi + lo;
+        }
+    } else if (lo != 0.0) {
+        sum = hi + lo;
+    } else {
+        sum = hi;
+    }
+
+    if (sum == 0.0) {
+        if (numbers.empty() || (allNegZeroOrZero && !hasPositiveZero)) {
+            return Value(-0.0);
+        }
+        return Value(0.0);
+    }
+
+    if (!std::isfinite(sum)) return Value(sum);
+    return Value(sum);
+}
+
+// Helper: get iterator from a value, returns {iteratorObj, nextFn}
+// Throws TypeError if not iterable
+static std::pair<Value, Value> getIterator(Interpreter* interp, const Value& val) {
+    if (!interp) throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable argument");
+
+    // Generators are their own iterator: gen[Symbol.iterator]() returns gen
+    // Since both Symbol.iterator and next are dynamically created in evaluateMember,
+    // we handle generators directly
+    if (val.isGenerator()) {
+        // Generator is its own iterator - next will be called via generatorNext()
+        return {val, Value(Undefined{})};
+    }
+
+    // Use interpreter to get Symbol.iterator via property lookup (handles prototype chain)
+    const auto& iterKey = WellKnownSymbols::iteratorKey();
+    auto [found, iterMethod] = interp->getPropertyForExternal(val, iterKey);
+
+    if (!found || !iterMethod.isFunction()) {
+        throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable argument");
+    }
+
+    Value iteratorObj = interp->callForHarness(iterMethod, {}, val);
+    if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw std::runtime_error(err.toString());
+    }
+
+    // If the iterator is a generator, handle its dynamic next()
+    if (iteratorObj.isGenerator()) {
+        return {iteratorObj, Value(Undefined{})};
+    }
+
+    // Get next method
+    Value nextFn;
+    auto [nextFound, fn] = interp->getPropertyForExternal(iteratorObj, "next");
+    if (nextFound && fn.isFunction()) {
+        nextFn = fn;
+    } else {
+        throw std::runtime_error("TypeError: iterator does not have a next method");
+    }
+
+    return {iteratorObj, nextFn};
+}
+
+// Helper: close iterator (call return() if present)
+static void closeIterator(Interpreter* interp, const Value& iteratorObj) {
+    if (!interp) return;
+    Value returnFn;
+    if (iteratorObj.isObject()) {
+        auto obj = iteratorObj.getGC<Object>();
+        auto it = obj->properties.find("return");
+        if (it != obj->properties.end() && it->second.isFunction()) returnFn = it->second;
+    }
+    if (returnFn.isFunction()) {
+        interp->callForHarness(returnFn, {}, iteratorObj);
+        if (interp->hasError()) interp->clearError();
+    }
+}
+
 // Math.sumPrecise - precise sum of iterable of numbers
 Value Math_sumPrecise(const std::vector<Value>& args) {
     if (args.empty()) {
         throw std::runtime_error("TypeError: Math.sumPrecise requires 1 argument");
     }
-    // We need to iterate over the argument
-    // For now, support arrays
-    auto computeSum = [](const std::vector<double>& numbers) -> Value {
-        bool hasInf = false, hasNegInf = false, hasNaN = false;
-        bool allNegZeroOrZero = true;
-        bool hasPositiveZero = false;
-        // Use Kahan summation for precision
-        double sum = 0.0;
-        double compensation = 0.0;
-        for (double val : numbers) {
-            if (std::isnan(val)) { hasNaN = true; allNegZeroOrZero = false; continue; }
-            if (val == std::numeric_limits<double>::infinity()) { hasInf = true; allNegZeroOrZero = false; continue; }
-            if (val == -std::numeric_limits<double>::infinity()) { hasNegInf = true; allNegZeroOrZero = false; continue; }
-            if (val != 0.0) allNegZeroOrZero = false;
-            if (val == 0.0 && !std::signbit(val)) hasPositiveZero = true;
-            double y = val - compensation;
-            double t = sum + y;
-            compensation = (t - sum) - y;
-            sum = t;
-        }
-        if (hasInf && hasNegInf) return Value(std::numeric_limits<double>::quiet_NaN());
-        if (hasNaN) return Value(std::numeric_limits<double>::quiet_NaN());
-        if (hasInf) return Value(std::numeric_limits<double>::infinity());
-        if (hasNegInf) return Value(-std::numeric_limits<double>::infinity());
-        // ES spec: empty list or all -0 => -0; if any +0 in all-zero list => +0
-        if (sum == 0.0) {
-            if (numbers.empty() || (allNegZeroOrZero && !hasPositiveZero)) {
-                return Value(-0.0);
-            }
-            return Value(0.0);
-        }
-        return Value(sum);
-    };
-    if (args[0].isArray()) {
-        auto arr = args[0].getGC<Array>();
-        std::vector<double> numbers;
-        for (const auto& elem : arr->elements) {
-            if (!elem.isNumber()) {
-                throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable of numbers");
-            }
-            numbers.push_back(std::get<double>(elem.data));
-        }
-        return computeSum(numbers);
+
+    // Non-object/non-iterable values are TypeError
+    if (args[0].isNumber() || args[0].isString() || args[0].isBool() ||
+        args[0].isNull() || args[0].isUndefined() || args[0].isBigInt()) {
+        throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable argument");
     }
-    // Support generators directly (they are iterators)
+
     Interpreter* interpreter = getGlobalInterpreter();
-    if (interpreter && args[0].isGenerator()) {
-        std::vector<double> numbers;
-        // Generators have next() method - use callForHarness
-        auto gen = args[0].getGC<Generator>();
-        while (true) {
-            // Call next on generator via interpreter
-            Value nextMethod;
-            // Look up "next" on the generator object
-            auto nextIt = gen->properties.find("next");
-            if (nextIt == gen->properties.end() || !nextIt->second.isFunction()) break;
-            Value step = interpreter->callForHarness(nextIt->second, {}, args[0]);
-            if (interpreter->hasError()) {
-                Value err = interpreter->getError();
-                interpreter->clearError();
-                throw std::runtime_error(err.toString());
-            }
-            if (!step.isObject()) break;
-            auto stepObj = step.getGC<Object>();
-            auto doneIt = stepObj->properties.find("done");
-            if (doneIt != stepObj->properties.end() && doneIt->second.toBool()) break;
-            auto valueIt = stepObj->properties.find("value");
-            Value val = (valueIt != stepObj->properties.end()) ? valueIt->second : Value(Undefined{});
-            if (!val.isNumber()) {
-                throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable of numbers");
-            }
-            numbers.push_back(std::get<double>(val.data));
+    auto [iteratorObj, nextFn] = getIterator(interpreter, args[0]);
+
+    std::vector<double> numbers;
+    while (true) {
+        Value step;
+        if (nextFn.isFunction()) {
+            step = interpreter->callForHarness(nextFn, {}, iteratorObj);
+        } else if (iteratorObj.isGenerator()) {
+            // Generator's next is dynamically created - use generatorNext
+            step = interpreter->generatorNext(iteratorObj);
+        } else {
+            break;
         }
-        return computeSum(numbers);
-    }
-    if (interpreter && args[0].isObject()) {
-        auto obj = args[0].getGC<Object>();
-        const auto& iterKey = WellKnownSymbols::iteratorKey();
-        auto iterMethodIt = obj->properties.find(iterKey);
-        if (iterMethodIt != obj->properties.end() && iterMethodIt->second.isFunction()) {
-            Value iteratorObj = interpreter->callForHarness(iterMethodIt->second, {}, args[0]);
-            if (interpreter->hasError()) {
-                Value err = interpreter->getError();
-                interpreter->clearError();
-                throw std::runtime_error(err.toString());
-            }
-            if (iteratorObj.isObject()) {
-                auto iterObjPtr = iteratorObj.getGC<Object>();
-                auto nextIt = iterObjPtr->properties.find("next");
-                if (nextIt != iterObjPtr->properties.end() && nextIt->second.isFunction()) {
-                    std::vector<double> numbers;
-                    while (true) {
-                        Value step = interpreter->callForHarness(nextIt->second, {}, iteratorObj);
-                        if (interpreter->hasError()) {
-                            Value err = interpreter->getError();
-                            interpreter->clearError();
-                            throw std::runtime_error(err.toString());
-                        }
-                        if (!step.isObject()) break;
-                        auto stepObj = step.getGC<Object>();
-                        auto doneIt2 = stepObj->properties.find("done");
-                        if (doneIt2 != stepObj->properties.end() && doneIt2->second.toBool()) break;
-                        auto valueIt = stepObj->properties.find("value");
-                        Value val = (valueIt != stepObj->properties.end()) ? valueIt->second : Value(Undefined{});
-                        if (!val.isNumber()) {
-                            throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable of numbers");
-                        }
-                        numbers.push_back(std::get<double>(val.data));
-                    }
-                    return computeSum(numbers);
-                }
-            }
+        if (interpreter->hasError()) {
+            Value err = interpreter->getError();
+            interpreter->clearError();
+            throw std::runtime_error(err.toString());
         }
+        if (!step.isObject()) break;
+        auto stepObj = step.getGC<Object>();
+        auto doneIt = stepObj->properties.find("done");
+        if (doneIt != stepObj->properties.end() && doneIt->second.toBool()) break;
+        auto valueIt = stepObj->properties.find("value");
+        Value val = (valueIt != stepObj->properties.end()) ? valueIt->second : Value(Undefined{});
+        if (!val.isNumber()) {
+            closeIterator(interpreter, iteratorObj);
+            throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable of numbers");
+        }
+        numbers.push_back(std::get<double>(val.data));
     }
-    throw std::runtime_error("TypeError: Math.sumPrecise requires an iterable argument");
+
+    return shewchukSum(numbers);
 }
 
 } // namespace lightjs

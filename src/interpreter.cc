@@ -1071,6 +1071,14 @@ std::pair<bool, Value> Interpreter::getPropertyForExternal(const Value& receiver
   return direct;
 }
 
+Value Interpreter::generatorNext(const Value& generatorVal, const Value& resumeValue) {
+  if (!generatorVal.isGenerator()) {
+    return makeIteratorResult(Value(Undefined{}), true);
+  }
+  auto gen = generatorVal.getGC<Generator>();
+  return runGeneratorNext(gen, ControlFlow::ResumeMode::Next, resumeValue);
+}
+
 bool Interpreter::isObjectLike(const Value& value) const {
   return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
          value.isProxy() || value.isPromise() || value.isGenerator() || value.isClass() ||
