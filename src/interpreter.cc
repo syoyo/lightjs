@@ -10948,6 +10948,81 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
 
+    // String.prototype.isWellFormed (ES2024) - check for lone surrogates
+    if (propName == "isWellFormed") {
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        // Check UTF-8 encoded string for lone surrogates (CESU-8 encoded)
+        size_t i = 0;
+        while (i < str.size()) {
+          unsigned char ch = static_cast<unsigned char>(str[i]);
+          if (ch < 0x80) { i++; continue; }
+          int32_t cp = 0;
+          int extra = 0;
+          if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+          else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
+          else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
+          else { return Value(false); } // Invalid UTF-8
+          if (i + extra >= str.size()) return Value(false);
+          for (int j = 0; j < extra; j++) {
+            i++;
+            if ((static_cast<unsigned char>(str[i]) & 0xC0) != 0x80) return Value(false);
+            cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
+          }
+          i++;
+          // Lone surrogate: U+D800..U+DFFF
+          if (cp >= 0xD800 && cp <= 0xDFFF) return Value(false);
+        }
+        return Value(true);
+      };
+      setNativeFnProps(fn, "isWellFormed", 0);
+      LIGHTJS_RETURN(Value(fn));
+    }
+
+    // String.prototype.toWellFormed (ES2024) - replace lone surrogates with U+FFFD
+    if (propName == "toWellFormed") {
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        std::string result;
+        size_t i = 0;
+        while (i < str.size()) {
+          unsigned char ch = static_cast<unsigned char>(str[i]);
+          if (ch < 0x80) { result += str[i]; i++; continue; }
+          size_t start = i;
+          int32_t cp = 0;
+          int extra = 0;
+          bool valid = true;
+          if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+          else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
+          else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
+          else { valid = false; }
+          if (valid && i + extra < str.size()) {
+            for (int j = 0; j < extra; j++) {
+              i++;
+              if ((static_cast<unsigned char>(str[i]) & 0xC0) != 0x80) { valid = false; break; }
+              cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
+            }
+            i++;
+          } else {
+            valid = false;
+            i++;
+          }
+          if (!valid || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            // Replace lone surrogate / invalid with U+FFFD (UTF-8: EF BF BD)
+            result += "\xEF\xBF\xBD";
+          } else {
+            // Copy valid multi-byte sequence
+            for (size_t j = start; j < i; j++) result += str[j];
+          }
+        }
+        return Value(result);
+      };
+      setNativeFnProps(fn, "toWellFormed", 0);
+      LIGHTJS_RETURN(Value(fn));
+    }
+
     if (propName == "localeCompare") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;

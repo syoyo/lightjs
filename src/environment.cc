@@ -19814,6 +19814,12 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     return Value(result);
   };
+  stringRaw->properties["name"] = Value(std::string("raw"));
+  stringRaw->properties["__non_writable_name"] = Value(true);
+  stringRaw->properties["__non_enum_name"] = Value(true);
+  stringRaw->properties["length"] = Value(1.0);
+  stringRaw->properties["__non_writable_length"] = Value(true);
+  stringRaw->properties["__non_enum_length"] = Value(true);
   stringConstructorObj->properties["raw"] = Value(stringRaw);
 
   auto stringPrototype = GarbageCollector::makeGC<Object>();
@@ -20193,6 +20199,61 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     return Value(result);
   }, false);
+
+  // String.prototype.isWellFormed (ES2024)
+  installStringPrototypeMethod("isWellFormed", 0, [thisToString](const std::vector<Value>& args) -> Value {
+    std::string str = thisToString(args, "isWellFormed");
+    size_t i = 0;
+    while (i < str.size()) {
+      unsigned char ch = static_cast<unsigned char>(str[i]);
+      if (ch < 0x80) { i++; continue; }
+      int32_t cp = 0; int extra = 0; bool valid = true;
+      if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+      else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
+      else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
+      else { return Value(false); }
+      if (i + extra >= str.size()) return Value(false);
+      for (int j = 0; j < extra; j++) {
+        i++;
+        if ((static_cast<unsigned char>(str[i]) & 0xC0) != 0x80) return Value(false);
+        cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
+      }
+      i++;
+      if (cp >= 0xD800 && cp <= 0xDFFF) return Value(false);
+    }
+    return Value(true);
+  }, true);
+
+  // String.prototype.toWellFormed (ES2024)
+  installStringPrototypeMethod("toWellFormed", 0, [thisToString](const std::vector<Value>& args) -> Value {
+    std::string str = thisToString(args, "toWellFormed");
+    std::string result;
+    size_t i = 0;
+    while (i < str.size()) {
+      unsigned char ch = static_cast<unsigned char>(str[i]);
+      if (ch < 0x80) { result += str[i]; i++; continue; }
+      size_t start = i;
+      int32_t cp = 0; int extra = 0; bool valid = true;
+      if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+      else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
+      else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
+      else { valid = false; }
+      if (valid && i + extra < str.size()) {
+        for (int j = 0; j < extra; j++) {
+          i++;
+          if ((static_cast<unsigned char>(str[i]) & 0xC0) != 0x80) { valid = false; break; }
+          cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
+        }
+        i++;
+      } else { valid = false; i++; }
+      if (!valid || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        result += "\xEF\xBF\xBD";
+      } else {
+        for (size_t j = start; j < i; j++) result += str[j];
+      }
+    }
+    return Value(result);
+  }, true);
 
   {
     const auto& iterKey = WellKnownSymbols::iteratorKey();
