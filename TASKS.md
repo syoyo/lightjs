@@ -41,12 +41,28 @@ This document tracks planned enhancements and future work for LightJS.
 | Scope | Pass | Total | Rate |
 |---|---|---|---|
 | `language` | 23194 | 23629 | 98.2% (11 fail, 424 skipped) |
-| `built-ins/Math` | 323 | 327 | 98.8% |
-| `built-ins/Number` | 336 | 338 | 99.4% |
+| `built-ins/Math` | 325 | 327 | 99.4% |
+| `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
-| `built-ins/JSON` | 107 | 165 | 64.8% |
+| `built-ins/JSON` | 115 | 165 | 69.7% |
 
 Unit tests: 346/346 passing.
+
+#### Changes (2026-03-20 #2)
+
+11 built-in tests fixed, 0 regressions:
+
+- **JSON.parse whitespace** (`src/json.cc`): strict SP/HT/LF/CR validation per spec.
+- **JSON.parse reviver** (`src/json.cc`): full reviver callback with correct call order (numeric indices ascending, then string keys, root last), property walking, wrapper object creation.
+- **JSON.parse ToString** (`src/json.cc`): call JS toString() on non-string input.
+- **JSON.stringify surrogates** (`src/json.cc`): proper lone surrogate escaping (\uXXXX), UTF-8 decoding for multi-byte chars.
+- **JSON.stringify toJSON** (`src/json.cc`): use getPropertyForExternal for prototype chain lookup.
+- **JSON.stringify getters** (`src/json.cc`): invoke getters during property serialization; handle deleted properties.
+- **JSON.stringify regex** (`src/json.cc`): serialize Regex/Map/Set as `{}` instead of `null`.
+- **Math.sumPrecise** (`src/math_object.cc`): Shewchuk exact summation with overflow prevention via pos/neg interleaving; full iterator protocol support (arrays, generators, custom iterables); iterator closing on TypeError.
+- **Number.prototype.toFixed** (`src/environment.cc`): throw TypeError for BigInt argument.
+- **Object.getOwnPropertyNames** (`src/value.cc`): include empty string keys.
+- **Interpreter.generatorNext** (`src/interpreter.cc`): public API for calling generator.next() from native code.
 
 #### Changes (2026-03-20)
 
@@ -332,10 +348,10 @@ REPL debugging commands:
 **Status:** `language` 98.2%, expanding to `built-ins`
 
 Next targets for `built-ins` scope (by priority):
-- **JSON** (64.8%): reviver callback support, `JSON.rawJSON`, parse edge cases
-- **Math** (98.8%): `Math.sumPrecise`, `Math.f16round` value conversion
-- **Number** (99.4%): 2 remaining failures
-- **Boolean** (98.0%): 1 remaining failure
+- **JSON** (69.7%): `JSON.rawJSON`/`JSON.isRawJSON` (14 tests), Proxy-dependent tests, reviver edge cases
+- **Math** (99.4%): `Math.sumPrecise` rounding correction (1 test), `Math.f16round` value conversion (1 test)
+- **Number** (99.7%): `proto-from-ctor-realm` (1 remaining failure, requires multi-realm support)
+- **Boolean** (98.0%): `proto-from-ctor-realm` (1 remaining failure)
 - **String**, **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
 
 Next targets for remaining 11 `language` failures:
@@ -427,4 +443,4 @@ When working on tasks:
 
 ---
 
-**Last Updated:** 2026-03-20
+**Last Updated:** 2026-03-20 (updated)
