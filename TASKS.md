@@ -36,7 +36,51 @@ This document tracks planned enhancements and future work for LightJS.
 
 - Note: runner may print `Failed to read module: .../syntax/foo.js` because that file is intentionally absent in the suite.
 
-### Latest Status (2026-03-10)
+### Latest Status (2026-03-20)
+
+| Scope | Pass | Total | Rate |
+|---|---|---|---|
+| `language` | 23194 | 23629 | 98.2% (11 fail, 424 skipped) |
+| `built-ins/Math` | 323 | 327 | 98.8% |
+| `built-ins/Number` | 336 | 338 | 99.4% |
+| `built-ins/Boolean` | 50 | 51 | 98.0% |
+| `built-ins/JSON` | 107 | 165 | 64.8% |
+
+Unit tests: 346/346 passing.
+
+#### Changes (2026-03-20)
+
+18 language tests fixed, 0 regressions since 2026-03-10 baseline (29 fail → 11 fail):
+
+- **Regex u-flag validation** (`src/lexer.cc`): identity escape, `\c` control char, legacy octal, `\u{...}` range check, lone `{`/`}`, lookbehind/lookahead quantifier, character class range.
+- **Regex named group validation** (`src/lexer.cc`): empty/invalid/duplicate group names, `\k` backreference validation, pattern transformation for std::regex compatibility.
+- **Arguments mapped nonconfigurable** (`src/environment.cc`): call parameter setter before erasing accessor markers in `Object.defineProperty`.
+- **Logical assignment no-set-put** (`src/interpreter.cc`): `&&=`/`||=`/`??=` now check if setter is callable (not just if key exists).
+- **Async function constructor** (`src/interpreter.cc`): plain async functions no longer get `isConstructor=true` or `.prototype`. Async generators unaffected.
+- **Object.setPrototypeOf with Proxy** (`src/environment.cc`): added `isProxy()` to allowed prototype types.
+
+#### OOM Safety (2026-03-20)
+
+- Per-child 2GB memory limit via `setrlimit(RLIMIT_AS)` in test262_runner fork (configurable: `LIGHTJS_TEST262_MEM_LIMIT_MB`).
+- `String.prototype.repeat` capped at 256MB output.
+- Parser recursion depth limit of 500 (`parseDepth_` in `parser.h`).
+- Loop iteration limit via `LIGHTJS_MAX_LOOP_ITERATIONS` env var (default unlimited).
+
+#### Remaining 11 Language Failures
+
+| Test | Category | Root Cause |
+|---|---|---|
+| `u-surrogate-pairs*.js` (5) | regex runtime | Runtime regex engine lacks Unicode surrogate pair support |
+| `u-astral.js` | regex runtime | Runtime regex engine lacks Unicode astral plane support |
+| `u-case-mapping.js` | regex runtime | Runtime regex engine lacks Unicode case folding |
+| `u-unicode-esc.js` | regex runtime | Runtime regex engine doesn't support `\u{HHHH}` syntax |
+| `forward-reference.js` | regex runtime | Runtime regex engine doesn't support named groups / `\k<name>` |
+| `instanceof/prototype-getter-with-object.js` | prototype chain | Crash when getter installed on `Function.prototype.prototype` |
+| `keyed-destructuring-...order...js` | eval order | Complex `with` + Proxy destructuring evaluation order |
+
+All require deeper runtime changes (regex engine Unicode overhaul or prototype chain rework).
+
+### Previous Status (2026-03-10)
 
 | Scope | Pass | Total | Rate |
 |---|---|---|---|
@@ -58,13 +102,6 @@ This document tracks planned enhancements and future work for LightJS.
   - `test/language/comments/S7.4_A5.js` (~48s)
   - `test/language/comments/S7.4_A6.js` (~17s)
   - `test/language/expressions/call/tco-call-args.js` (~14s)
-
-#### Current Biggest Failure Shards (2026-03-10)
-
-- `language/literals/regexp`: 27 failures
-- `language/global-code`: 16 failures
-- `language/function-code`: 14 failures
-- `language/arguments-object`: 10 failures
 
 ### Recent Completions (2026-02-14)
 
@@ -292,12 +329,19 @@ REPL debugging commands:
 #### Expand Test262 Coverage
 **Impact:** Standards compliance
 **Complexity:** Ongoing
-**Status:** Infrastructure exists
+**Status:** `language` 98.2%, expanding to `built-ins`
 
-- Run full Test262 suite
-- Generate compliance report
-- Fix failing tests systematically
-- Target: 50%+ compliance
+Next targets for `built-ins` scope (by priority):
+- **JSON** (64.8%): reviver callback support, `JSON.rawJSON`, parse edge cases
+- **Math** (98.8%): `Math.sumPrecise`, `Math.f16round` value conversion
+- **Number** (99.4%): 2 remaining failures
+- **Boolean** (98.0%): 1 remaining failure
+- **String**, **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
+
+Next targets for remaining 11 `language` failures:
+- Runtime regex Unicode overhaul (surrogate pairs, astral, `\u{...}`, `\k<name>`) — 9 failures
+- `instanceof` prototype getter crash — 1 failure
+- Destructuring evaluation order with `with`+Proxy — 1 failure
 
 ### Documentation
 
@@ -383,4 +427,4 @@ When working on tasks:
 
 ---
 
-**Last Updated:** 2026-01-31
+**Last Updated:** 2026-03-20

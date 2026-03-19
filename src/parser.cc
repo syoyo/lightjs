@@ -2379,6 +2379,12 @@ std::optional<Program> Parser::parse() {
 }
 
 StmtPtr Parser::parseStatement(bool allowModuleItem) {
+  if (++parseDepth_ > kMaxParseDepth) {
+    --parseDepth_;
+    throw std::runtime_error("SyntaxError: Maximum parse depth exceeded");
+  }
+  struct ParseDepthGuard { int& d; ~ParseDepthGuard() { --d; } } _pdg{parseDepth_};
+
   // Parse labeled statements
   if (isIdentifierLikeToken(current().type) && peek().type == TokenType::Colon) {
     const Token& tok = current();
@@ -5407,6 +5413,12 @@ StmtPtr Parser::parseExportDeclaration() {
 }
 
 ExprPtr Parser::parseExpression() {
+  if (++parseDepth_ > kMaxParseDepth) {
+    --parseDepth_;
+    throw std::runtime_error("SyntaxError: Maximum parse depth exceeded");
+  }
+  struct ParseDepthGuard { int& d; ~ParseDepthGuard() { --d; } } _pdg{parseDepth_};
+
   auto expr = parseAssignment();
   if (!expr) return nullptr;
 

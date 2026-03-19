@@ -2,6 +2,7 @@
 #include "string_table.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <cctype>
 #if USE_SIMPLE_REGEX
 #include "simple_regex.h"
@@ -1093,25 +1094,463 @@ std::optional<Token> Lexer::readRegex() {
     advance();
   }
 
-  // Validate pattern+flags early so Test262 negative regexp-literal parse tests
-  // are handled as SyntaxError during lexing/parsing (not deferred to runtime).
-  // This is intentionally conservative: we validate using the same backend we
-  // use at runtime (std::regex or simple_regex).
-  try {
-#if USE_SIMPLE_REGEX
-    bool caseInsensitive = flags.find('i') != std::string::npos;
-    simple_regex::Regex tmp(pattern, caseInsensitive);
-    (void)tmp;
-#else
-    std::regex::flag_type options = std::regex::ECMAScript;
-    if (flags.find('i') != std::string::npos) {
-      options |= std::regex::icase;
+  // --- ECMAScript-specific regex validation (beyond what std::regex catches) ---
+  bool hasUFlag = flags.find('u') != std::string::npos;
+  bool hasVFlag = flags.find('v') != std::string::npos;
+  bool unicodeMode = hasUFlag || hasVFlag;
+
+  // u and v flags are mutually exclusive
+  if (hasUFlag && hasVFlag) {
+    throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+  }
+
+  // Validate the pattern for ECMAScript-specific rules
+  bool hasNamedGroups = false;
+  std::vector<std::string> namedGroups;
+  {
+    size_t i = 0;
+    size_t len = pattern.size();
+    int groupCount = 0;
+
+    // Count capture groups and collect named group names for validation
+    for (size_t j = 0; j < len; ++j) {
+      if (pattern[j] == '\\' && j + 1 < len) { ++j; continue; }
+      if (pattern[j] == '[') {
+        ++j;
+        while (j < len && pattern[j] != ']') { if (pattern[j] == '\\' && j + 1 < len) ++j; ++j; }
+        continue;
+      }
+      if (pattern[j] == '(' && j + 1 < len && pattern[j + 1] == '?' &&
+          j + 2 < len && pattern[j + 2] == '<' && j + 3 < len &&
+          pattern[j + 3] != '=' && pattern[j + 3] != '!') {
+        // Named capture group (?<name>...)
+        ++groupCount;
+        hasNamedGroups = true;
+        size_t nameStart = j + 3;
+        size_t nameEnd = nameStart;
+        while (nameEnd < len && pattern[nameEnd] != '>') ++nameEnd;
+        if (nameEnd < len) {
+          namedGroups.push_back(pattern.substr(nameStart, nameEnd - nameStart));
+        }
+        j = nameEnd;
+      } else if (pattern[j] == '(' && (j + 1 >= len || pattern[j + 1] != '?')) {
+        ++groupCount;
+      }
     }
-    std::regex tmp(pattern, options);
-    (void)tmp;
+
+    // Helper: check if a quantifier follows at position i
+    auto isQuantifier = [&](size_t pos) -> bool {
+      if (pos >= len) return false;
+      char c = pattern[pos];
+      return c == '?' || c == '*' || c == '+' || c == '{';
+    };
+
+    // Walk through the pattern checking for invalid constructs
+    i = 0;
+    bool inCC = false;
+    while (i < len) {
+      char c = pattern[i];
+
+      // Track character classes
+      if (c == '[' && !inCC) { inCC = true; ++i; continue; }
+      if (c == ']' && inCC) { inCC = false; ++i; continue; }
+      if (inCC) {
+        if (c == '\\') { i += 2; } else { ++i; }
+        continue;
+      }
+
+      // Check for InvalidBracedQuantifier: {n}, {n,}, {n,m} at Atom position
+      // (i.e. not preceded by a quantifiable atom)
+      if (c == '{' && i == 0) {
+        // Check if this is a braced quantifier pattern
+        size_t j = i + 1;
+        bool isDigit = false;
+        while (j < len && pattern[j] >= '0' && pattern[j] <= '9') { isDigit = true; ++j; }
+        if (isDigit && j < len) {
+          if (pattern[j] == '}') {
+            throw std::runtime_error("SyntaxError: Invalid regular expression: Nothing to repeat");
+          }
+          if (pattern[j] == ',') {
+            ++j;
+            while (j < len && pattern[j] >= '0' && pattern[j] <= '9') ++j;
+            if (j < len && pattern[j] == '}') {
+              throw std::runtime_error("SyntaxError: Invalid regular expression: Nothing to repeat");
+            }
+          }
+        }
+      }
+
+      // Handle escape sequences
+      if (c == '\\') {
+        if (i + 1 < len) {
+          char next = pattern[i + 1];
+
+          if (unicodeMode) {
+            // In unicode mode, identity escapes are restricted to SyntaxCharacter and /
+            // SyntaxCharacter: ^ $ \ . * + ? ( ) [ ] { } |
+            auto isSyntaxChar = [](char ch) {
+              return ch == '^' || ch == '$' || ch == '\\' || ch == '.' ||
+                     ch == '*' || ch == '+' || ch == '?' || ch == '(' ||
+                     ch == ')' || ch == '[' || ch == ']' || ch == '{' ||
+                     ch == '}' || ch == '|' || ch == '/';
+            };
+
+            // Check for legacy octal escapes in unicode mode
+            if (next >= '1' && next <= '9') {
+              // Could be a backreference - check if it's a valid group number
+              size_t refEnd = i + 1;
+              int refNum = 0;
+              while (refEnd < len && pattern[refEnd] >= '0' && pattern[refEnd] <= '9') {
+                refNum = refNum * 10 + (pattern[refEnd] - '0');
+                ++refEnd;
+              }
+              if (refNum > groupCount) {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid escape in unicode mode");
+              }
+            } else if (next == '0') {
+              // \0 is allowed (null character), but \00, \01 etc are octal
+              if (i + 2 < len && pattern[i + 2] >= '0' && pattern[i + 2] <= '9') {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid escape in unicode mode");
+              }
+            } else if (next == 'c') {
+              // \cA-\cZ and \ca-\cz are valid, \c0 etc are not
+              if (i + 2 < len) {
+                char ctrl = pattern[i + 2];
+                if (!((ctrl >= 'A' && ctrl <= 'Z') || (ctrl >= 'a' && ctrl <= 'z'))) {
+                  throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid escape in unicode mode");
+                }
+              }
+            } else if (next == 'k') {
+              // \k in unicode mode requires a valid named backreference \k<name>
+              if (i + 2 >= len || pattern[i + 2] != '<') {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid named reference");
+              }
+              size_t nameStart = i + 3;
+              size_t nameEnd = nameStart;
+              while (nameEnd < len && pattern[nameEnd] != '>') ++nameEnd;
+              if (nameEnd >= len) {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid named reference");
+              }
+              std::string refName = pattern.substr(nameStart, nameEnd - nameStart);
+              if (refName.empty()) {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid named reference");
+              }
+              // Check that the referenced group exists
+              bool found = false;
+              for (const auto& gn : namedGroups) {
+                if (gn == refName) { found = true; break; }
+              }
+              if (!found) {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid named reference");
+              }
+              i = nameEnd + 1;
+              continue;
+            } else if (next == 'u') {
+              // Validate \u escape in unicode mode
+              if (i + 2 < len && pattern[i + 2] == '{') {
+                // \u{HHHH} - validate hex digits and range
+                size_t braceStart = i + 3;
+                size_t braceEnd = braceStart;
+                while (braceEnd < len && pattern[braceEnd] != '}') ++braceEnd;
+                if (braceEnd >= len) {
+                  throw std::runtime_error("SyntaxError: Invalid regular expression: unterminated unicode escape");
+                }
+                std::string hexStr = pattern.substr(braceStart, braceEnd - braceStart);
+                if (hexStr.empty()) {
+                  throw std::runtime_error("SyntaxError: Invalid regular expression: invalid unicode escape");
+                }
+                // Validate all characters are hex digits
+                for (char hc : hexStr) {
+                  if (!((hc >= '0' && hc <= '9') || (hc >= 'a' && hc <= 'f') || (hc >= 'A' && hc <= 'F'))) {
+                    throw std::runtime_error("SyntaxError: Invalid regular expression: invalid unicode escape");
+                  }
+                }
+                // Check range: must be <= 0x10FFFF
+                unsigned long codePoint = std::stoul(hexStr, nullptr, 16);
+                if (codePoint > 0x10FFFF) {
+                  throw std::runtime_error("SyntaxError: Invalid regular expression: unicode escape out of range");
+                }
+                i = braceEnd + 1;
+                continue;
+              }
+              // \uHHHH - 4 hex digits required in unicode mode
+              // (handled by existing i += 2 and next iteration)
+            } else if (!isSyntaxChar(next) &&
+                       next != 'b' && next != 'B' && next != 'd' && next != 'D' &&
+                       next != 'w' && next != 'W' && next != 's' && next != 'S' &&
+                       next != 'f' && next != 'n' && next != 'r' && next != 't' &&
+                       next != 'v' && next != 'x' && next != 'c' &&
+                       next != '0' && next != 'k' && next != 'p' && next != 'P') {
+              throw std::runtime_error("SyntaxError: Invalid regular expression: Invalid escape in unicode mode");
+            }
+          }
+        }
+        i += 2;
+        continue;
+      }
+
+      // Check for assertions (lookahead/lookbehind) and quantifiers on them
+      if (c == '(' && i + 1 < len && pattern[i + 1] == '?') {
+        bool isLookbehind = false;
+        bool isLookahead = false;
+        size_t assertEnd = i;
+
+        if (i + 2 < len) {
+          if (pattern[i + 2] == '=' || pattern[i + 2] == '!') {
+            isLookahead = true;
+          } else if (pattern[i + 2] == '<' && i + 3 < len) {
+            if (pattern[i + 3] == '=' || pattern[i + 3] == '!') {
+              isLookbehind = true;
+            }
+          }
+        }
+
+        if (isLookahead || isLookbehind) {
+          // Find the matching closing paren
+          int depth = 1;
+          assertEnd = (isLookbehind ? i + 4 : i + 3);
+          while (assertEnd < len && depth > 0) {
+            if (pattern[assertEnd] == '\\') { assertEnd += 2; continue; }
+            if (pattern[assertEnd] == '(') ++depth;
+            if (pattern[assertEnd] == ')') --depth;
+            if (depth > 0) ++assertEnd;
+          }
+          if (assertEnd < len) ++assertEnd; // skip closing ')'
+
+          // Check if followed by a quantifier
+          if (assertEnd < len && isQuantifier(assertEnd)) {
+            if (isLookbehind) {
+              // Lookbehinds are NEVER quantifiable
+              throw std::runtime_error("SyntaxError: Invalid regular expression: quantifier on lookbehind");
+            }
+            if (unicodeMode) {
+              // In unicode mode, lookaheads are also not quantifiable
+              throw std::runtime_error("SyntaxError: Invalid regular expression: quantifier on assertion in unicode mode");
+            }
+          }
+          i = assertEnd;
+          continue;
+        }
+      }
+
+      // In unicode mode, lone { and } are not allowed as pattern characters
+      if (unicodeMode && (c == '{' || c == '}')) {
+        if (c == '{') {
+          // Check if this is a valid quantifier {n}, {n,}, {n,m}
+          size_t j = i + 1;
+          bool validQuantifier = false;
+          size_t quantEnd = 0;
+          bool hasDigit = false;
+          while (j < len && pattern[j] >= '0' && pattern[j] <= '9') { hasDigit = true; ++j; }
+          if (hasDigit && j < len) {
+            if (pattern[j] == '}') { validQuantifier = true; quantEnd = j; }
+            else if (pattern[j] == ',') {
+              ++j;
+              while (j < len && pattern[j] >= '0' && pattern[j] <= '9') ++j;
+              if (j < len && pattern[j] == '}') { validQuantifier = true; quantEnd = j; }
+            }
+          }
+          if (!validQuantifier) {
+            throw std::runtime_error("SyntaxError: Invalid regular expression: lone { in unicode mode");
+          }
+          // Skip past the closing } so we don't reject it as a lone }
+          i = quantEnd + 1;
+          continue;
+        } else {
+          // lone } not following a valid quantifier opening
+          throw std::runtime_error("SyntaxError: Invalid regular expression: lone } in unicode mode");
+        }
+      }
+
+      ++i;
+    }
+
+    // Unicode mode: validate character class ranges
+    if (unicodeMode) {
+      i = 0;
+      while (i < len) {
+        if (pattern[i] == '\\') { i += 2; continue; }
+        if (pattern[i] == '[') {
+          ++i;
+          bool negated = (i < len && pattern[i] == '^');
+          if (negated) ++i;
+
+          // Walk through class contents looking for invalid ranges
+          while (i < len && pattern[i] != ']') {
+            if (pattern[i] == '\\') {
+              char esc = (i + 1 < len) ? pattern[i + 1] : 0;
+              bool isCharClass = (esc == 'd' || esc == 'D' || esc == 'w' || esc == 'W' ||
+                                  esc == 's' || esc == 'S');
+              i += 2;
+              // Check if followed by dash and another atom (creating a range)
+              if (isCharClass && i < len && pattern[i] == '-' && i + 1 < len && pattern[i + 1] != ']') {
+                throw std::runtime_error("SyntaxError: Invalid regular expression: invalid character class range in unicode mode");
+              }
+            } else {
+              char first = pattern[i];
+              ++i;
+              if (i < len && pattern[i] == '-' && i + 1 < len && pattern[i + 1] != ']') {
+                ++i; // skip -
+                if (i < len && pattern[i] == '\\') {
+                  char esc = (i + 1 < len) ? pattern[i + 1] : 0;
+                  bool isCharClass = (esc == 'd' || esc == 'D' || esc == 'w' || esc == 'W' ||
+                                      esc == 's' || esc == 'S');
+                  if (isCharClass) {
+                    throw std::runtime_error("SyntaxError: Invalid regular expression: invalid character class range in unicode mode");
+                  }
+                  i += 2;
+                } else if (i < len) {
+                  ++i;
+                }
+              }
+            }
+          }
+          if (i < len) ++i; // skip ]
+          continue;
+        }
+        ++i;
+      }
+    }
+  }
+
+  // Custom validation for named group patterns (std::regex doesn't support them)
+  if (hasNamedGroups) {
+    // Validate named group names and check for duplicates
+    std::set<std::string> seenNames;
+    size_t j = 0;
+    while (j < pattern.size()) {
+      if (pattern[j] == '\\' && j + 1 < pattern.size()) { j += 2; continue; }
+      if (pattern[j] == '[') { ++j; while (j < pattern.size() && pattern[j] != ']') { if (pattern[j] == '\\') ++j; ++j; } if (j < pattern.size()) ++j; continue; }
+      if (pattern[j] == '(' && j + 1 < pattern.size() && pattern[j + 1] == '?' &&
+          j + 2 < pattern.size() && pattern[j + 2] == '<' &&
+          j + 3 < pattern.size() && pattern[j + 3] != '=' && pattern[j + 3] != '!') {
+        // Named capture group (?<name>...)
+        size_t nameStart = j + 3;
+        size_t nameEnd = nameStart;
+        while (nameEnd < pattern.size() && pattern[nameEnd] != '>') ++nameEnd;
+        if (nameEnd >= pattern.size()) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: unterminated group name");
+        }
+        std::string name = pattern.substr(nameStart, nameEnd - nameStart);
+        if (name.empty()) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: empty group name");
+        }
+        // Validate identifier: first char must be letter, _ or $
+        char first = name[0];
+        if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
+              first == '_' || first == '$')) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: invalid group name");
+        }
+        for (size_t k = 1; k < name.size(); ++k) {
+          char ch = name[k];
+          if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                (ch >= '0' && ch <= '9') || ch == '_' || ch == '$')) {
+            throw std::runtime_error("SyntaxError: Invalid regular expression: invalid group name");
+          }
+        }
+        if (seenNames.count(name)) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: duplicate group name");
+        }
+        seenNames.insert(name);
+        j = nameEnd + 1;
+      } else {
+        ++j;
+      }
+    }
+  }
+
+  // Also validate \k references in non-unicode mode
+  // (unicode mode \k validation is handled above)
+  if (!unicodeMode && hasNamedGroups) {
+    size_t j = 0;
+    while (j + 1 < pattern.size()) {
+      if (pattern[j] == '\\' && pattern[j + 1] == 'k') {
+        if (j + 2 >= pattern.size() || pattern[j + 2] != '<') {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: invalid named reference");
+        }
+        size_t nameStart = j + 3;
+        size_t nameEnd = nameStart;
+        while (nameEnd < pattern.size() && pattern[nameEnd] != '>') ++nameEnd;
+        if (nameEnd >= pattern.size()) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: invalid named reference");
+        }
+        std::string refName = pattern.substr(nameStart, nameEnd - nameStart);
+        // In non-unicode mode with named groups, dangling \k<name> is a SyntaxError
+        // (Annex B only allows \k as identity escape when there are NO named groups)
+        bool found = false;
+        for (const auto& gn : namedGroups) {
+          if (gn == refName) { found = true; break; }
+        }
+        if (!found) {
+          throw std::runtime_error("SyntaxError: Invalid regular expression: invalid named reference");
+        }
+        j = nameEnd + 1;
+      } else if (pattern[j] == '\\') {
+        j += 2;
+      } else {
+        ++j;
+      }
+    }
+  }
+
+  // Validate pattern+flags early using std::regex/simple_regex for basic syntax.
+  // For patterns with features std::regex doesn't support (named groups, unicode escapes),
+  // transform the pattern before validation.
+  if (!unicodeMode) {
+    std::string validationPattern = pattern;
+    // Strip named group syntax (?<name>...) → (...) for std::regex validation
+    if (hasNamedGroups) {
+      std::string transformed;
+      size_t j = 0;
+      while (j < validationPattern.size()) {
+        if (validationPattern[j] == '\\' && j + 1 < validationPattern.size()) {
+          if (validationPattern[j + 1] == 'k') {
+            // Replace \k<name> with a non-capturing group (avoids forward reference issues)
+            transformed += "(?:)";
+            j += 2;
+            if (j < validationPattern.size() && validationPattern[j] == '<') {
+              while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
+              if (j < validationPattern.size()) ++j;
+            }
+          } else {
+            transformed += validationPattern[j];
+            transformed += validationPattern[j + 1];
+            j += 2;
+          }
+          continue;
+        }
+        if (validationPattern[j] == '(' && j + 1 < validationPattern.size() &&
+            validationPattern[j + 1] == '?' && j + 2 < validationPattern.size() &&
+            validationPattern[j + 2] == '<' && j + 3 < validationPattern.size() &&
+            validationPattern[j + 3] != '=' && validationPattern[j + 3] != '!') {
+          // Replace (?<name> with (
+          transformed += '(';
+          j += 3;
+          while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
+          if (j < validationPattern.size()) ++j;
+        } else {
+          transformed += validationPattern[j];
+          ++j;
+        }
+      }
+      validationPattern = transformed;
+    }
+    try {
+#if USE_SIMPLE_REGEX
+      bool caseInsensitive = flags.find('i') != std::string::npos;
+      simple_regex::Regex tmp(validationPattern, caseInsensitive);
+      (void)tmp;
+#else
+      std::regex::flag_type options = std::regex::ECMAScript;
+      if (flags.find('i') != std::string::npos) {
+        options |= std::regex::icase;
+      }
+      std::regex tmp(validationPattern, options);
+      (void)tmp;
 #endif
-  } catch (...) {
-    throw std::runtime_error("SyntaxError: Invalid regular expression");
+    } catch (...) {
+      throw std::runtime_error("SyntaxError: Invalid regular expression");
+    }
   }
 
   // Encode pattern length as prefix so parser can split unambiguously.

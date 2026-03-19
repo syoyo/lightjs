@@ -26,6 +26,8 @@ private:
   bool strictMode_ = false;
   bool error_ = false;  // Set on syntax errors to abort parsing
   bool isEvalContext_ = false;  // True when parsing eval() code
+  int parseDepth_ = 0;  // Recursion depth counter for OOM protection
+  static constexpr int kMaxParseDepth = 500;
   std::set<std::string> allowedPrivateNames_;
   bool inSingleStatementPosition_ = false;  // True when parsing body of for/while/if/etc.
   int superCallDisallowDepth_ = 0;

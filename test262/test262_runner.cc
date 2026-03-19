@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <sys/resource.h>
 
 namespace fs = std::filesystem;
 using namespace lightjs;
@@ -872,6 +873,21 @@ private:
 
     if (pid == 0) {
       close(pipefd[0]);
+      // Set per-child memory limit (default 2GB, configurable via env var)
+      {
+        rlim_t memLimitBytes = 2ULL * 1024 * 1024 * 1024; // 2GB default
+        const char* envLimit = std::getenv("LIGHTJS_TEST262_MEM_LIMIT_MB");
+        if (envLimit && *envLimit != '\0') {
+          try {
+            long mb = std::stol(envLimit);
+            if (mb > 0) memLimitBytes = static_cast<rlim_t>(mb) * 1024 * 1024;
+          } catch (...) {}
+        }
+        struct rlimit rl;
+        rl.rlim_cur = memLimitBytes;
+        rl.rlim_max = memLimitBytes;
+        setrlimit(RLIMIT_AS, &rl);
+      }
       Test262Result childResult = runSingleTest(testPath, testCode);
       std::string payload = serializeResult(childResult);
       (void)write(pipefd[1], payload.data(), payload.size());

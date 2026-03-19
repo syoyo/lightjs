@@ -693,7 +693,7 @@ bool hasUseStrictDirective(const std::vector<StmtPtr>& body) {
 // Forward declaration for TDZ initialization
 static void collectVarHoistNames(const Expression& expr, std::vector<std::string>& names);
 
-Interpreter::Interpreter(GCPtr<Environment> env) : env_(env) {
+Interpreter::Interpreter(GCPtr<Environment> env) : env_(env), maxLoopIterations_(getMaxLoopIterations()) {
   setGlobalInterpreter(this);
 }
 
@@ -4722,8 +4722,9 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         }
         // Check setter status
         auto setterIt = objPtr->properties.find("__set_" + propName);
-        if (hasGetter && setterIt == objPtr->properties.end()) {
-          // Getter exists but no setter - assignment will fail
+        if (hasGetter && (setterIt == objPtr->properties.end() ||
+            !setterIt->second.isFunction())) {
+          // Getter exists but no callable setter - assignment will fail
           hasSetter = false;
         }
         // Check non-writable marker
@@ -13451,7 +13452,9 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   }
   // Regular functions (non-arrow, non-method) are constructors.
   // Generator methods still need a .prototype object for iterator instances.
-  if (!expr.isArrow && (!expr.isMethod || expr.isGenerator)) {
+  // Plain async functions (non-generator) are not constructors and don't get .prototype.
+  bool isPlainAsync = func->isAsync && !func->isGenerator;
+  if (!expr.isArrow && !isPlainAsync && (!expr.isMethod || expr.isGenerator || func->isGenerator)) {
     func->isConstructor = (!expr.isMethod && !func->isGenerator);
     // Create default prototype object
     auto proto = GarbageCollector::makeGC<Object>();
@@ -17424,32 +17427,36 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->properties["name"] = Value(decl.id.name);
   func->properties["__non_writable_name"] = Value(true);
   func->properties["__non_enum_name"] = Value(true);
-  func->isConstructor = !func->isGenerator;
+  // Async functions (non-generator) are not constructors (no MakeConstructor call per spec)
+  // Async generators are also not constructors but DO have a .prototype object
+  func->isConstructor = !func->isGenerator && !func->isAsync;
 
-  // Create default prototype object
-  auto proto = GarbageCollector::makeGC<Object>();
-  GarbageCollector::instance().reportAllocation(sizeof(Object));
-  if (func->isGenerator) {
-    if (auto genProto = env_->get("__generator_prototype__"); genProto && genProto->isObject()) {
-      proto->properties["__proto__"] = *genProto;
-    }
-    func->properties["__non_enum_prototype"] = Value(true);
-    func->properties["__non_configurable_prototype"] = Value(true);
-  } else {
-    proto->properties["constructor"] = Value(func);
-    proto->properties["__non_enum_constructor"] = Value(true);
-    // Ordinary function prototypes inherit from Object.prototype.
-    if (auto objectCtorVal = env_->getRoot()->get("Object"); objectCtorVal && objectCtorVal->isFunction()) {
-      auto objectCtor = objectCtorVal->getGC<Function>();
-      auto objectProtoIt = objectCtor->properties.find("prototype");
-      if (objectProtoIt != objectCtor->properties.end()) {
-        proto->properties["__proto__"] = objectProtoIt->second;
+  // Create default prototype object (only for constructors and generators, also async generators)
+  if (!(func->isAsync && !func->isGenerator)) {
+    auto proto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    if (func->isGenerator) {
+      if (auto genProto = env_->get("__generator_prototype__"); genProto && genProto->isObject()) {
+        proto->properties["__proto__"] = *genProto;
+      }
+      func->properties["__non_enum_prototype"] = Value(true);
+      func->properties["__non_configurable_prototype"] = Value(true);
+    } else {
+      proto->properties["constructor"] = Value(func);
+      proto->properties["__non_enum_constructor"] = Value(true);
+      // Ordinary function prototypes inherit from Object.prototype.
+      if (auto objectCtorVal = env_->getRoot()->get("Object"); objectCtorVal && objectCtorVal->isFunction()) {
+        auto objectCtor = objectCtorVal->getGC<Function>();
+        auto objectProtoIt = objectCtor->properties.find("prototype");
+        if (objectProtoIt != objectCtor->properties.end()) {
+          proto->properties["__proto__"] = objectProtoIt->second;
+        }
       }
     }
+    func->properties["prototype"] = Value(proto);
+    func->properties["__non_enum_prototype"] = Value(true);
+    func->properties["__non_configurable_prototype"] = Value(true);
   }
-  func->properties["prototype"] = Value(proto);
-  func->properties["__non_enum_prototype"] = Value(true);
-  func->properties["__non_configurable_prototype"] = Value(true);
 
   // Set __proto__ to Function.prototype or GeneratorFunction.prototype
   std::string funcProtoName = func->isGenerator ? "__generator_function_prototype__" : "Function";
@@ -17589,8 +17596,14 @@ Task Interpreter::evaluateWhile(const WhileStmt& stmt) {
   Value result = Value(Undefined{});
   std::string myLabel = pendingIterationLabel_;
   pendingIterationLabel_.clear();
+  size_t loopIter = 0;
 
   while (true) {
+    if (maxLoopIterations_ > 0 && ++loopIter > maxLoopIterations_) {
+      throwError(ErrorType::RangeError, "Maximum loop iterations exceeded");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
     auto testTask = evaluate(*stmt.test);
     LIGHTJS_RUN_TASK_VOID(testTask);
 
@@ -17807,6 +17820,7 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   }
 
   Value result = Value(Undefined{});
+  size_t loopIter = 0;
 
   // CreatePerIterationEnvironment helper (ES6 14.7.4.4)
   // Creates a fresh scope copying let bindings, so closures capture per-iteration values
@@ -17825,6 +17839,11 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
   createPerIterationEnv();
 
   while (true) {
+    if (maxLoopIterations_ > 0 && ++loopIter > maxLoopIterations_) {
+      throwError(ErrorType::RangeError, "Maximum loop iterations exceeded");
+      env_ = prevEnv;
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
     if (stmt.test) {
       auto testTask = evaluate(*stmt.test);
       LIGHTJS_RUN_TASK_VOID(testTask);
@@ -17883,8 +17902,14 @@ Task Interpreter::evaluateDoWhile(const DoWhileStmt& stmt) {
   // Consume pending label if this loop is directly labeled
   std::string myLabel = pendingIterationLabel_;
   pendingIterationLabel_.clear();
+  size_t loopIter = 0;
 
   do {
+    if (maxLoopIterations_ > 0 && ++loopIter > maxLoopIterations_) {
+      throwError(ErrorType::RangeError, "Maximum loop iterations exceeded");
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+
     Value bodyResult;
     auto bodyTask = evaluate(*stmt.body);
   LIGHTJS_RUN_TASK(bodyTask, bodyResult);

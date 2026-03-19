@@ -17254,7 +17254,7 @@ GCPtr<Environment> Environment::createGlobal() {
     // proto must be Object or null
     if (!args[1].isNull() && !args[1].isObject() && !args[1].isFunction() && !args[1].isClass() &&
         !args[1].isArray() && !args[1].isError() && !args[1].isRegex() && !args[1].isMap() &&
-        !args[1].isSet() && !args[1].isPromise()) {
+        !args[1].isSet() && !args[1].isPromise() && !args[1].isProxy()) {
       throw std::runtime_error("TypeError: Object prototype may only be an Object or null");
     }
     // If O is not Object, return O
@@ -19113,20 +19113,23 @@ GCPtr<Environment> Environment::createGlobal() {
         }
 
         if (valueField.has_value()) {
-          // Converting accessor -> data: remove accessor markers
-          arr->properties.erase("__get_" + key);
-          arr->properties.erase("__set_" + key);
-          // For numeric keys, set in elements array; for others, use properties
+          // If this is a mapped arguments index, sync value via the parameter setter
+          // BEFORE erasing accessor markers (which are the mapping getters/setters).
           bool isNumeric = true;
           size_t idx = 0;
           try { idx = std::stoul(key); } catch (...) { isNumeric = false; }
-          // If this is a mapped arguments index, keep the parameter binding in sync.
           if (hadMappedArgumentsBinding && isNumeric) {
             auto setIt = arr->properties.find("__set_" + key);
             if (setIt != arr->properties.end() && setIt->second.isFunction()) {
               auto fn = setIt->second.getGC<Function>();
               fn->nativeFunc({*valueField});
             }
+          }
+          // Converting accessor -> data: remove accessor markers
+          // BUT skip for mapped arguments (their __get_/__set_ are parameter bindings)
+          if (!hadMappedArgumentsBinding) {
+            arr->properties.erase("__get_" + key);
+            arr->properties.erase("__set_" + key);
           }
           if (isNumeric && idx < arr->elements.size()) {
             arr->elements[idx] = *valueField;
@@ -19991,6 +19994,11 @@ GCPtr<Environment> Environment::createGlobal() {
       throw std::runtime_error("RangeError: Invalid count value");
     }
     size_t n = static_cast<size_t>(count);
+    // Guard against OOM: cap result at 256MB
+    static constexpr size_t kMaxRepeatBytes = 256 * 1024 * 1024;
+    if (str.size() > 0 && n > kMaxRepeatBytes / str.size()) {
+      throw std::runtime_error("RangeError: Invalid count value");
+    }
     std::string result;
     result.reserve(str.size() * n);
     for (size_t i = 0; i < n; ++i) result += str;

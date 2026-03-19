@@ -338,6 +338,17 @@ private:
   // Per-realm (Interpreter) template object cache for tagged templates.
   std::unordered_map<const void*, Value> templateObjectCache_;
 
+  // Loop iteration limit for OOM protection (0 = unlimited)
+  // Configurable via LIGHTJS_MAX_LOOP_ITERATIONS env var
+  size_t maxLoopIterations_ = 0;
+  static size_t getMaxLoopIterations() {
+    const char* env = std::getenv("LIGHTJS_MAX_LOOP_ITERATIONS");
+    if (env && *env != '\0') {
+      try { long v = std::stol(env); if (v > 0) return static_cast<size_t>(v); } catch (...) {}
+    }
+    return 0; // unlimited by default
+  }
+
   // RAII helper for stack depth tracking
   struct StackGuard {
     size_t& depth_;
