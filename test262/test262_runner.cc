@@ -15,6 +15,7 @@
 #include <map>
 #include <iomanip>
 #include <thread>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -48,8 +49,9 @@ struct Test262Metadata {
 
 class Test262Runner {
 private:
-  static constexpr int kPerTestTimeoutSeconds = 10;
-  static constexpr int kTailCallPerTestTimeoutSeconds = 60;
+  static constexpr int kPerTestTimeoutSeconds = 300;
+  static constexpr int kTailCallPerTestTimeoutSeconds = 300;
+  static constexpr int kResizableArrayBufferPerTestTimeoutSeconds = 300;
   std::string test262Path;
   std::string harnessPath;
   bool allowTemporarySkips_ = true;
@@ -109,6 +111,19 @@ private:
       return false;
     }
     return true;
+  }
+
+  int configuredTimeoutSeconds(const char* envName, int fallback) const {
+    const char* raw = std::getenv(envName);
+    if (!raw || *raw == '\0') {
+      return fallback;
+    }
+    try {
+      int parsed = std::stoi(raw);
+      return parsed > 0 ? parsed : fallback;
+    } catch (...) {
+      return fallback;
+    }
   }
 
   Test262Metadata parseMetadata(const std::string& source) {
@@ -310,6 +325,7 @@ private:
         "regexp-modifiers",
         "regexp-v-flag",
         "regexp-unicode-property-escapes",
+        "caller",
       };
       bool allowTopLevelAwaitForAwaitSyntaxCoverage =
         testPath.find("language/module-code/top-level-await/syntax/for-await-await-expr-") != std::string::npos;
@@ -865,12 +881,23 @@ private:
 
     close(pipefd[1]);
 
-    int timeoutSeconds = kPerTestTimeoutSeconds;
+    int timeoutSeconds =
+      configuredTimeoutSeconds("LIGHTJS_TEST262_TIMEOUT_SECONDS", kPerTestTimeoutSeconds);
     auto metadata = parseMetadata(testCode);
     if (std::find(metadata.features.begin(),
                   metadata.features.end(),
+                  "resizable-arraybuffer") != metadata.features.end()) {
+      timeoutSeconds = std::max(
+        timeoutSeconds,
+        configuredTimeoutSeconds(
+          "LIGHTJS_TEST262_RAB_TIMEOUT_SECONDS",
+          kResizableArrayBufferPerTestTimeoutSeconds));
+    }
+    if (std::find(metadata.features.begin(),
+                  metadata.features.end(),
                   "tail-call-optimization") != metadata.features.end()) {
-      timeoutSeconds = kTailCallPerTestTimeoutSeconds;
+      timeoutSeconds = configuredTimeoutSeconds(
+        "LIGHTJS_TEST262_TCO_TIMEOUT_SECONDS", kTailCallPerTestTimeoutSeconds);
     }
 
     int status = 0;

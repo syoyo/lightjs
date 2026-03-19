@@ -216,22 +216,42 @@ void installTest262Harness(GCPtr<Environment> env) {
   auto detachArrayBuffer = GarbageCollector::makeGC<Function>();
   detachArrayBuffer->isNative = true;
   detachArrayBuffer->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    // Mark TypedArray as detached (simplified)
     if (!args.empty()) {
-      if (auto* arr = std::get_if<GCPtr<TypedArray>>(&args[0].data)) {
-        (*arr)->buffer.clear();
+      if (auto* buffer = std::get_if<GCPtr<ArrayBuffer>>(&args[0].data)) {
+        if (*buffer) {
+          (*buffer)->detach();
+        }
+      } else if (auto* arr = std::get_if<GCPtr<TypedArray>>(&args[0].data)) {
+        if (*arr && (*arr)->viewedBuffer) {
+          (*arr)->viewedBuffer->detach();
+        }
       }
     }
     return Value(Undefined{});
   };
   $262->properties["detachArrayBuffer"] = Value(detachArrayBuffer);
 
-  // $262.evalScript()
+  // $262.evalScript() - evaluate a script string in global scope
+  // (like creating a new <script> element with proper GlobalDeclarationInstantiation).
   auto evalScript = GarbageCollector::makeGC<Function>();
   evalScript->isNative = true;
-  evalScript->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    // Simplified evalScript
-    return Value(Undefined{});
+  evalScript->nativeFunc = [env](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isString()) {
+      return Value(Undefined{});
+    }
+    auto* interpreter = getGlobalInterpreter();
+    if (!interpreter) {
+      throw std::runtime_error("TypeError: $262.evalScript: no active interpreter");
+    }
+    // Use runScriptInGlobalScope for proper script semantics
+    // (non-configurable var bindings, GlobalDeclarationInstantiation checks)
+    Value result = interpreter->runScriptInGlobalScope(args[0].toString());
+    if (interpreter->hasError()) {
+      Value err = interpreter->getError();
+      interpreter->clearError();
+      throw std::runtime_error(err.toString());
+    }
+    return result;
   };
   $262->properties["evalScript"] = Value(evalScript);
 
@@ -381,40 +401,74 @@ void installTest262Harness(GCPtr<Environment> env) {
   };
   assertCallable->properties["throws"] = Value(throws);
 
-  auto arraysEqual = [](const Value& lhs, const Value& rhs) -> bool {
-    auto* arr1 = std::get_if<GCPtr<Array>>(&lhs.data);
-    auto* arr2 = std::get_if<GCPtr<Array>>(&rhs.data);
-    if (!arr1 || !arr2) return false;
-    if ((*arr1)->elements.size() != (*arr2)->elements.size()) return false;
-    for (size_t i = 0; i < (*arr1)->elements.size(); i++) {
-      if ((*arr1)->elements[i].toString() != (*arr2)->elements[i].toString()) {
-        return false;
+  auto extractArrayLike = [](const Value& value, std::vector<std::string>& out) -> bool {
+    if (auto* arr = std::get_if<GCPtr<Array>>(&value.data)) {
+      out.reserve((*arr)->elements.size());
+      for (const auto& element : (*arr)->elements) {
+        out.push_back(element.toString());
       }
+      return true;
     }
-    return true;
+    if (auto* typedArray = std::get_if<GCPtr<TypedArray>>(&value.data)) {
+      size_t length = (*typedArray)->currentLength();
+      out.reserve(length);
+      for (size_t i = 0; i < length; ++i) {
+        if ((*typedArray)->type == TypedArrayType::BigInt64 ||
+            (*typedArray)->type == TypedArrayType::BigUint64) {
+          if ((*typedArray)->type == TypedArrayType::BigUint64) {
+            out.push_back(Value(BigInt(bigint::BigIntValue((*typedArray)->getBigUintElement(i)))).toString());
+          } else {
+            out.push_back(Value(BigInt((*typedArray)->getBigIntElement(i))).toString());
+          }
+        } else {
+          out.push_back(Value((*typedArray)->getElement(i)).toString());
+        }
+      }
+      return true;
+    }
+    return false;
+  };
+
+  auto arraysEqual = [extractArrayLike](const Value& lhs, const Value& rhs) -> bool {
+    std::vector<std::string> left;
+    std::vector<std::string> right;
+    bool leftArrayLike = extractArrayLike(lhs, left);
+    bool rightArrayLike = extractArrayLike(rhs, right);
+    if (leftArrayLike && rightArrayLike) {
+      return left == right;
+    }
+    return !lhs.isUndefined() && !lhs.isNull() && !rhs.isUndefined() && !rhs.isNull() &&
+           (lhs.isObject() || lhs.isArray() || lhs.isFunction() || lhs.isRegex() || lhs.isPromise() ||
+            lhs.isGenerator() || lhs.isClass() || lhs.isMap() || lhs.isSet() || lhs.isWeakMap() ||
+            lhs.isWeakSet() || lhs.isTypedArray() || lhs.isArrayBuffer() || lhs.isDataView() || lhs.isError()) &&
+           (rhs.isObject() || rhs.isArray() || rhs.isFunction() || rhs.isRegex() || rhs.isPromise() ||
+            rhs.isGenerator() || rhs.isClass() || rhs.isMap() || rhs.isSet() || rhs.isWeakMap() ||
+            rhs.isWeakSet() || rhs.isTypedArray() || rhs.isArrayBuffer() || rhs.isDataView() || rhs.isError());
   };
 
   // assert.compareArray(actual, expected[, message])
   // Test262 expects this to return `undefined` on success and throw on mismatch.
   auto assertCompareArray = GarbageCollector::makeGC<Function>();
   assertCompareArray->isNative = true;
-  assertCompareArray->nativeFunc = [arraysEqual](const std::vector<Value>& args) -> Value {
+  assertCompareArray->nativeFunc = [arraysEqual, extractArrayLike](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) {
       throw std::runtime_error("assert.compareArray requires at least 2 arguments");
     }
     if (!arraysEqual(args[0], args[1])) {
       std::string message = args.size() > 2 ? args[2].toString() : "Array comparison failed";
-      auto* arr1 = std::get_if<GCPtr<Array>>(&args[0].data);
-      auto* arr2 = std::get_if<GCPtr<Array>>(&args[1].data);
-      if (!arr1 || !arr2) {
+      std::vector<std::string> left;
+      std::vector<std::string> right;
+      bool leftArrayLike = extractArrayLike(args[0], left);
+      bool rightArrayLike = extractArrayLike(args[1], right);
+      if (!leftArrayLike || !rightArrayLike) {
         throw std::runtime_error("AssertionError: " + message + " (non-array operand)");
       }
-      size_t len1 = (*arr1)->elements.size();
-      size_t len2 = (*arr2)->elements.size();
+      size_t len1 = left.size();
+      size_t len2 = right.size();
       size_t minLen = std::min(len1, len2);
       for (size_t i = 0; i < minLen; i++) {
-        std::string lhs = (*arr1)->elements[i].toString();
-        std::string rhs = (*arr2)->elements[i].toString();
+        const std::string& lhs = left[i];
+        const std::string& rhs = right[i];
         if (lhs != rhs) {
           throw std::runtime_error(
             "AssertionError: " + message + " (index " + std::to_string(i) +

@@ -17,6 +17,7 @@ public:
   void setAllowedPrivateNames(const std::set<std::string>& names) {
     allowedPrivateNames_ = names;
   }
+  void setEvalContext(bool isEval) { isEvalContext_ = isEval; }
 
 private:
   std::vector<Token> tokens_;
@@ -24,6 +25,7 @@ private:
   bool isModule_ = false;
   bool strictMode_ = false;
   bool error_ = false;  // Set on syntax errors to abort parsing
+  bool isEvalContext_ = false;  // True when parsing eval() code
   std::set<std::string> allowedPrivateNames_;
   bool inSingleStatementPosition_ = false;  // True when parsing body of for/while/if/etc.
   int superCallDisallowDepth_ = 0;
@@ -33,6 +35,7 @@ private:
   int newTargetDepth_ = 0;  // Depth of non-arrow functions (for new.target validation)
   int returnDisallowDepth_ = 0;  // Disallow `return` even if nested in a function (e.g. class static blocks)
   int staticBlockDepth_ = 0;
+  int classBodyDepth_ = 0;  // Depth of class body context (for super validation)
   int asyncFunctionDepth_ = 0;
   int generatorFunctionDepth_ = 0;
   std::vector<bool> awaitContextStack_;

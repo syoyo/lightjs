@@ -1830,6 +1830,15 @@ bool Module::initializeDeclaredExports(Interpreter* interpreter) {
     if (defaultFunction.assignDefaultName) {
       setDefaultExportNameIfNeeded(functionValue);
     }
+    if (functionValue.isFunction()) {
+      auto fn = functionValue.getGC<Function>();
+      auto namedExprIt = fn->properties.find("__named_expression__");
+      if (namedExprIt != fn->properties.end()) {
+        // `export default function f(){}` is declaration-like and should bind `f`
+        // through the module environment, not through immutable NFE binding rules.
+        fn->properties["__named_expression__"] = Value(false);
+      }
+    }
     environment_->define(defaultFunction.bindingName, functionValue);
   }
 

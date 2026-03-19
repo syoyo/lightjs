@@ -11,6 +11,8 @@ size_t String_utf16Length(const std::string& str);
 Value String_charAt(const std::vector<Value>& args);
 Value String_charCodeAt(const std::vector<Value>& args);
 Value String_codePointAt(const std::vector<Value>& args);
+Value String_at(const std::vector<Value>& args);
+Value String_iterator(const std::vector<Value>& args);
 Value String_indexOf(const std::vector<Value>& args);
 Value String_lastIndexOf(const std::vector<Value>& args);
 Value String_substring(const std::vector<Value>& args);

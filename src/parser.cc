@@ -380,7 +380,7 @@ bool hasUseStrictDirectiveInBody(const std::vector<StmtPtr>& body, bool* hasLega
       break;
     }
     if (auto* str = std::get_if<StringLiteral>(&exprStmt->expression->node)) {
-      if (str->value == "use strict") {
+      if (str->value == "use strict" && !str->hasEscape) {
         if (hasLegacyEscapeBeforeStrict) *hasLegacyEscapeBeforeStrict = sawLegacy;
         return true;
       }
@@ -2333,7 +2333,7 @@ std::optional<Program> Parser::parse() {
               if (str->hasLegacyEscape) {
                 prologueHadLegacyEscape = true;
               }
-              if (str->value == "use strict") {
+              if (str->value == "use strict" && !str->hasEscape) {
                 strictMode_ = true;
                 if (prologueHadLegacyEscape) {
                   error_ = true;
@@ -2753,28 +2753,24 @@ StmtPtr Parser::parseFunctionDeclaration() {
 
   std::string name;
   {
-    awaitContextStack_.push_back(isAsync);
-    yieldContextStack_.push_back(isGenerator);
-    struct NameContextGuard {
-      Parser* parser;
-      ~NameContextGuard() {
-        parser->awaitContextStack_.pop_back();
-        parser->yieldContextStack_.pop_back();
-      }
-    } nameGuard{this};
-
     if (!isIdentifierLikeToken(current().type) &&
         !(match(TokenType::Yield) && !strictMode_)) {
       return nullptr;
     }
     name = current().value;
-    if (staticBlockDepth_ > 0 && name == "await") {
+    // Reject 'await' as function name inside async context or static blocks
+    if (name == "await" && (!canUseAwaitAsIdentifier() || staticBlockDepth_ > 0)) {
+      return nullptr;
+    }
+    // Reject 'yield' as function name inside generator context or strict mode
+    if (name == "yield" && !canUseYieldAsIdentifier()) {
       return nullptr;
     }
     advance();
   }
 
   ++functionDepth_;
+  ++newTargetDepth_;
   awaitContextStack_.push_back(isAsync);
   yieldContextStack_.push_back(isGenerator);
   if (isAsync) {
@@ -2949,7 +2945,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
     // Peek at first statement: check for "use strict" string literal (after the '{')
     auto peekPos = pos_ + 1;
     if (peekPos < tokens_.size() && tokens_[peekPos].type == TokenType::String &&
-        tokens_[peekPos].value == "use strict") {
+        tokens_[peekPos].value == "use strict" && !tokens_[peekPos].escaped) {
       strictMode_ = true;
     }
   }
@@ -2967,6 +2963,7 @@ StmtPtr Parser::parseFunctionDeclaration() {
   if (isAsync) {
     --asyncFunctionDepth_;
   }
+  --newTargetDepth_;
   --functionDepth_;
   awaitContextStack_.pop_back();
   yieldContextStack_.pop_back();
@@ -3009,8 +3006,23 @@ StmtPtr Parser::parseFunctionDeclaration() {
     std::vector<std::string> lexicalNames;
     collectTopLevelLexicallyDeclaredNames(blockStmt->body, lexicalNames);
     std::set<std::string> paramNameSet(boundParamNames.begin(), boundParamNames.end());
+    bool strictFnCode = strictMode_ || hasUseStrictDirective;
+    // Collect function declaration names for sloppy-mode exemption
+    std::set<std::string> funcDeclNamesInBody;
+    if (!strictFnCode) {
+      for (const auto& stmt : blockStmt->body) {
+        if (!stmt) continue;
+        if (auto* fnDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+          funcDeclNamesInBody.insert(fnDecl->id.name);
+        }
+      }
+    }
     for (const auto& lexName : lexicalNames) {
       if (paramNameSet.count(lexName) != 0) {
+        // In sloppy mode, function declarations can shadow parameters
+        if (!strictFnCode && funcDeclNamesInBody.count(lexName) != 0) {
+          continue;
+        }
         return nullptr;
       }
     }
@@ -3083,6 +3095,12 @@ StmtPtr Parser::parseClassDeclaration() {
     explicit StrictModeGuard(Parser* p) : parser(p), saved(p->strictMode_) { parser->strictMode_ = true; }
     ~StrictModeGuard() { parser->strictMode_ = saved; }
   } strictGuard(this);
+  ++classBodyDepth_;
+  struct ClassBodyDepthGuard1 {
+    int& depth;
+    explicit ClassBodyDepthGuard1(int& d) : depth(d) {}
+    ~ClassBodyDepthGuard1() { --depth; }
+  } classBodyGuard1(classBodyDepth_);
   struct PrivateNameScopeGuard {
     std::vector<std::set<std::string>>& scopes;
     explicit PrivateNameScopeGuard(std::vector<std::set<std::string>>& s) : scopes(s) {
@@ -3379,6 +3397,7 @@ StmtPtr Parser::parseClassDeclaration() {
       }
 
       ++functionDepth_;
+      ++newTargetDepth_;
       awaitContextStack_.push_back(method.isAsync);
       yieldContextStack_.push_back(method.isGenerator);
       if (method.isAsync) {
@@ -3542,6 +3561,7 @@ StmtPtr Parser::parseClassDeclaration() {
           if (method.isAsync) {
             --asyncFunctionDepth_;
           }
+          --newTargetDepth_;
           --functionDepth_;
           awaitContextStack_.pop_back();
           yieldContextStack_.pop_back();
@@ -3565,6 +3585,7 @@ StmtPtr Parser::parseClassDeclaration() {
       if (method.isAsync) {
         --asyncFunctionDepth_;
       }
+      --newTargetDepth_;
       --functionDepth_;
       awaitContextStack_.pop_back();
       yieldContextStack_.pop_back();
@@ -5492,6 +5513,18 @@ ExprPtr Parser::parseAssignment() {
         return false;
       }
     }
+    // Check for parameter names that conflict with lexically declared names in body
+    if (!boundParamNames.empty()) {
+      std::vector<std::string> lexNames;
+      collectStatementListLexicalNames(func.body, lexNames, false);
+      for (const auto& paramName : boundParamNames) {
+        for (const auto& lexName : lexNames) {
+          if (paramName == lexName) {
+            return false;
+          }
+        }
+      }
+    }
     if (strictFunctionCode) {
       for (const auto& stmt : func.body) {
         if (stmt && statementContainsStrictRestrictedIdentifierReference(*stmt)) {
@@ -5649,6 +5682,12 @@ ExprPtr Parser::parseAssignment() {
             advance();
             param.defaultValue = parseAssignment();
             if (!param.defaultValue) {
+              --asyncFunctionDepth_;
+              --functionDepth_;
+              awaitContextStack_.pop_back();
+              return nullptr;
+            }
+            if (expressionContainsAwaitLike(*param.defaultValue)) {
               --asyncFunctionDepth_;
               --functionDepth_;
               awaitContextStack_.pop_back();
@@ -5865,6 +5904,10 @@ ExprPtr Parser::parseAssignment() {
           if (!param.defaultValue) {
             return nullptr;
           }
+          if (!canUseAwaitAsIdentifier() &&
+              expressionContainsAwaitLike(*param.defaultValue)) {
+            return nullptr;
+          }
         }
 
         params.push_back(std::move(param));
@@ -5889,6 +5932,20 @@ ExprPtr Parser::parseAssignment() {
     }
 
     if (isArrowFunc) {
+      bool hasAwaitExpressionInParams = false;
+      if (!canUseAwaitAsIdentifier()) {
+        for (size_t i = savedPos; i < pos_; ++i) {
+          if ((tokens_[i].type == TokenType::Await ||
+               (tokens_[i].type == TokenType::Identifier && tokens_[i].value == "await")) &&
+              !tokens_[i].escaped) {
+            hasAwaitExpressionInParams = true;
+            break;
+          }
+        }
+      }
+      if (hasAwaitExpressionInParams) {
+        return nullptr;
+      }
       bool hasYieldExpressionInParams = false;
       if (!yieldContextStack_.empty() && yieldContextStack_.back()) {
         for (size_t i = savedPos; i < pos_; ++i) {
@@ -6929,6 +6986,7 @@ ExprPtr Parser::parsePrimary() {
     advance();
     auto strLit = StringLiteral{value};
     strLit.hasLegacyEscape = tok.hasLegacyEscape;
+    strLit.hasEscape = tok.escaped;
     return makeExpr(strLit, tok);
   }
 
@@ -6976,6 +7034,17 @@ ExprPtr Parser::parsePrimary() {
         }
         if (j + 1 >= raw.size()) return std::nullopt;
         char n = raw[++j];
+        unsigned char un = static_cast<unsigned char>(n);
+        if (un == 0xE2 && j + 2 < raw.size() &&
+            static_cast<unsigned char>(raw[j + 1]) == 0x80) {
+          unsigned char third = static_cast<unsigned char>(raw[j + 2]);
+          if (third == 0xA8 || third == 0xA9) {
+            // LineContinuation: backslash + U+2028/U+2029 contributes no
+            // cooked code units.
+            j += 2;
+            continue;
+          }
+        }
         switch (n) {
           case 'n': cooked.push_back('\n'); break;
           case 't': cooked.push_back('\t'); break;
@@ -7124,9 +7193,11 @@ ExprPtr Parser::parsePrimary() {
     const Token& tok = current();
     std::string value = tok.value;
     advance();
-    size_t sep = value.find("||");
-    std::string pattern = value.substr(0, sep);
-    std::string flags = (sep != std::string::npos) ? value.substr(sep + 2) : "";
+    // Decode "<length>:" + pattern + flags
+    size_t colonPos = value.find(':');
+    size_t patLen = std::stoul(value.substr(0, colonPos));
+    std::string pattern = value.substr(colonPos + 1, patLen);
+    std::string flags = value.substr(colonPos + 1 + patLen);
     return makeExpr(RegexLiteral{pattern, flags}, tok);
   }
 
@@ -7222,7 +7293,10 @@ ExprPtr Parser::parsePrimary() {
       }
 
       std::vector<ExprPtr> args;
+      bool savedAllowIn = allowIn_;
+      allowIn_ = true;
       auto specifier = parseAssignment();
+      allowIn_ = savedAllowIn;
       if (!specifier) {
         return nullptr;
       }
@@ -7231,7 +7305,10 @@ ExprPtr Parser::parsePrimary() {
       if (match(TokenType::Comma)) {
         advance();
         if (!match(TokenType::RightParen)) {
+          savedAllowIn = allowIn_;
+          allowIn_ = true;
           auto options = parseAssignment();
+          allowIn_ = savedAllowIn;
           if (!options) {
             return nullptr;
           }
@@ -7271,7 +7348,10 @@ ExprPtr Parser::parsePrimary() {
 
           auto importId = std::make_unique<Expression>(Identifier{"import"});
           std::vector<ExprPtr> args;
+          bool savedAllowIn = allowIn_;
+          allowIn_ = true;
           auto specifier = parseAssignment();
+          allowIn_ = savedAllowIn;
           if (!specifier) {
             return nullptr;
           }
@@ -7326,6 +7406,11 @@ ExprPtr Parser::parsePrimary() {
   }
 
   if (match(TokenType::Super)) {
+    // super is only valid inside methods, constructors, static blocks, class bodies, or eval
+    if (newTargetDepth_ == 0 && staticBlockDepth_ == 0 && classBodyDepth_ == 0 && !isEvalContext_) {
+      error_ = true;
+      return nullptr;
+    }
     advance();
     return std::make_unique<Expression>(SuperExpr{});
   }
@@ -7530,6 +7615,7 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
           ++functionDepth_;
+          ++newTargetDepth_;
           awaitContextStack_.push_back(false);
           yieldContextStack_.push_back(false);
           struct AccessorParseGuard {
@@ -7660,6 +7746,7 @@ ExprPtr Parser::parseObjectExpression() {
             return nullptr;
           }
           ++functionDepth_;
+          ++newTargetDepth_;
           awaitContextStack_.push_back(false);
           yieldContextStack_.push_back(false);
           struct AccessorParseGuard {
@@ -7802,6 +7889,7 @@ ExprPtr Parser::parseObjectExpression() {
         // Enter function parsing context for params/defaults and body.
         ++superCallDisallowDepth_;
         ++functionDepth_;
+        ++newTargetDepth_;
         awaitContextStack_.push_back(isAsync);
         yieldContextStack_.push_back(isGenerator);
         if (isAsync) {
@@ -8156,11 +8244,9 @@ ExprPtr Parser::parseFunctionExpression() {
   if ((isGenerator && name == "yield") || (isAsync && name == "await")) {
     return nullptr;
   }
-  if (staticBlockDepth_ > 0 && name == "await") {
-    return nullptr;
-  }
 
   ++functionDepth_;
+  ++newTargetDepth_;
   awaitContextStack_.push_back(isAsync);
   yieldContextStack_.push_back(isGenerator);
   if (isAsync) {
@@ -8364,6 +8450,7 @@ ExprPtr Parser::parseFunctionExpression() {
   if (isAsync) {
     --asyncFunctionDepth_;
   }
+  --newTargetDepth_;
   --functionDepth_;
   awaitContextStack_.pop_back();
   yieldContextStack_.pop_back();
@@ -8402,8 +8489,21 @@ ExprPtr Parser::parseFunctionExpression() {
     std::vector<std::string> lexicalNames;
     collectTopLevelLexicallyDeclaredNames(blockStmt->body, lexicalNames);
     std::set<std::string> paramNameSet(boundParamNames.begin(), boundParamNames.end());
+    bool strictFnCode2 = strictMode_ || hasUseStrictDirective;
+    std::set<std::string> funcDeclNamesInBody2;
+    if (!strictFnCode2) {
+      for (const auto& stmt : blockStmt->body) {
+        if (!stmt) continue;
+        if (auto* fnDecl = std::get_if<FunctionDeclaration>(&stmt->node)) {
+          funcDeclNamesInBody2.insert(fnDecl->id.name);
+        }
+      }
+    }
     for (const auto& lexName : lexicalNames) {
       if (paramNameSet.count(lexName) != 0) {
+        if (!strictFnCode2 && funcDeclNamesInBody2.count(lexName) != 0) {
+          continue;
+        }
         return nullptr;
       }
     }
@@ -8474,6 +8574,12 @@ ExprPtr Parser::parseClassExpression() {
     explicit StrictModeGuard(Parser* p) : parser(p), saved(p->strictMode_) { parser->strictMode_ = true; }
     ~StrictModeGuard() { parser->strictMode_ = saved; }
   } strictGuard(this);
+  ++classBodyDepth_;
+  struct ClassBodyDepthGuard2 {
+    int& depth;
+    explicit ClassBodyDepthGuard2(int& d) : depth(d) {}
+    ~ClassBodyDepthGuard2() { --depth; }
+  } classBodyGuard2(classBodyDepth_);
   struct PrivateNameScopeGuard {
     std::vector<std::set<std::string>>& scopes;
     explicit PrivateNameScopeGuard(std::vector<std::set<std::string>>& s) : scopes(s) {
@@ -8760,6 +8866,7 @@ ExprPtr Parser::parseClassExpression() {
         return nullptr;
       }
       ++functionDepth_;
+      ++newTargetDepth_;
       awaitContextStack_.push_back(method.isAsync);
       yieldContextStack_.push_back(method.isGenerator);
       if (method.isAsync) {
@@ -8920,6 +9027,7 @@ ExprPtr Parser::parseClassExpression() {
           if (method.isAsync) {
             --asyncFunctionDepth_;
           }
+          --newTargetDepth_;
           --functionDepth_;
           awaitContextStack_.pop_back();
           yieldContextStack_.pop_back();
@@ -8943,6 +9051,7 @@ ExprPtr Parser::parseClassExpression() {
       if (method.isAsync) {
         --asyncFunctionDepth_;
       }
+      --newTargetDepth_;
       --functionDepth_;
       awaitContextStack_.pop_back();
       yieldContextStack_.pop_back();
@@ -9053,6 +9162,11 @@ ExprPtr Parser::parseNewExpression() {
       peek().type == TokenType::Identifier &&
       peek().value == "target") {
     if (newTok.escaped) {
+      error_ = true;
+      return nullptr;
+    }
+    // new.target is only valid inside non-arrow function code, static blocks, or eval
+    if (newTargetDepth_ == 0 && staticBlockDepth_ == 0 && !isEvalContext_) {
       error_ = true;
       return nullptr;
     }

@@ -66,12 +66,20 @@ struct Symbol {
   static size_t nextId;
   size_t id;
   std::string description;
+  bool hasDescription = true;  // false when Symbol() or Symbol(undefined)
 
-  Symbol(const std::string& desc = "") : id(nextId++), description(desc) {}
-  Symbol(size_t symbolId, const std::string& desc) : id(symbolId), description(desc) {
+  Symbol(const std::string& desc = "") : id(nextId++), description(desc), hasDescription(true) {}
+  Symbol(size_t symbolId, const std::string& desc) : id(symbolId), description(desc), hasDescription(true) {
     if (nextId <= symbolId) {
       nextId = symbolId + 1;
     }
+  }
+  // Constructor for Symbol() with no description
+  static Symbol withoutDescription() {
+    Symbol s;
+    s.hasDescription = false;
+    s.description = "";
+    return s;
   }
 
   bool operator==(const Symbol& other) const { return id == other.id; }

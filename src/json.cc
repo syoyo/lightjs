@@ -1,4 +1,6 @@
 #include "value.h"
+#include "environment.h"
+#include "interpreter.h"
 #include "streams.h"
 #include "wasm_js.h"
 #include <sstream>
@@ -71,15 +73,71 @@ private:
                     case 'n': result += '\n'; break;
                     case 'r': result += '\r'; break;
                     case 't': result += '\t'; break;
-                    case 'u':
-                        // Unicode escape - simplified implementation
-                        pos_ += 4; // Skip the 4 hex digits
-                        result += '?'; // Placeholder
+                    case 'u': {
+                        // Unicode escape \uXXXX - pos_ is currently on 'u'
+                        pos_++; // skip past 'u'
+                        if (pos_ + 4 > str_.size()) {
+                            throw std::runtime_error("Invalid unicode escape in JSON string");
+                        }
+                        std::string hex = str_.substr(pos_, 4);
+                        pos_ += 3; // advance 3 (the outer loop does pos_++ for the 4th)
+                        unsigned int codePoint = 0;
+                        for (char c : hex) {
+                            codePoint <<= 4;
+                            if (c >= '0' && c <= '9') codePoint |= (c - '0');
+                            else if (c >= 'a' && c <= 'f') codePoint |= (c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') codePoint |= (c - 'A' + 10);
+                            else throw std::runtime_error("Invalid hex digit in unicode escape");
+                        }
+                        // Handle surrogate pairs
+                        if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
+                            // High surrogate - check for low surrogate
+                            // pos_ is now on last hex digit of first escape
+                            // Need to check pos_+1 = '\\', pos_+2 = 'u'
+                            if (pos_ + 2 < str_.size() && str_[pos_ + 1] == '\\' && str_[pos_ + 2] == 'u') {
+                                pos_ += 3; // skip past last-hex, backslash, 'u'
+                                if (pos_ + 4 > str_.size()) throw std::runtime_error("Invalid surrogate pair");
+                                std::string hex2 = str_.substr(pos_, 4);
+                                pos_ += 3; // point at last hex (outer loop will advance)
+                                unsigned int low = 0;
+                                for (char c : hex2) {
+                                    low <<= 4;
+                                    if (c >= '0' && c <= '9') low |= (c - '0');
+                                    else if (c >= 'a' && c <= 'f') low |= (c - 'a' + 10);
+                                    else if (c >= 'A' && c <= 'F') low |= (c - 'A' + 10);
+                                }
+                                if (low >= 0xDC00 && low <= 0xDFFF) {
+                                    codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (low - 0xDC00);
+                                }
+                            }
+                        }
+                        // Encode as UTF-8
+                        if (codePoint <= 0x7F) {
+                            result += static_cast<char>(codePoint);
+                        } else if (codePoint <= 0x7FF) {
+                            result += static_cast<char>(0xC0 | (codePoint >> 6));
+                            result += static_cast<char>(0x80 | (codePoint & 0x3F));
+                        } else if (codePoint <= 0xFFFF) {
+                            result += static_cast<char>(0xE0 | (codePoint >> 12));
+                            result += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
+                            result += static_cast<char>(0x80 | (codePoint & 0x3F));
+                        } else if (codePoint <= 0x10FFFF) {
+                            result += static_cast<char>(0xF0 | (codePoint >> 18));
+                            result += static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F));
+                            result += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
+                            result += static_cast<char>(0x80 | (codePoint & 0x3F));
+                        }
                         break;
+                    }
                     default:
                         throw std::runtime_error("Invalid escape sequence");
                 }
             } else {
+                // JSON spec: control characters U+0000-U+001F must be escaped
+                unsigned char ch = static_cast<unsigned char>(str_[pos_]);
+                if (ch < 0x20) {
+                    throw std::runtime_error("Unexpected control character in JSON string");
+                }
                 result += str_[pos_];
             }
             pos_++;
@@ -269,40 +327,152 @@ public:
 class JSONStringifier {
 private:
     std::ostringstream out_;
+    std::string gap_;  // indentation string per level
+    std::string indent_; // current indentation
+    std::vector<const void*> stack_; // circular reference detection
+    Value replacerFn_ = Value(Undefined{});
+    std::vector<std::string> propertyList_;
+    bool hasPropertyList_ = false;
 
-    void stringifyValue(const Value& value) {
-        if (value.isUndefined()) {
-            // undefined becomes null in JSON
-            out_ << "null";
-        } else if (value.isNull()) {
+    bool isObjectLike(const Value& v) const {
+        return v.isObject() || v.isArray() || v.isFunction() || v.isClass() ||
+               v.isError() || v.isPromise() || v.isMap() || v.isSet() ||
+               v.isRegex() || v.isProxy() || v.isTypedArray() || v.isArrayBuffer() ||
+               v.isDataView();
+    }
+
+    const void* getPointer(const Value& v) const {
+        if (v.isObject()) return v.getGC<Object>().get();
+        if (v.isArray()) return v.getGC<Array>().get();
+        if (v.isError()) return v.getGC<Error>().get();
+        if (v.isFunction()) return v.getGC<Function>().get();
+        if (v.isMap()) return v.getGC<Map>().get();
+        if (v.isSet()) return v.getGC<Set>().get();
+        return nullptr;
+    }
+
+    void checkCircular(const Value& v) {
+        auto ptr = getPointer(v);
+        if (!ptr) return;
+        for (auto p : stack_) {
+            if (p == ptr) {
+                throw std::runtime_error("TypeError: Converting circular structure to JSON");
+            }
+        }
+    }
+
+    // Call toJSON if present (ES spec: GetV checks prototype chain for primitives too)
+    Value callToJSON(const Value& value, const std::string& key) {
+        auto* interp = getGlobalInterpreter();
+        if (!interp) return value;
+        // For objects, check own properties first
+        if (value.isObject()) {
+            auto obj = value.getGC<Object>();
+            auto it = obj->properties.find("toJSON");
+            if (it != obj->properties.end() && it->second.isFunction()) {
+                return interp->callForHarness(it->second, {Value(key)}, value);
+            }
+        } else if (value.isArray()) {
+            auto arr = value.getGC<Array>();
+            auto it = arr->properties.find("toJSON");
+            if (it != arr->properties.end() && it->second.isFunction()) {
+                return interp->callForHarness(it->second, {Value(key)}, value);
+            }
+        } else if (value.isBigInt()) {
+            // Check BigInt.prototype.toJSON via property lookup
+            auto [found, toJSON] = interp->getPropertyForExternal(value, "toJSON");
+            if (found && toJSON.isFunction()) {
+                return interp->callForHarness(toJSON, {Value(key)}, value);
+            }
+        }
+        return value;
+    }
+
+    // Apply replacer function
+    Value applyReplacer(const Value& holder, const std::string& key, Value value) {
+        if (replacerFn_.isFunction()) {
+            auto* interp = getGlobalInterpreter();
+            if (interp) {
+                value = interp->callForHarness(replacerFn_, {Value(key), value}, holder);
+            }
+        }
+        return value;
+    }
+
+    // Unwrap String/Number/Boolean wrapper objects via ToPrimitive
+    Value unwrapPrimitive(const Value& value) {
+        if (value.isObject()) {
+            auto obj = value.getGC<Object>();
+            auto primIt = obj->properties.find("__primitive_value__");
+            if (primIt != obj->properties.end()) {
+                const auto& prim = primIt->second;
+                if (prim.isNumber()) {
+                    // ToNumber: call valueOf if overridden
+                    auto valueOfIt = obj->properties.find("valueOf");
+                    if (valueOfIt != obj->properties.end() && valueOfIt->second.isFunction()) {
+                        auto* interp = getGlobalInterpreter();
+                        if (interp) return interp->callForHarness(valueOfIt->second, {}, value);
+                    }
+                    return prim;
+                } else if (prim.isString()) {
+                    // ToString: call toString if overridden
+                    auto toStringIt = obj->properties.find("toString");
+                    if (toStringIt != obj->properties.end() && toStringIt->second.isFunction()) {
+                        auto* interp = getGlobalInterpreter();
+                        if (interp) return interp->callForHarness(toStringIt->second, {}, value);
+                    }
+                    return prim;
+                } else if (prim.isBool()) {
+                    return prim;
+                }
+                return prim;
+            }
+        }
+        return value;
+    }
+
+    // Returns true if value was written, false if it should be omitted
+    bool serializeValue(const Value& holder, const std::string& key, Value value) {
+        // Step 1: call toJSON
+        value = callToJSON(value, key);
+        // Step 2: apply replacer
+        value = applyReplacer(holder, key, value);
+        // Unwrap primitive wrappers
+        value = unwrapPrimitive(value);
+
+        if (value.isUndefined() || value.isFunction() || value.isClass() || value.isSymbol()) {
+            return false; // omit
+        }
+        if (value.isNull()) {
             out_ << "null";
         } else if (value.isBool()) {
             out_ << (std::get<bool>(value.data) ? "true" : "false");
         } else if (value.isNumber()) {
             double num = std::get<double>(value.data);
             if (std::isfinite(num)) {
-                out_ << num;
+                out_ << ecmaNumberToString(num);
             } else {
-                out_ << "null"; // Infinity and NaN become null
+                out_ << "null";
             }
         } else if (value.isBigInt()) {
-            // BigInt cannot be JSON serialized
-            throw std::runtime_error("Cannot stringify BigInt");
+            throw std::runtime_error("TypeError: Do not know how to serialize a BigInt");
         } else if (value.isString()) {
             stringifyString(std::get<std::string>(value.data));
         } else if (value.isArray()) {
-            stringifyArray(*value.getGC<Array>());
-        } else if (value.isObject()) {
-            stringifyObject(*value.getGC<Object>());
+            checkCircular(value);
+            serializeArray(value);
+        } else if (value.isObject() || value.isError()) {
+            checkCircular(value);
+            serializeObject(value);
         } else {
-            // Functions, symbols, etc. become null
             out_ << "null";
         }
+        return true;
     }
 
     void stringifyString(const std::string& str) {
         out_ << '"';
-        for (char ch : str) {
+        for (unsigned char ch : str) {
             switch (ch) {
                 case '"': out_ << "\\\""; break;
                 case '\\': out_ << "\\\\"; break;
@@ -314,8 +484,9 @@ private:
                 default:
                     if (ch < 32) {
                         out_ << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
+                        out_ << std::dec; // reset to decimal
                     } else {
-                        out_ << ch;
+                        out_ << (char)ch;
                     }
                     break;
             }
@@ -323,35 +494,189 @@ private:
         out_ << '"';
     }
 
-    void stringifyArray(const Array& arr) {
-        out_ << '[';
-        for (size_t i = 0; i < arr.elements.size(); ++i) {
-            if (i > 0) out_ << ',';
-            stringifyValue(arr.elements[i]);
-        }
-        out_ << ']';
+    bool isInternalKey(const std::string& key) const {
+        if (key.size() >= 2 && key[0] == '_' && key[1] == '_') return true;
+        if (isSymbolPropertyKey(key)) return true;
+        return false;
     }
 
-    void stringifyObject(const Object& obj) {
+    void serializeArray(const Value& arrayVal) {
+        auto arr = arrayVal.getGC<Array>();
+        auto ptr = getPointer(arrayVal);
+        stack_.push_back(ptr);
+        std::string prevIndent = indent_;
+        indent_ += gap_;
+        out_ << '[';
+        bool empty = true;
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+            if (i > 0) out_ << ',';
+            if (!gap_.empty()) {
+                out_ << '\n' << indent_;
+            }
+            empty = false;
+            if (!serializeValue(arrayVal, std::to_string(i), arr->elements[i])) {
+                out_ << "null"; // undefined/function slots become null in arrays
+            }
+        }
+        indent_ = prevIndent;
+        if (!empty && !gap_.empty()) {
+            out_ << '\n' << indent_;
+        }
+        out_ << ']';
+        stack_.pop_back();
+    }
+
+    void serializeObject(const Value& objVal) {
+        OrderedMap<std::string, Value>* props = nullptr;
+        if (objVal.isObject()) {
+            props = &objVal.getGC<Object>()->properties;
+        } else if (objVal.isError()) {
+            props = &objVal.getGC<Error>()->properties;
+        }
+        if (!props) { out_ << "{}"; return; }
+
+        auto ptr = getPointer(objVal);
+        stack_.push_back(ptr);
+        std::string prevIndent = indent_;
+        indent_ += gap_;
         out_ << '{';
         bool first = true;
-        for (const auto& key : obj.properties.orderedKeys()) {
-            auto it = obj.properties.find(key);
-            if (it == obj.properties.end()) continue;
-            if (!first) out_ << ',';
-            first = false;
-            stringifyString(key);
-            out_ << ':';
-            stringifyValue(it->second);
+
+        // Determine which keys to use
+        std::vector<std::string> keys;
+        if (hasPropertyList_) {
+            keys = propertyList_;
+        } else {
+            // OrdinaryOwnPropertyKeys: integer indices ascending, then strings in insertion order
+            std::vector<std::pair<uint32_t, std::string>> indexKeys;
+            std::vector<std::string> stringKeys;
+            for (const auto& key : props->orderedKeys()) {
+                if (isInternalKey(key)) continue;
+                if (isSymbolPropertyKey(key)) continue;
+                if (props->find("__non_enum_" + key) != props->end()) continue;
+                // Check if key is an array index
+                bool isIdx = false;
+                if (!key.empty() && key[0] >= '0' && key[0] <= '9') {
+                    bool allDigits = true;
+                    for (char c : key) if (c < '0' || c > '9') { allDigits = false; break; }
+                    if (allDigits && (key.size() == 1 || key[0] != '0')) {
+                        try {
+                            unsigned long long parsed = std::stoull(key);
+                            if (parsed < 4294967295ULL) {
+                                indexKeys.push_back({static_cast<uint32_t>(parsed), key});
+                                isIdx = true;
+                            }
+                        } catch (...) {}
+                    }
+                }
+                if (!isIdx) stringKeys.push_back(key);
+            }
+            std::sort(indexKeys.begin(), indexKeys.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [_, k] : indexKeys) keys.push_back(k);
+            for (const auto& k : stringKeys) keys.push_back(k);
+        }
+
+        for (const auto& key : keys) {
+            auto it = props->find(key);
+            if (it == props->end()) continue;
+            Value val = it->second;
+            // Try to serialize - serializeValue handles omission
+            std::ostringstream saved;
+            saved << out_.str();
+            auto savedPos = out_.tellp();
+
+            if (!gap_.empty()) {
+                // Build entry with indentation
+                std::ostringstream entry;
+                entry << '\n' << indent_;
+                stringifyStringTo(entry, key);
+                entry << ": ";
+                // Temporarily redirect output
+                std::string prevOut = out_.str();
+                out_.str("");
+                out_.clear();
+                bool written = serializeValue(objVal, key, val);
+                std::string valueStr = out_.str();
+                out_.str(prevOut);
+                out_.clear();
+                out_.seekp(0, std::ios_base::end);
+                if (written) {
+                    if (!first) out_ << ',';
+                    first = false;
+                    out_ << entry.str() << valueStr;
+                }
+            } else {
+                std::string prevOut = out_.str();
+                out_.str("");
+                out_.clear();
+                bool written = serializeValue(objVal, key, val);
+                std::string valueStr = out_.str();
+                out_.str(prevOut);
+                out_.clear();
+                out_.seekp(0, std::ios_base::end);
+                if (written) {
+                    if (!first) out_ << ',';
+                    first = false;
+                    stringifyString(key);
+                    out_ << ':' << valueStr;
+                }
+            }
+        }
+        indent_ = prevIndent;
+        if (!first && !gap_.empty()) {
+            out_ << '\n' << indent_;
         }
         out_ << '}';
+        stack_.pop_back();
+    }
+
+    void stringifyStringTo(std::ostringstream& os, const std::string& str) {
+        os << '"';
+        for (unsigned char ch : str) {
+            switch (ch) {
+                case '"': os << "\\\""; break;
+                case '\\': os << "\\\\"; break;
+                case '\b': os << "\\b"; break;
+                case '\f': os << "\\f"; break;
+                case '\n': os << "\\n"; break;
+                case '\r': os << "\\r"; break;
+                case '\t': os << "\\t"; break;
+                default:
+                    if (ch < 32) {
+                        os << "\\u" << std::hex << std::setfill('0') << std::setw(4) << (int)ch;
+                        os << std::dec;
+                    } else {
+                        os << (char)ch;
+                    }
+                    break;
+            }
+        }
+        os << '"';
     }
 
 public:
+    void setGap(const std::string& g) { gap_ = g; }
+    void setReplacer(const Value& fn) { replacerFn_ = fn; }
+    void setPropertyList(const std::vector<std::string>& list) {
+        propertyList_ = list;
+        hasPropertyList_ = true;
+    }
+
     std::string stringify(const Value& value) {
         out_.str("");
         out_.clear();
-        stringifyValue(value);
+        indent_ = "";
+        stack_.clear();
+
+        // Wrap in a holder object for the replacer
+        auto holder = GarbageCollector::makeGC<Object>();
+        holder->properties[""] = value;
+        Value holderVal(holder);
+
+        if (!serializeValue(holderVal, "", value)) {
+            return ""; // signals undefined
+        }
         return out_.str();
     }
 };
@@ -359,28 +684,183 @@ public:
 // JSON object implementation
 Value JSON_parse(const std::vector<Value>& args) {
     if (args.empty()) {
-        throw std::runtime_error("JSON.parse requires at least 1 argument");
+        throw std::runtime_error("SyntaxError: Unexpected end of JSON input");
     }
 
-    if (!args[0].isString()) {
-        throw std::runtime_error("JSON.parse argument must be a string");
+    std::string jsonStr;
+    if (args[0].isString()) {
+        jsonStr = std::get<std::string>(args[0].data);
+    } else {
+        jsonStr = args[0].toString();
     }
 
-    std::string jsonStr = std::get<std::string>(args[0].data);
     JSONParser parser(jsonStr);
     return parser.parse();
 }
 
 Value JSON_stringify(const std::vector<Value>& args) {
     if (args.empty()) {
-        return Value("undefined");
+        return Value(Undefined{});
     }
 
+    Value val = args[0];
+
     JSONStringifier stringifier;
+
+    // Process replacer (2nd argument)
+    if (args.size() > 1) {
+        Value replacer = args[1];
+        if (replacer.isFunction()) {
+            stringifier.setReplacer(replacer);
+        } else if (replacer.isArray()) {
+            auto arr = replacer.getGC<Array>();
+            std::vector<std::string> propList;
+            for (const auto& elem : arr->elements) {
+                std::string item;
+                bool hasItem = false;
+                if (elem.isString()) {
+                    item = std::get<std::string>(elem.data);
+                    hasItem = true;
+                } else if (elem.isNumber()) {
+                    item = elem.toString();
+                    hasItem = true;
+                } else if (elem.isObject()) {
+                    // ES spec: Object with [[StringData]] or [[NumberData]]
+                    auto obj = elem.getGC<Object>();
+                    auto pvIt = obj->properties.find("__primitive_value__");
+                    if (pvIt != obj->properties.end()) {
+                        if (pvIt->second.isString()) {
+                            // Call ToString on the wrapper (uses toString method)
+                            Interpreter* interp = getGlobalInterpreter();
+                            if (interp) {
+                                auto toStringIt = obj->properties.find("toString");
+                                if (toStringIt != obj->properties.end() && toStringIt->second.isFunction()) {
+                                    Value result = interp->callForHarness(toStringIt->second, {}, elem);
+                                    if (!interp->hasError()) {
+                                        item = result.toString();
+                                        hasItem = true;
+                                    } else {
+                                        Value err = interp->getError();
+                                        interp->clearError();
+                                        throw std::runtime_error(err.toString());
+                                    }
+                                } else {
+                                    item = pvIt->second.toString();
+                                    hasItem = true;
+                                }
+                            } else {
+                                item = pvIt->second.toString();
+                                hasItem = true;
+                            }
+                        } else if (pvIt->second.isNumber()) {
+                            // Call ToString on the wrapper
+                            Interpreter* interp = getGlobalInterpreter();
+                            if (interp) {
+                                auto toStringIt = obj->properties.find("toString");
+                                if (toStringIt != obj->properties.end() && toStringIt->second.isFunction()) {
+                                    Value result = interp->callForHarness(toStringIt->second, {}, elem);
+                                    if (!interp->hasError()) {
+                                        item = result.toString();
+                                        hasItem = true;
+                                    } else {
+                                        Value err = interp->getError();
+                                        interp->clearError();
+                                        throw std::runtime_error(err.toString());
+                                    }
+                                } else {
+                                    item = pvIt->second.toString();
+                                    hasItem = true;
+                                }
+                            } else {
+                                item = pvIt->second.toString();
+                                hasItem = true;
+                            }
+                        }
+                    }
+                }
+                if (hasItem) {
+                    // Avoid duplicates
+                    bool found = false;
+                    for (const auto& p : propList) if (p == item) { found = true; break; }
+                    if (!found) propList.push_back(item);
+                }
+            }
+            stringifier.setPropertyList(propList);
+        }
+    }
+
+    // Process space (3rd argument)
+    if (args.size() > 2) {
+        Value space = args[2];
+        // ES spec: If space is an object, convert via ToNumber or ToString
+        if (space.isObject()) {
+            auto obj = space.getGC<Object>();
+            auto primIt = obj->properties.find("__primitive_value__");
+            if (primIt != obj->properties.end()) {
+                // Check if it's a Number or String wrapper
+                if (primIt->second.isNumber()) {
+                    // ToNumber: call valueOf if overridden
+                    auto valueOfIt = obj->properties.find("valueOf");
+                    if (valueOfIt != obj->properties.end() && valueOfIt->second.isFunction()) {
+                        auto* interp = getGlobalInterpreter();
+                        if (interp) {
+                            space = interp->callForHarness(valueOfIt->second, {}, space);
+                        } else {
+                            space = primIt->second;
+                        }
+                    } else {
+                        space = primIt->second;
+                    }
+                } else if (primIt->second.isString()) {
+                    // ToString: call toString if overridden
+                    auto toStringIt = obj->properties.find("toString");
+                    if (toStringIt != obj->properties.end() && toStringIt->second.isFunction()) {
+                        auto* interp = getGlobalInterpreter();
+                        if (interp) {
+                            space = interp->callForHarness(toStringIt->second, {}, space);
+                        } else {
+                            space = primIt->second;
+                        }
+                    } else {
+                        space = primIt->second;
+                    }
+                } else {
+                    space = primIt->second;
+                }
+            }
+        }
+        if (space.isNumber()) {
+            int n = std::min(10, std::max(0, static_cast<int>(space.toNumber())));
+            if (n > 0) {
+                stringifier.setGap(std::string(n, ' '));
+            }
+        } else if (space.isString()) {
+            std::string s = std::get<std::string>(space.data);
+            if (s.size() > 10) s = s.substr(0, 10);
+            if (!s.empty()) {
+                stringifier.setGap(s);
+            }
+        }
+    }
+
+    // Top-level: apply replacer to val first via the holder
+    // The stringifier handles this internally
+
     try {
-        std::string result = stringifier.stringify(args[0]);
+        std::string result = stringifier.stringify(val);
+        if (result.empty() && (val.isUndefined() || val.isFunction() || val.isClass() || val.isSymbol())) {
+            return Value(Undefined{});
+        }
+        // Check if stringifier returned empty due to replacer returning undefined
+        if (result.empty()) {
+            return Value(Undefined{});
+        }
         return Value(result);
-    } catch (const std::exception&) {
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        if (msg.find("TypeError") != std::string::npos) {
+            throw; // re-throw TypeError (BigInt, circular)
+        }
         return Value(Undefined{});
     }
 }

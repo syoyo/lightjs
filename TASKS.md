@@ -36,6 +36,36 @@ This document tracks planned enhancements and future work for LightJS.
 
 - Note: runner may print `Failed to read module: .../syntax/foo.js` because that file is intentionally absent in the suite.
 
+### Latest Status (2026-03-10)
+
+| Scope | Pass | Total | Rate |
+|---|---|---|---|
+| `language/expressions` | 11022 | 11036 | 99.9% (0 fail, 14 skipped) |
+| `language/async-generator` | 623 | 623 | 100.0% |
+| `language` | 23126 | 23624 | 97.9% (81 fail, 417 skipped) |
+
+- Added async-generator request queueing for `next/return/throw` in `src/interpreter.cc` to serialize concurrent async-generator operations.
+- Fixed regex literal lexing around line terminators (`\n`, `\r`, `U+2028`, `U+2029`) and statement-list regex starts after `}` in `src/lexer.cc`.
+- Updated Test262 isolated worker timeout defaults to 5 minutes in `test262/test262_runner.cc`:
+  - `kPerTestTimeoutSeconds = 300`
+  - `kTailCallPerTestTimeoutSeconds = 300`
+  - `kResizableArrayBufferPerTestTimeoutSeconds = 300`
+
+#### Hang/Timeout Investigation (2026-03-10)
+
+- No true per-test timeout events were observed in the latest `language` run (`[timeout]` not present in output).
+- The run can look stalled because a few tests are very slow but eventually pass:
+  - `test/language/comments/S7.4_A5.js` (~48s)
+  - `test/language/comments/S7.4_A6.js` (~17s)
+  - `test/language/expressions/call/tco-call-args.js` (~14s)
+
+#### Current Biggest Failure Shards (2026-03-10)
+
+- `language/literals/regexp`: 27 failures
+- `language/global-code`: 16 failures
+- `language/function-code`: 14 failures
+- `language/arguments-object`: 10 failures
+
 ### Recent Completions (2026-02-14)
 
 - Fixed `return` comma-expression parsing in `src/parser.cc` (unblocks TCO comma tests).

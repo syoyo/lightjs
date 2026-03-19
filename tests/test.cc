@@ -10,6 +10,17 @@ using namespace lightjs;
 namespace {
 int gTotalTests = 0;
 int gFailedTests = 0;
+
+std::string taggedTemplateLineSeparatorTest() {
+  std::string code =
+      "function tag(cs) { return cs[0] === '' && cs.raw[0] === '\\\\";
+  code += "\xE2\x80\xA8";
+  code += "'; }\n";
+  code += "tag`\\";
+  code += "\xE2\x80\xA8";
+  code += "`";
+  return code;
+}
 }
 
 void runTest(const std::string& name, const std::string& code, const std::string& expected = "",
@@ -202,17 +213,17 @@ int main() {
   )", "-42n");
 
   runTest("Uint8Array creation", R"(
-    let arr = Uint8Array(10);
+    let arr = new Uint8Array(10);
     arr
   )", "[TypedArray]");
 
   runTest("Uint8Array length", R"(
-    let arr = Uint8Array(5);
+    let arr = new Uint8Array(5);
     arr.length
   )", "5");
 
   runTest("Uint8Array set and get", R"(
-    let arr = Uint8Array(3);
+    let arr = new Uint8Array(3);
     arr[0] = 100;
     arr[1] = 200;
     arr[2] = 50;
@@ -220,14 +231,14 @@ int main() {
   )", "200");
 
   runTest("Int8Array negative values", R"(
-    let arr = Int8Array(2);
+    let arr = new Int8Array(2);
     arr[0] = -10;
     arr[1] = 120;
     arr[0]
   )", "-10");
 
   runTest("Uint8ClampedArray clamping", R"(
-    let arr = Uint8ClampedArray(3);
+    let arr = new Uint8ClampedArray(3);
     arr[0] = 300;
     arr[1] = -50;
     arr[2] = 128;
@@ -235,21 +246,21 @@ int main() {
   )", "255");
 
   runTest("Float32Array", R"(
-    let arr = Float32Array(2);
+    let arr = new Float32Array(2);
     arr[0] = 3.14;
     arr[1] = 2.71;
     arr[0]
-  )", "3.14");
+  )", "3.140000104904175");
 
   runTest("Int32Array", R"(
-    let arr = Int32Array(2);
+    let arr = new Int32Array(2);
     arr[0] = 1000000;
     arr[1] = -999999;
     arr[0]
-  )", "1e+06");
+  )", "1000000");
 
   runTest("Uint16Array", R"(
-    let arr = Uint16Array(3);
+    let arr = new Uint16Array(3);
     arr[0] = 65535;
     arr[1] = 32768;
     arr[2] = 100;
@@ -257,22 +268,22 @@ int main() {
   )", "32768");
 
   runTest("TypedArray byteLength", R"(
-    let arr = Uint32Array(10);
+    let arr = new Uint32Array(10);
     arr.byteLength
   )", "40");
 
   runTest("Float16Array creation", R"(
-    let arr = Float16Array(5);
+    let arr = new Float16Array(5);
     arr
   )", "[TypedArray]");
 
   runTest("Float16Array length", R"(
-    let arr = Float16Array(8);
+    let arr = new Float16Array(8);
     arr.length
   )", "8");
 
   runTest("Float16Array set and get", R"(
-    let arr = Float16Array(3);
+    let arr = new Float16Array(3);
     arr[0] = 1.5;
     arr[1] = 2.75;
     arr[2] = 3.25;
@@ -280,7 +291,7 @@ int main() {
   )", "2.75");
 
   runTest("Float16Array byteLength", R"(
-    let arr = Float16Array(10);
+    let arr = new Float16Array(10);
     arr.byteLength
   )", "20");
 
@@ -613,6 +624,246 @@ int main() {
     arr
   )", "[Array]");
 
+  runTest("Array.from - array-like with mapper", R"(
+    let arr = Array.from({ length: 4 }, (_, i) => i * 2);
+    arr[0] + "," + arr[1] + "," + arr[2] + "," + arr[3] + "," + arr.length
+  )", "0,2,4,6,4");
+
+  runTest("Array.prototype.indexOf - function identity", R"(
+    [Float64Array, Float32Array].indexOf(Int32Array)
+  )", "-1");
+
+  runTest("Array.prototype.lastIndexOf - function identity", R"(
+    [Float64Array, Float32Array, Int32Array].lastIndexOf(Float32Array)
+  )", "1");
+
+  runTest("Array.prototype.join - explicit undefined separator", R"(
+    [1, 2, 3].join(undefined) + "|" + [1, 2].join({ toString: function() { return "x"; }})
+  )", "1,2,3|1x2");
+
+  runTest("Number.prototype.toString - default formatting", R"(
+    (9007199254740992).toString() + "|" + (1000000).toString()
+  )", "9007199254740992|1000000");
+
+  runTest("TypedArray.prototype.copyWithin - basic", R"(
+    let ta = new Uint8Array([0, 1, 2, 3]);
+    ta.copyWithin(1, 0, 2);
+    "" + ta[0] + "," + ta[1] + "," + ta[2] + "," + ta[3]
+  )", "0,0,1,3");
+
+  runTest("TypedArray.prototype.reverse - basic", R"(
+    let ta = new Uint8Array([1, 2, 3]);
+    let out = ta.reverse();
+    "" + (out === ta) + "|" + ta[0] + "," + ta[1] + "," + ta[2]
+  )", "true|3,2,1");
+
+  runTest("TypedArray.prototype.slice - basic", R"(
+    let ta = new Uint8Array([1, 2, 3, 4]);
+    let out = ta.slice(1, 3);
+    "" + out[0] + "," + out[1] + "|" + ta[0] + "," + ta[1] + "," + ta[2] + "," + ta[3]
+  )", "2,3|1,2,3,4");
+
+  runTest("TypedArray.of - coercion before out-of-bounds check", R"(
+    let rab = new ArrayBuffer(3, { maxByteLength: 4 });
+    let ta = new Int8Array(rab);
+    let one = {
+      valueOf() {
+        rab.resize(0);
+        return 1;
+      }
+    };
+    let two = {
+      valueOf() {
+        rab.resize(4);
+        return 2;
+      }
+    };
+    let out = Int8Array.of.call(function() { return ta; }, one, two, 3);
+    "" + (out === ta) + "|" + ta.length + "|" + ta[0] + "," + ta[1] + "," + ta[2] + "," + ta[3]
+  )", "true|4|0,2,3,0");
+
+  runTest("TypedArray out-of-bounds ignores prototype numeric properties", R"(
+    let rab = new ArrayBuffer(4, { maxByteLength: 8 });
+    let ta = new Int8Array(rab, 0, 4);
+    ta.__proto__ = { 2: "wrong" };
+    ta[2] = 10;
+    let before = "" + ta[2] + "|" + (2 in ta);
+    rab.resize(0);
+    before + "|" + ta[2] + "|" + (2 in ta)
+  )", "10|true|undefined|false");
+
+  runTest("TypedArray constructor prototype descriptor", R"(
+    let desc = Object.getOwnPropertyDescriptor(TypedArray, "prototype");
+    "" + desc.writable + "," + desc.enumerable + "," + desc.configurable
+  )", "false,false,false");
+
+  runTest("Class template literal coercion", R"(
+    class MyUint8Array extends Uint8Array {}
+    `${MyUint8Array}` === "[Function]"
+  )", "true");
+
+  runTest("TypedArray.prototype.lastIndexOf - basic", R"(
+    let ta = new Uint8Array([1, 2, 1, 3]);
+    ta.lastIndexOf(1) + "," + ta.lastIndexOf(1, 1) + "," + ta.lastIndexOf(4)
+  )", "2,0,-1");
+
+  runTest("TypedArray.prototype.reduceRight - basic", R"(
+    let ta = new Uint8Array([1, 2, 3]);
+    let log = [];
+    let out = ta.reduceRight((acc, value, index) => {
+      log.push("" + acc + ":" + value + ":" + index);
+      return acc + value;
+    }, 0);
+    out + "|" + log.join(",")
+  )", "6|0:3:2,3:2:1,5:1:0");
+
+  runTest("TypedArray.prototype.every - basic", R"(
+    let ta = new Uint8Array([2, 4, 6]);
+    let out1 = ta.every(v => v % 2 === 0);
+    let out2 = ta.every(v => v < 6);
+    "" + out1 + "," + out2
+  )", "true,false");
+
+  runTest("TypedArray.prototype.some - basic", R"(
+    let ta = new Uint8Array([1, 3, 4]);
+    let out1 = ta.some(v => v % 2 === 0);
+    let out2 = ta.some(v => v > 10);
+    "" + out1 + "," + out2
+  )", "true,false");
+
+  runTest("TypedArray.prototype.includes - basic", R"(
+    let ta = new Float64Array([1, NaN, 3]);
+    "" + ta.includes(NaN) + "," + ta.includes(2)
+  )", "true,false");
+
+  runTest("TypedArray.prototype.indexOf - basic", R"(
+    let ta = new Float64Array([1, NaN, 1]);
+    "" + ta.indexOf(1) + "," + ta.indexOf(NaN) + "," + ta.indexOf(4)
+  )", "0,-1,-1");
+
+  runTest("TypedArray.prototype.findIndex - basic", R"(
+    let ta = new Uint8Array([1, 4, 6]);
+    "" + ta.findIndex(v => v % 2 === 0) + "," + ta.findIndex(v => v > 10)
+  )", "1,-1");
+
+  runTest("TypedArray.prototype.findLast - basic", R"(
+    let ta = new Uint8Array([1, 4, 6]);
+    "" + ta.findLast(v => v % 2 === 0) + "," + ta.findLast(v => v > 10)
+  )", "6,undefined");
+
+  runTest("TypedArray.prototype.findLastIndex - basic", R"(
+    let ta = new Uint8Array([1, 4, 6]);
+    "" + ta.findLastIndex(v => v % 2 === 0) + "," + ta.findLastIndex(v => v > 10)
+  )", "2,-1");
+
+  runTest("TypedArray.prototype.at - basic", R"(
+    let ta = new Uint8Array([1, 4, 6]);
+    "" + ta.at(1) + "," + ta.at(-1) + "," + ta.at(9)
+  )", "4,6,undefined");
+
+  runTest("TypedArray.prototype.map - basic", R"(
+    let ta = new Uint8Array([1, 4, 6]);
+    let out = ta.map(v => v + 1);
+    "" + out[0] + "," + out[1] + "," + out[2] + "|" + ta[0] + "," + ta[1] + "," + ta[2]
+  )", "2,5,7|1,4,6");
+
+  runTest("TypedArray.prototype.map - inherited species constructor", R"(
+    let hit = 0;
+    class MyArray extends Uint8Array {
+      constructor(...args) {
+        super(...args);
+        hit++;
+      }
+    }
+    let ta = new MyArray([1, 2, 3]);
+    let out = ta.map(v => v + 1);
+    "" + hit + "|" + (out instanceof MyArray) + "|" + out[0] + "," + out[1] + "," + out[2]
+  )", "2|true|2,3,4");
+
+  runTest("TypedArray.prototype.map - species constructor resizes source rab", R"(
+    let rab = new ArrayBuffer(4, { maxByteLength: 8 });
+    let write = new Uint8Array(rab);
+    write[0] = 0;
+    write[1] = 1;
+    write[2] = 2;
+    write[3] = 3;
+    let flag = false;
+    let hit = 0;
+    class MyArray extends Uint8Array {
+      constructor(...args) {
+        super(...args);
+        hit++;
+        if (flag) {
+          rab.resize(2);
+        }
+      }
+    }
+    let ta = new MyArray(rab, 0, 4);
+    flag = true;
+    let values = [];
+    ta.map(v => { values.push(v); return 0; });
+    "" + hit + "|" + values.join(",") + "|" + rab.byteLength
+  )", "2|,,,|2");
+
+  runTest("Nested native subclass preserves newTarget prototype", R"(
+    class A extends Uint8Array {}
+    class B extends A {}
+    let value = new B(2);
+    "" + (value instanceof B) + "|" + (value.constructor === B)
+  )", "true|true");
+
+  runTest("TypedArray.prototype.toReversed - basic", R"(
+    let ta = new Uint8Array([1, 2, 3]);
+    let out = ta.toReversed();
+    out[0] + "," + out[1] + "," + out[2] + "|" + ta[0] + "," + ta[1] + "," + ta[2]
+  )", "3,2,1|1,2,3");
+
+  runTest("TypedArray.prototype.toSorted - basic", R"(
+    let ta = new Uint8Array([3, 1, 2]);
+    let out = ta.toSorted();
+    out[0] + "," + out[1] + "," + out[2] + "|" + ta[0] + "," + ta[1] + "," + ta[2]
+  )", "1,2,3|3,1,2");
+
+  runTest("TypedArray.prototype.toLocaleString - basic", R"(
+    new Uint8Array([42, 0, 7]).toLocaleString()
+  )", "42,0,7");
+
+  runTest("TypedArray.prototype.toLocaleString - respects Number.prototype override", R"(
+    let calls = 0;
+    Number.prototype.toLocaleString = function() {
+      calls++;
+      return "n" + this.valueOf();
+    };
+    new Uint8Array([4, 5]).toLocaleString() + "|" + calls
+  )", "n4,n5|2");
+
+  runTest("TypedArray.prototype Symbol.toStringTag - basic", R"(
+    let ta = new Uint8Array(2);
+    let desc = Object.getOwnPropertyDescriptor(TypedArray.prototype, Symbol.toStringTag);
+    "" + ta[Symbol.toStringTag] + "|" + (typeof desc.get) + "|" + (desc.set === undefined)
+  )", "Uint8Array|function|true");
+
+  runTest("TypedArray.prototype.toString - array alias", R"(
+    "" + (TypedArray.prototype.toString === Array.prototype.toString) + "|" + new Uint8Array([1, 2]).toString()
+  )", "true|1,2");
+
+  runTest("TypedArray.prototype.with - order and copy", R"(
+    let ta = new Int16Array([0, 1, 2]);
+    let log = [];
+    let index = { valueOf() { log.push("index"); return 1; } };
+    let value = { valueOf() { log.push("value"); ta[0] = 9; return 4; } };
+    let out = ta.with(index, value);
+    log.join(",") + "|" + out[0] + "," + out[1] + "," + out[2] + "|" + ta[0] + "," + ta[1] + "," + ta[2]
+  )", "index,value|9,4,2|9,1,2");
+
+  runTest("TypedArray.prototype.with - ignores species", R"(
+    let ta = new Uint8Array([1, 2, 3]);
+    Object.defineProperty(ta, "constructor", {
+      get() { throw new Error("unexpected constructor lookup"); }
+    });
+    Object.getPrototypeOf(ta.with(0, 7)) === Uint8Array.prototype
+  )", "true");
+
   runTest("Array.of", R"(
     let arr = Array.of(1, 2, 3, 4);
     arr
@@ -680,6 +931,23 @@ int main() {
     let x = 5;
     `Result: ${x * 2} (doubled from ${x})`
   )", "Result: 10 (doubled from 5)");
+
+  runTest("Tagged template line continuation U+2028",
+          taggedTemplateLineSeparatorTest(), "true");
+
+  runTest("typeof accessor global only evaluates once", R"(
+    let count = 0;
+    Object.defineProperty(globalThis, "typeofGetterProbe", {
+      get() {
+        count = count + 1;
+        return 1;
+      },
+      configurable: true
+    });
+    let result = typeof typeofGetterProbe;
+    delete globalThis.typeofGetterProbe;
+    result + "," + count
+  )", "number,1");
 
   runTest("Object spread - basic", R"(
     let obj1 = { a: 1, b: 2 };
@@ -1044,124 +1312,124 @@ int main() {
 
   // ArrayBuffer tests
   runTest("ArrayBuffer - basic construction", R"(
-    const buffer = ArrayBuffer(16);
+    const buffer = new ArrayBuffer(16);
     buffer.byteLength
   )", "16");
 
   runTest("ArrayBuffer - zero length", R"(
-    const buffer = ArrayBuffer(0);
+    const buffer = new ArrayBuffer(0);
     buffer.byteLength
   )", "0");
 
   runTest("ArrayBuffer - type check", R"(
-    const buffer = ArrayBuffer(8);
-    "" + buffer
-  )", "[ArrayBuffer]");
+    const buffer = new ArrayBuffer(8);
+    Object.prototype.toString.call(buffer)
+  )", "[object ArrayBuffer]");
 
   // DataView tests - basic properties
   runTest("DataView - basic construction", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.byteLength
   )", "16");
 
   runTest("DataView - with offset", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer, 4);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer, 4);
     view.byteOffset
   )", "4");
 
   runTest("DataView - with offset and length", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer, 4, 8);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer, 4, 8);
     view.byteLength
   )", "8");
 
   runTest("DataView - buffer property", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.buffer.byteLength
   )", "16");
 
   // DataView - Int8/Uint8 operations
   runTest("DataView - setInt8 and getInt8", R"(
-    const buffer = ArrayBuffer(4);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
     view.setInt8(0, -42);
     view.getInt8(0)
   )", "-42");
 
   runTest("DataView - setUint8 and getUint8", R"(
-    const buffer = ArrayBuffer(4);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
     view.setUint8(0, 200);
     view.getUint8(0)
   )", "200");
 
   // DataView - Int16/Uint16 operations
   runTest("DataView - setInt16 and getInt16 (big-endian)", R"(
-    const buffer = ArrayBuffer(4);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
     view.setInt16(0, -1234, false);
     view.getInt16(0, false)
   )", "-1234");
 
   runTest("DataView - setUint16 and getUint16 (little-endian)", R"(
-    const buffer = ArrayBuffer(4);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
     view.setUint16(0, 5678, true);
     view.getUint16(0, true)
   )", "5678");
 
   // DataView - Int32/Uint32 operations
   runTest("DataView - setInt32 and getInt32", R"(
-    const buffer = ArrayBuffer(8);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
     view.setInt32(0, -123456, false);
     view.getInt32(0, false)
   )", "-123456");
 
   runTest("DataView - setUint32 and getUint32", R"(
-    const buffer = ArrayBuffer(8);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
     view.setUint32(0, 987654, true);
     view.getUint32(0, true)
   )", "987654");
 
   // DataView - Float32/Float64 operations
   runTest("DataView - setFloat32 and getFloat32", R"(
-    const buffer = ArrayBuffer(8);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
     view.setFloat32(0, 3.14, false);
     view.getFloat32(0, false)
-  )", "3.14");
+  )", "3.140000104904175");
 
   runTest("DataView - setFloat64 and getFloat64", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.setFloat64(0, 2.718281828, true);
     view.getFloat64(0, true)
-  )", "2.71828");
+  )", "2.718281828");
 
   // DataView - BigInt operations
   runTest("DataView - setBigInt64 and getBigInt64", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.setBigInt64(0, 9007199254740991n, false);
     view.getBigInt64(0, false)
   )", "9007199254740991n");
 
   runTest("DataView - setBigUint64 and getBigUint64", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.setBigUint64(0, 18446744073709551n, true);
     view.getBigUint64(0, true)
   )", "18446744073709551n");
 
   // DataView - multiple values in same buffer
   runTest("DataView - multiple values", R"(
-    const buffer = ArrayBuffer(16);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
     view.setInt8(0, 42);
     view.setInt16(2, 1000, false);
     view.setInt32(4, 100000, false);
@@ -1170,8 +1438,8 @@ int main() {
 
   // DataView - endianness test
   runTest("DataView - endianness matters", R"(
-    const buffer = ArrayBuffer(4);
-    const view = DataView(buffer);
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
     view.setUint16(0, 258, true);
     view.getUint8(0) + "," + view.getUint8(1)
   )", "2,1");
@@ -1224,17 +1492,17 @@ int main() {
   runTest("Unicode - emoji length", R"(
     const str = "Hello 👋 World 🌍";
     str.length
-  )", "15");
+  )", "17");
 
   runTest("Unicode - CJK characters", R"(
     const str = "你好世界";
     str.length
   )", "4");
 
-  runTest("Unicode - charAt with emoji", R"(
+  runTest("Unicode - charAt with emoji returns high surrogate", R"(
     const str = "A👋B";
-    str.charAt(1)
-  )", "👋");
+    str.charCodeAt(1)
+  )", "55357");
 
   runTest("Unicode - codePointAt", R"(
     const str = "👋";
@@ -1261,12 +1529,12 @@ int main() {
   runTest("Unicode - mixed scripts", R"(
     const str = "Hello世界🌍";
     str.length
-  )", "8");
+  )", "9");
 
   runTest("Unicode - surrogate pair emoji", R"(
     const str = "🎉🎊🎈";
     str.length
-  )", "3");
+  )", "6");
 
   // Delete operator tests
   runTest("Delete operator - object property", R"(

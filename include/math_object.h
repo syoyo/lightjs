@@ -41,5 +41,7 @@ Value Math_tanh(const std::vector<Value>& args);
 Value Math_asinh(const std::vector<Value>& args);
 Value Math_acosh(const std::vector<Value>& args);
 Value Math_atanh(const std::vector<Value>& args);
+Value Math_f16round(const std::vector<Value>& args);
+Value Math_sumPrecise(const std::vector<Value>& args);
 
 } // namespace lightjs

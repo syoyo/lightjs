@@ -318,6 +318,17 @@ public:
                        const Value& thisValue = Value(Undefined{}));
   Value constructFromNative(const Value& constructor,
                             const std::vector<Value>& args);
+  std::pair<bool, Value> getPropertyForExternal(const Value& receiver,
+                                                const std::string& key);
+
+  // Run a script string in the global scope (like a new <script> element).
+  // Unlike eval, this uses proper GlobalDeclarationInstantiation semantics.
+  Value runScriptInGlobalScope(const std::string& source);
+
+  // Public ToPrimitive for native code (ES spec ToPrimitive)
+  Value toPrimitive(const Value& input, bool preferString) {
+    return toPrimitiveValue(input, preferString);
+  }
 
 private:
   GCPtr<Environment> env_;
@@ -463,6 +474,7 @@ private:
   Value getPrototypeFromConstructorValue(const Value& ctorValue);
   GCPtr<Environment> getRealmRootEnvFromConstructorValue(const Value& ctorValue);
   Value getIntrinsicObjectPrototypeForCtor(const Value& ctorValue);
+  Value getIntrinsicPrototypeForCtorNamed(const Value& ctorValue, const std::string& ctorName);
   Value getOrdinaryCreatePrototypeFromNewTarget(const Value& newTargetValue);
   Value getInstanceFieldSuperBase(const GCPtr<Class>& cls);
   Value getStaticFieldSuperBase(const GCPtr<Class>& cls);
@@ -559,5 +571,10 @@ private:
     return StackFrameGuard(stackTrace_, frame);
   }
 };
+
+// ES spec ToNumber with ToPrimitive for objects.
+// Use this in native functions instead of Value::toNumber() when the argument
+// might be an object (ES spec requires ToPrimitive(input, "number") first).
+double toNumberES(const Value& v);
 
 }

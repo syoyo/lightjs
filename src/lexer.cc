@@ -310,13 +310,36 @@ void Lexer::skipBlockComment() {
   advance();
   advance();
   while (!isAtEnd()) {
-    if (current() == '*' && peek() == '/') {
+    unsigned char c = static_cast<unsigned char>(current());
+    if (c == '*' && peek() == '/') {
       advance();
       advance();
-      break;
+      return;
+    }
+    if (c == '\r') {
+      advance();
+      if (!isAtEnd() && current() == '\n') {
+        advance();
+      }
+      line_++;
+      column_ = 1;
+      continue;
+    }
+    // U+2028 LINE SEPARATOR (E2 80 A8) and U+2029 PARAGRAPH SEPARATOR (E2 80 A9)
+    if (c == 0xE2 && pos_ + 2 < source_.size()) {
+      unsigned char c2 = static_cast<unsigned char>(source_[pos_ + 1]);
+      unsigned char c3 = static_cast<unsigned char>(source_[pos_ + 2]);
+      if (c2 == 0x80 && (c3 == 0xA8 || c3 == 0xA9)) {
+        advance(); advance(); advance();
+        line_++;
+        column_ = 1;
+        continue;
+      }
     }
     advance();
   }
+  // Unterminated multi-line comment
+  throw std::runtime_error("SyntaxError: Unterminated comment");
 }
 
 bool Lexer::isDigit(char c) {
@@ -590,11 +613,13 @@ std::optional<Token> Lexer::readString(char quote) {
 
   std::string str;
   bool hasLegacyEscape = false;
+  bool hasAnyEscape = false;
   while (!isAtEnd() && current() != quote) {
     if (current() == '\n' || current() == '\r') {
       throw std::runtime_error("SyntaxError: Unterminated string literal");
     }
     if (current() == '\\') {
+      hasAnyEscape = true;
       advance();
       if (!isAtEnd()) {
         unsigned char uc = static_cast<unsigned char>(current());
@@ -769,11 +794,13 @@ std::optional<Token> Lexer::readString(char quote) {
     auto internedStr = StringTable::instance().intern(str);
     auto tok = Token(TokenType::String, internedStr, startLine, startColumn);
     tok.hasLegacyEscape = hasLegacyEscape;
+    tok.escaped = hasAnyEscape;
     return tok;
   }
 
   auto tok = Token(TokenType::String, str, startLine, startColumn);
   tok.hasLegacyEscape = hasLegacyEscape;
+  tok.escaped = hasAnyEscape;
   return tok;
 }
 
@@ -987,15 +1014,34 @@ std::optional<Token> Lexer::readRegex() {
 
   std::string pattern;
   bool inCharClass = false;
+  auto isRegexLineTerminator = [this]() -> bool {
+    if (isAtEnd()) return false;
+    char c = current();
+    if (c == '\n' || c == '\r') return true;
+    // U+2028/U+2029 encoded as UTF-8.
+    if (pos_ + 2 < source_.size() &&
+        static_cast<unsigned char>(c) == 0xE2 &&
+        static_cast<unsigned char>(peek()) == 0x80) {
+      char third = source_[pos_ + 2];
+      if (static_cast<unsigned char>(third) == 0xA8 ||
+          static_cast<unsigned char>(third) == 0xA9) {
+        return true;
+      }
+    }
+    return false;
+  };
   while (!isAtEnd()) {
     char c = current();
-    if (c == '\n') {
+    if (isRegexLineTerminator()) {
       throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
     }
     if (c == '\\') {
       pattern += c;
       advance();
       if (isAtEnd()) {
+        throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
+      }
+      if (isRegexLineTerminator()) {
         throw std::runtime_error("SyntaxError: Unterminated regular expression literal");
       }
       pattern += current();
@@ -1068,7 +1114,9 @@ std::optional<Token> Lexer::readRegex() {
     throw std::runtime_error("SyntaxError: Invalid regular expression");
   }
 
-  std::string value = pattern + "||" + flags;
+  // Encode pattern length as prefix so parser can split unambiguously.
+  // Format: "<length>:" + pattern + flags
+  std::string value = std::to_string(pattern.size()) + ":" + pattern + flags;
   return Token(TokenType::Regex, value, startLine, startColumn);
 }
 
@@ -1297,20 +1345,65 @@ std::vector<Token> Lexer::tokenize() {
         }
         break;
       case '/':
-        if (peek() == '=') {
-          tokens.emplace_back(TokenType::SlashEqual, startLine, startColumn);
-          advance();
-          advance();
-        } else {
+        {
+          auto looksLikeRegexAfterSlash = [this]() -> bool {
+            size_t p = pos_ + 1;
+            bool inClass = false;
+            while (p < source_.size()) {
+              unsigned char ch = static_cast<unsigned char>(source_[p]);
+              if (ch == '\n' || ch == '\r') return false;
+              if (ch == 0xE2 && p + 2 < source_.size() &&
+                  static_cast<unsigned char>(source_[p + 1]) == 0x80 &&
+                  (static_cast<unsigned char>(source_[p + 2]) == 0xA8 ||
+                   static_cast<unsigned char>(source_[p + 2]) == 0xA9)) {
+                return false;
+              }
+              if (ch == '\\') {
+                p += 2;
+                continue;
+              }
+              if (ch == '[') {
+                inClass = true;
+                p++;
+                continue;
+              }
+              if (ch == ']' && inClass) {
+                inClass = false;
+                p++;
+                continue;
+              }
+              if (ch == '/' && !inClass) {
+                return true;
+              }
+              p++;
+            }
+            return false;
+          };
+
           bool canBeRegex = tokens.empty() || expectsRegex(tokens.back().type);
+          if (!canBeRegex && !tokens.empty() && tokens.back().type == TokenType::RightBrace) {
+            char nextChar = peek();
+            bool nextIsSpace = (nextChar == ' ' || nextChar == '\t' ||
+                                nextChar == '\n' || nextChar == '\r' ||
+                                nextChar == '\f' || nextChar == '\v');
+            if (!nextIsSpace) {
+              canBeRegex = looksLikeRegexAfterSlash();
+            }
+          }
           if (canBeRegex) {
             if (auto token = readRegex()) {
               tokens.push_back(*token);
               break;
             }
           }
-          tokens.emplace_back(TokenType::Slash, startLine, startColumn);
-          advance();
+          if (peek() == '=') {
+            tokens.emplace_back(TokenType::SlashEqual, startLine, startColumn);
+            advance();
+            advance();
+          } else {
+            tokens.emplace_back(TokenType::Slash, startLine, startColumn);
+            advance();
+          }
         }
         break;
       case '%':

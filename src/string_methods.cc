@@ -3,15 +3,137 @@
 #include "wasm_js.h"
 #include "gc.h"
 #include "unicode.h"
+#include "environment.h"
+#include "interpreter.h"
 #include <stdexcept>
 #include <algorithm>
 #include <sstream>
 #include <regex>
 #include <limits>
+#include <cmath>
 
 namespace lightjs {
 
 namespace {
+
+[[noreturn]] void throwInterpreterError(Interpreter* interpreter) {
+    Value error = interpreter->getError();
+    interpreter->clearError();
+    throw JsValueException(error);
+}
+
+bool isObjectLikeForStringBuiltin(const Value& value) {
+    return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
+           value.isProxy() || value.isPromise() || value.isGenerator() || value.isClass() ||
+           value.isMap() || value.isSet() || value.isWeakMap() || value.isWeakSet() ||
+           value.isTypedArray() || value.isArrayBuffer() || value.isDataView() || value.isError();
+}
+
+std::optional<Value> getPropertyForCoercion(const Value& receiver, const std::string& key) {
+    auto getFromObject = [&](const auto& objectLike) -> std::optional<Value> {
+        std::string getterName = "__get_" + key;
+        auto getterIt = objectLike->properties.find(getterName);
+        if (getterIt != objectLike->properties.end()) {
+            if (!getterIt->second.isFunction()) {
+                return Value(Undefined{});
+            }
+            Interpreter* interpreter = getGlobalInterpreter();
+            if (!interpreter) {
+                return Value(Undefined{});
+            }
+            Value out = interpreter->callForHarness(getterIt->second, {}, receiver);
+            if (interpreter->hasError()) {
+                throwInterpreterError(interpreter);
+            }
+            return out;
+        }
+
+        auto it = objectLike->properties.find(key);
+        if (it != objectLike->properties.end()) {
+            return it->second;
+        }
+
+        auto protoIt = objectLike->properties.find("__proto__");
+        if (protoIt != objectLike->properties.end() && isObjectLikeForStringBuiltin(protoIt->second)) {
+            return getPropertyForCoercion(protoIt->second, key);
+        }
+        return std::nullopt;
+    };
+
+    if (receiver.isObject()) return getFromObject(receiver.getGC<Object>());
+    if (receiver.isArray()) return getFromObject(receiver.getGC<Array>());
+    if (receiver.isFunction()) return getFromObject(receiver.getGC<Function>());
+    if (receiver.isRegex()) return getFromObject(receiver.getGC<Regex>());
+    return std::nullopt;
+}
+
+Value toPrimitiveForStringBuiltin(const Value& value, bool preferString) {
+    if (!isObjectLikeForStringBuiltin(value)) {
+        return value;
+    }
+
+    if (value.isObject()) {
+        auto obj = value.getGC<Object>();
+        auto primitiveIt = obj->properties.find("__primitive_value__");
+        if (primitiveIt != obj->properties.end() && !isObjectLikeForStringBuiltin(primitiveIt->second)) {
+            return primitiveIt->second;
+        }
+    }
+
+    Interpreter* interpreter = getGlobalInterpreter();
+    const char* firstMethod = preferString ? "toString" : "valueOf";
+    const char* secondMethod = preferString ? "valueOf" : "toString";
+    for (const char* methodName : {firstMethod, secondMethod}) {
+        auto method = getPropertyForCoercion(value, methodName);
+        if (!method.has_value()) {
+            continue;
+        }
+        if (!method->isFunction()) {
+            continue;
+        }
+        if (!interpreter) {
+            break;
+        }
+        Value primitive = interpreter->callForHarness(*method, {}, value);
+        if (interpreter->hasError()) {
+            throwInterpreterError(interpreter);
+        }
+        if (!isObjectLikeForStringBuiltin(primitive)) {
+            return primitive;
+        }
+    }
+
+    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+}
+
+std::string requireStringCoercibleThis(const std::vector<Value>& args, const char* methodName) {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+        throw std::runtime_error(std::string("TypeError: String.prototype.") + methodName +
+                                 " called on null or undefined");
+    }
+
+    Value primitive = toPrimitiveForStringBuiltin(args[0], true);
+    if (primitive.isSymbol()) {
+        throw std::runtime_error(std::string("TypeError: Cannot convert Symbol to string"));
+    }
+    return primitive.toString();
+}
+
+double toIntegerForStringBuiltinArg(const Value& value) {
+    Value primitive = toPrimitiveForStringBuiltin(value, false);
+    if (primitive.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert Symbol to number");
+    }
+
+    double number = primitive.toNumber();
+    if (std::isnan(number) || number == 0.0) {
+        return 0.0;
+    }
+    if (!std::isfinite(number)) {
+        return number;
+    }
+    return std::trunc(number);
+}
 
 size_t utf16Length(const std::string& str) {
     size_t units = 0;
@@ -54,6 +176,14 @@ bool utf16CodeUnitAt(const std::string& str, size_t targetIndex, uint16_t& outUn
     return false;
 }
 
+std::string utf16CodeUnitStringAt(const std::string& str, size_t targetIndex) {
+    uint16_t codeUnit = 0;
+    if (!utf16CodeUnitAt(str, targetIndex, codeUnit)) {
+        return "";
+    }
+    return unicode::encodeUTF8(codeUnit);
+}
+
 } // namespace
 
 size_t String_utf16Length(const std::string& str) {
@@ -62,39 +192,29 @@ size_t String_utf16Length(const std::string& str) {
 
 // String.prototype.charAt (UTF-16 code unit based)
 Value String_charAt(const std::vector<Value>& args) {
-    if (args.empty() || !args[0].isString()) {
-        throw std::runtime_error("String.charAt called on non-string");
-    }
-
-    std::string str = std::get<std::string>(args[0].data);
+    std::string str = requireStringCoercibleThis(args, "charAt");
     int index = 0;
-
-    if (args.size() > 1 && args[1].isNumber()) {
-        index = static_cast<int>(std::get<double>(args[1].data));
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        index = static_cast<int>(toIntegerForStringBuiltinArg(args[1]));
     }
 
     if (index < 0) {
         return Value(std::string(""));
     }
 
-    uint16_t codeUnit = 0;
-    if (!utf16CodeUnitAt(str, static_cast<size_t>(index), codeUnit)) {
+    std::string codeUnitString = utf16CodeUnitStringAt(str, static_cast<size_t>(index));
+    if (codeUnitString.empty()) {
         return Value(std::string(""));
     }
-    return Value(unicode::encodeUTF8(codeUnit));
+    return Value(codeUnitString);
 }
 
 // String.prototype.charCodeAt (UTF-16 code unit based)
 Value String_charCodeAt(const std::vector<Value>& args) {
-    if (args.empty() || !args[0].isString()) {
-        throw std::runtime_error("String.charCodeAt called on non-string");
-    }
-
-    std::string str = std::get<std::string>(args[0].data);
+    std::string str = requireStringCoercibleThis(args, "charCodeAt");
     int index = 0;
-
-    if (args.size() > 1 && args[1].isNumber()) {
-        index = static_cast<int>(std::get<double>(args[1].data));
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        index = static_cast<int>(toIntegerForStringBuiltinArg(args[1]));
     }
 
     if (index < 0) {
@@ -110,15 +230,10 @@ Value String_charCodeAt(const std::vector<Value>& args) {
 
 // String.prototype.codePointAt (full Unicode code point using UTF-16 indexing)
 Value String_codePointAt(const std::vector<Value>& args) {
-    if (args.empty() || !args[0].isString()) {
-        throw std::runtime_error("String.codePointAt called on non-string");
-    }
-
-    std::string str = std::get<std::string>(args[0].data);
+    std::string str = requireStringCoercibleThis(args, "codePointAt");
     int index = 0;
-
-    if (args.size() > 1 && args[1].isNumber()) {
-        index = static_cast<int>(std::get<double>(args[1].data));
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        index = static_cast<int>(toIntegerForStringBuiltinArg(args[1]));
     }
 
     if (index < 0) {
@@ -140,6 +255,57 @@ Value String_codePointAt(const std::vector<Value>& args) {
         }
     }
     return Value(static_cast<double>(codePoint));
+}
+
+// String.prototype.at (UTF-16 code unit based, relative indexing)
+Value String_at(const std::vector<Value>& args) {
+    std::string str = requireStringCoercibleThis(args, "at");
+    double relativeIndex = 0.0;
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        relativeIndex = toIntegerForStringBuiltinArg(args[1]);
+    }
+
+    int len = static_cast<int>(utf16Length(str));
+    int index = static_cast<int>(relativeIndex);
+    if (index < 0) {
+        index = len + index;
+    }
+    if (index < 0 || index >= len) {
+        return Value(Undefined{});
+    }
+
+    std::string codeUnitString = utf16CodeUnitStringAt(str, static_cast<size_t>(index));
+    if (codeUnitString.empty()) {
+        return Value(Undefined{});
+    }
+    return Value(codeUnitString);
+}
+
+Value String_iterator(const std::vector<Value>& args) {
+    std::string str = requireStringCoercibleThis(args, "[Symbol.iterator]");
+
+    auto iteratorObj = GarbageCollector::makeGC<Object>();
+    auto byteIndex = std::make_shared<size_t>(0);
+    auto nextFn = GarbageCollector::makeGC<Function>();
+    nextFn->isNative = true;
+    nextFn->isConstructor = false;
+    nextFn->properties["__throw_on_new__"] = Value(true);
+    nextFn->nativeFunc = [str, byteIndex](const std::vector<Value>&) -> Value {
+        auto result = GarbageCollector::makeGC<Object>();
+        if (*byteIndex >= str.size()) {
+            result->properties["value"] = Value(Undefined{});
+            result->properties["done"] = Value(true);
+            return Value(result);
+        }
+
+        size_t start = *byteIndex;
+        unicode::decodeUTF8(str, *byteIndex);
+        result->properties["value"] = Value(str.substr(start, *byteIndex - start));
+        result->properties["done"] = Value(false);
+        return Value(result);
+    };
+    iteratorObj->properties["next"] = Value(nextFn);
+    return Value(iteratorObj);
 }
 
 // String.prototype.indexOf
@@ -293,26 +459,47 @@ Value String_split(const std::vector<Value>& args) {
     }
 
     std::string str = std::get<std::string>(args[0].data);
-    auto result = GarbageCollector::makeGC<Array>();
-    GarbageCollector::instance().reportAllocation(sizeof(Array));
+    auto result = makeArrayWithPrototype();
 
-    if (args.size() < 2) {
-        // No separator - return array with original string
+    // Handle limit parameter (ToUint32 per spec) - args[2] since args[0] is this
+    uint32_t limit = 0xFFFFFFFF; // max uint32 = no limit
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        double lim = args[2].toNumber();
+        if (std::isnan(lim) || !std::isfinite(lim) || lim == 0.0) {
+            limit = 0;
+        } else {
+            double integer = std::trunc(lim);
+            double mod = std::fmod(integer, 4294967296.0);
+            if (mod < 0) mod += 4294967296.0;
+            limit = static_cast<uint32_t>(mod);
+        }
+    }
+
+    // If limit is 0, return empty array
+    if (limit == 0) {
+        return Value(result);
+    }
+
+    // If separator is undefined, return [str]
+    if (args.size() < 2 || args[1].isUndefined()) {
         result->elements.push_back(Value(str));
         return Value(result);
     }
 
     std::string separator = args[1].toString();
-    int limit = -1;
-
-    if (args.size() > 2 && args[2].isNumber()) {
-        limit = static_cast<int>(std::get<double>(args[2].data));
-    }
 
     if (separator.empty()) {
-        // Split into individual characters
-        for (size_t i = 0; i < str.length() && (limit < 0 || result->elements.size() < static_cast<size_t>(limit)); ++i) {
-            result->elements.push_back(Value(std::string(1, str[i])));
+        // Split into individual characters (UTF-8 aware)
+        size_t i = 0;
+        while (i < str.size() && result->elements.size() < limit) {
+            unsigned char c = str[i];
+            size_t charLen = 1;
+            if ((c & 0x80) == 0) charLen = 1;
+            else if ((c & 0xE0) == 0xC0) charLen = 2;
+            else if ((c & 0xF0) == 0xE0) charLen = 3;
+            else if ((c & 0xF8) == 0xF0) charLen = 4;
+            result->elements.push_back(Value(str.substr(i, charLen)));
+            i += charLen;
         }
         return Value(result);
     }
@@ -321,12 +508,12 @@ Value String_split(const std::vector<Value>& args) {
     size_t found = 0;
 
     while ((found = str.find(separator, pos)) != std::string::npos &&
-           (limit < 0 || result->elements.size() < static_cast<size_t>(limit))) {
+           result->elements.size() < limit) {
         result->elements.push_back(Value(str.substr(pos, found - pos)));
         pos = found + separator.length();
     }
 
-    if (limit < 0 || result->elements.size() < static_cast<size_t>(limit)) {
+    if (result->elements.size() < limit) {
         result->elements.push_back(Value(str.substr(pos)));
     }
 
@@ -384,19 +571,7 @@ Value String_trim(const std::vector<Value>& args) {
         throw std::runtime_error("String.trim called on non-string");
     }
 
-    std::string str = std::get<std::string>(args[0].data);
-
-    // Trim from start
-    str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }));
-
-    // Trim from end
-    str.erase(std::find_if(str.rbegin(), str.rend(), [](unsigned char ch) {
-        return !std::isspace(ch);
-    }).base(), str.end());
-
-    return Value(str);
+    return Value(stripESWhitespace(std::get<std::string>(args[0].data)));
 }
 
 // String.fromCharCode (static method)

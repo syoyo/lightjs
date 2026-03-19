@@ -41,6 +41,7 @@ struct BigIntLiteral {
 struct StringLiteral {
   std::string value;
   bool hasLegacyEscape = false;
+  bool hasEscape = false;  // true if any escape sequence was used
 };
 
 struct TemplateElement {

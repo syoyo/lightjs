@@ -1,4 +1,6 @@
 #include "value.h"
+#include "environment.h"
+#include "interpreter.h"
 #include "streams.h"
 #include "wasm_js.h"
 #include "event_loop.h"
@@ -17,6 +19,110 @@
 namespace lightjs {
 
 namespace {
+double toIntegerOrZero(double value) {
+  if (!std::isfinite(value) || value == 0.0) {
+    return 0.0;
+  }
+  return std::trunc(value);
+}
+
+template <typename UnsignedT>
+UnsignedT toUintN(double value) {
+  constexpr uint64_t kModulus = uint64_t{1} << (sizeof(UnsignedT) * 8);
+  long double integer = static_cast<long double>(toIntegerOrZero(value));
+  long double wrapped = std::fmod(integer, static_cast<long double>(kModulus));
+  if (wrapped < 0) {
+    wrapped += static_cast<long double>(kModulus);
+  }
+  return static_cast<UnsignedT>(static_cast<uint64_t>(wrapped));
+}
+
+int32_t toInt32Element(double value) {
+  return static_cast<int32_t>(toUintN<uint32_t>(value));
+}
+
+uint8_t toUint8Clamp(double value) {
+  if (std::isnan(value) || value <= 0.0) {
+    return 0;
+  }
+  if (value >= 255.0) {
+    return 255;
+  }
+  double floorValue = std::floor(value);
+  double fraction = value - floorValue;
+  if (fraction > 0.5) {
+    return static_cast<uint8_t>(floorValue + 1.0);
+  }
+  if (fraction < 0.5) {
+    return static_cast<uint8_t>(floorValue);
+  }
+  uint8_t truncated = static_cast<uint8_t>(floorValue);
+  return (truncated % 2 == 0) ? truncated : static_cast<uint8_t>(truncated + 1);
+}
+
+double readTypedArrayNumberUnchecked(TypedArrayType type, const uint8_t* ptr) {
+  switch (type) {
+    case TypedArrayType::Int8:
+      return static_cast<double>(*reinterpret_cast<const int8_t*>(ptr));
+    case TypedArrayType::Uint8:
+    case TypedArrayType::Uint8Clamped:
+      return static_cast<double>(*reinterpret_cast<const uint8_t*>(ptr));
+    case TypedArrayType::Int16:
+      return static_cast<double>(*reinterpret_cast<const int16_t*>(ptr));
+    case TypedArrayType::Uint16:
+      return static_cast<double>(*reinterpret_cast<const uint16_t*>(ptr));
+    case TypedArrayType::Float16:
+      return static_cast<double>(float16_to_float32(*reinterpret_cast<const uint16_t*>(ptr)));
+    case TypedArrayType::Int32:
+      return static_cast<double>(*reinterpret_cast<const int32_t*>(ptr));
+    case TypedArrayType::Uint32:
+      return static_cast<double>(*reinterpret_cast<const uint32_t*>(ptr));
+    case TypedArrayType::Float32:
+      return static_cast<double>(*reinterpret_cast<const float*>(ptr));
+    case TypedArrayType::Float64:
+      return *reinterpret_cast<const double*>(ptr);
+    default:
+      return 0.0;
+  }
+}
+
+void writeTypedArrayNumberUnchecked(TypedArrayType type, uint8_t* ptr, double value) {
+  switch (type) {
+    case TypedArrayType::Int8:
+      *reinterpret_cast<int8_t*>(ptr) = static_cast<int8_t>(toUintN<uint8_t>(value));
+      break;
+    case TypedArrayType::Uint8:
+      *reinterpret_cast<uint8_t*>(ptr) = toUintN<uint8_t>(value);
+      break;
+    case TypedArrayType::Uint8Clamped:
+      *reinterpret_cast<uint8_t*>(ptr) = toUint8Clamp(value);
+      break;
+    case TypedArrayType::Int16:
+      *reinterpret_cast<int16_t*>(ptr) = static_cast<int16_t>(toUintN<uint16_t>(value));
+      break;
+    case TypedArrayType::Uint16:
+      *reinterpret_cast<uint16_t*>(ptr) = toUintN<uint16_t>(value);
+      break;
+    case TypedArrayType::Float16:
+      *reinterpret_cast<uint16_t*>(ptr) = float64_to_float16(value);
+      break;
+    case TypedArrayType::Int32:
+      *reinterpret_cast<int32_t*>(ptr) = toInt32Element(value);
+      break;
+    case TypedArrayType::Uint32:
+      *reinterpret_cast<uint32_t*>(ptr) = toUintN<uint32_t>(value);
+      break;
+    case TypedArrayType::Float32:
+      *reinterpret_cast<float*>(ptr) = static_cast<float>(value);
+      break;
+    case TypedArrayType::Float64:
+      *reinterpret_cast<double*>(ptr) = value;
+      break;
+    default:
+      break;
+  }
+}
+
 void queuePromiseCallback(std::function<void()> callback) {
   EventLoopContext::instance().getLoop().queueMicrotask(std::move(callback));
 }
@@ -106,61 +212,260 @@ bool propertyKeyToSymbol(const std::string& key, Symbol& outSymbol) {
   return true;
 }
 
+// ES spec Unicode whitespace check at byte position in UTF-8 string.
+// Returns true if the byte(s) at pos form a whitespace code point, sets advance to byte count.
+bool isESWhitespace(const std::string& str, size_t pos, size_t& advance) {
+  if (pos >= str.size()) { advance = 0; return false; }
+  unsigned char c = static_cast<unsigned char>(str[pos]);
+  // ASCII whitespace: TAB, LF, VT, FF, CR, SP
+  if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+    advance = 1; return true;
+  }
+  // 2-byte: U+00A0 NBSP (C2 A0)
+  if (c == 0xC2 && pos + 1 < str.size() && static_cast<unsigned char>(str[pos+1]) == 0xA0) {
+    advance = 2; return true;
+  }
+  // 3-byte sequences
+  if (pos + 2 < str.size()) {
+    unsigned char c2 = static_cast<unsigned char>(str[pos+1]);
+    unsigned char c3 = static_cast<unsigned char>(str[pos+2]);
+    if (c == 0xE1 && c2 == 0x9A && c3 == 0x80) { advance = 3; return true; } // U+1680
+    if (c == 0xE2 && c2 == 0x80 && c3 >= 0x80 && c3 <= 0x8A) { advance = 3; return true; } // U+2000-U+200A
+    if (c == 0xE2 && c2 == 0x80 && (c3 == 0xA8 || c3 == 0xA9)) { advance = 3; return true; } // U+2028/2029
+    if (c == 0xE2 && c2 == 0x80 && c3 == 0xAF) { advance = 3; return true; } // U+202F
+    if (c == 0xE2 && c2 == 0x81 && c3 == 0x9F) { advance = 3; return true; } // U+205F
+    if (c == 0xE3 && c2 == 0x80 && c3 == 0x80) { advance = 3; return true; } // U+3000
+    if (c == 0xEF && c2 == 0xBB && c3 == 0xBF) { advance = 3; return true; } // U+FEFF
+  }
+  advance = 1;
+  return false;
+}
+
+std::string stripLeadingESWhitespace(const std::string& str) {
+  size_t pos = 0;
+  while (pos < str.size()) {
+    size_t adv = 1;
+    if (!isESWhitespace(str, pos, adv)) break;
+    pos += adv;
+  }
+  return str.substr(pos);
+}
+
+std::string stripTrailingESWhitespace(const std::string& str) {
+  size_t end = str.size();
+  while (end > 0) {
+    bool found = false;
+    if (end >= 3) {
+      size_t adv = 1;
+      if (isESWhitespace(str, end - 3, adv) && adv == 3) {
+        end -= 3; found = true; continue;
+      }
+    }
+    if (!found && end >= 2) {
+      size_t adv = 1;
+      if (isESWhitespace(str, end - 2, adv) && adv == 2) {
+        end -= 2; found = true; continue;
+      }
+    }
+    if (!found) {
+      unsigned char c = static_cast<unsigned char>(str[end - 1]);
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+        end -= 1; continue;
+      }
+      break;
+    }
+  }
+  return str.substr(0, end);
+}
+
+std::string stripESWhitespace(const std::string& str) {
+  return stripTrailingESWhitespace(stripLeadingESWhitespace(str));
+}
+
+std::string ecmaNumberToString(double number) {
+  if (std::isnan(number)) return "NaN";
+  if (std::isinf(number)) return number < 0 ? "-Infinity" : "Infinity";
+  if (number == 0.0) return "0";
+
+  // Find shortest decimal representation that round-trips
+  char buf[64];
+  int prec;
+  for (prec = 1; prec <= 21; prec++) {
+    snprintf(buf, sizeof(buf), "%.*g", prec, number);
+    char* end;
+    double parsed = strtod(buf, &end);
+    if (parsed == number) break;
+  }
+  // buf now has the shortest representation in %g format
+  std::string s(buf);
+
+  // Parse the %g output and reformat per ES spec
+  double absNumber = std::fabs(number);
+  std::string sign;
+  std::string digits;
+  int exponent = 0;
+
+  auto epos = s.find_first_of("eE");
+  if (epos != std::string::npos) {
+    // %g chose scientific notation
+    std::string mPart = s.substr(0, epos);
+    exponent = std::stoi(s.substr(epos + 1));
+    // Remove sign from mantissa
+    size_t mStart = 0;
+    if (!mPart.empty() && (mPart[0] == '-' || mPart[0] == '+')) mStart = 1;
+    for (size_t i = mStart; i < mPart.size(); i++) {
+      if (mPart[i] >= '0' && mPart[i] <= '9') digits += mPart[i];
+    }
+  } else {
+    // %g chose fixed notation
+    size_t mStart = 0;
+    if (!s.empty() && (s[0] == '-' || s[0] == '+')) mStart = 1;
+    auto dotPos = s.find('.');
+    if (dotPos != std::string::npos) {
+      std::string intPart = s.substr(mStart, dotPos - mStart);
+      std::string fracPart = s.substr(dotPos + 1);
+      if (intPart == "0" || intPart.empty()) {
+        // e.g., "0.001" → digits from frac, count leading zeros for exponent
+        int leadingZeros = 0;
+        for (char c : fracPart) {
+          if (c == '0') leadingZeros++;
+          else break;
+        }
+        for (char c : fracPart) {
+          if (c >= '0' && c <= '9') digits += c;
+        }
+        // Remove leading zeros from digits
+        size_t firstNonZero = digits.find_first_not_of('0');
+        digits = (firstNonZero != std::string::npos) ? digits.substr(firstNonZero) : "0";
+        exponent = -(leadingZeros + 1);
+      } else {
+        digits = intPart + fracPart;
+        exponent = static_cast<int>(intPart.size()) - 1;
+      }
+    } else {
+      // Pure integer from %g (e.g., "100")
+      digits = s.substr(mStart);
+      // Remove trailing zeros to get significant digits, but track original length for exponent
+      exponent = static_cast<int>(digits.size()) - 1;
+      while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+    }
+  }
+
+  int n = static_cast<int>(digits.size()); // number of significant digits
+  int k = n;
+  int e = exponent; // exponent such that value = digits * 10^(e-k+1)
+
+  // ES spec formatting rules (7.1.12.1):
+  // Let s be sign, k = number of digits, n = exponent + 1
+  int nn = e + 1; // ES spec's n
+  if (number < 0) sign = "-";
+
+  if (k <= nn && nn <= 21) {
+    // Case: integer-like, no exponent needed
+    // m = digits + (nn-k) zeros
+    return sign + digits + std::string(nn - k, '0');
+  }
+  if (0 < nn && nn <= 21) {
+    // Case: insert decimal point
+    return sign + digits.substr(0, nn) + "." + digits.substr(nn);
+  }
+  if (-6 < nn && nn <= 0) {
+    // Case: 0.000...digits
+    return sign + "0." + std::string(-nn, '0') + digits;
+  }
+  // Case: exponential notation
+  std::string result = sign;
+  if (k == 1) {
+    result += digits;
+  } else {
+    result += digits.substr(0, 1) + "." + digits.substr(1);
+  }
+  result += "e";
+  result += (e >= 0) ? "+" : "-";
+  result += std::to_string(std::abs(e));
+  return result;
+}
+
 std::string valueToPropertyKey(const Value& value) {
   if (value.isSymbol()) {
     return symbolToPropertyKey(std::get<Symbol>(value.data));
   }
   if (value.isNumber()) {
-    double number = value.toNumber();
-    if (std::isnan(number)) return "NaN";
-    if (std::isinf(number)) return number < 0 ? "-Infinity" : "Infinity";
-    if (number == 0.0) return "0";
-    double absNumber = std::fabs(number);
-    const bool useExponent = absNumber >= 1e21 || (absNumber > 0.0 && absNumber < 1e-6);
-
-    std::ostringstream oss;
-    if (useExponent) {
-      oss << std::scientific << std::setprecision(15) << number;
-    } else {
-      // Fixed with trimming approximates ES Number::toString for the ranges
-      // exercised by property key conversion tests.
-      oss << std::fixed << std::setprecision(15) << number;
-    }
-    std::string out = oss.str();
-
-    auto expPos = out.find_first_of("eE");
-    if (expPos != std::string::npos) {
-      std::string mantissa = out.substr(0, expPos);
-      std::string exponent = out.substr(expPos + 1);
-      // Trim mantissa trailing zeros/dot.
-      auto dot = mantissa.find('.');
-      if (dot != std::string::npos) {
-        while (!mantissa.empty() && mantissa.back() == '0') mantissa.pop_back();
-        if (!mantissa.empty() && mantissa.back() == '.') mantissa.pop_back();
+    return ecmaNumberToString(value.toNumber());
+  }
+  // ToPrimitive for objects: call toString/valueOf
+  if (value.isObject()) {
+    auto obj = value.getGC<Object>();
+    auto primIt = obj->properties.find("__primitive_value__");
+    if (primIt != obj->properties.end()) {
+      if (primIt->second.isSymbol()) {
+        return symbolToPropertyKey(std::get<Symbol>(primIt->second.data));
       }
-
-      char sign = '+';
-      size_t idx = 0;
-      if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
-        sign = exponent[0];
-        idx = 1;
+      return primIt->second.toString();
+    }
+    // Try calling toString() then valueOf() via the interpreter
+    auto* interp = getGlobalInterpreter();
+    if (interp) {
+      // Check for own toString method first, then prototype chain
+      auto findMethod = [&](const std::string& methodName) -> Value {
+        auto it = obj->properties.find(methodName);
+        if (it != obj->properties.end() && it->second.isFunction()) {
+          return it->second;
+        }
+        // Walk prototype chain
+        auto protoIt = obj->properties.find("__proto__");
+        if (protoIt != obj->properties.end() && protoIt->second.isObject()) {
+          auto proto = protoIt->second.getGC<Object>();
+          int depth = 0;
+          while (proto && depth < 20) {
+            auto methodIt = proto->properties.find(methodName);
+            if (methodIt != proto->properties.end() && methodIt->second.isFunction()) {
+              return methodIt->second;
+            }
+            auto nextIt = proto->properties.find("__proto__");
+            if (nextIt == proto->properties.end() || !nextIt->second.isObject()) break;
+            proto = nextIt->second.getGC<Object>();
+            depth++;
+          }
+        }
+        return Value(Undefined{});
+      };
+      // ES spec: ToPrimitive with hint "string" tries toString first, then valueOf
+      Value toStringMethod = findMethod("toString");
+      if (toStringMethod.isFunction()) {
+        Value result = interp->callForHarness(toStringMethod, {}, value);
+        if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+          if (result.isSymbol()) {
+            return symbolToPropertyKey(std::get<Symbol>(result.data));
+          }
+          return result.toString();
+        }
       }
-      while (idx < exponent.size() && exponent[idx] == '0') idx++;
-      std::string expDigits = (idx < exponent.size()) ? exponent.substr(idx) : "0";
-
-      out = mantissa + "e";
-      out += sign;
-      out += expDigits;
-      return out;
+      Value valueOfMethod = findMethod("valueOf");
+      if (valueOfMethod.isFunction()) {
+        Value result = interp->callForHarness(valueOfMethod, {}, value);
+        if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+          if (result.isSymbol()) {
+            return symbolToPropertyKey(std::get<Symbol>(result.data));
+          }
+          return result.toString();
+        }
+      }
+      // Both returned objects: throw TypeError
+      throw std::runtime_error("TypeError: Cannot convert object to primitive value");
     }
-
-    // Non-exponent form: trim trailing zeros/dot.
-    auto dot = out.find('.');
-    if (dot != std::string::npos) {
-      while (!out.empty() && out.back() == '0') out.pop_back();
-      if (!out.empty() && out.back() == '.') out.pop_back();
+  }
+  if (value.isArray()) {
+    // Arrays: try toString via join
+    auto arr = value.getGC<Array>();
+    std::string result;
+    for (size_t i = 0; i < arr->elements.size(); i++) {
+      if (i > 0) result += ",";
+      if (!arr->elements[i].isUndefined() && !arr->elements[i].isNull()) {
+        result += arr->elements[i].toString();
+      }
     }
-    return out;
+    return result;
   }
   return value.toString();
 }
@@ -202,17 +507,7 @@ double Value::toNumber() const {
     } else if constexpr (std::is_same_v<T, BigInt>) {
       return arg.value.template convert_to<double>();
     } else if constexpr (std::is_same_v<T, std::string>) {
-      size_t start = 0;
-      while (start < arg.size() &&
-             std::isspace(static_cast<unsigned char>(arg[start]))) {
-        start++;
-      }
-      size_t end = arg.size();
-      while (end > start &&
-             std::isspace(static_cast<unsigned char>(arg[end - 1]))) {
-        end--;
-      }
-      std::string s = arg.substr(start, end - start);
+      std::string s = stripESWhitespace(arg);
       if (s.empty()) {
         return 0.0;
       }
@@ -238,18 +533,61 @@ double Value::toNumber() const {
         return std::nan("");
       }
 
+      // Handle binary literals: 0b/0B (no sign allowed)
+      if (s.size() >= 3 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) {
+        double result = 0.0;
+        for (size_t i = 2; i < s.size(); ++i) {
+          if (s[i] != '0' && s[i] != '1') return std::nan("");
+          result = result * 2 + (s[i] - '0');
+        }
+        return result;
+      }
+
+      // Handle octal literals: 0o/0O (no sign allowed)
+      if (s.size() >= 3 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) {
+        double result = 0.0;
+        for (size_t i = 2; i < s.size(); ++i) {
+          if (s[i] < '0' || s[i] > '7') return std::nan("");
+          result = result * 8 + (s[i] - '0');
+        }
+        return result;
+      }
+
+      // Handle hex literals: 0x/0X (no sign allowed per ES spec)
+      if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        if (s.size() == 2) return std::nan("");  // "0x" alone
+        double result = 0.0;
+        for (size_t i = 2; i < s.size(); ++i) {
+          char c = s[i];
+          int digit;
+          if (c >= '0' && c <= '9') digit = c - '0';
+          else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+          else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+          else return std::nan("");  // invalid char, decimal point, etc.
+          result = result * 16 + digit;
+        }
+        return result;
+      }
+
+      // Reject signed hex/binary/octal: +0x..., -0x..., etc.
+      if (s.size() >= 3 && (s[0] == '+' || s[0] == '-') &&
+          s[1] == '0' && (s[2] == 'x' || s[2] == 'X' || s[2] == 'b' || s[2] == 'B' || s[2] == 'o' || s[2] == 'O')) {
+        return std::nan("");
+      }
+
       char* parseEnd = nullptr;
       errno = 0;
       double parsed = std::strtod(s.c_str(), &parseEnd);
       if (parseEnd == s.c_str()) {
         return std::nan("");
       }
-      while (*parseEnd != '\0' &&
-             std::isspace(static_cast<unsigned char>(*parseEnd))) {
-        parseEnd++;
-      }
       if (*parseEnd != '\0') {
         return std::nan("");
+      }
+      // Reject non-spec infinity from strtod
+      if (std::isinf(parsed) && s != "Infinity" && s != "+Infinity" && s != "-Infinity") {
+        // Only if it wasn't a genuine overflow
+        if (errno != ERANGE) return std::nan("");
       }
       return parsed;
     } else {
@@ -294,20 +632,21 @@ std::string Value::toString() const {
     } else if constexpr (std::is_same_v<T, bool>) {
       return arg ? "true" : "false";
     } else if constexpr (std::is_same_v<T, double>) {
-      if (std::isnan(arg)) return "NaN";
-      if (std::isinf(arg)) return arg > 0 ? "Infinity" : "-Infinity";
-      std::ostringstream oss;
-      oss << arg;
-      return oss.str();
+      return ecmaNumberToString(arg);
     } else if constexpr (std::is_same_v<T, BigInt>) {
       return bigint::toString(arg.value);
     } else if constexpr (std::is_same_v<T, Symbol>) {
-      return "Symbol(" + arg.description + ")";
+      if (arg.hasDescription) {
+        return "Symbol(" + arg.description + ")";
+      }
+      return "Symbol()";
     } else if constexpr (std::is_same_v<T, ModuleBinding>) {
       return "[ModuleBinding]";
     } else if constexpr (std::is_same_v<T, std::string>) {
       return arg;
     } else if constexpr (std::is_same_v<T, GCPtr<Function>>) {
+      return "[Function]";
+    } else if constexpr (std::is_same_v<T, GCPtr<Class>>) {
       return "[Function]";
     } else if constexpr (std::is_same_v<T, GCPtr<Array>>) {
       return "[Array]";
@@ -357,31 +696,7 @@ double TypedArray::getElement(size_t index) const {
 
   size_t byteIndex = byteOffset + index * elementSize();
   const auto& bytes = storage();
-  const uint8_t* ptr = &bytes[byteIndex];
-
-  switch (type) {
-    case TypedArrayType::Int8:
-      return static_cast<double>(*reinterpret_cast<const int8_t*>(ptr));
-    case TypedArrayType::Uint8:
-    case TypedArrayType::Uint8Clamped:
-      return static_cast<double>(*reinterpret_cast<const uint8_t*>(ptr));
-    case TypedArrayType::Int16:
-      return static_cast<double>(*reinterpret_cast<const int16_t*>(ptr));
-    case TypedArrayType::Uint16:
-      return static_cast<double>(*reinterpret_cast<const uint16_t*>(ptr));
-    case TypedArrayType::Float16:
-      return static_cast<double>(float16_to_float32(*reinterpret_cast<const uint16_t*>(ptr)));
-    case TypedArrayType::Int32:
-      return static_cast<double>(*reinterpret_cast<const int32_t*>(ptr));
-    case TypedArrayType::Uint32:
-      return static_cast<double>(*reinterpret_cast<const uint32_t*>(ptr));
-    case TypedArrayType::Float32:
-      return static_cast<double>(*reinterpret_cast<const float*>(ptr));
-    case TypedArrayType::Float64:
-      return *reinterpret_cast<const double*>(ptr);
-    default:
-      return 0.0;
-  }
+  return readTypedArrayNumberUnchecked(type, &bytes[byteIndex]);
 }
 
 void TypedArray::setElement(size_t index, double value) {
@@ -389,46 +704,7 @@ void TypedArray::setElement(size_t index, double value) {
 
   size_t byteIndex = byteOffset + index * elementSize();
   auto& bytes = storage();
-  uint8_t* ptr = &bytes[byteIndex];
-
-  switch (type) {
-    case TypedArrayType::Int8:
-      *reinterpret_cast<int8_t*>(ptr) = static_cast<int8_t>(value);
-      break;
-    case TypedArrayType::Uint8:
-      *reinterpret_cast<uint8_t*>(ptr) = static_cast<uint8_t>(value);
-      break;
-    case TypedArrayType::Uint8Clamped: {
-      int32_t clamped = static_cast<int32_t>(value);
-      if (clamped < 0) clamped = 0;
-      if (clamped > 255) clamped = 255;
-      *reinterpret_cast<uint8_t*>(ptr) = static_cast<uint8_t>(clamped);
-      break;
-    }
-    case TypedArrayType::Int16:
-      *reinterpret_cast<int16_t*>(ptr) = static_cast<int16_t>(value);
-      break;
-    case TypedArrayType::Uint16:
-      *reinterpret_cast<uint16_t*>(ptr) = static_cast<uint16_t>(value);
-      break;
-    case TypedArrayType::Float16:
-      *reinterpret_cast<uint16_t*>(ptr) = float32_to_float16(static_cast<float>(value));
-      break;
-    case TypedArrayType::Int32:
-      *reinterpret_cast<int32_t*>(ptr) = static_cast<int32_t>(value);
-      break;
-    case TypedArrayType::Uint32:
-      *reinterpret_cast<uint32_t*>(ptr) = static_cast<uint32_t>(value);
-      break;
-    case TypedArrayType::Float32:
-      *reinterpret_cast<float*>(ptr) = static_cast<float>(value);
-      break;
-    case TypedArrayType::Float64:
-      *reinterpret_cast<double*>(ptr) = value;
-      break;
-    default:
-      break;
-  }
+  writeTypedArrayNumberUnchecked(type, &bytes[byteIndex], value);
 }
 
 int64_t TypedArray::getBigIntElement(size_t index) const {
@@ -448,6 +724,23 @@ int64_t TypedArray::getBigIntElement(size_t index) const {
   }
 }
 
+uint64_t TypedArray::getBigUintElement(size_t index) const {
+  if (index >= currentLength()) return 0;
+
+  size_t byteIndex = byteOffset + index * elementSize();
+  const auto& bytes = storage();
+  const uint8_t* ptr = &bytes[byteIndex];
+
+  switch (type) {
+    case TypedArrayType::BigUint64:
+      return *reinterpret_cast<const uint64_t*>(ptr);
+    case TypedArrayType::BigInt64:
+      return static_cast<uint64_t>(*reinterpret_cast<const int64_t*>(ptr));
+    default:
+      return static_cast<uint64_t>(getElement(index));
+  }
+}
+
 void TypedArray::setBigIntElement(size_t index, int64_t value) {
   if (index >= currentLength()) return;
 
@@ -461,6 +754,26 @@ void TypedArray::setBigIntElement(size_t index, int64_t value) {
       break;
     case TypedArrayType::BigUint64:
       *reinterpret_cast<uint64_t*>(ptr) = static_cast<uint64_t>(value);
+      break;
+    default:
+      setElement(index, static_cast<double>(value));
+      break;
+  }
+}
+
+void TypedArray::setBigUintElement(size_t index, uint64_t value) {
+  if (index >= currentLength()) return;
+
+  size_t byteIndex = byteOffset + index * elementSize();
+  auto& bytes = storage();
+  uint8_t* ptr = &bytes[byteIndex];
+
+  switch (type) {
+    case TypedArrayType::BigUint64:
+      *reinterpret_cast<uint64_t*>(ptr) = value;
+      break;
+    case TypedArrayType::BigInt64:
+      *reinterpret_cast<int64_t*>(ptr) = static_cast<int64_t>(value);
       break;
     default:
       setElement(index, static_cast<double>(value));
@@ -527,13 +840,17 @@ void TypedArray::copyFrom(const TypedArray& source, size_t srcOffset, size_t dst
 
   const auto& sourceBytes = source.storage();
   auto& targetBytes = storage();
+  const size_t sourceElementSize = source.elementSize();
+  const size_t targetElementSize = elementSize();
+  const size_t srcByteOffset = source.byteOffset + srcOffset * sourceElementSize;
+  const size_t dstByteOffset = byteOffset + dstOffset * targetElementSize;
 
-  // Fast path: same type, just memcpy
-  if (type == source.type) {
-    size_t bytesToCopy = count * elementSize();
-    size_t srcByteOffset = source.byteOffset + srcOffset * source.elementSize();
-    size_t dstByteOffset = byteOffset + dstOffset * elementSize();
-    simd::memcpySIMD(&targetBytes[dstByteOffset], &sourceBytes[srcByteOffset], bytesToCopy);
+  // Fast path: same representation, just move the bytes.
+  if (type == source.type ||
+      ((type == TypedArrayType::BigInt64 || type == TypedArrayType::BigUint64) &&
+       (source.type == TypedArrayType::BigInt64 || source.type == TypedArrayType::BigUint64))) {
+    size_t bytesToCopy = count * targetElementSize;
+    std::memmove(&targetBytes[dstByteOffset], &sourceBytes[srcByteOffset], bytesToCopy);
     return;
   }
 
@@ -541,89 +858,91 @@ void TypedArray::copyFrom(const TypedArray& source, size_t srcOffset, size_t dst
 #if USE_SIMD
   // Float32 -> Int32
   if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Int32) {
-    const float* src = reinterpret_cast<const float*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    int32_t* dst = reinterpret_cast<int32_t*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const float* src = reinterpret_cast<const float*>(&sourceBytes[srcByteOffset]);
+    int32_t* dst = reinterpret_cast<int32_t*>(&targetBytes[dstByteOffset]);
     simd::convertFloat32ToInt32(src, dst, count);
     return;
   }
 
   // Int32 -> Float32
   if (source.type == TypedArrayType::Int32 && type == TypedArrayType::Float32) {
-    const int32_t* src = reinterpret_cast<const int32_t*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    float* dst = reinterpret_cast<float*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const int32_t* src = reinterpret_cast<const int32_t*>(&sourceBytes[srcByteOffset]);
+    float* dst = reinterpret_cast<float*>(&targetBytes[dstByteOffset]);
     simd::convertInt32ToFloat32(src, dst, count);
     return;
   }
 
   // Float64 -> Int32
   if (source.type == TypedArrayType::Float64 && type == TypedArrayType::Int32) {
-    const double* src = reinterpret_cast<const double*>(&sourceBytes[source.byteOffset + srcOffset * 8]);
-    int32_t* dst = reinterpret_cast<int32_t*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const double* src = reinterpret_cast<const double*>(&sourceBytes[srcByteOffset]);
+    int32_t* dst = reinterpret_cast<int32_t*>(&targetBytes[dstByteOffset]);
     simd::convertFloat64ToInt32(src, dst, count);
     return;
   }
 
   // Uint8 -> Float32
   if (source.type == TypedArrayType::Uint8 && type == TypedArrayType::Float32) {
-    const uint8_t* src = &sourceBytes[source.byteOffset + srcOffset];
-    float* dst = reinterpret_cast<float*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const uint8_t* src = &sourceBytes[srcByteOffset];
+    float* dst = reinterpret_cast<float*>(&targetBytes[dstByteOffset]);
     simd::convertUint8ToFloat32(src, dst, count);
     return;
   }
 
   // Float32 -> Uint8
   if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Uint8) {
-    const float* src = reinterpret_cast<const float*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    uint8_t* dst = &targetBytes[byteOffset + dstOffset];
+    const float* src = reinterpret_cast<const float*>(&sourceBytes[srcByteOffset]);
+    uint8_t* dst = &targetBytes[dstByteOffset];
     simd::convertFloat32ToUint8(src, dst, count);
     return;
   }
 
   // Float32 -> Uint8Clamped
   if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Uint8Clamped) {
-    const float* src = reinterpret_cast<const float*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    uint8_t* dst = &targetBytes[byteOffset + dstOffset];
+    const float* src = reinterpret_cast<const float*>(&sourceBytes[srcByteOffset]);
+    uint8_t* dst = &targetBytes[dstByteOffset];
     simd::clampFloat32ToUint8(src, dst, count);
     return;
   }
 
   // Int16 -> Float32
   if (source.type == TypedArrayType::Int16 && type == TypedArrayType::Float32) {
-    const int16_t* src = reinterpret_cast<const int16_t*>(&sourceBytes[source.byteOffset + srcOffset * 2]);
-    float* dst = reinterpret_cast<float*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const int16_t* src = reinterpret_cast<const int16_t*>(&sourceBytes[srcByteOffset]);
+    float* dst = reinterpret_cast<float*>(&targetBytes[dstByteOffset]);
     simd::convertInt16ToFloat32(src, dst, count);
     return;
   }
 
   // Float32 -> Int16
   if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Int16) {
-    const float* src = reinterpret_cast<const float*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    int16_t* dst = reinterpret_cast<int16_t*>(&targetBytes[byteOffset + dstOffset * 2]);
+    const float* src = reinterpret_cast<const float*>(&sourceBytes[srcByteOffset]);
+    int16_t* dst = reinterpret_cast<int16_t*>(&targetBytes[dstByteOffset]);
     simd::convertFloat32ToInt16(src, dst, count);
     return;
   }
 
   // Float32 -> Float16 (batch)
   if (source.type == TypedArrayType::Float32 && type == TypedArrayType::Float16) {
-    const float* src = reinterpret_cast<const float*>(&sourceBytes[source.byteOffset + srcOffset * 4]);
-    uint16_t* dst = reinterpret_cast<uint16_t*>(&targetBytes[byteOffset + dstOffset * 2]);
+    const float* src = reinterpret_cast<const float*>(&sourceBytes[srcByteOffset]);
+    uint16_t* dst = reinterpret_cast<uint16_t*>(&targetBytes[dstByteOffset]);
     simd::convertFloat32ToFloat16Batch(src, dst, count);
     return;
   }
 
   // Float16 -> Float32 (batch)
   if (source.type == TypedArrayType::Float16 && type == TypedArrayType::Float32) {
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(&sourceBytes[source.byteOffset + srcOffset * 2]);
-    float* dst = reinterpret_cast<float*>(&targetBytes[byteOffset + dstOffset * 4]);
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(&sourceBytes[srcByteOffset]);
+    float* dst = reinterpret_cast<float*>(&targetBytes[dstByteOffset]);
     simd::convertFloat16ToFloat32Batch(src, dst, count);
     return;
   }
 #endif
 
-  // Generic fallback: element-by-element conversion
+  // Generic fallback: convert raw elements without re-checking bounds on every step.
+  const uint8_t* src = &sourceBytes[srcByteOffset];
+  uint8_t* dst = &targetBytes[dstByteOffset];
   for (size_t i = 0; i < count; ++i) {
-    double val = source.getElement(srcOffset + i);
-    setElement(dstOffset + i, val);
+    double val = readTypedArrayNumberUnchecked(source.type, src + i * sourceElementSize);
+    writeTypedArrayNumberUnchecked(type, dst + i * targetElementSize, val);
   }
 }
 
@@ -767,6 +1086,7 @@ static bool valuesEqual(const Value& a, const Value& b) {
   if (a.isString()) return std::get<std::string>(a.data) == std::get<std::string>(b.data);
   if (a.isBool()) return std::get<bool>(a.data) == std::get<bool>(b.data);
   if (a.isBigInt()) return std::get<BigInt>(a.data).value == std::get<BigInt>(b.data).value;
+  if (a.isSymbol()) return std::get<Symbol>(a.data).id == std::get<Symbol>(b.data).id;
   if (a.isNull() || a.isUndefined()) return true;
 
   // For objects, compare by reference
@@ -1156,12 +1476,39 @@ static OrderedMap<std::string, Value>* getPropertiesMap(const Value& val) {
 }
 
 Value Object_keys(const std::vector<Value>& args) {
-  auto result = GarbageCollector::makeGC<Array>();
-  if (args.empty()) return Value(result);
+  auto result = makeArrayWithPrototype();
+  if (args.empty()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  const auto& arg = args[0];
+  // Throw TypeError for null/undefined
+  if (arg.isNull() || arg.isUndefined()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  // Handle string primitives: Object.keys("abc") → ["0","1","2"]
+  if (arg.isString()) {
+    const std::string& str = std::get<std::string>(arg.data);
+    // Count code points for proper Unicode support
+    size_t cpIdx = 0;
+    size_t bytePos = 0;
+    while (bytePos < str.size()) {
+      result->elements.push_back(Value(std::to_string(cpIdx)));
+      // Skip UTF-8 bytes
+      unsigned char c = str[bytePos];
+      if (c < 0x80) bytePos += 1;
+      else if ((c & 0xE0) == 0xC0) bytePos += 2;
+      else if ((c & 0xF0) == 0xE0) bytePos += 3;
+      else bytePos += 4;
+      cpIdx++;
+    }
+    return Value(result);
+  }
 
   // Handle Object with module namespace
-  if (args[0].isObject()) {
-    auto obj = args[0].getGC<Object>();
+  if (arg.isObject()) {
+    auto obj = arg.getGC<Object>();
     if (obj->isModuleNamespace) {
       for (const auto& key : obj->moduleExportNames) {
         auto getterIt = obj->properties.find("__get_" + key);
@@ -1177,7 +1524,12 @@ Value Object_keys(const std::vector<Value>& args) {
     }
   }
 
-  auto* props = getPropertiesMap(args[0]);
+  // Handle number/boolean primitives - no enumerable own properties
+  if (arg.isNumber() || arg.isBool()) {
+    return Value(result);
+  }
+
+  auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
@@ -1189,9 +1541,39 @@ Value Object_keys(const std::vector<Value>& args) {
 }
 
 Value Object_values(const std::vector<Value>& args) {
-  auto result = GarbageCollector::makeGC<Array>();
-  if (args.empty()) return Value(result);
-  auto* props = getPropertiesMap(args[0]);
+  auto result = makeArrayWithPrototype();
+  if (args.empty()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  const auto& arg = args[0];
+  if (arg.isNull() || arg.isUndefined()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  // Handle string primitives: Object.values("abc") → ["a","b","c"]
+  if (arg.isString()) {
+    const std::string& str = std::get<std::string>(arg.data);
+    size_t bytePos = 0;
+    while (bytePos < str.size()) {
+      unsigned char c = str[bytePos];
+      size_t len = 1;
+      if (c >= 0x80) {
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else len = 4;
+      }
+      result->elements.push_back(Value(str.substr(bytePos, len)));
+      bytePos += len;
+    }
+    return Value(result);
+  }
+
+  if (arg.isNumber() || arg.isBool()) {
+    return Value(result);
+  }
+
+  auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
@@ -1204,15 +1586,50 @@ Value Object_values(const std::vector<Value>& args) {
 }
 
 Value Object_entries(const std::vector<Value>& args) {
-  auto result = GarbageCollector::makeGC<Array>();
-  if (args.empty()) return Value(result);
-  auto* props = getPropertiesMap(args[0]);
+  auto result = makeArrayWithPrototype();
+  if (args.empty()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  const auto& arg = args[0];
+  if (arg.isNull() || arg.isUndefined()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
+
+  // Handle string primitives: Object.entries("abc") → [["0","a"],["1","b"],["2","c"]]
+  if (arg.isString()) {
+    const std::string& str = std::get<std::string>(arg.data);
+    size_t cpIdx = 0;
+    size_t bytePos = 0;
+    while (bytePos < str.size()) {
+      unsigned char c = str[bytePos];
+      size_t len = 1;
+      if (c >= 0x80) {
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else len = 4;
+      }
+      auto entry = makeArrayWithPrototype();
+      entry->elements.push_back(Value(std::to_string(cpIdx)));
+      entry->elements.push_back(Value(str.substr(bytePos, len)));
+      result->elements.push_back(Value(entry));
+      bytePos += len;
+      cpIdx++;
+    }
+    return Value(result);
+  }
+
+  if (arg.isNumber() || arg.isBool()) {
+    return Value(result);
+  }
+
+  auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
     if (props->count("__non_enum_" + key)) continue;
     auto it = props->find(key);
-    auto entry = GarbageCollector::makeGC<Array>();
+    auto entry = makeArrayWithPrototype();
     entry->elements.push_back(Value(key));
     entry->elements.push_back(it->second);
     result->elements.push_back(Value(entry));
@@ -1221,39 +1638,256 @@ Value Object_entries(const std::vector<Value>& args) {
   return Value(result);
 }
 
+// Helper: get enumerable own string-keyed properties from a source value
+// Returns pairs of (key, value) in ES property order
+static std::vector<std::pair<std::string, Value>> getEnumerableOwnProperties(const Value& source) {
+  std::vector<std::pair<std::string, Value>> result;
+
+  // String sources: each character is an enumerable indexed property
+  if (source.isString()) {
+    const std::string& str = std::get<std::string>(source.data);
+    // Iterate by UTF-16 code units for ES compat
+    size_t i = 0;
+    size_t idx = 0;
+    while (i < str.size()) {
+      unsigned char c = str[i];
+      size_t charLen = 1;
+      if ((c & 0x80) == 0) charLen = 1;
+      else if ((c & 0xE0) == 0xC0) charLen = 2;
+      else if ((c & 0xF0) == 0xE0) charLen = 3;
+      else if ((c & 0xF8) == 0xF0) charLen = 4;
+      std::string ch = str.substr(i, charLen);
+      result.push_back({std::to_string(idx), Value(ch)});
+      i += charLen;
+      idx++;
+    }
+    return result;
+  }
+
+  // Number, Boolean, Symbol, BigInt: no own enumerable string-keyed properties
+  if (source.isNumber() || source.isBool() || source.isSymbol() || source.isBigInt()) {
+    return result;
+  }
+
+  // Array sources: indexed elements + own properties
+  if (source.isArray()) {
+    auto arr = source.getGC<Array>();
+    // Add array elements (indexed, enumerable by default)
+    for (size_t i = 0; i < arr->elements.size(); i++) {
+      std::string key = std::to_string(i);
+      // Skip deleted elements and holes
+      if (arr->properties.find("__deleted_" + key + "__") != arr->properties.end()) continue;
+      if (arr->properties.find("__hole_" + key + "__") != arr->properties.end()) continue;
+      if (arr->properties.find("__non_enum_" + key) != arr->properties.end()) continue;
+      result.push_back({key, arr->elements[i]});
+    }
+    // Add non-indexed own properties
+    for (const auto& key : arr->properties.orderedKeys()) {
+      if (isInternalProperty(key)) continue;
+      if (isSymbolPropertyKey(key)) continue;
+      if (arr->properties.count("__non_enum_" + key)) continue;
+      // Skip numeric indices already handled
+      uint32_t idx2;
+      if (isArrayIndex(key, idx2) && idx2 < arr->elements.size()) continue;
+      if (key == "length") {
+        result.push_back({key, Value(static_cast<double>(arr->elements.size()))});
+        continue;
+      }
+      auto it = arr->properties.find(key);
+      if (it != arr->properties.end()) {
+        result.push_back({key, it->second});
+      }
+    }
+    return result;
+  }
+
+  // Generic object-like types: Object, Function, Class, etc.
+  OrderedMap<std::string, Value>* props = nullptr;
+  if (source.isObject()) props = &source.getGC<Object>()->properties;
+  else if (source.isFunction()) props = &source.getGC<Function>()->properties;
+  else if (source.isClass()) props = &source.getGC<Class>()->properties;
+  else if (source.isPromise()) props = &source.getGC<Promise>()->properties;
+  else if (source.isRegex()) props = &source.getGC<Regex>()->properties;
+  else if (source.isError()) props = &source.getGC<Error>()->properties;
+  else if (source.isMap()) props = &source.getGC<Map>()->properties;
+  else if (source.isSet()) props = &source.getGC<Set>()->properties;
+
+  if (!props) return result;
+
+  // String keys first (in property order: integer indices, then strings)
+  for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
+    if (isInternalProperty(key)) continue;
+    if (isSymbolPropertyKey(key)) continue;
+    if (props->count("__non_enum_" + key)) continue;
+    auto it = props->find(key);
+    if (it != props->end()) {
+      result.push_back({key, it->second});
+    }
+  }
+  // Symbol keys last (in insertion order)
+  for (const auto& key : props->orderedKeys()) {
+    if (!isSymbolPropertyKey(key)) continue;
+    if (isInternalProperty(key)) continue;
+    if (props->count("__non_enum_" + key)) continue;
+    auto it = props->find(key);
+    if (it != props->end()) {
+      result.push_back({key, it->second});
+    }
+  }
+  return result;
+}
+
+// Helper: assign a property value to a target, respecting non-writable constraints
+static void assignToTarget(Value& target, const std::string& key, const Value& value) {
+  if (target.isArray()) {
+    auto arr = target.getGC<Array>();
+    // Check non-writable
+    if (arr->properties.count("__non_writable_" + key)) {
+      throw std::runtime_error("TypeError: Cannot assign to read only property '" + key + "'");
+    }
+    // Handle "length" specially for arrays
+    if (key == "length" && value.isNumber()) {
+      double newLen = value.toNumber();
+      uint32_t len = static_cast<uint32_t>(newLen);
+      if (len < arr->elements.size()) {
+        arr->elements.resize(len);
+      } else if (len > arr->elements.size()) {
+        arr->elements.resize(len, Value(Undefined{}));
+      }
+      return;
+    }
+    // Handle numeric index
+    uint32_t idx;
+    if (isArrayIndex(key, idx)) {
+      if (idx >= arr->elements.size()) {
+        arr->elements.resize(idx + 1, Value(Undefined{}));
+      }
+      arr->elements[idx] = value;
+      return;
+    }
+    arr->properties[key] = value;
+    return;
+  }
+
+  OrderedMap<std::string, Value>* props = nullptr;
+  if (target.isObject()) props = &target.getGC<Object>()->properties;
+  else if (target.isFunction()) props = &target.getGC<Function>()->properties;
+  else if (target.isClass()) props = &target.getGC<Class>()->properties;
+  else if (target.isPromise()) props = &target.getGC<Promise>()->properties;
+  else if (target.isError()) props = &target.getGC<Error>()->properties;
+
+  if (!props) return;
+
+  // Check non-writable
+  if (props->count("__non_writable_" + key)) {
+    throw std::runtime_error("TypeError: Cannot assign to read only property '" + key + "'");
+  }
+
+  // Check if target has a setter for this property (accessor property)
+  if (props->count("__set_" + key)) {
+    // For accessor properties, we'd need to call the setter - for now just set the value
+    // In test262, accessor properties with setters should invoke them
+    (*props)[key] = value;
+    return;
+  }
+
+  (*props)[key] = value;
+}
+
 Value Object_assign(const std::vector<Value>& args) {
   if (args.empty()) {
-    throw std::runtime_error("Object.assign requires at least 1 argument");
+    throw std::runtime_error("TypeError: Object.assign requires at least 1 argument");
   }
 
   Value target = args[0];
   if (target.isNull() || target.isUndefined()) {
-    throw std::runtime_error("Cannot convert undefined or null to object");
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
   }
 
-  // Convert target to object if needed
-  GCPtr<Object> targetObj;
-  if (target.isObject()) {
-    targetObj = target.getGC<Object>();
-  } else {
-    targetObj = GarbageCollector::makeGC<Object>();
+  // ToObject: if target is already an object-like type, keep it; otherwise wrap
+  Value targetVal = target;
+  if (target.isString() || target.isNumber() || target.isBool() ||
+      target.isBigInt() || target.isSymbol()) {
+    // Wrap primitive to object
+    auto wrapped = GarbageCollector::makeGC<Object>();
+    wrapped->properties["__primitive_value__"] = target;
+
+    // For string targets, add indexed characters as non-writable, non-configurable, enumerable
+    if (target.isString()) {
+      const std::string& str = std::get<std::string>(target.data);
+      size_t i = 0, idx = 0;
+      while (i < str.size()) {
+        unsigned char c = str[i];
+        size_t charLen = 1;
+        if ((c & 0x80) == 0) charLen = 1;
+        else if ((c & 0xE0) == 0xC0) charLen = 2;
+        else if ((c & 0xF0) == 0xE0) charLen = 3;
+        else if ((c & 0xF8) == 0xF0) charLen = 4;
+        std::string ch = str.substr(i, charLen);
+        std::string key = std::to_string(idx);
+        wrapped->properties[key] = Value(ch);
+        wrapped->properties["__non_writable_" + key] = Value(true);
+        wrapped->properties["__non_configurable_" + key] = Value(true);
+        i += charLen;
+        idx++;
+      }
+      wrapped->properties["length"] = Value(static_cast<double>(idx));
+      wrapped->properties["__non_writable_length"] = Value(true);
+      wrapped->properties["__non_enum_length"] = Value(true);
+      wrapped->properties["__non_configurable_length"] = Value(true);
+    }
+
+    // Set __proto__ to the appropriate prototype for valueOf/toString inheritance
+    auto* interp = getGlobalInterpreter();
+    if (interp) {
+      auto env = interp->getEnvironment();
+      // Walk to global env
+      while (env && env->getParent()) env = env->getParentPtr();
+      if (env) {
+        std::string ctorName;
+        if (target.isNumber()) ctorName = "Number";
+        else if (target.isBool()) ctorName = "Boolean";
+        else if (target.isString()) ctorName = "String";
+        else if (target.isSymbol()) ctorName = "Symbol";
+        else if (target.isBigInt()) ctorName = "BigInt";
+        if (!ctorName.empty()) {
+          if (auto ctor = env->get(ctorName)) {
+            OrderedMap<std::string, Value>* ctorProps = nullptr;
+            if (ctor->isFunction()) {
+              ctorProps = &ctor->getGC<Function>()->properties;
+            } else if (ctor->isObject()) {
+              ctorProps = &ctor->getGC<Object>()->properties;
+            } else if (ctor->isClass()) {
+              ctorProps = &ctor->getGC<Class>()->properties;
+            }
+            if (ctorProps) {
+              auto protoIt = ctorProps->find("prototype");
+              if (protoIt != ctorProps->end()) {
+                wrapped->properties["__proto__"] = protoIt->second;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    targetVal = Value(wrapped);
   }
 
-  // Copy properties from sources
+  // Copy properties from each source
   for (size_t i = 1; i < args.size(); ++i) {
-    if (args[i].isNull() || args[i].isUndefined()) {
+    const Value& source = args[i];
+    if (source.isNull() || source.isUndefined()) {
       continue; // Skip null/undefined sources
     }
 
-    if (args[i].isObject()) {
-      auto sourceObj = args[i].getGC<Object>();
-      for (const auto& [key, value] : sourceObj->properties) {
-        targetObj->properties[key] = value;
-      }
+    auto ownProps = getEnumerableOwnProperties(source);
+    for (const auto& [key, value] : ownProps) {
+      assignToTarget(targetVal, key, value);
     }
   }
 
-  return Value(targetObj);
+  return targetVal;
 }
 
 Value Object_hasOwnProperty(const std::vector<Value>& args) {
@@ -1288,11 +1922,25 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
   if (args[0].isArray()) {
     auto arr = args[0].getGC<Array>();
     if (isInternalProperty(key)) return Value(false);
-    // Arrays always have an own `length` data property.
-    if (key == "length") return Value(true);
+    // Arrays always have an own `length` data property (unless deleted from arguments).
+    if (key == "length") {
+      if (arr->properties.find("__deleted_length__") != arr->properties.end()) {
+        return Value(false);
+      }
+      return Value(true);
+    }
     try {
       size_t idx = std::stoull(key);
-      if (idx < arr->elements.size()) return Value(true);
+      if (idx < arr->elements.size()) {
+        // Check if this index was deleted or is a hole
+        if (arr->properties.find("__deleted_" + key + "__") != arr->properties.end()) {
+          return Value(false);
+        }
+        if (arr->properties.find("__hole_" + key + "__") != arr->properties.end()) {
+          return Value(false);
+        }
+        return Value(true);
+      }
     } catch (...) {}
     if (arr->properties.find(key) != arr->properties.end()) return Value(true);
     if (arr->properties.find("__get_" + key) != arr->properties.end()) return Value(true);
@@ -1455,7 +2103,7 @@ static bool isInternalProperty(const std::string& key) {
 }
 
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
-  auto result = GarbageCollector::makeGC<Array>();
+  auto result = makeArrayWithPrototype();
 
   if (args.empty()) {
     return Value(result);
@@ -1556,6 +2204,76 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     return Value(result);
   }
 
+  if (args[0].isArray()) {
+    auto arr = args[0].getGC<Array>();
+    // Add numeric index keys for non-hole, non-deleted elements
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < arr->elements.size(); i++) {
+      std::string key = std::to_string(i);
+      if (arr->properties.find("__deleted_" + key + "__") != arr->properties.end()) continue;
+      if (arr->properties.find("__hole_" + key + "__") != arr->properties.end()) continue;
+      keys.push_back(key);
+    }
+    // Add "length"
+    if (arr->properties.find("__deleted_length__") == arr->properties.end()) {
+      keys.push_back("length");
+    }
+    // Add non-index, non-internal own properties
+    for (const auto& rawKey : arr->properties.orderedKeys()) {
+      if (isInternalProperty(rawKey)) continue;
+      if (isSymbolPropertyKey(rawKey)) continue;
+      // Skip already-added numeric indices and length
+      if (rawKey == "length") continue;
+      uint32_t idx2;
+      if (parseArrayIndexKey(rawKey, idx2)) continue;
+      keys.push_back(rawKey);
+    }
+    for (const auto& k : keys) {
+      result->elements.push_back(Value(k));
+    }
+    return Value(result);
+  }
+
+  if (args[0].isError()) {
+    auto err = args[0].getGC<Error>();
+    std::vector<std::string> keys;
+    for (const auto& rawKey : err->properties.orderedKeys()) {
+      if (isInternalProperty(rawKey)) continue;
+      if (isSymbolPropertyKey(rawKey)) continue;
+      keys.push_back(rawKey);
+    }
+    appendInOwnPropertyKeyOrder(keys, false);
+    return Value(result);
+  }
+
+  if (args[0].isPromise()) {
+    auto p = args[0].getGC<Promise>();
+    std::vector<std::string> keys;
+    for (const auto& rawKey : p->properties.orderedKeys()) {
+      if (isInternalProperty(rawKey)) continue;
+      if (isSymbolPropertyKey(rawKey)) continue;
+      keys.push_back(rawKey);
+    }
+    appendInOwnPropertyKeyOrder(keys, false);
+    return Value(result);
+  }
+
+  if (args[0].isRegex()) {
+    auto rx = args[0].getGC<Regex>();
+    std::vector<std::string> keys;
+    // Add standard regex properties
+    keys.push_back("source");
+    keys.push_back("flags");
+    for (const auto& rawKey : rx->properties.orderedKeys()) {
+      if (isInternalProperty(rawKey)) continue;
+      if (isSymbolPropertyKey(rawKey)) continue;
+      if (rawKey == "source" || rawKey == "flags") continue;
+      keys.push_back(rawKey);
+    }
+    appendInOwnPropertyKeyOrder(keys, false);
+    return Value(result);
+  }
+
   if (!args[0].isObject()) {
     return Value(result);
   }
@@ -1646,16 +2364,46 @@ Value Object_create(const std::vector<Value>& args) {
       if (setIt != desc->properties.end() && setIt->second.isFunction()) {
         newObj->properties["__set_" + key] = setIt->second;
       }
+      // Ensure property key exists even if no value/get/set
+      if (newObj->properties.find(key) == newObj->properties.end()) {
+        newObj->properties[key] = Value(Undefined{});
+      }
+      // Validate descriptor
+      bool hasGetField = getIt != desc->properties.end();
+      bool hasSetField = setIt != desc->properties.end();
+      bool hasValueField = valueIt != desc->properties.end();
       auto writableIt = desc->properties.find("writable");
-      if (writableIt != desc->properties.end() && !writableIt->second.toBool()) {
-        newObj->properties["__non_writable_" + key] = Value(true);
+      bool hasWritableField = writableIt != desc->properties.end();
+      // Validate: cannot mix data and accessor
+      if ((hasGetField || hasSetField) && (hasValueField || hasWritableField)) {
+        throw std::runtime_error("TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+      }
+      // Validate: getter/setter must be callable or undefined
+      if (hasGetField && !getIt->second.isUndefined() && !getIt->second.isFunction()) {
+        throw std::runtime_error("TypeError: Getter must be a function: " + getIt->second.toString());
+      }
+      if (hasSetField && !setIt->second.isUndefined() && !setIt->second.isFunction()) {
+        throw std::runtime_error("TypeError: Setter must be a function: " + setIt->second.toString());
+      }
+      // Attributes default to false for defineProperty/Object.create
+      bool isAccessor = hasGetField || hasSetField;
+      if (!isAccessor) {
+        if (hasWritableField && writableIt->second.toBool()) {
+          newObj->properties.erase("__non_writable_" + key);
+        } else {
+          newObj->properties["__non_writable_" + key] = Value(true);
+        }
       }
       auto enumIt = desc->properties.find("enumerable");
-      if (enumIt != desc->properties.end() && !enumIt->second.toBool()) {
+      if (enumIt != desc->properties.end() && enumIt->second.toBool()) {
+        newObj->properties.erase("__non_enum_" + key);
+      } else {
         newObj->properties["__non_enum_" + key] = Value(true);
       }
       auto configIt = desc->properties.find("configurable");
-      if (configIt != desc->properties.end() && !configIt->second.toBool()) {
+      if (configIt != desc->properties.end() && configIt->second.toBool()) {
+        newObj->properties.erase("__non_configurable_" + key);
+      } else {
         newObj->properties["__non_configurable_" + key] = Value(true);
       }
     }
@@ -1667,7 +2415,23 @@ Value Object_create(const std::vector<Value>& args) {
 Value Object_fromEntries(const std::vector<Value>& args) {
   auto newObj = GarbageCollector::makeGC<Object>();
 
-  if (args.empty() || !args[0].isArray()) {
+  if (args.empty()) {
+    throw std::runtime_error("TypeError: Object.fromEntries requires an iterable argument");
+  }
+  if (args[0].isNull() || args[0].isUndefined()) {
+    throw std::runtime_error("TypeError: Object.fromEntries requires an iterable argument");
+  }
+
+  // Support Map input
+  if (args[0].isMap()) {
+    auto map = args[0].getGC<Map>();
+    for (const auto& [key, val] : map->entries) {
+      newObj->properties[valueToPropertyKey(key)] = val;
+    }
+    return Value(newObj);
+  }
+
+  if (!args[0].isArray()) {
     return Value(newObj);
   }
 
@@ -1677,7 +2441,7 @@ Value Object_fromEntries(const std::vector<Value>& args) {
     if (entry.isArray()) {
       auto pair = entry.getGC<Array>();
       if (pair->elements.size() >= 2) {
-        std::string key = pair->elements[0].toString();
+        std::string key = valueToPropertyKey(pair->elements[0]);
         newObj->properties[key] = pair->elements[1];
       }
     }
@@ -1707,23 +2471,37 @@ inline bool isLittleEndian() {
   return *reinterpret_cast<uint8_t*>(&test) == 0x01;
 }
 
+static size_t dataViewAccessibleLength(const DataView& view, size_t elementSize) {
+  if (!view.buffer || view.buffer->detached) {
+    throw std::runtime_error("TypeError: DataView has a detached buffer");
+  }
+  size_t visibleLength = view.currentByteLength();
+  if (view.byteOffset > view.buffer->byteLength || elementSize > visibleLength) {
+    return visibleLength;
+  }
+  return visibleLength;
+}
+
 // DataView get methods
 int8_t DataView::getInt8(size_t offset) const {
-  if (offset >= byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int8_t));
+  if (offset >= visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
   return static_cast<int8_t>(buffer->data[byteOffset + offset]);
 }
 
 uint8_t DataView::getUint8(size_t offset) const {
-  if (offset >= byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint8_t));
+  if (offset >= visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
   return buffer->data[byteOffset + offset];
 }
 
 int16_t DataView::getInt16(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(int16_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int16_t));
+  if (offset + sizeof(int16_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1738,7 +2516,8 @@ int16_t DataView::getInt16(size_t offset, bool littleEndian) const {
 }
 
 uint16_t DataView::getUint16(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(uint16_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
+  if (offset + sizeof(uint16_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1752,7 +2531,8 @@ uint16_t DataView::getUint16(size_t offset, bool littleEndian) const {
 }
 
 int32_t DataView::getInt32(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(int32_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int32_t));
+  if (offset + sizeof(int32_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1766,7 +2546,8 @@ int32_t DataView::getInt32(size_t offset, bool littleEndian) const {
 }
 
 uint32_t DataView::getUint32(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(uint32_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint32_t));
+  if (offset + sizeof(uint32_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1779,8 +2560,24 @@ uint32_t DataView::getUint32(size_t offset, bool littleEndian) const {
   return value;
 }
 
+float DataView::getFloat16(size_t offset, bool littleEndian) const {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
+  if (offset + sizeof(uint16_t) > visibleLength) {
+    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
+  }
+
+  uint16_t value;
+  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(uint16_t));
+
+  if (littleEndian != isLittleEndian()) {
+    value = swapEndian(value);
+  }
+  return float16_to_float32(value);
+}
+
 float DataView::getFloat32(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(float) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(float));
+  if (offset + sizeof(float) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1794,7 +2591,8 @@ float DataView::getFloat32(size_t offset, bool littleEndian) const {
 }
 
 double DataView::getFloat64(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(double) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(double));
+  if (offset + sizeof(double) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1808,7 +2606,8 @@ double DataView::getFloat64(size_t offset, bool littleEndian) const {
 }
 
 int64_t DataView::getBigInt64(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(int64_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int64_t));
+  if (offset + sizeof(int64_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1822,7 +2621,8 @@ int64_t DataView::getBigInt64(size_t offset, bool littleEndian) const {
 }
 
 uint64_t DataView::getBigUint64(size_t offset, bool littleEndian) const {
-  if (offset + sizeof(uint64_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint64_t));
+  if (offset + sizeof(uint64_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1837,21 +2637,24 @@ uint64_t DataView::getBigUint64(size_t offset, bool littleEndian) const {
 
 // DataView set methods
 void DataView::setInt8(size_t offset, int8_t value) {
-  if (offset >= byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int8_t));
+  if (offset >= visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
   buffer->data[byteOffset + offset] = static_cast<uint8_t>(value);
 }
 
 void DataView::setUint8(size_t offset, uint8_t value) {
-  if (offset >= byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint8_t));
+  if (offset >= visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
   buffer->data[byteOffset + offset] = value;
 }
 
 void DataView::setInt16(size_t offset, int16_t value, bool littleEndian) {
-  if (offset + sizeof(int16_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int16_t));
+  if (offset + sizeof(int16_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1862,7 +2665,8 @@ void DataView::setInt16(size_t offset, int16_t value, bool littleEndian) {
 }
 
 void DataView::setUint16(size_t offset, uint16_t value, bool littleEndian) {
-  if (offset + sizeof(uint16_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
+  if (offset + sizeof(uint16_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1873,7 +2677,8 @@ void DataView::setUint16(size_t offset, uint16_t value, bool littleEndian) {
 }
 
 void DataView::setInt32(size_t offset, int32_t value, bool littleEndian) {
-  if (offset + sizeof(int32_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int32_t));
+  if (offset + sizeof(int32_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1884,7 +2689,8 @@ void DataView::setInt32(size_t offset, int32_t value, bool littleEndian) {
 }
 
 void DataView::setUint32(size_t offset, uint32_t value, bool littleEndian) {
-  if (offset + sizeof(uint32_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint32_t));
+  if (offset + sizeof(uint32_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1894,8 +2700,22 @@ void DataView::setUint32(size_t offset, uint32_t value, bool littleEndian) {
   std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(uint32_t));
 }
 
+void DataView::setFloat16(size_t offset, double value, bool littleEndian) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
+  if (offset + sizeof(uint16_t) > visibleLength) {
+    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
+  }
+
+  uint16_t bits = float64_to_float16(value);
+  if (littleEndian != isLittleEndian()) {
+    bits = swapEndian(bits);
+  }
+  std::memcpy(&buffer->data[byteOffset + offset], &bits, sizeof(uint16_t));
+}
+
 void DataView::setFloat32(size_t offset, float value, bool littleEndian) {
-  if (offset + sizeof(float) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(float));
+  if (offset + sizeof(float) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1906,7 +2726,8 @@ void DataView::setFloat32(size_t offset, float value, bool littleEndian) {
 }
 
 void DataView::setFloat64(size_t offset, double value, bool littleEndian) {
-  if (offset + sizeof(double) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(double));
+  if (offset + sizeof(double) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1917,7 +2738,8 @@ void DataView::setFloat64(size_t offset, double value, bool littleEndian) {
 }
 
 void DataView::setBigInt64(size_t offset, int64_t value, bool littleEndian) {
-  if (offset + sizeof(int64_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int64_t));
+  if (offset + sizeof(int64_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 
@@ -1928,7 +2750,8 @@ void DataView::setBigInt64(size_t offset, int64_t value, bool littleEndian) {
 }
 
 void DataView::setBigUint64(size_t offset, uint64_t value, bool littleEndian) {
-  if (offset + sizeof(uint64_t) > byteLength) {
+  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint64_t));
+  if (offset + sizeof(uint64_t) > visibleLength) {
     throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
 

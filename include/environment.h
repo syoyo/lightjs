@@ -15,12 +15,17 @@ class Interpreter;
 void setGlobalModuleLoader(std::shared_ptr<ModuleLoader> loader);
 void setGlobalInterpreter(Interpreter* interpreter);
 Interpreter* getGlobalInterpreter();
+void setGlobalArrayPrototype(const Value& proto);
+Value getGlobalArrayPrototype();
+GCPtr<Array> makeArrayWithPrototype();
 class Environment : public GCObject, public std::enable_shared_from_this<Environment> {
 public:
   Environment() = default;
   explicit Environment(Environment* parent);
 
   void define(const std::string& name, const Value& value, bool isConst = false);
+  // Set binding directly without syncing to globalThis (for hoisting existing properties)
+  void setBindingDirect(const std::string& name, const Value& value);
   void defineImmutableNFE(const std::string& name, const Value& value);
   void defineLexical(const std::string& name, const Value& value, bool isConst = false);
   void defineTDZ(const std::string& name);  // Define name in temporal dead zone

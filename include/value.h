@@ -5,6 +5,7 @@
 #endif
 
 #include <functional>
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -113,6 +114,7 @@ struct Object : public GCObject {
   std::vector<std::string> moduleExportNames;  // Sorted string export keys.
   bool frozen = false;  // Object.freeze() prevents adding/removing/modifying properties
   bool sealed = false;  // Object.seal() prevents adding/removing properties (can still modify)
+  bool nonExtensible = false;  // Object.preventExtensions() prevents adding new properties only
   bool useSlots = false;  // Whether to use slot-based storage
 
   Object() : shape(nullptr) {}  // Shape created lazily when needed
@@ -214,6 +216,7 @@ struct Regex : public GCObject {
     std::regex::flag_type options = std::regex::ECMAScript;
     for (char flag : flags) {
       if (flag == 'i') options |= std::regex::icase;
+      if (flag == 'm') options |= std::regex::multiline;
     }
     regex = std::regex(pattern, options);
 #endif
@@ -359,13 +362,17 @@ struct ArrayBuffer : public GCObject {
   size_t byteLength;
   size_t maxByteLength;
   bool resizable;
+  bool detached;
+  bool immutable;
   std::vector<GCPtr<TypedArray>> views;
   OrderedMap<std::string, Value> properties;
 
   ArrayBuffer(size_t length, size_t maxLength = 0)
     : byteLength(length),
       maxByteLength(maxLength == 0 ? length : maxLength),
-      resizable(maxLength != 0 && maxLength != length) {
+      resizable(maxLength != 0 && maxLength != length),
+      detached(false),
+      immutable(false) {
     data.resize(length, 0);
   }
 
@@ -374,15 +381,23 @@ struct ArrayBuffer : public GCObject {
     : data(sourceData),
       byteLength(sourceData.size()),
       maxByteLength(sourceData.size()),
-      resizable(false) {}
+      resizable(false),
+      detached(false),
+      immutable(false) {}
 
   bool resize(size_t newByteLength) {
-    if (!resizable || newByteLength > maxByteLength) {
+    if (detached || immutable || !resizable || newByteLength > maxByteLength) {
       return false;
     }
     data.resize(newByteLength, 0);
     byteLength = newByteLength;
     return true;
+  }
+
+  void detach() {
+    detached = true;
+    data.clear();
+    byteLength = 0;
   }
 
   // GCObject interface
@@ -395,23 +410,24 @@ struct DataView : public GCObject {
   GCPtr<ArrayBuffer> buffer;
   size_t byteOffset;
   size_t byteLength;
+  bool lengthTracking;
   OrderedMap<std::string, Value> properties;
 
   DataView(GCPtr<ArrayBuffer> buf, size_t offset = 0, size_t length = 0)
-    : buffer(buf), byteOffset(offset) {
+    : buffer(buf), byteOffset(offset), byteLength(length), lengthTracking(false) {
     if (buf) {
-      if (length == 0) {
-        byteLength = buf->byteLength - offset;
-      } else {
-        byteLength = length;
+      if (byteOffset > buf->byteLength) {
+        byteLength = 0;
       }
-      // Validate bounds
-      if (byteOffset + byteLength > buf->byteLength) {
-        byteLength = buf->byteLength > byteOffset ? buf->byteLength - byteOffset : 0;
-      }
-    } else {
-      byteLength = 0;
     }
+  }
+
+  size_t currentByteLength() const {
+    if (!buffer || byteOffset > buffer->byteLength) {
+      return 0;
+    }
+    size_t available = buffer->byteLength - byteOffset;
+    return lengthTracking ? available : (byteLength < available ? byteLength : available);
   }
 
   // Get methods with optional little-endian parameter (default true for DataView)
@@ -421,6 +437,7 @@ struct DataView : public GCObject {
   uint16_t getUint16(size_t byteOffset, bool littleEndian = false) const;
   int32_t getInt32(size_t byteOffset, bool littleEndian = false) const;
   uint32_t getUint32(size_t byteOffset, bool littleEndian = false) const;
+  float getFloat16(size_t byteOffset, bool littleEndian = false) const;
   float getFloat32(size_t byteOffset, bool littleEndian = false) const;
   double getFloat64(size_t byteOffset, bool littleEndian = false) const;
   int64_t getBigInt64(size_t byteOffset, bool littleEndian = false) const;
@@ -433,6 +450,7 @@ struct DataView : public GCObject {
   void setUint16(size_t byteOffset, uint16_t value, bool littleEndian = false);
   void setInt32(size_t byteOffset, int32_t value, bool littleEndian = false);
   void setUint32(size_t byteOffset, uint32_t value, bool littleEndian = false);
+  void setFloat16(size_t byteOffset, double value, bool littleEndian = false);
   void setFloat32(size_t byteOffset, float value, bool littleEndian = false);
   void setFloat64(size_t byteOffset, double value, bool littleEndian = false);
   void setBigInt64(size_t byteOffset, int64_t value, bool littleEndian = false);
@@ -458,25 +476,68 @@ enum class TypedArrayType {
   BigUint64
 };
 
-inline uint16_t float32_to_float16(float value) {
-  uint32_t f32;
-  std::memcpy(&f32, &value, sizeof(float));
+inline uint32_t round_to_even_uint32(long double value) {
+  long double floorValue = std::floor(value);
+  uint32_t rounded = static_cast<uint32_t>(floorValue);
+  long double fraction = value - floorValue;
+  if (fraction > 0.5L) {
+    return rounded + 1;
+  }
+  if (fraction < 0.5L) {
+    return rounded;
+  }
+  return (rounded & 1u) ? rounded + 1 : rounded;
+}
 
-  uint32_t sign = (f32 >> 16) & 0x8000;
-  int32_t exponent = ((f32 >> 23) & 0xFF) - 127 + 15;
-  uint32_t mantissa = f32 & 0x7FFFFF;
+inline uint16_t float64_to_float16(double value) {
+  uint16_t sign = std::signbit(value) ? 0x8000 : 0;
+  if (std::isnan(value)) {
+    return static_cast<uint16_t>(sign | 0x7E00);
+  }
+  if (std::isinf(value)) {
+    return static_cast<uint16_t>(sign | 0x7C00);
+  }
+  if (value == 0.0) {
+    return sign;
+  }
 
-  if (exponent <= 0) {
-    if (exponent < -10) {
-      return static_cast<uint16_t>(sign);
+  long double absValue = std::fabs(static_cast<long double>(value));
+  constexpr long double kMinSubnormal = 0x1p-24L;
+  constexpr long double kMinNormal = 0x1p-14L;
+
+  if (absValue < kMinNormal) {
+    uint32_t subnormalMantissa = round_to_even_uint32(absValue / kMinSubnormal);
+    if (subnormalMantissa == 0) {
+      return sign;
     }
-    mantissa = (mantissa | 0x800000) >> (1 - exponent);
-    return static_cast<uint16_t>(sign | (mantissa >> 13));
-  } else if (exponent >= 0x1F) {
+    if (subnormalMantissa >= 1024) {
+      return static_cast<uint16_t>(sign | 0x0400);
+    }
+    return static_cast<uint16_t>(sign | subnormalMantissa);
+  }
+
+  int exponent = 0;
+  std::frexp(absValue, &exponent);
+  int32_t halfExponent = exponent - 1 + 15;
+  if (halfExponent >= 0x1F) {
     return static_cast<uint16_t>(sign | 0x7C00);
   }
 
-  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+  long double normalized = std::ldexp(absValue, -(exponent - 1));
+  uint32_t mantissa = round_to_even_uint32((normalized - 1.0L) * 1024.0L);
+  if (mantissa == 1024) {
+    mantissa = 0;
+    halfExponent++;
+    if (halfExponent >= 0x1F) {
+      return static_cast<uint16_t>(sign | 0x7C00);
+    }
+  }
+
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(halfExponent) << 10) | mantissa);
+}
+
+inline uint16_t float32_to_float16(float value) {
+  return float64_to_float16(static_cast<double>(value));
 }
 
 inline float float16_to_float32(uint16_t value) {
@@ -555,7 +616,9 @@ struct TypedArray : public GCObject {
   double getElement(size_t index) const;
   void setElement(size_t index, double value);
   int64_t getBigIntElement(size_t index) const;
+  uint64_t getBigUintElement(size_t index) const;
   void setBigIntElement(size_t index, int64_t value);
+  void setBigUintElement(size_t index, uint64_t value);
   bool isView() const { return static_cast<bool>(viewedBuffer); }
   bool isOutOfBounds() const;
   size_t currentLength() const;
@@ -702,5 +765,12 @@ std::string symbolToPropertyKey(const Symbol& symbol);
 bool isSymbolPropertyKey(const std::string& key);
 bool propertyKeyToSymbol(const std::string& key, Symbol& outSymbol);
 std::string valueToPropertyKey(const Value& value);
+std::string ecmaNumberToString(double value);
+
+// ES spec Unicode whitespace helpers (shared across value.cc, string_methods.cc, interpreter.cc)
+bool isESWhitespace(const std::string& str, size_t pos, size_t& advance);
+std::string stripESWhitespace(const std::string& str);
+std::string stripLeadingESWhitespace(const std::string& str);
+std::string stripTrailingESWhitespace(const std::string& str);
 
 }
