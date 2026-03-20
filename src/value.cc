@@ -1576,10 +1576,22 @@ Value Object_values(const std::vector<Value>& args) {
   auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
+  Interpreter* interp = getGlobalInterpreter();
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
     if (props->count("__non_enum_" + key)) continue;
-    auto it = props->find(key);
-    result->elements.push_back(it->second);
+    // Use getPropertyForExternal to invoke getters
+    if (interp) {
+      auto [found, val] = interp->getPropertyForExternal(arg, key);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (found) result->elements.push_back(val);
+    } else {
+      auto it = props->find(key);
+      result->elements.push_back(it->second);
+    }
   }
 
   return Value(result);
@@ -1626,12 +1638,23 @@ Value Object_entries(const std::vector<Value>& args) {
   auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
+  Interpreter* interp = getGlobalInterpreter();
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
     if (props->count("__non_enum_" + key)) continue;
-    auto it = props->find(key);
     auto entry = makeArrayWithPrototype();
     entry->elements.push_back(Value(key));
-    entry->elements.push_back(it->second);
+    if (interp) {
+      auto [found, val] = interp->getPropertyForExternal(arg, key);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      entry->elements.push_back(found ? val : Value(Undefined{}));
+    } else {
+      auto it = props->find(key);
+      entry->elements.push_back(it->second);
+    }
     result->elements.push_back(Value(entry));
   }
 
