@@ -16739,6 +16739,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoToString = GarbageCollector::makeGC<Function>();
   objectProtoToString->isNative = true;
   objectProtoToString->properties["__uses_this_arg__"] = Value(true);
+  objectProtoToString->properties["name"] = Value(std::string("toString"));
+  objectProtoToString->properties["__non_writable_name"] = Value(true);
+  objectProtoToString->properties["__non_enum_name"] = Value(true);
+  objectProtoToString->properties["length"] = Value(0.0);
+  objectProtoToString->properties["__non_writable_length"] = Value(true);
+  objectProtoToString->properties["__non_enum_length"] = Value(true);
   objectProtoToString->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || args[0].isUndefined()) {
       return Value(std::string("[object Undefined]"));
@@ -16747,50 +16753,91 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(std::string("[object Null]"));
     }
 
-    std::string tag = "Object";
-    if (args[0].isObject()) {
-      auto obj = args[0].getGC<Object>();
-      // Determine builtinTag first
+    // Step 1-14: Determine builtinTag based on type
+    std::string builtinTag = "Object";
+    const Value& O = args[0];
+
+    // Primitive types (auto-boxed for toString)
+    if (O.isBool()) builtinTag = "Boolean";
+    else if (O.isNumber()) builtinTag = "Number";
+    else if (O.isString()) builtinTag = "String";
+    else if (O.isBigInt()) builtinTag = "BigInt";
+    else if (O.isSymbol()) builtinTag = "Symbol";
+    else if (O.isArray()) {
+      builtinTag = "Array";
+      // Check for Arguments object
+      auto arr = O.getGC<Array>();
+      if (arr->properties.count("__is_arguments_object__")) builtinTag = "Arguments";
+    }
+    else if (O.isFunction()) {
+      builtinTag = "Function";
+      auto fn = O.getGC<Function>();
+      if (fn->isGenerator) builtinTag = "GeneratorFunction";
+    }
+    else if (O.isGenerator()) builtinTag = "Generator";
+    else if (O.isRegex()) builtinTag = "RegExp";
+    else if (O.isError()) builtinTag = "Error";
+    else if (O.isMap()) builtinTag = "Map";
+    else if (O.isSet()) builtinTag = "Set";
+    else if (O.isWeakMap()) builtinTag = "WeakMap";
+    else if (O.isWeakSet()) builtinTag = "WeakSet";
+    else if (O.isPromise()) builtinTag = "Promise";
+    else if (O.isTypedArray()) {
+      auto ta = O.getGC<TypedArray>();
+      switch (ta->type) {
+        case TypedArrayType::Int8: builtinTag = "Int8Array"; break;
+        case TypedArrayType::Uint8: builtinTag = "Uint8Array"; break;
+        case TypedArrayType::Uint8Clamped: builtinTag = "Uint8ClampedArray"; break;
+        case TypedArrayType::Int16: builtinTag = "Int16Array"; break;
+        case TypedArrayType::Uint16: builtinTag = "Uint16Array"; break;
+        case TypedArrayType::Int32: builtinTag = "Int32Array"; break;
+        case TypedArrayType::Uint32: builtinTag = "Uint32Array"; break;
+        case TypedArrayType::Float16: builtinTag = "Float16Array"; break;
+        case TypedArrayType::Float32: builtinTag = "Float32Array"; break;
+        case TypedArrayType::Float64: builtinTag = "Float64Array"; break;
+        case TypedArrayType::BigInt64: builtinTag = "BigInt64Array"; break;
+        case TypedArrayType::BigUint64: builtinTag = "BigUint64Array"; break;
+      }
+    }
+    else if (O.isArrayBuffer()) builtinTag = "ArrayBuffer";
+    else if (O.isDataView()) builtinTag = "DataView";
+    else if (O.isObject()) {
+      auto obj = O.getGC<Object>();
+      // Check for wrapper types
       auto primIt = obj->properties.find("__primitive_value__");
       if (primIt != obj->properties.end()) {
-        if (primIt->second.isString()) tag = "String";
-        else if (primIt->second.isNumber()) tag = "Number";
-        else if (primIt->second.isBool()) tag = "Boolean";
+        if (primIt->second.isString()) builtinTag = "String";
+        else if (primIt->second.isNumber()) builtinTag = "Number";
+        else if (primIt->second.isBool()) builtinTag = "Boolean";
+        else if (primIt->second.isBigInt()) builtinTag = "BigInt";
+        else if (primIt->second.isSymbol()) builtinTag = "Symbol";
       }
-      // Step 15-16: If @@toStringTag is a string, use it; otherwise use builtinTag
-      auto toStringTagIt = obj->properties.find(WellKnownSymbols::toStringTagKey());
-      if (toStringTagIt != obj->properties.end() && toStringTagIt->second.isString()) {
-        tag = std::get<std::string>(toStringTagIt->second.data);
+      // Check for Date objects
+      if (obj->properties.count("__date_ms__") || obj->properties.count("__date_value__")) {
+        builtinTag = "Date";
       }
-    } else if (args[0].isArray()) {
-      tag = "Array";
-    } else if (args[0].isFunction()) {
-      tag = "Function";
-    } else if (args[0].isTypedArray()) {
-      auto ta = args[0].getGC<TypedArray>();
-      switch (ta->type) {
-        case TypedArrayType::Int8: tag = "Int8Array"; break;
-        case TypedArrayType::Uint8: tag = "Uint8Array"; break;
-        case TypedArrayType::Uint8Clamped: tag = "Uint8ClampedArray"; break;
-        case TypedArrayType::Int16: tag = "Int16Array"; break;
-        case TypedArrayType::Uint16: tag = "Uint16Array"; break;
-        case TypedArrayType::Int32: tag = "Int32Array"; break;
-        case TypedArrayType::Uint32: tag = "Uint32Array"; break;
-        case TypedArrayType::Float16: tag = "Float16Array"; break;
-        case TypedArrayType::Float32: tag = "Float32Array"; break;
-        case TypedArrayType::Float64: tag = "Float64Array"; break;
-        case TypedArrayType::BigInt64: tag = "BigInt64Array"; break;
-        case TypedArrayType::BigUint64: tag = "BigUint64Array"; break;
+      // Check for Arguments objects
+      if (obj->properties.count("__is_arguments_object__")) {
+        builtinTag = "Arguments";
       }
-    } else if (args[0].isArrayBuffer()) {
-      tag = "ArrayBuffer";
-    } else if (args[0].isDataView()) {
-      tag = "DataView";
-    } else if (args[0].isRegex()) {
-      tag = "RegExp";
-    } else if (args[0].isError()) {
-      tag = "Error";
     }
+
+    // Step 15-16: Check @@toStringTag - use it if string, else use builtinTag
+    std::string tag = builtinTag;
+    auto* interp = getGlobalInterpreter();
+    if (interp) {
+      const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
+      auto [found, tagVal] = interp->getPropertyForExternal(O, toStringTagKey);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (found && tagVal.isString()) {
+        tag = std::get<std::string>(tagVal.data);
+      }
+    }
+
     return Value(std::string("[object ") + tag + "]");
   };
   objectPrototype->properties["toString"] = Value(objectProtoToString);
