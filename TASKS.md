@@ -45,7 +45,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 125 | 165 | 75.8% |
-| `built-ins/String` | 1110 | 1223 | 90.8% |
+| `built-ins/String` | 1126 | 1223 | 92.1% |
 | `built-ins/Object` | 2980 | 3413 | 87.4% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
@@ -388,7 +388,7 @@ Next targets for `built-ins` scope (by priority):
 - **Math** (99.4%): `Math.sumPrecise` rounding correction (1 test), `Math.f16round` value conversion (1 test)
 - **Number** (99.7%): `proto-from-ctor-realm` (1 remaining failure, requires multi-realm support)
 - **Boolean** (98.0%): `proto-from-ctor-realm` (1 remaining failure)
-- **String** (90.8%): 108 remaining — split (22), replace (20), replaceAll (15), match (8), normalize (6), search (3), toLocale/Case (12), other (22). Remaining: ToUint32 coercion order, $1-$9 capture group substitution, empty regex split, function replacer args, Unicode normalization.
+- **String** (92.1%): 92 remaining — replace (15), replaceAll (15), split (11), match (8), normalize (6), search (3), toLocale/Case (12), other (22). Remaining: $1-$9 capture group substitution, regex $-patterns in @@replace, empty regex split, Unicode normalization.
 - **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
 
 Next targets for remaining 11 `language` failures:
