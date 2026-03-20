@@ -528,7 +528,7 @@ Value String_split(const std::vector<Value>& args) {
     std::string str = std::get<std::string>(args[0].data);
 
     // ES2020: Check for @@split on the separator
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
         auto* interp = getGlobalInterpreter();
         if (interp) {
             const std::string& splitKey = WellKnownSymbols::splitKey();
@@ -614,7 +614,7 @@ Value String_replace(const std::vector<Value>& args) {
     std::string str = std::get<std::string>(args[0].data);
 
     // ES2020: Check for @@replace on the searchValue
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
         auto* interp = getGlobalInterpreter();
         if (interp) {
             const std::string& replaceKey = WellKnownSymbols::replaceKey();
@@ -634,12 +634,26 @@ Value String_replace(const std::vector<Value>& args) {
         return Value(str);
     }
 
-    std::string searchValue = args[1].toString();
-    std::string replaceValue = args[2].toString();
+    std::string searchValue = toStringForStringBuiltinArg(args[1]);
+    std::string replaceTemplate = toStringForStringBuiltinArg(args[2]);
 
     size_t pos = str.find(searchValue);
     if (pos != std::string::npos) {
-        str.replace(pos, searchValue.length(), replaceValue);
+        // GetSubstitution: process $-patterns
+        std::string replacement;
+        for (size_t i = 0; i < replaceTemplate.size(); i++) {
+            if (replaceTemplate[i] == '$' && i + 1 < replaceTemplate.size()) {
+                char next = replaceTemplate[i + 1];
+                if (next == '$') { replacement += '$'; i++; }
+                else if (next == '&') { replacement += searchValue; i++; }
+                else if (next == '`') { replacement += str.substr(0, pos); i++; }
+                else if (next == '\'') { replacement += str.substr(pos + searchValue.size()); i++; }
+                else { replacement += '$'; }
+            } else {
+                replacement += replaceTemplate[i];
+            }
+        }
+        str.replace(pos, searchValue.length(), replacement);
     }
 
     return Value(str);

@@ -20415,7 +20415,7 @@ GCPtr<Environment> Environment::createGlobal() {
   installStringPrototypeMethod("search", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "search");
     // ES2020: Check for @@search on the argument
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
       auto* interp = getGlobalInterpreter();
       if (interp) {
         const std::string& searchKey = WellKnownSymbols::searchKey();
@@ -20454,7 +20454,7 @@ GCPtr<Environment> Environment::createGlobal() {
   installStringPrototypeMethod("match", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "match");
     // ES2020: Check for @@match on the argument
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
       auto* interp = getGlobalInterpreter();
       if (interp) {
         const std::string& matchKey = WellKnownSymbols::matchKey();
@@ -20538,8 +20538,8 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.replaceAll
   installStringPrototypeMethod("replaceAll", 2, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "replaceAll");
-    // ES2021: Check @@replace on the searchValue
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+    // ES2021: Check @@replace on the searchValue (objects only, not primitives)
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
       auto* interp = getGlobalInterpreter();
       if (interp) {
         // IsRegExp check via @@match

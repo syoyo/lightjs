@@ -10845,7 +10845,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       splitFn->isNative = true;
       splitFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         // ES2020 21.1.3.17: If separator is not null/undefined, check for @@split
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
           auto* interp = getGlobalInterpreter();
           if (interp) {
             const std::string& splitKey = WellKnownSymbols::splitKey();
@@ -11146,7 +11146,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         // ES2020 21.1.3.15: If regexp is not null/undefined, check for @@search
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
           auto* interp = getGlobalInterpreter();
           if (interp) {
             const std::string& searchKey = WellKnownSymbols::searchKey();
@@ -11175,7 +11175,24 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
           return Value(-1.0);
         }
+        // RegExpCreate fallback: create RegExp from ToString(arg), search with it
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        try {
+          auto rx = GarbageCollector::makeGC<Regex>(searchStr, "");
+#if USE_SIMPLE_REGEX
+          std::vector<simple_regex::Regex::Match> matches;
+          if (rx->regex->search(str, matches) && !matches.empty()) {
+            return Value(static_cast<double>(matches[0].start));
+          }
+#else
+          std::smatch m;
+          if (std::regex_search(str, m, rx->regex)) {
+            return Value(static_cast<double>(m.position(0)));
+          }
+#endif
+        } catch (...) {
+          // If regex creation fails, fall through to string search
+        }
         size_t pos = str.find(searchStr);
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
@@ -11189,7 +11206,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       matchFn->isNative = true;
       matchFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         // ES2020 21.1.3.11: If regexp is not null/undefined, check for @@match
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
           auto* interp = getGlobalInterpreter();
           if (interp) {
             const std::string& matchKey = WellKnownSymbols::matchKey();
@@ -11203,7 +11220,41 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             }
           }
         }
-        if (args.empty() || !args[0].isRegex()) return Value(Null{});
+        if (args.empty() || !args[0].isRegex()) {
+          // RegExpCreate fallback: create RegExp from ToString(arg), match with it
+          std::string pattern = args.empty() ? "" : (args[0].isUndefined() ? "" : toStringForStringBuiltinArg(args[0]));
+          try {
+            auto rx = GarbageCollector::makeGC<Regex>(pattern, "");
+#if USE_SIMPLE_REGEX
+            std::vector<simple_regex::Regex::Match> matches;
+            if (rx->regex->search(str, matches)) {
+              auto result = makeArrayWithPrototype();
+              for (const auto& m : matches) result->elements.push_back(Value(m.str));
+              if (!matches.empty()) {
+                result->properties["index"] = Value(static_cast<double>(matches[0].start));
+                result->properties["input"] = Value(str);
+              }
+              return Value(result);
+            }
+#else
+            std::smatch m;
+            if (std::regex_search(str, m, rx->regex)) {
+              auto result = makeArrayWithPrototype();
+              result->elements.push_back(Value(m.str(0)));
+              for (size_t i = 1; i < m.size(); ++i) {
+                if (m[i].matched) result->elements.push_back(Value(m.str(i)));
+                else result->elements.push_back(Value(Undefined{}));
+              }
+              result->properties["index"] = Value(static_cast<double>(m.position(0)));
+              result->properties["input"] = Value(str);
+              return Value(result);
+            }
+#endif
+          } catch (...) {
+            // If regex creation fails, return null
+          }
+          return Value(Null{});
+        }
         auto regexPtr = args[0].getGC<Regex>();
 #if USE_SIMPLE_REGEX
         std::vector<simple_regex::Regex::Match> matches;
@@ -11252,7 +11303,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto interp = this;
       replaceFn->nativeFunc = [str, interp](const std::vector<Value>& args) -> Value {
         // ES2020 21.1.3.14: If searchValue is not null/undefined, check @@replace
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
           const std::string& replaceKey = WellKnownSymbols::replaceKey();
           auto [found, replacer] = interp->getPropertyForExternal(args[0], replaceKey);
           if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
@@ -11329,10 +11380,24 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             }
             return Value(result);
           }
-          std::string replacement = args[1].toString();
+          std::string replaceTemplate = args[1].toString();
           std::string result = str;
           size_t pos = result.find(search);
           if (pos != std::string::npos) {
+            // GetSubstitution: process $-patterns
+            std::string replacement;
+            for (size_t i = 0; i < replaceTemplate.size(); i++) {
+              if (replaceTemplate[i] == '$' && i + 1 < replaceTemplate.size()) {
+                char next = replaceTemplate[i + 1];
+                if (next == '$') { replacement += '$'; i++; }
+                else if (next == '&') { replacement += search; i++; }
+                else if (next == '`') { replacement += str.substr(0, pos); i++; }
+                else if (next == '\'') { replacement += str.substr(pos + search.size()); i++; }
+                else { replacement += '$'; } // Unrecognized: keep $
+              } else {
+                replacement += replaceTemplate[i];
+              }
+            }
             result.replace(pos, search.length(), replacement);
           }
           return Value(result);
@@ -11347,7 +11412,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       replaceAllFn->isNative = true;
       replaceAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         // ES2021 21.1.3.18: If searchValue is not null/undefined, check @@replace
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
           auto* interp = getGlobalInterpreter();
           if (interp) {
             // Check if searchValue is a RegExp (via @@match)
@@ -11391,14 +11456,46 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
         }
         if (args.size() < 2) return Value(str);
-        std::string search = args[0].toString();
-        std::string replacement = args[1].toString();
-        std::string result = str;
-        if (search.empty()) return Value(result);
+        std::string search = toStringForStringBuiltinArg(args[0]);
+        std::string replacement = args[1].isFunction() ? "" : toStringForStringBuiltinArg(args[1]);
+        if (search.empty()) {
+          // Insert replacement between every character and at start/end
+          std::string result;
+          result += replacement;
+          for (size_t i = 0; i < str.size(); ++i) {
+            result += str[i];
+            result += replacement;
+          }
+          return Value(result);
+        }
+        // GetSubstitution helper for replaceAll
+        auto getSubstitution = [&](const std::string& matched, size_t matchPos) -> std::string {
+          std::string sub;
+          for (size_t i = 0; i < replacement.size(); i++) {
+            if (replacement[i] == '$' && i + 1 < replacement.size()) {
+              char next = replacement[i + 1];
+              if (next == '$') { sub += '$'; i++; }
+              else if (next == '&') { sub += matched; i++; }
+              else if (next == '`') { sub += str.substr(0, matchPos); i++; }
+              else if (next == '\'') { sub += str.substr(matchPos + matched.size()); i++; }
+              else { sub += '$'; }
+            } else {
+              sub += replacement[i];
+            }
+          }
+          return sub;
+        };
+        std::string result;
         size_t pos = 0;
-        while ((pos = result.find(search, pos)) != std::string::npos) {
-          result.replace(pos, search.length(), replacement);
-          pos += replacement.length();
+        while (true) {
+          size_t found = str.find(search, pos);
+          if (found == std::string::npos) {
+            result += str.substr(pos);
+            break;
+          }
+          result += str.substr(pos, found - pos);
+          result += getSubstitution(search, found);
+          pos = found + search.size();
         }
         return Value(result);
       };
