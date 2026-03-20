@@ -9200,6 +9200,26 @@ GCPtr<Environment> Environment::createGlobal() {
   auto uriErrorCtor = createErrorConstructor(ErrorType::URIError, "URIError");
   auto evalErrorCtor = createErrorConstructor(ErrorType::EvalError, "EvalError");
 
+  // Set sub-error prototypes' __proto__ to Error.prototype (for proper toString inheritance)
+  {
+    auto errorProtoIt = errorCtor->properties.find("prototype");
+    if (errorProtoIt != errorCtor->properties.end()) {
+      Value errorProtoVal = errorProtoIt->second;
+      auto setProtoChain = [&](GCPtr<Function> sub) {
+        auto subProtoIt = sub->properties.find("prototype");
+        if (subProtoIt != sub->properties.end() && subProtoIt->second.isObject()) {
+          subProtoIt->second.getGC<Object>()->properties["__proto__"] = errorProtoVal;
+        }
+      };
+      setProtoChain(typeErrorCtor);
+      setProtoChain(referenceErrorCtor);
+      setProtoChain(rangeErrorCtor);
+      setProtoChain(syntaxErrorCtor);
+      setProtoChain(uriErrorCtor);
+      setProtoChain(evalErrorCtor);
+    }
+  }
+
   // Error.isError (ES2025)
   {
     auto isErrorFn = GarbageCollector::makeGC<Function>();
