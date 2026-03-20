@@ -141,6 +141,8 @@ struct Token {
   std::shared_ptr<std::string> internedValue;  // For interned strings (identifiers)
   uint32_t line;
   uint32_t column;
+  uint32_t offset = 0;  // Byte offset in source text
+  uint32_t endOffset = 0;  // End byte offset (offset + token length)
   bool escaped;
   bool hasLegacyEscape = false;  // octal escapes (\1-\7) or \8 \9
 

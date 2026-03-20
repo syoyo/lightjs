@@ -46,6 +46,7 @@ struct Function : public GCObject {
   bool isGenerator;
   bool isStrict;
   bool isConstructor = false;  // Can be called with 'new'
+  std::string sourceText;  // Original source for Function.prototype.toString
   NativeFunction nativeFunc;
   OrderedMap<std::string, Value> properties;
 

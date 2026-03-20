@@ -2502,6 +2502,7 @@ GCPtr<Environment> Environment::createGlobal() {
     std::string source = args[0].toString();
     Lexer lexer(source);
     auto tokens = lexer.tokenize();
+    // Source will be used for function toString
 
     for (size_t i = 0; i + 2 < tokens.size(); ++i) {
       if (tokens[i].type == TokenType::Import &&
@@ -22044,8 +22045,11 @@ GCPtr<Environment> Environment::createGlobal() {
       if (fn->isNative) {
         return Value("function " + name + "() { [native code] }");
       }
-      // For user-defined functions: return consistent format matching Value::toString()
-      // (Full source text preservation would require parser changes)
+      // Source text is stored in fn->sourceText but returning it would break
+      // ToPrimitive/computed property key compatibility since Value::toString()
+      // returns "[Function]". Once Value::toString() is updated to be consistent,
+      // uncomment:
+      // if (!fn->sourceText.empty()) return Value(fn->sourceText);
       return Value(args[0].toString());
     } else if (args[0].isClass()) {
       auto cls = args[0].getGC<Class>();

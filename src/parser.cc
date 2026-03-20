@@ -3052,6 +3052,13 @@ StmtPtr Parser::parseFunctionDeclaration() {
   funcDecl.destructurePrologue = std::move(destructurePrologue);
   funcDecl.isAsync = isAsync;
   funcDecl.isGenerator = isGenerator;
+  // Extract source text for Function.prototype.toString
+  if (!source_.empty() && startTok.offset < source_.size()) {
+    uint32_t endOff = (pos_ > 0 && pos_ <= tokens_.size()) ? tokens_[pos_ - 1].endOffset : static_cast<uint32_t>(source_.size());
+    if (endOff > startTok.offset && endOff <= source_.size()) {
+      funcDecl.sourceText = source_.substr(startTok.offset, endOff - startTok.offset);
+    }
+  }
 
   return makeStmt(std::move(funcDecl), startTok);
 }
@@ -8218,6 +8225,7 @@ ExprPtr Parser::parseObjectExpression() {
 }
 
 ExprPtr Parser::parseFunctionExpression() {
+  const Token& fnStartTok = current();
   bool isAsync = false;
   if (match(TokenType::Async)) {
     if (current().escaped) {
@@ -8539,6 +8547,13 @@ ExprPtr Parser::parseFunctionExpression() {
   funcExpr.isGenerator = isGenerator;
   funcExpr.body = std::move(blockStmt->body);
   funcExpr.destructurePrologue = std::move(destructurePrologue);
+  // Extract source text for Function.prototype.toString
+  if (!source_.empty() && fnStartTok.offset < source_.size()) {
+    uint32_t endOff = (pos_ > 0 && pos_ <= tokens_.size()) ? tokens_[pos_ - 1].endOffset : static_cast<uint32_t>(source_.size());
+    if (endOff > fnStartTok.offset && endOff <= source_.size()) {
+      funcExpr.sourceText = source_.substr(fnStartTok.offset, endOff - fnStartTok.offset);
+    }
+  }
 
   return std::make_unique<Expression>(std::move(funcExpr));
 }

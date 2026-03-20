@@ -1606,6 +1606,8 @@ std::vector<Token> Lexer::tokenize() {
     skipWhitespace();
     if (isAtEnd()) break;
 
+    size_t prevTokenCount = tokens.size();
+    uint32_t tokenStartOffset = static_cast<uint32_t>(pos_);
     uint32_t startLine = line_;
     uint32_t startColumn = column_;
     char c = current();
@@ -2033,9 +2035,19 @@ std::vector<Token> Lexer::tokenize() {
                                  std::to_string(startLine) + ", column " + std::to_string(startColumn));
         break;
     }
+    // Set byte offsets on any tokens created in this iteration
+    uint32_t tokenEndOffset = static_cast<uint32_t>(pos_);
+    for (size_t i = prevTokenCount; i < tokens.size(); i++) {
+      tokens[i].offset = tokenStartOffset;
+      tokens[i].endOffset = tokenEndOffset;
+    }
   }
 
   tokens.emplace_back(TokenType::EndOfFile, line_, column_);
+  if (!tokens.empty()) {
+    tokens.back().offset = static_cast<uint32_t>(pos_);
+    tokens.back().endOffset = static_cast<uint32_t>(pos_);
+  }
   return tokens;
 }
 

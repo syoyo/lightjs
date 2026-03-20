@@ -810,6 +810,7 @@ Value Interpreter::runScriptInGlobalScope(const std::string& source) {
   Lexer lexer(source);
   auto tokens = lexer.tokenize();
   Parser parser(tokens);
+  parser.setSource(source);
   auto program = parser.parse();
   if (!program) {
     throwError(ErrorType::SyntaxError, "Parse error in evalScript");
@@ -13854,6 +13855,7 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
   func->properties["name"] = Value(expr.name);
   func->properties["__non_writable_name"] = Value(true);
   func->properties["__non_enum_name"] = Value(true);
+  func->sourceText = expr.sourceText;
   if (expr.isArrow) {
     func->properties["__is_arrow_function__"] = Value(true);
   }
@@ -17837,6 +17839,7 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
   func->properties["name"] = Value(decl.id.name);
   func->properties["__non_writable_name"] = Value(true);
   func->properties["__non_enum_name"] = Value(true);
+  func->sourceText = decl.sourceText;
   // Async functions (non-generator) are not constructors (no MakeConstructor call per spec)
   // Async generators are also not constructors but DO have a .prototype object
   func->isConstructor = !func->isGenerator && !func->isAsync;

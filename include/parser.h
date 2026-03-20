@@ -11,6 +11,7 @@ namespace lightjs {
 class Parser {
 public:
   explicit Parser(std::vector<Token> tokens, bool isModule = false);
+  void setSource(const std::string& source) { source_ = source; }
 
   std::optional<Program> parse();
   void setStrictMode(bool strict) { strictMode_ = strict; }
@@ -21,6 +22,7 @@ public:
 
 private:
   std::vector<Token> tokens_;
+  std::string source_;  // Original source text for function toString
   size_t pos_ = 0;
   bool isModule_ = false;
   bool strictMode_ = false;

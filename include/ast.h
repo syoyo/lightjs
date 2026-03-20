@@ -179,6 +179,7 @@ struct FunctionExpr {
   std::vector<StmtPtr> body;
   std::vector<StmtPtr> destructurePrologue;  // Synthetic bindings for destructuring params
   std::string name;
+  std::string sourceText;  // Original source text for Function.prototype.toString
   bool isAsync;
   bool isGenerator;  // Generator function (function*)
   bool isArrow;  // Arrow function expression (e.g., (x) => x * 2)
@@ -323,6 +324,7 @@ struct FunctionDeclaration {
   std::optional<Identifier> restParam;  // Rest parameter (e.g., ...args)
   std::vector<StmtPtr> body;
   std::vector<StmtPtr> destructurePrologue;  // Synthetic bindings for destructuring params
+  std::string sourceText;  // Original source text for Function.prototype.toString
   bool isAsync;
   bool isGenerator;  // Generator function (function*)
   FunctionDeclaration() : isAsync(false), isGenerator(false) {}

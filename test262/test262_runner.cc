@@ -714,6 +714,7 @@ private:
 
       // Parsing
       Parser parser(tokens, metadata.isModule);
+      parser.setSource(preparedCode);
       auto program = parser.parse();
 
       if (!program) {
