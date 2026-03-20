@@ -21848,7 +21848,6 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty()) {
       throw std::runtime_error("TypeError: Function.prototype.toString requires that 'this' be a Function");
     }
-    // Get function name
     std::string name;
     if (args[0].isFunction()) {
       auto fn = args[0].getGC<Function>();
@@ -21856,23 +21855,16 @@ GCPtr<Environment> Environment::createGlobal() {
       if (nameIt != fn->properties.end() && nameIt->second.isString()) {
         name = std::get<std::string>(nameIt->second.data);
       }
-      // For native functions, return standard NativeFunction format
+      // For native functions, return NativeFunction format
       if (fn->isNative) {
         return Value("function " + name + "() { [native code] }");
       }
-      // For user-defined functions with source text
-      auto srcIt = fn->properties.find("__source_text__");
-      if (srcIt != fn->properties.end() && srcIt->second.isString()) {
-        return Value(std::get<std::string>(srcIt->second.data));
-      }
-      return Value("function " + name + "() { [native code] }");
+      // For user-defined functions: return consistent format matching Value::toString()
+      // (Full source text preservation would require parser changes)
+      return Value(args[0].toString());
     } else if (args[0].isClass()) {
       auto cls = args[0].getGC<Class>();
       name = cls->name;
-      auto srcIt = cls->properties.find("__source_text__");
-      if (srcIt != cls->properties.end() && srcIt->second.isString()) {
-        return Value(std::get<std::string>(srcIt->second.data));
-      }
       return Value("function " + name + "() { [native code] }");
     }
     throw std::runtime_error("TypeError: Function.prototype.toString requires that 'this' be a Function");
