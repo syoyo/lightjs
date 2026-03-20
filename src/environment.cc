@@ -17072,6 +17072,9 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoPropertyIsEnumerable->properties["__non_writable_length"] = Value(true);
   objectProtoPropertyIsEnumerable->properties["__non_enum_length"] = Value(true);
   objectProtoPropertyIsEnumerable->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
     if (args.size() < 2) return Value(false);
     Value thisVal = args[0];
     std::string key = valueToPropertyKey(args[1]);
