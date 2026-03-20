@@ -21723,9 +21723,30 @@ GCPtr<Environment> Environment::createGlobal() {
     auto fn = args[0].getGC<Function>();
     Value thisArg = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> callArgs;
-    if (args.size() > 2 && args[2].isArray()) {
-      auto arr = args[2].getGC<Array>();
-      callArgs = arr->elements;
+    if (args.size() > 2 && !args[2].isUndefined() && !args[2].isNull()) {
+      const Value& argArray = args[2];
+      // CreateListFromArrayLike: must be an object
+      if (!argArray.isArray() && !argArray.isObject() && !argArray.isTypedArray() &&
+          !argArray.isFunction() && !argArray.isProxy()) {
+        throw std::runtime_error("TypeError: CreateListFromArrayLike called on non-object");
+      }
+      if (argArray.isArray()) {
+        callArgs = argArray.getGC<Array>()->elements;
+      } else {
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+          auto [foundLen, lenVal] = interp->getPropertyForExternal(argArray, "length");
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          double len = foundLen ? lenVal.toNumber() : 0;
+          if (std::isnan(len) || len < 0) len = 0;
+          size_t n = static_cast<size_t>(std::min(len, 4294967295.0));
+          for (size_t i = 0; i < n; ++i) {
+            auto [foundElem, elemVal] = interp->getPropertyForExternal(argArray, std::to_string(i));
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            callArgs.push_back(foundElem ? elemVal : Value(Undefined{}));
+          }
+        }
+      }
     }
     if (fn->isNative) {
       auto requireNewIt = fn->properties.find("__require_new__");
@@ -21800,6 +21821,27 @@ GCPtr<Environment> Environment::createGlobal() {
       }
     }
     boundFn->properties["name"] = Value(std::string("bound " + targetName));
+    boundFn->properties["__non_writable_name"] = Value(true);
+    boundFn->properties["__non_enum_name"] = Value(true);
+
+    // ES2020 19.2.3.2 step 4: Set bound function length
+    double targetLen = 0.0;
+    if (targetFn) {
+      auto lenIt = targetFn->properties.find("length");
+      if (lenIt != targetFn->properties.end() && lenIt->second.isNumber()) {
+        targetLen = std::get<double>(lenIt->second.data);
+      }
+    } else if (targetCls) {
+      auto lenIt = targetCls->properties.find("length");
+      if (lenIt != targetCls->properties.end() && lenIt->second.isNumber()) {
+        targetLen = std::get<double>(lenIt->second.data);
+      }
+    }
+    double L = std::max(0.0, targetLen - static_cast<double>(boundArgs.size()));
+    boundFn->properties["length"] = Value(L);
+    boundFn->properties["__non_writable_length"] = Value(true);
+    boundFn->properties["__non_enum_length"] = Value(true);
+
     boundFn->nativeFunc = [target, boundThis, boundArgs](const std::vector<Value>& callArgs) -> Value {
       // [[Call]] of a bound function: call target with boundThis and boundArgs + callArgs.
       // Bound class constructors are not callable without 'new'.
