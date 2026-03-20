@@ -8847,21 +8847,87 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       auto rx = args[0].getGC<Regex>();
       std::string str = args.size() > 1 ? args[1].toString() : "";
-      std::string replacement = args.size() > 2 ? args[2].toString() : "undefined";
+      bool isFnReplacer = args.size() > 2 && args[2].isFunction();
+      std::string replTmpl = (!isFnReplacer && args.size() > 2) ? args[2].toString() : "";
       bool global = rx->flags.find('g') != std::string::npos;
+
+      // ES GetSubstitution helper
+      auto getSubstitution = [&](const std::string& matched, size_t pos,
+                                  const std::vector<std::string>& captures) -> std::string {
+        if (isFnReplacer) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            std::vector<Value> cbArgs;
+            cbArgs.push_back(Value(matched));
+            for (const auto& cap : captures) cbArgs.push_back(Value(cap));
+            cbArgs.push_back(Value(static_cast<double>(pos)));
+            cbArgs.push_back(Value(str));
+            Value result = interp->callForHarness(args[2], cbArgs, Value(Undefined{}));
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            return result.toString();
+          }
+          return "";
+        }
+        std::string sub;
+        for (size_t i = 0; i < replTmpl.size(); i++) {
+          if (replTmpl[i] == '$' && i + 1 < replTmpl.size()) {
+            char c = replTmpl[i + 1];
+            if (c == '$') { sub += '$'; i++; }
+            else if (c == '&') { sub += matched; i++; }
+            else if (c == '`') { sub += str.substr(0, pos); i++; }
+            else if (c == '\'') { sub += str.substr(pos + matched.size()); i++; }
+            else if (c >= '0' && c <= '9') {
+              // Try two-digit capture index first
+              size_t idx = c - '0';
+              if (i + 2 < replTmpl.size() && replTmpl[i + 2] >= '0' && replTmpl[i + 2] <= '9') {
+                size_t idx2 = idx * 10 + (replTmpl[i + 2] - '0');
+                if (idx2 >= 1 && idx2 <= captures.size()) {
+                  sub += captures[idx2 - 1]; i += 2; continue;
+                }
+              }
+              // One-digit
+              if (idx >= 1 && idx <= captures.size()) {
+                sub += captures[idx - 1]; i++;
+              } else {
+                sub += '$'; // No matching capture, keep literal
+              }
+            } else { sub += '$'; }
+          } else { sub += replTmpl[i]; }
+        }
+        return sub;
+      };
+
 #if USE_SIMPLE_REGEX
-      (void)global;
-      std::string result = str;
-      size_t pos = result.find(rx->pattern);
-      if (pos != std::string::npos) {
-        result.replace(pos, rx->pattern.length(), replacement);
+      std::vector<simple_regex::Regex::Match> matches;
+      if (rx->regex->search(str, matches) && !matches.empty()) {
+        std::vector<std::string> captures;
+        for (size_t i = 1; i < matches.size(); i++) captures.push_back(matches[i].str);
+        std::string result = str.substr(0, matches[0].start);
+        result += getSubstitution(matches[0].str, matches[0].start, captures);
+        result += str.substr(matches[0].start + matches[0].str.size());
+        return Value(result);
       }
-      return Value(result);
+      return Value(str);
 #else
-      if (!global) {
-        return Value(std::regex_replace(str, rx->regex, replacement, std::regex_constants::format_first_only));
+      std::string result;
+      size_t lastEnd = 0;
+      auto it = std::sregex_iterator(str.begin(), str.end(), rx->regex);
+      auto endIt = std::sregex_iterator();
+      for (; it != endIt; ++it) {
+        size_t matchStart = static_cast<size_t>(it->position(0));
+        std::string matched = it->str(0);
+        std::vector<std::string> captures;
+        for (size_t g = 1; g < it->size(); g++) {
+          captures.push_back((*it)[g].matched ? (*it)[g].str() : "");
+        }
+        result += str.substr(lastEnd, matchStart - lastEnd);
+        result += getSubstitution(matched, matchStart, captures);
+        lastEnd = matchStart + matched.size();
+        if (!global) { lastEnd = matchStart + matched.size(); break; }
+        if (matched.empty()) lastEnd++; // Avoid infinite loop on empty match
       }
-      return Value(std::regex_replace(str, rx->regex, replacement));
+      result += str.substr(lastEnd);
+      return Value(result);
 #endif
     };
     const auto& replaceKey = WellKnownSymbols::replaceKey();
