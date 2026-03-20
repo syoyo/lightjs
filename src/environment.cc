@@ -17696,26 +17696,59 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectFreeze = GarbageCollector::makeGC<Function>();
   objectFreeze->isNative = true;
   objectFreeze->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isObject()) {
-      if (!args.empty() && args[0].isTypedArray()) {
-        args[0].getGC<TypedArray>()->properties["__frozen__"] = Value(true);
-        args[0].getGC<TypedArray>()->properties["__sealed__"] = Value(true);
-      } else if (!args.empty() && args[0].isArrayBuffer()) {
-        args[0].getGC<ArrayBuffer>()->properties["__frozen__"] = Value(true);
-        args[0].getGC<ArrayBuffer>()->properties["__sealed__"] = Value(true);
-      } else if (!args.empty() && args[0].isDataView()) {
-        args[0].getGC<DataView>()->properties["__frozen__"] = Value(true);
-        args[0].getGC<DataView>()->properties["__sealed__"] = Value(true);
+    if (args.empty()) return Value(Undefined{});
+    const Value& target = args[0];
+    // Non-object primitives: return as-is
+    if (target.isUndefined() || target.isNull() || target.isBool() ||
+        target.isNumber() || target.isString() || target.isBigInt() || target.isSymbol()) {
+      return target;
+    }
+    // Set frozen/sealed flags on the appropriate properties map
+    auto setFrozen = [](OrderedMap<std::string, Value>& props) {
+      props["__frozen__"] = Value(true);
+      props["__sealed__"] = Value(true);
+      props["__non_extensible__"] = Value(true);
+      // Mark all own data properties as non-writable and non-configurable
+      for (const auto& key : props.orderedKeys()) {
+        if (key.find("__") == 0) continue;
+        props["__non_writable_" + key] = Value(true);
+        props["__non_configurable_" + key] = Value(true);
       }
-      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      if (obj->isModuleNamespace) {
+        throw std::runtime_error("TypeError: Cannot freeze module namespace object");
+      }
+      obj->frozen = true;
+      obj->sealed = true;
+      setFrozen(obj->properties);
+    } else if (target.isArray()) {
+      auto arr = target.getGC<Array>();
+      setFrozen(arr->properties);
+      // Freeze array elements (make non-writable)
+      for (size_t i = 0; i < arr->elements.size(); ++i) {
+        arr->properties["__non_writable_" + std::to_string(i)] = Value(true);
+        arr->properties["__non_configurable_" + std::to_string(i)] = Value(true);
+      }
+    } else if (target.isFunction()) {
+      setFrozen(target.getGC<Function>()->properties);
+    } else if (target.isRegex()) {
+      setFrozen(target.getGC<Regex>()->properties);
+    } else if (target.isError()) {
+      setFrozen(target.getGC<Error>()->properties);
+    } else if (target.isTypedArray()) {
+      setFrozen(target.getGC<TypedArray>()->properties);
+    } else if (target.isArrayBuffer()) {
+      setFrozen(target.getGC<ArrayBuffer>()->properties);
+    } else if (target.isDataView()) {
+      setFrozen(target.getGC<DataView>()->properties);
+    } else if (target.isMap()) {
+      setFrozen(target.getGC<Map>()->properties);
+    } else if (target.isSet()) {
+      setFrozen(target.getGC<Set>()->properties);
     }
-    auto obj = args[0].getGC<Object>();
-    if (obj->isModuleNamespace) {
-      throw std::runtime_error("TypeError: Cannot freeze module namespace object");
-    }
-    obj->frozen = true;
-    obj->sealed = true;  // Frozen objects are also sealed
-    return args[0];
+    return target;
   };
   objectConstructor->properties["freeze"] = Value(objectFreeze);
 
@@ -17723,19 +17756,43 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectSeal = GarbageCollector::makeGC<Function>();
   objectSeal->isNative = true;
   objectSeal->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isObject()) {
-      if (!args.empty() && args[0].isTypedArray()) {
-        args[0].getGC<TypedArray>()->properties["__sealed__"] = Value(true);
-      } else if (!args.empty() && args[0].isArrayBuffer()) {
-        args[0].getGC<ArrayBuffer>()->properties["__sealed__"] = Value(true);
-      } else if (!args.empty() && args[0].isDataView()) {
-        args[0].getGC<DataView>()->properties["__sealed__"] = Value(true);
-      }
-      return args.empty() ? Value(Undefined{}) : args[0];
+    if (args.empty()) return Value(Undefined{});
+    const Value& target = args[0];
+    if (target.isUndefined() || target.isNull() || target.isBool() ||
+        target.isNumber() || target.isString() || target.isBigInt() || target.isSymbol()) {
+      return target;
     }
-    auto obj = args[0].getGC<Object>();
-    obj->sealed = true;
-    return args[0];
+    auto setSealed = [](OrderedMap<std::string, Value>& props) {
+      props["__sealed__"] = Value(true);
+      props["__non_extensible__"] = Value(true);
+      for (const auto& key : props.orderedKeys()) {
+        if (key.find("__") == 0) continue;
+        props["__non_configurable_" + key] = Value(true);
+      }
+    };
+    if (target.isObject()) {
+      target.getGC<Object>()->sealed = true;
+      setSealed(target.getGC<Object>()->properties);
+    } else if (target.isArray()) {
+      setSealed(target.getGC<Array>()->properties);
+    } else if (target.isFunction()) {
+      setSealed(target.getGC<Function>()->properties);
+    } else if (target.isRegex()) {
+      setSealed(target.getGC<Regex>()->properties);
+    } else if (target.isError()) {
+      setSealed(target.getGC<Error>()->properties);
+    } else if (target.isTypedArray()) {
+      setSealed(target.getGC<TypedArray>()->properties);
+    } else if (target.isArrayBuffer()) {
+      setSealed(target.getGC<ArrayBuffer>()->properties);
+    } else if (target.isDataView()) {
+      setSealed(target.getGC<DataView>()->properties);
+    } else if (target.isMap()) {
+      setSealed(target.getGC<Map>()->properties);
+    } else if (target.isSet()) {
+      setSealed(target.getGC<Set>()->properties);
+    }
+    return target;
   };
   objectConstructor->properties["seal"] = Value(objectSeal);
 
