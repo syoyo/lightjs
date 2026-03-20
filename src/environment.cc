@@ -22201,11 +22201,14 @@ GCPtr<Environment> Environment::createGlobal() {
 
     std::string targetName;
     if (targetFn) {
-      targetName = targetFn->properties.count("name") ? targetFn->properties["name"].toString() : "";
+      auto nameIt = targetFn->properties.find("name");
+      if (nameIt != targetFn->properties.end() && nameIt->second.isString()) {
+        targetName = std::get<std::string>(nameIt->second.data);
+      }
     } else if (targetCls) {
       auto it = targetCls->properties.find("name");
       if (it != targetCls->properties.end() && it->second.isString()) {
-        targetName = it->second.toString();
+        targetName = std::get<std::string>(it->second.data);
       } else {
         targetName = targetCls->name;
       }
@@ -22227,7 +22230,17 @@ GCPtr<Environment> Environment::createGlobal() {
         targetLen = std::get<double>(lenIt->second.data);
       }
     }
-    double L = std::max(0.0, targetLen - static_cast<double>(boundArgs.size()));
+    double L = 0.0;
+    if (std::isnan(targetLen) || targetLen == 0.0) {
+      L = 0.0;
+    } else if (targetLen == std::numeric_limits<double>::infinity()) {
+      L = std::numeric_limits<double>::infinity();
+    } else if (targetLen == -std::numeric_limits<double>::infinity()) {
+      L = 0.0;
+    } else {
+      double intLen = std::trunc(targetLen);
+      L = std::max(0.0, intLen - static_cast<double>(boundArgs.size()));
+    }
     boundFn->properties["length"] = Value(L);
     boundFn->properties["__non_writable_length"] = Value(true);
     boundFn->properties["__non_enum_length"] = Value(true);
