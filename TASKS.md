@@ -46,7 +46,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 125 | 165 | 75.8% |
 | `built-ins/String` | 1159 | 1223 | 94.8% |
-| `built-ins/Object` | 3050 | 3413 | 89.4% |
+| `built-ins/Object` | 3059 | 3413 | 89.7% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
 | `built-ins/parseFloat` | 54 | 54 | 100.0% |
