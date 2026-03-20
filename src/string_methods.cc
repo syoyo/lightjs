@@ -5,6 +5,7 @@
 #include "unicode.h"
 #include "environment.h"
 #include "interpreter.h"
+#include "symbols.h"
 #include <stdexcept>
 #include <algorithm>
 #include <sstream>
@@ -72,6 +73,30 @@ Value toPrimitiveForStringBuiltin(const Value& value, bool preferString) {
         return value;
     }
 
+    Interpreter* interpreter = getGlobalInterpreter();
+
+    // Step 1: Check for @@toPrimitive (Symbol.toPrimitive)
+    const std::string& toPrimitiveKey = WellKnownSymbols::toPrimitiveKey();
+    auto exoticPrim = getPropertyForCoercion(value, toPrimitiveKey);
+    if (exoticPrim.has_value() && !exoticPrim->isUndefined() && !exoticPrim->isNull()) {
+        if (!exoticPrim->isFunction()) {
+            throw std::runtime_error("TypeError: @@toPrimitive is not callable");
+        }
+        if (!interpreter) {
+            throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+        }
+        std::string hint = preferString ? "string" : "number";
+        Value result = interpreter->callForHarness(*exoticPrim, {Value(hint)}, value);
+        if (interpreter->hasError()) {
+            throwInterpreterError(interpreter);
+        }
+        if (isObjectLikeForStringBuiltin(result)) {
+            throw std::runtime_error("TypeError: @@toPrimitive must return a primitive value");
+        }
+        return result;
+    }
+
+    // Step 2: Check for __primitive_value__ (boxed primitives like Object(0n))
     if (value.isObject()) {
         auto obj = value.getGC<Object>();
         auto primitiveIt = obj->properties.find("__primitive_value__");
@@ -80,7 +105,7 @@ Value toPrimitiveForStringBuiltin(const Value& value, bool preferString) {
         }
     }
 
-    Interpreter* interpreter = getGlobalInterpreter();
+    // Step 3: OrdinaryToPrimitive - try toString/valueOf in preferred order
     const char* firstMethod = preferString ? "toString" : "valueOf";
     const char* secondMethod = preferString ? "valueOf" : "toString";
     for (const char* methodName : {firstMethod, secondMethod}) {
@@ -119,10 +144,15 @@ std::string requireStringCoercibleThis(const std::vector<Value>& args, const cha
     return primitive.toString();
 }
 
+} // end anonymous namespace
+
 double toIntegerForStringBuiltinArg(const Value& value) {
     Value primitive = toPrimitiveForStringBuiltin(value, false);
     if (primitive.isSymbol()) {
-        throw std::runtime_error("TypeError: Cannot convert Symbol to number");
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a number");
+    }
+    if (primitive.isBigInt()) {
+        throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
     }
 
     double number = primitive.toNumber();
@@ -134,6 +164,27 @@ double toIntegerForStringBuiltinArg(const Value& value) {
     }
     return std::trunc(number);
 }
+
+double toNumberForStringBuiltinArg(const Value& value) {
+    Value primitive = toPrimitiveForStringBuiltin(value, false);
+    if (primitive.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a number");
+    }
+    if (primitive.isBigInt()) {
+        throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
+    }
+    return primitive.toNumber();
+}
+
+std::string toStringForStringBuiltinArg(const Value& value) {
+    Value primitive = toPrimitiveForStringBuiltin(value, true);
+    if (primitive.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+    }
+    return primitive.toString();
+}
+
+namespace {
 
 size_t utf16Length(const std::string& str) {
     size_t units = 0;
@@ -316,23 +367,25 @@ Value String_indexOf(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
 
-    if (args.size() < 2) {
+    std::string searchStr;
+    if (args.size() < 2 || args[1].isUndefined()) {
+        searchStr = "undefined";
+    } else {
+        searchStr = toStringForStringBuiltinArg(args[1]);
+    }
+
+    double fromIndex = 0;
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        fromIndex = toIntegerForStringBuiltinArg(args[2]);
+        if (fromIndex < 0) fromIndex = 0;
+    }
+
+    if (fromIndex >= static_cast<double>(str.length())) {
+        if (searchStr.empty()) return Value(static_cast<double>(str.length()));
         return Value(-1.0);
     }
 
-    std::string searchStr = args[1].toString();
-    int fromIndex = 0;
-
-    if (args.size() > 2 && args[2].isNumber()) {
-        fromIndex = static_cast<int>(std::get<double>(args[2].data));
-        fromIndex = std::max(0, fromIndex);
-    }
-
-    if (fromIndex >= static_cast<int>(str.length())) {
-        return Value(-1.0);
-    }
-
-    size_t pos = str.find(searchStr, fromIndex);
+    size_t pos = str.find(searchStr, static_cast<size_t>(fromIndex));
     if (pos == std::string::npos) {
         return Value(-1.0);
     }
@@ -348,16 +401,25 @@ Value String_lastIndexOf(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
 
-    if (args.size() < 2) {
-        return Value(-1.0);
+    std::string searchStr;
+    if (args.size() < 2 || args[1].isUndefined()) {
+        searchStr = "undefined";
+    } else {
+        searchStr = toStringForStringBuiltinArg(args[1]);
     }
 
-    std::string searchStr = args[1].toString();
-    int fromIndex = str.length();
+    double numPos = std::numeric_limits<double>::quiet_NaN();
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        numPos = toNumberForStringBuiltinArg(args[2]);
+    }
 
-    if (args.size() > 2 && args[2].isNumber()) {
-        fromIndex = static_cast<int>(std::get<double>(args[2].data));
-        fromIndex = std::min(fromIndex, static_cast<int>(str.length()));
+    size_t fromIndex;
+    if (std::isnan(numPos)) {
+        fromIndex = str.length();
+    } else {
+        double pos = std::trunc(numPos);
+        if (pos < 0) pos = 0;
+        fromIndex = static_cast<size_t>(std::min(pos, static_cast<double>(str.length())));
     }
 
     size_t pos = str.rfind(searchStr, fromIndex);
@@ -376,18 +438,19 @@ Value String_substring(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
     int len = str.length();
-    int start = 0;
-    int end = len;
 
-    if (args.size() > 1 && args[1].isNumber()) {
-        start = static_cast<int>(std::get<double>(args[1].data));
-        start = std::max(0, std::min(start, len));
+    double intStart = 0;
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        intStart = toIntegerForStringBuiltinArg(args[1]);
     }
 
-    if (args.size() > 2 && args[2].isNumber()) {
-        end = static_cast<int>(std::get<double>(args[2].data));
-        end = std::max(0, std::min(end, len));
+    double intEnd = len;
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        intEnd = toIntegerForStringBuiltinArg(args[2]);
     }
+
+    int start = static_cast<int>(std::max(0.0, std::min(intStart, static_cast<double>(len))));
+    int end = static_cast<int>(std::max(0.0, std::min(intEnd, static_cast<double>(len))));
 
     if (start > end) {
         std::swap(start, end);
@@ -404,21 +467,22 @@ Value String_substr(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
     int len = str.length();
-    int start = 0;
-    int length = len;
 
-    if (args.size() > 1 && args[1].isNumber()) {
-        start = static_cast<int>(std::get<double>(args[1].data));
+    int start = 0;
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        start = static_cast<int>(toIntegerForStringBuiltinArg(args[1]));
         if (start < 0) start = std::max(0, len + start);
         if (start >= len) return Value(std::string(""));
     }
 
-    if (args.size() > 2 && args[2].isNumber()) {
-        length = static_cast<int>(std::get<double>(args[2].data));
+    int length = len;
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        length = static_cast<int>(toIntegerForStringBuiltinArg(args[2]));
         length = std::max(0, length);
     }
 
     length = std::min(length, len - start);
+    if (length <= 0) return Value(std::string(""));
     return Value(str.substr(start, length));
 }
 
@@ -430,20 +494,23 @@ Value String_slice(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
     int len = str.length();
-    int start = 0;
-    int end = len;
 
-    if (args.size() > 1 && args[1].isNumber()) {
-        start = static_cast<int>(std::get<double>(args[1].data));
-        if (start < 0) start = std::max(0, len + start);
-        if (start > len) start = len;
+    double intStart = 0;
+    if (args.size() > 1 && !args[1].isUndefined()) {
+        intStart = toIntegerForStringBuiltinArg(args[1]);
     }
 
-    if (args.size() > 2 && args[2].isNumber()) {
-        end = static_cast<int>(std::get<double>(args[2].data));
-        if (end < 0) end = std::max(0, len + end);
-        if (end > len) end = len;
+    double intEnd = len;
+    if (args.size() > 2 && !args[2].isUndefined()) {
+        intEnd = toIntegerForStringBuiltinArg(args[2]);
     }
+
+    int start, end;
+    if (intStart < 0) start = static_cast<int>(std::max(static_cast<double>(0), static_cast<double>(len) + intStart));
+    else start = static_cast<int>(std::min(intStart, static_cast<double>(len)));
+
+    if (intEnd < 0) end = static_cast<int>(std::max(static_cast<double>(0), static_cast<double>(len) + intEnd));
+    else end = static_cast<int>(std::min(intEnd, static_cast<double>(len)));
 
     if (start >= end) {
         return Value(std::string(""));
@@ -459,6 +526,24 @@ Value String_split(const std::vector<Value>& args) {
     }
 
     std::string str = std::get<std::string>(args[0].data);
+
+    // ES2020: Check for @@split on the separator
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+            const std::string& splitKey = WellKnownSymbols::splitKey();
+            auto [found, splitter] = interp->getPropertyForExternal(args[1], splitKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !splitter.isUndefined() && !splitter.isNull()) {
+                if (!splitter.isFunction()) throw std::runtime_error("TypeError: @@split is not a function");
+                Value limitVal = args.size() > 2 ? args[2] : Value(Undefined{});
+                Value result = interp->callForHarness(splitter, {Value(str), limitVal}, args[1]);
+                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+                return result;
+            }
+        }
+    }
+
     auto result = makeArrayWithPrototype();
 
     // Handle limit parameter (ToUint32 per spec) - args[2] since args[0] is this
@@ -528,6 +613,23 @@ Value String_replace(const std::vector<Value>& args) {
 
     std::string str = std::get<std::string>(args[0].data);
 
+    // ES2020: Check for @@replace on the searchValue
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+            const std::string& replaceKey = WellKnownSymbols::replaceKey();
+            auto [found, replacer] = interp->getPropertyForExternal(args[1], replaceKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !replacer.isUndefined() && !replacer.isNull()) {
+                if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
+                Value replaceValue = args.size() > 2 ? args[2] : Value(Undefined{});
+                Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[1]);
+                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+                return result;
+            }
+        }
+    }
+
     if (args.size() < 3) {
         return Value(str);
     }
@@ -578,7 +680,8 @@ Value String_trim(const std::vector<Value>& args) {
 Value String_fromCharCode(const std::vector<Value>& args) {
     std::string result;
     for (const auto& arg : args) {
-        uint32_t code = static_cast<uint32_t>(arg.toNumber());
+        double num = toNumberForStringBuiltinArg(arg);
+        uint32_t code = static_cast<uint32_t>(static_cast<int32_t>(std::fmod(num, 65536.0)));
         // Treat as UTF-16 code unit, but convert to UTF-8
         result += unicode::encodeUTF8(code & 0xFFFF);
     }
@@ -589,8 +692,8 @@ Value String_fromCharCode(const std::vector<Value>& args) {
 Value String_fromCodePoint(const std::vector<Value>& args) {
     std::vector<uint32_t> codePoints;
     for (const auto& arg : args) {
-        double num = arg.toNumber();
-        if (num < 0 || num > 0x10FFFF || num != static_cast<uint32_t>(num)) {
+        double num = toNumberForStringBuiltinArg(arg);
+        if (num < 0 || num > 0x10FFFF || std::isnan(num) || num != std::trunc(num)) {
             throw std::runtime_error("RangeError: Invalid code point");
         }
         codePoints.push_back(static_cast<uint32_t>(num));

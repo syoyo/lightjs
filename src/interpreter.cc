@@ -1327,20 +1327,7 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
   }
 
   if (receiver.isRegex()) {
-    auto regex = receiver.getGC<Regex>();
-    std::string getterKey = "__get_" + key;
-    auto getterIt = regex->properties.find(getterKey);
-    if (getterIt != regex->properties.end()) {
-      if (getterIt->second.isFunction()) {
-        return {true, callFunction(getterIt->second, {}, receiver)};
-      }
-      return {true, Value(Undefined{})};
-    }
-    auto it = regex->properties.find(key);
-    if (it != regex->properties.end()) {
-      return {true, it->second};
-    }
-    return {false, Value(Undefined{})};
+    return getFromPropertyBag(receiver.getGC<Regex>()->properties);
   }
 
   if (receiver.isProxy()) {
@@ -10733,19 +10720,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto includesFn = GarbageCollector::makeGC<Function>();
       includesFn->isNative = true;
       includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(false);
         // ES spec: throw TypeError if searchString is a RegExp
-        if (args[0].isRegex()) {
+        if (!args.empty() && args[0].isRegex()) {
           throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
         }
-        std::string searchStr = args[0].toString();
-        size_t position = 0;
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        double pos = 0;
         if (args.size() > 1 && !args[1].isUndefined()) {
-          double pos = args[1].toNumber();
-          if (std::isnan(pos) || pos < 0) pos = 0;
-          if (pos > static_cast<double>(str.length())) return Value(false);
-          position = static_cast<size_t>(pos);
+          pos = toIntegerForStringBuiltinArg(args[1]);
+          if (pos < 0) pos = 0;
         }
+        size_t position = static_cast<size_t>(std::min(pos, static_cast<double>(str.length())));
         return Value(str.find(searchStr, position) != std::string::npos);
       };
       setNativeFnProps(includesFn, "includes", 1);
@@ -10756,13 +10741,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto repeatFn = GarbageCollector::makeGC<Function>();
       repeatFn->isNative = true;
       repeatFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(std::string(""));
-        int count = static_cast<int>(args[0].toNumber());
-        if (count < 0 || count == INT_MAX) return Value(std::string(""));
-        std::string result;
-        for (int i = 0; i < count; ++i) {
-          result += str;
+        double count = args.empty() ? 0 : toNumberForStringBuiltinArg(args[0]);
+        if (std::isnan(count)) count = 0;
+        if (count < 0 || count == std::numeric_limits<double>::infinity()) {
+          throw std::runtime_error("RangeError: Invalid count value");
         }
+        size_t n = static_cast<size_t>(count);
+        static constexpr size_t kMaxRepeatBytes = 256 * 1024 * 1024;
+        if (str.size() > 0 && n > kMaxRepeatBytes / str.size()) {
+          throw std::runtime_error("RangeError: Invalid count value");
+        }
+        std::string result;
+        result.reserve(str.size() * n);
+        for (size_t i = 0; i < n; ++i) result += str;
         return Value(result);
       };
       setNativeFnProps(repeatFn, "repeat", 1);
@@ -10774,10 +10765,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       padStartFn->isNative = true;
       padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
-        size_t targetLength = static_cast<size_t>(args[0].toNumber());
+        double maxLen = toIntegerForStringBuiltinArg(args[0]);
+        if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
+        size_t targetLength = static_cast<size_t>(maxLen);
         if (targetLength <= str.length()) return Value(str);
 
-        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        std::string padString = (args.size() > 1 && !args[1].isUndefined()) ? toStringForStringBuiltinArg(args[1]) : " ";
         if (padString.empty()) return Value(str);
 
         size_t padLength = targetLength - str.length();
@@ -10797,10 +10790,12 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       padEndFn->isNative = true;
       padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         if (args.empty()) return Value(str);
-        size_t targetLength = static_cast<size_t>(args[0].toNumber());
+        double maxLen = toIntegerForStringBuiltinArg(args[0]);
+        if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
+        size_t targetLength = static_cast<size_t>(maxLen);
         if (targetLength <= str.length()) return Value(str);
 
-        std::string padString = args.size() > 1 ? args[1].toString() : " ";
+        std::string padString = (args.size() > 1 && !args[1].isUndefined()) ? toStringForStringBuiltinArg(args[1]) : " ";
         if (padString.empty()) return Value(str);
 
         size_t padLength = targetLength - str.length();
@@ -10849,6 +10844,22 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto splitFn = GarbageCollector::makeGC<Function>();
       splitFn->isNative = true;
       splitFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        // ES2020 21.1.3.17: If separator is not null/undefined, check for @@split
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            const std::string& splitKey = WellKnownSymbols::splitKey();
+            auto [found, splitter] = interp->getPropertyForExternal(args[0], splitKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !splitter.isUndefined() && !splitter.isNull()) {
+              if (!splitter.isFunction()) throw std::runtime_error("TypeError: @@split is not a function");
+              Value limitVal = args.size() > 1 ? args[1] : Value(Undefined{});
+              Value result = interp->callForHarness(splitter, {Value(str), limitVal}, args[0]);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              return result;
+            }
+          }
+        }
         auto result = makeArrayWithPrototype();
 
         // Handle limit parameter (ToUint32 per spec)
@@ -10905,13 +10916,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(true);
-        if (args[0].isRegex()) {
+        if (!args.empty() && args[0].isRegex()) {
           throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
         }
-        std::string searchStr = args[0].toString();
-        size_t position = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : 0;
-        if (position > str.length()) return Value(false);
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        double pos = 0;
+        if (args.size() > 1 && !args[1].isUndefined()) {
+          pos = toIntegerForStringBuiltinArg(args[1]);
+        }
+        size_t position = static_cast<size_t>(std::max(0.0, std::min(pos, static_cast<double>(str.length()))));
+        if (position + searchStr.length() > str.length()) return Value(false);
         return Value(str.compare(position, searchStr.length(), searchStr) == 0);
       };
       setNativeFnProps(fn, "startsWith", 1);
@@ -10922,13 +10936,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(true);
-        if (args[0].isRegex()) {
+        if (!args.empty() && args[0].isRegex()) {
           throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
         }
-        std::string searchStr = args[0].toString();
-        size_t endPos = args.size() > 1 ? static_cast<size_t>(args[1].toNumber()) : str.length();
-        if (endPos > str.length()) endPos = str.length();
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        double e = static_cast<double>(str.length());
+        if (args.size() > 1 && !args[1].isUndefined()) {
+          e = toIntegerForStringBuiltinArg(args[1]);
+        }
+        size_t endPos = static_cast<size_t>(std::max(0.0, std::min(e, static_cast<double>(str.length()))));
         if (searchStr.length() > endPos) return Value(false);
         return Value(str.compare(endPos - searchStr.length(), searchStr.length(), searchStr) == 0);
       };
@@ -10953,17 +10969,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // Check UTF-8 encoded string for lone surrogates (CESU-8 encoded)
+        // Decode UTF-8 code points, check for lone surrogates in UTF-16 model
+        std::vector<int32_t> cps;
         size_t i = 0;
         while (i < str.size()) {
           unsigned char ch = static_cast<unsigned char>(str[i]);
-          if (ch < 0x80) { i++; continue; }
-          int32_t cp = 0;
-          int extra = 0;
-          if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+          int32_t cp = 0; int extra = 0;
+          if (ch < 0x80) { cp = ch; extra = 0; }
+          else if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
           else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
           else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
-          else { return Value(false); } // Invalid UTF-8
+          else { return Value(false); }
           if (i + extra >= str.size()) return Value(false);
           for (int j = 0; j < extra; j++) {
             i++;
@@ -10971,8 +10987,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
           }
           i++;
-          // Lone surrogate: U+D800..U+DFFF
-          if (cp >= 0xD800 && cp <= 0xDFFF) return Value(false);
+          cps.push_back(cp);
+        }
+        for (size_t k = 0; k < cps.size(); k++) {
+          int32_t cp = cps[k];
+          if (cp >= 0xD800 && cp <= 0xDBFF) {
+            if (k + 1 < cps.size() && cps[k + 1] >= 0xDC00 && cps[k + 1] <= 0xDFFF) {
+              k++; continue; // Valid pair
+            }
+            return Value(false); // Lone high surrogate
+          } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            return Value(false); // Lone low surrogate
+          }
         }
         return Value(true);
       };
@@ -10985,16 +11011,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        std::string result;
+        // First decode all code points with byte spans
+        struct CpSpan { int32_t cp; size_t start; size_t end; };
+        std::vector<CpSpan> cps;
         size_t i = 0;
         while (i < str.size()) {
           unsigned char ch = static_cast<unsigned char>(str[i]);
-          if (ch < 0x80) { result += str[i]; i++; continue; }
           size_t start = i;
-          int32_t cp = 0;
-          int extra = 0;
-          bool valid = true;
-          if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+          int32_t cp = 0; int extra = 0; bool valid = true;
+          if (ch < 0x80) { cp = ch; extra = 0; }
+          else if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
           else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
           else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
           else { valid = false; }
@@ -11005,16 +11031,27 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
               cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
             }
             i++;
-          } else {
-            valid = false;
-            i++;
-          }
-          if (!valid || (cp >= 0xD800 && cp <= 0xDFFF)) {
-            // Replace lone surrogate / invalid with U+FFFD (UTF-8: EF BF BD)
+          } else { valid = false; i++; }
+          if (!valid) cp = 0xFFFD;
+          cps.push_back({cp, start, i});
+        }
+        // Build result, combining paired surrogates and replacing lone ones
+        std::string result;
+        for (size_t k = 0; k < cps.size(); k++) {
+          int32_t cp = cps[k].cp;
+          if (cp >= 0xD800 && cp <= 0xDBFF) {
+            if (k + 1 < cps.size() && cps[k + 1].cp >= 0xDC00 && cps[k + 1].cp <= 0xDFFF) {
+              int32_t combined = 0x10000 + ((cp - 0xD800) << 10) + (cps[k + 1].cp - 0xDC00);
+              result += unicode::encodeUTF8(static_cast<uint32_t>(combined));
+              k++; continue;
+            }
+            result += "\xEF\xBF\xBD";
+          } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            result += "\xEF\xBF\xBD";
+          } else if (cp == 0xFFFD) {
             result += "\xEF\xBF\xBD";
           } else {
-            // Copy valid multi-byte sequence
-            for (size_t j = start; j < i; j++) result += str[j];
+            for (size_t j = cps[k].start; j < cps[k].end; j++) result += str[j];
           }
         }
         return Value(result);
@@ -11061,16 +11098,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(-1.0);
-        std::string searchStr = args[0].toString();
-        size_t fromIndex = 0;
-        if (args.size() > 1) {
-          double fi = args[1].toNumber();
-          if (std::isnan(fi) || fi < 0) fi = 0;
-          fromIndex = static_cast<size_t>(fi);
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        double fromIndex = 0;
+        if (args.size() > 1 && !args[1].isUndefined()) {
+          fromIndex = toIntegerForStringBuiltinArg(args[1]);
+          if (fromIndex < 0) fromIndex = 0;
         }
-        if (fromIndex >= str.length() && !searchStr.empty()) return Value(-1.0);
-        size_t pos = str.find(searchStr, fromIndex);
+        if (fromIndex >= static_cast<double>(str.length())) {
+          if (searchStr.empty()) return Value(static_cast<double>(str.length()));
+          return Value(-1.0);
+        }
+        size_t pos = str.find(searchStr, static_cast<size_t>(fromIndex));
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
       };
@@ -11082,15 +11120,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(-1.0);
-        std::string searchStr = args[0].toString();
-        size_t fromIndex = str.length();
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
+        double numPos = std::numeric_limits<double>::quiet_NaN();
         if (args.size() > 1 && !args[1].isUndefined()) {
-          double fi = args[1].toNumber();
-          if (!std::isnan(fi)) {
-            if (fi < 0) fi = 0;
-            fromIndex = static_cast<size_t>(fi);
-          }
+          numPos = toNumberForStringBuiltinArg(args[1]);
+        }
+        size_t fromIndex;
+        if (std::isnan(numPos)) {
+          fromIndex = str.length();
+        } else {
+          double pos = std::trunc(numPos);
+          if (pos < 0) pos = 0;
+          fromIndex = static_cast<size_t>(std::min(pos, static_cast<double>(str.length())));
         }
         size_t pos = str.rfind(searchStr, fromIndex);
         if (pos == std::string::npos) return Value(-1.0);
@@ -11104,8 +11145,22 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(0.0);
-        if (args[0].isRegex()) {
+        // ES2020 21.1.3.15: If regexp is not null/undefined, check for @@search
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            const std::string& searchKey = WellKnownSymbols::searchKey();
+            auto [found, searcher] = interp->getPropertyForExternal(args[0], searchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !searcher.isUndefined() && !searcher.isNull()) {
+              if (!searcher.isFunction()) throw std::runtime_error("TypeError: @@search is not a function");
+              Value result = interp->callForHarness(searcher, {Value(str)}, args[0]);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              return result;
+            }
+          }
+        }
+        if (!args.empty() && args[0].isRegex()) {
           auto regexPtr = args[0].getGC<Regex>();
 #if USE_SIMPLE_REGEX
           std::vector<simple_regex::Regex::Match> matches;
@@ -11120,7 +11175,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
           return Value(-1.0);
         }
-        std::string searchStr = args[0].toString();
+        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         size_t pos = str.find(searchStr);
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
@@ -11133,6 +11188,21 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto matchFn = GarbageCollector::makeGC<Function>();
       matchFn->isNative = true;
       matchFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        // ES2020 21.1.3.11: If regexp is not null/undefined, check for @@match
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            const std::string& matchKey = WellKnownSymbols::matchKey();
+            auto [found, matcher] = interp->getPropertyForExternal(args[0], matchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !matcher.isUndefined() && !matcher.isNull()) {
+              if (!matcher.isFunction()) throw std::runtime_error("TypeError: @@match is not a function");
+              Value result = interp->callForHarness(matcher, {Value(str)}, args[0]);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              return result;
+            }
+          }
+        }
         if (args.empty() || !args[0].isRegex()) return Value(Null{});
         auto regexPtr = args[0].getGC<Regex>();
 #if USE_SIMPLE_REGEX
@@ -11181,6 +11251,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       replaceFn->isNative = true;
       auto interp = this;
       replaceFn->nativeFunc = [str, interp](const std::vector<Value>& args) -> Value {
+        // ES2020 21.1.3.14: If searchValue is not null/undefined, check @@replace
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          const std::string& replaceKey = WellKnownSymbols::replaceKey();
+          auto [found, replacer] = interp->getPropertyForExternal(args[0], replaceKey);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (found && !replacer.isUndefined() && !replacer.isNull()) {
+            if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
+            Value replaceValue = args.size() > 1 ? args[1] : Value(Undefined{});
+            Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[0]);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            return result;
+          }
+        }
         if (args.size() < 2) return Value(str);
         if (args[0].isRegex()) {
           auto regexPtr = args[0].getGC<Regex>();
@@ -11263,6 +11346,50 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto replaceAllFn = GarbageCollector::makeGC<Function>();
       replaceAllFn->isNative = true;
       replaceAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+        // ES2021 21.1.3.18: If searchValue is not null/undefined, check @@replace
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            // Check if searchValue is a RegExp (via @@match)
+            const std::string& matchKey = WellKnownSymbols::matchKey();
+            auto [hasMatch, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            bool isRegExp = false;
+            if (hasMatch && !matchProp.isUndefined() && !matchProp.isNull()) {
+              isRegExp = true;
+            } else if (args[0].isRegex()) {
+              isRegExp = true;
+            }
+            // If it's a RegExp, must have 'g' flag
+            if (isRegExp) {
+              if (args[0].isRegex()) {
+                auto regexPtr = args[0].getGC<Regex>();
+                if (regexPtr->flags.find('g') == std::string::npos) {
+                  throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
+                }
+              } else {
+                // Check flags property for 'g'
+                auto [hasFlags, flagsVal] = interp->getPropertyForExternal(args[0], "flags");
+                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+                std::string flags = hasFlags ? flagsVal.toString() : "";
+                if (flags.find('g') == std::string::npos) {
+                  throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
+                }
+              }
+            }
+            // Check for @@replace
+            const std::string& replaceKey = WellKnownSymbols::replaceKey();
+            auto [found, replacer] = interp->getPropertyForExternal(args[0], replaceKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !replacer.isUndefined() && !replacer.isNull()) {
+              if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
+              Value replaceValue = args.size() > 1 ? args[1] : Value(Undefined{});
+              Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[0]);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              return result;
+            }
+          }
+        }
         if (args.size() < 2) return Value(str);
         std::string search = args[0].toString();
         std::string replacement = args[1].toString();
@@ -11392,19 +11519,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         int len = static_cast<int>(str.length());
-        int start = 0, end = len;
-        if (!args.empty()) {
-          double s = args[0].toNumber();
-          if (std::isnan(s) || s < 0) s = 0;
-          if (s > len) s = len;
-          start = static_cast<int>(s);
+        double intStart = 0;
+        if (!args.empty() && !args[0].isUndefined()) {
+          intStart = toIntegerForStringBuiltinArg(args[0]);
         }
+        double intEnd = len;
         if (args.size() > 1 && !args[1].isUndefined()) {
-          double e = args[1].toNumber();
-          if (std::isnan(e) || e < 0) e = 0;
-          if (e > len) e = len;
-          end = static_cast<int>(e);
+          intEnd = toIntegerForStringBuiltinArg(args[1]);
         }
+        int start = static_cast<int>(std::max(0.0, std::min(intStart, static_cast<double>(len))));
+        int end = static_cast<int>(std::max(0.0, std::min(intEnd, static_cast<double>(len))));
         if (start > end) std::swap(start, end);
         return Value(str.substr(start, end - start));
       };
@@ -11417,19 +11541,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         int len = static_cast<int>(str.length());
-        int start = 0, end = len;
-        if (!args.empty()) {
-          int s = static_cast<int>(args[0].toNumber());
-          if (s < 0) s = std::max(0, len + s);
-          if (s > len) s = len;
-          start = s;
+        double intStart = 0;
+        if (!args.empty() && !args[0].isUndefined()) {
+          intStart = toIntegerForStringBuiltinArg(args[0]);
         }
+        double intEnd = len;
         if (args.size() > 1 && !args[1].isUndefined()) {
-          int e = static_cast<int>(args[1].toNumber());
-          if (e < 0) e = std::max(0, len + e);
-          if (e > len) e = len;
-          end = e;
+          intEnd = toIntegerForStringBuiltinArg(args[1]);
         }
+        int start, end;
+        if (intStart < 0) start = std::max(0, len + static_cast<int>(std::max(intStart, static_cast<double>(-len))));
+        else start = std::min(static_cast<int>(std::min(intStart, static_cast<double>(len))), len);
+        if (intEnd < 0) end = std::max(0, len + static_cast<int>(std::max(intEnd, static_cast<double>(-len))));
+        else end = std::min(static_cast<int>(std::min(intEnd, static_cast<double>(len))), len);
         if (start >= end) return Value(std::string(""));
         return Value(str.substr(start, end - start));
       };

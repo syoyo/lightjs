@@ -45,7 +45,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 125 | 165 | 75.8% |
-| `built-ins/String` | 927 | 1223 | 75.8% |
+| `built-ins/String` | 1072 | 1223 | 87.7% |
 | `built-ins/Object` | 2980 | 3413 | 87.4% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
@@ -55,6 +55,21 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/BigInt` | 77 | 77 | 100.0% |
 
 Unit tests: 346/346 passing.
+
+#### Changes (2026-03-20 #4)
+
+145 String tests fixed (927→1072/1223), 0 regressions:
+
+- **String.raw** (`src/environment.cc`): spec-compliant ToObject validation, TypeError on null/undefined, JS toString() invocation via callForHarness, getter support, Symbol rejection. 30/30 passing.
+- **String.prototype.slice** (`src/interpreter.cc`, `src/string_methods.cc`): NaN/Infinity handling, double→int clamping via toIntegerForStringBuiltinArg. 38/38 passing.
+- **indexOf/lastIndexOf** (`src/string_methods.cc`): Symbol.toPrimitive support in toPrimitiveForStringBuiltin, BigInt TypeError. 47/47 passing.
+- **fromCharCode/fromCodePoint** (`src/string_methods.cc`): proper ToPrimitive coercion via toNumberForStringBuiltinArg. 28/28 passing.
+- **substring** (`src/interpreter.cc`, `src/string_methods.cc`): toIntegerForStringBuiltinArg for argument coercion. 46/46 passing.
+- **isWellFormed/toWellFormed** (`src/interpreter.cc`, `src/environment.cc`): surrogate pair detection (adjacent high+low surrogates recognized as valid pairs).
+- **includes** (`src/interpreter.cc`, `src/environment.cc`): empty string at position >= length returns true.
+- **Symbol protocol** (`src/interpreter.cc`, `src/environment.cc`, `src/string_methods.cc`): Symbol.match/search/replace/split checks on search/match/replace/replaceAll/split. Installed @@match/@@search/@@replace/@@split on RegExp.prototype. Fixed Regex prototype chain traversal in getPropertyForPrimitive.
+- **Date.prototype[@@toPrimitive]** (`src/environment.cc`): hint-based toPrimitive for Date objects.
+- **Type coercion** (`src/string_methods.cc`): Symbol.toPrimitive support, BigInt rejection, proper OrdinaryToPrimitive ordering across all string methods.
 
 #### Changes (2026-03-20 #3)
 
@@ -373,7 +388,8 @@ Next targets for `built-ins` scope (by priority):
 - **Math** (99.4%): `Math.sumPrecise` rounding correction (1 test), `Math.f16round` value conversion (1 test)
 - **Number** (99.7%): `proto-from-ctor-realm` (1 remaining failure, requires multi-realm support)
 - **Boolean** (98.0%): `proto-from-ctor-realm` (1 remaining failure)
-- **String**, **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
+- **String** (87.7%): 146 remaining — replaceAll (27), split (26), replace (26), match (19), search (8), normalize (6), toLocale/Case (12), other (22). Most need deeper regex Symbol protocol, RegExpCreate fallback, or Unicode normalization.
+- **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
 
 Next targets for remaining 11 `language` failures:
 - Runtime regex Unicode overhaul (surrogate pairs, astral, `\u{...}`, `\k<name>`) — 9 failures

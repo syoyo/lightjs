@@ -28,4 +28,10 @@ Value String_trim(const std::vector<Value>& args);
 Value String_fromCharCode(const std::vector<Value>& args);
 Value String_fromCodePoint(const std::vector<Value>& args);
 
+// Spec-compliant type coercion helpers for string built-ins
+// These throw TypeError on Symbol values, unlike Value::toString()/toNumber()
+std::string toStringForStringBuiltinArg(const Value& value);
+double toNumberForStringBuiltinArg(const Value& value);
+double toIntegerForStringBuiltinArg(const Value& value);
+
 } // namespace lightjs

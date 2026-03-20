@@ -8716,6 +8716,230 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(rx->flags.find('s') != std::string::npos);
   });
 
+  // Install Symbol methods on RegExp.prototype
+  // @@match - RegExp.prototype[Symbol.match](string)
+  {
+    auto matchFn = GarbageCollector::makeGC<Function>();
+    matchFn->isNative = true;
+    matchFn->isConstructor = false;
+    matchFn->properties["name"] = Value(std::string("[Symbol.match]"));
+    matchFn->properties["__non_writable_name"] = Value(true);
+    matchFn->properties["__non_enum_name"] = Value(true);
+    matchFn->properties["length"] = Value(1.0);
+    matchFn->properties["__non_writable_length"] = Value(true);
+    matchFn->properties["__non_enum_length"] = Value(true);
+    matchFn->properties["__uses_this_arg__"] = Value(true);
+    matchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      // this = regex (args[0]), string = args[1]
+      if (args.empty() || !args[0].isRegex()) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.match] called on non-RegExp");
+      }
+      auto rx = args[0].getGC<Regex>();
+      std::string str = args.size() > 1 ? args[1].toString() : "";
+      bool global = rx->flags.find('g') != std::string::npos;
+#if USE_SIMPLE_REGEX
+      std::vector<simple_regex::Regex::Match> matches;
+      if (!global) {
+        if (rx->regex->search(str, matches)) {
+          auto result = makeArrayWithPrototype();
+          for (const auto& m : matches) result->elements.push_back(Value(m.str));
+          if (!matches.empty()) {
+            result->properties["index"] = Value(static_cast<double>(matches[0].start));
+            result->properties["input"] = Value(str);
+          }
+          return Value(result);
+        }
+        return Value(Null{});
+      }
+      // Global: all matches
+      auto result = makeArrayWithPrototype();
+      size_t searchStart = 0;
+      while (searchStart <= str.size()) {
+        matches.clear();
+        std::string sub = str.substr(searchStart);
+        if (!rx->regex->search(sub, matches) || matches.empty()) break;
+        result->elements.push_back(Value(matches[0].str));
+        size_t matchEnd = searchStart + matches[0].start + matches[0].str.size();
+        searchStart = matchEnd == searchStart ? matchEnd + 1 : matchEnd;
+      }
+      if (result->elements.empty()) return Value(Null{});
+      return Value(result);
+#else
+      if (!global) {
+        std::smatch m;
+        if (!std::regex_search(str, m, rx->regex)) return Value(Null{});
+        auto result = makeArrayWithPrototype();
+        result->elements.push_back(Value(m.str(0)));
+        for (size_t i = 1; i < m.size(); ++i) {
+          if (m[i].matched) result->elements.push_back(Value(m.str(i)));
+          else result->elements.push_back(Value(Undefined{}));
+        }
+        result->properties["index"] = Value(static_cast<double>(m.position(0)));
+        result->properties["input"] = Value(str);
+        return Value(result);
+      }
+      auto result = makeArrayWithPrototype();
+      auto begin = std::sregex_iterator(str.begin(), str.end(), rx->regex);
+      auto end = std::sregex_iterator();
+      for (auto it = begin; it != end; ++it) {
+        result->elements.push_back(Value(it->str()));
+      }
+      if (result->elements.empty()) return Value(Null{});
+      return Value(result);
+#endif
+    };
+    const auto& matchKey = WellKnownSymbols::matchKey();
+    regExpPrototype->properties[matchKey] = Value(matchFn);
+    regExpPrototype->properties["__non_enum_" + matchKey] = Value(true);
+  }
+
+  // @@search - RegExp.prototype[Symbol.search](string)
+  {
+    auto searchFn = GarbageCollector::makeGC<Function>();
+    searchFn->isNative = true;
+    searchFn->isConstructor = false;
+    searchFn->properties["name"] = Value(std::string("[Symbol.search]"));
+    searchFn->properties["__non_writable_name"] = Value(true);
+    searchFn->properties["__non_enum_name"] = Value(true);
+    searchFn->properties["length"] = Value(1.0);
+    searchFn->properties["__non_writable_length"] = Value(true);
+    searchFn->properties["__non_enum_length"] = Value(true);
+    searchFn->properties["__uses_this_arg__"] = Value(true);
+    searchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isRegex()) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.search] called on non-RegExp");
+      }
+      auto rx = args[0].getGC<Regex>();
+      std::string str = args.size() > 1 ? args[1].toString() : "";
+#if USE_SIMPLE_REGEX
+      std::vector<simple_regex::Regex::Match> matches;
+      if (rx->regex->search(str, matches) && !matches.empty()) {
+        return Value(static_cast<double>(matches[0].start));
+      }
+#else
+      std::smatch m;
+      if (std::regex_search(str, m, rx->regex)) {
+        return Value(static_cast<double>(m.position(0)));
+      }
+#endif
+      return Value(-1.0);
+    };
+    const auto& searchKey = WellKnownSymbols::searchKey();
+    regExpPrototype->properties[searchKey] = Value(searchFn);
+    regExpPrototype->properties["__non_enum_" + searchKey] = Value(true);
+  }
+
+  // @@replace - RegExp.prototype[Symbol.replace](string, replaceValue)
+  {
+    auto replaceFn = GarbageCollector::makeGC<Function>();
+    replaceFn->isNative = true;
+    replaceFn->isConstructor = false;
+    replaceFn->properties["name"] = Value(std::string("[Symbol.replace]"));
+    replaceFn->properties["__non_writable_name"] = Value(true);
+    replaceFn->properties["__non_enum_name"] = Value(true);
+    replaceFn->properties["length"] = Value(2.0);
+    replaceFn->properties["__non_writable_length"] = Value(true);
+    replaceFn->properties["__non_enum_length"] = Value(true);
+    replaceFn->properties["__uses_this_arg__"] = Value(true);
+    replaceFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isRegex()) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.replace] called on non-RegExp");
+      }
+      auto rx = args[0].getGC<Regex>();
+      std::string str = args.size() > 1 ? args[1].toString() : "";
+      std::string replacement = args.size() > 2 ? args[2].toString() : "undefined";
+      bool global = rx->flags.find('g') != std::string::npos;
+#if USE_SIMPLE_REGEX
+      (void)global;
+      std::string result = str;
+      size_t pos = result.find(rx->pattern);
+      if (pos != std::string::npos) {
+        result.replace(pos, rx->pattern.length(), replacement);
+      }
+      return Value(result);
+#else
+      if (!global) {
+        return Value(std::regex_replace(str, rx->regex, replacement, std::regex_constants::format_first_only));
+      }
+      return Value(std::regex_replace(str, rx->regex, replacement));
+#endif
+    };
+    const auto& replaceKey = WellKnownSymbols::replaceKey();
+    regExpPrototype->properties[replaceKey] = Value(replaceFn);
+    regExpPrototype->properties["__non_enum_" + replaceKey] = Value(true);
+  }
+
+  // @@split - RegExp.prototype[Symbol.split](string, limit)
+  {
+    auto splitFn = GarbageCollector::makeGC<Function>();
+    splitFn->isNative = true;
+    splitFn->isConstructor = false;
+    splitFn->properties["name"] = Value(std::string("[Symbol.split]"));
+    splitFn->properties["__non_writable_name"] = Value(true);
+    splitFn->properties["__non_enum_name"] = Value(true);
+    splitFn->properties["length"] = Value(2.0);
+    splitFn->properties["__non_writable_length"] = Value(true);
+    splitFn->properties["__non_enum_length"] = Value(true);
+    splitFn->properties["__uses_this_arg__"] = Value(true);
+    splitFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isRegex()) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.split] called on non-RegExp");
+      }
+      auto rx = args[0].getGC<Regex>();
+      std::string str = args.size() > 1 ? args[1].toString() : "";
+      uint32_t limit = 0xFFFFFFFF;
+      if (args.size() > 2 && !args[2].isUndefined()) {
+        double lim = args[2].toNumber();
+        if (!std::isnan(lim) && std::isfinite(lim) && lim >= 0) {
+          limit = static_cast<uint32_t>(std::min(lim, static_cast<double>(0xFFFFFFFF)));
+        } else {
+          limit = 0;
+        }
+      }
+      auto result = makeArrayWithPrototype();
+      if (limit == 0) return Value(result);
+#if USE_SIMPLE_REGEX
+      // Simple split using string find
+      std::string pattern = rx->pattern;
+      size_t pos = 0;
+      while (pos <= str.size()) {
+        size_t found = str.find(pattern, pos);
+        if (found == std::string::npos) break;
+        result->elements.push_back(Value(str.substr(pos, found - pos)));
+        if (result->elements.size() >= limit) return Value(result);
+        pos = found + (pattern.empty() ? 1 : pattern.size());
+      }
+      result->elements.push_back(Value(str.substr(pos)));
+#else
+      std::sregex_iterator it(str.begin(), str.end(), rx->regex);
+      std::sregex_iterator endIt;
+      size_t lastEnd = 0;
+      for (; it != endIt; ++it) {
+        size_t matchStart = static_cast<size_t>(it->position(0));
+        size_t matchLen = static_cast<size_t>(it->length(0));
+        result->elements.push_back(Value(str.substr(lastEnd, matchStart - lastEnd)));
+        if (result->elements.size() >= limit) return Value(result);
+        // Add capture groups
+        for (size_t g = 1; g < it->size(); g++) {
+          if ((*it)[g].matched) result->elements.push_back(Value((*it)[g].str()));
+          else result->elements.push_back(Value(Undefined{}));
+          if (result->elements.size() >= limit) return Value(result);
+        }
+        lastEnd = matchStart + matchLen;
+        if (matchLen == 0) lastEnd++; // Avoid infinite loop on empty match
+      }
+      result->elements.push_back(Value(str.substr(lastEnd)));
+#endif
+      if (result->elements.size() > limit) {
+        result->elements.resize(limit);
+      }
+      return Value(result);
+    };
+    const auto& splitKey = WellKnownSymbols::splitKey();
+    regExpPrototype->properties[splitKey] = Value(splitFn);
+    regExpPrototype->properties["__non_enum_" + splitKey] = Value(true);
+  }
+
   auto regExpConstructor = GarbageCollector::makeGC<Function>();
   regExpConstructor->isNative = true;
   regExpConstructor->isConstructor = true;
@@ -19703,6 +19927,62 @@ GCPtr<Environment> Environment::createGlobal() {
     installDateStub("toLocaleDateString", 0.0);
     installDateStub("toLocaleTimeString", 0.0);
     installDateStub("toJSON", 1.0);
+
+    // Date.prototype[@@toPrimitive]
+    {
+      auto toPrimFn = GarbageCollector::makeGC<Function>();
+      toPrimFn->isNative = true;
+      toPrimFn->isConstructor = false;
+      toPrimFn->properties["name"] = Value(std::string("[Symbol.toPrimitive]"));
+      toPrimFn->properties["__non_writable_name"] = Value(true);
+      toPrimFn->properties["__non_enum_name"] = Value(true);
+      toPrimFn->properties["length"] = Value(1.0);
+      toPrimFn->properties["__non_writable_length"] = Value(true);
+      toPrimFn->properties["__non_enum_length"] = Value(true);
+      toPrimFn->properties["__uses_this_arg__"] = Value(true);
+      toPrimFn->properties["__throw_on_new__"] = Value(true);
+      toPrimFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || (!args[0].isObject() && !args[0].isArray())) {
+          throw std::runtime_error("TypeError: Date.prototype[Symbol.toPrimitive] requires an object");
+        }
+        std::string hint = "default";
+        if (args.size() > 1 && args[1].isString()) {
+          hint = std::get<std::string>(args[1].data);
+        }
+        if (hint != "string" && hint != "number" && hint != "default") {
+          throw std::runtime_error("TypeError: Invalid hint");
+        }
+        // For Date, "default" hint is treated as "string"
+        if (hint == "number") {
+          // Return valueOf() result
+          if (args[0].isObject()) {
+            auto obj = args[0].getGC<Object>();
+            auto valOfIt = obj->properties.find("valueOf");
+            if (valOfIt != obj->properties.end() && valOfIt->second.isFunction()) {
+              auto* interp = getGlobalInterpreter();
+              if (interp) return interp->callForHarness(valOfIt->second, {}, args[0]);
+            }
+            auto primIt = obj->properties.find("__date_value__");
+            if (primIt != obj->properties.end()) return primIt->second;
+          }
+          return Value(std::numeric_limits<double>::quiet_NaN());
+        }
+        // "string" or "default" hint: return toString() result
+        if (args[0].isObject()) {
+          auto obj = args[0].getGC<Object>();
+          auto toStrIt = obj->properties.find("toString");
+          if (toStrIt != obj->properties.end() && toStrIt->second.isFunction()) {
+            auto* interp = getGlobalInterpreter();
+            if (interp) return interp->callForHarness(toStrIt->second, {}, args[0]);
+          }
+        }
+        return Value(std::string("Invalid Date"));
+      };
+      const auto& toPrimKey = WellKnownSymbols::toPrimitiveKey();
+      datePrototype->properties[toPrimKey] = Value(toPrimFn);
+      datePrototype->properties["__non_enum_" + toPrimKey] = Value(true);
+      datePrototype->properties["__non_writable_" + toPrimKey] = Value(true);
+    }
   }
 
   // Date static methods
@@ -19786,30 +20066,99 @@ GCPtr<Environment> Environment::createGlobal() {
   stringConstructorObj->properties["fromCodePoint"] = Value(fromCodePoint);
   stringConstructorObj->properties["__non_enum_fromCodePoint"] = Value(true);
 
-  // String.raw
+  // String.raw - ES6 21.1.2.4
   auto stringRaw = GarbageCollector::makeGC<Function>();
   stringRaw->isNative = true;
   stringRaw->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || (!args[0].isObject() && !args[0].isArray())) {
-      return Value(std::string(""));
-    }
-    // Get the template object's raw property
-    GCPtr<Array> rawArr;
-    if (args[0].isObject()) {
-      auto obj = args[0].getGC<Object>();
-      auto rawIt = obj->properties.find("raw");
-      if (rawIt != obj->properties.end() && rawIt->second.isArray()) {
-        rawArr = rawIt->second.getGC<Array>();
-      }
-    }
-    if (!rawArr) return Value(std::string(""));
+    auto* interp = getGlobalInterpreter();
 
+    // Helper: ToString with JS method invocation for objects
+    auto jsToString = [&](const Value& val) -> std::string {
+      if (val.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      }
+      if (val.isObject() && interp) {
+        auto obj = val.getGC<Object>();
+        auto toStrIt = obj->properties.find("toString");
+        if (toStrIt != obj->properties.end() && toStrIt->second.isFunction()) {
+          Value result = interp->callForHarness(toStrIt->second, {}, val);
+          if (interp->hasError()) {
+            { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          }
+          return result.toString();
+        }
+      }
+      return val.toString();
+    };
+
+    // Helper: Get property from value, invoking getters
+    auto getProp = [&](const Value& obj, const std::string& key) -> Value {
+      if (interp) {
+        auto [found, val] = interp->getPropertyForExternal(obj, key);
+        if (interp->hasError()) {
+          { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        }
+        if (found) return val;
+        return Value(Undefined{});
+      }
+      // Fallback without interpreter
+      if (obj.isObject()) {
+        auto o = obj.getGC<Object>();
+        auto it = o->properties.find(key);
+        if (it != o->properties.end()) return it->second;
+      } else if (obj.isArray()) {
+        auto a = obj.getGC<Array>();
+        auto it = a->properties.find(key);
+        if (it != a->properties.end()) return it->second;
+      }
+      return Value(Undefined{});
+    };
+
+    // Step 3-4: ToObject(template) - throws TypeError on null/undefined
+    if (args.empty() || args[0].isNull() || args[0].isUndefined()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+
+    Value templateVal = args[0];
+    size_t numberOfSubstitutions = args.size() > 1 ? args.size() - 1 : 0;
+
+    // Step 5-6: Get raw property and ToObject(raw) - throws on null/undefined
+    Value rawVal = getProp(templateVal, "raw");
+    if (rawVal.isNull() || rawVal.isUndefined()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+
+    // Step 7-8: Get length from raw, ToLength(length)
+    double literalSegments = 0;
+    if (rawVal.isArray()) {
+      literalSegments = static_cast<double>(rawVal.getGC<Array>()->elements.size());
+    } else if (rawVal.isObject()) {
+      Value lenVal = getProp(rawVal, "length");
+      if (lenVal.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a number");
+      }
+      literalSegments = lenVal.toNumber();
+      if (std::isnan(literalSegments) || literalSegments < 0) literalSegments = 0;
+      literalSegments = std::floor(literalSegments);
+    }
+
+    // Step 9: If literalSegments <= 0, return ""
+    if (literalSegments <= 0) return Value(std::string(""));
+
+    size_t numLiterals = static_cast<size_t>(literalSegments);
+
+    // Step 10-12: Build string
     std::string result;
-    size_t literalCount = rawArr->elements.size();
-    for (size_t i = 0; i < literalCount; i++) {
-      result += rawArr->elements[i].toString();
-      if (i + 1 < literalCount && i + 1 < args.size()) {
-        result += args[i + 1].toString();
+    for (size_t i = 0; i < numLiterals; i++) {
+      // Step 12b-c: Get(raw, nextKey) then ToString
+      Value nextSeg = getProp(rawVal, std::to_string(i));
+      result += jsToString(nextSeg);
+
+      // Step 12e-i: Append substitution if not last segment
+      if (i + 1 < numLiterals) {
+        if (i < numberOfSubstitutions) {
+          result += jsToString(args[i + 1]);
+        }
       }
     }
     return Value(result);
@@ -19821,6 +20170,7 @@ GCPtr<Environment> Environment::createGlobal() {
   stringRaw->properties["__non_writable_length"] = Value(true);
   stringRaw->properties["__non_enum_length"] = Value(true);
   stringConstructorObj->properties["raw"] = Value(stringRaw);
+  stringConstructorObj->properties["__non_enum_raw"] = Value(true);
 
   auto stringPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
@@ -19965,16 +20315,13 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.startsWith
   installStringPrototypeMethod("startsWith", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "startsWith");
-    if (args.size() < 2) return Value(false);
-    // Check if arg is regex - throw TypeError
-    if (args[1].isRegex()) {
+    if (args.size() >= 2 && args[1].isRegex()) {
       throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
     }
-    std::string searchStr = args[1].toString();
+    std::string searchStr = (args.size() < 2 || args[1].isUndefined()) ? "undefined" : toStringForStringBuiltinArg(args[1]);
     size_t pos = 0;
     if (args.size() > 2 && !args[2].isUndefined()) {
-      double p = args[2].toNumber();
-      if (std::isnan(p)) p = 0;
+      double p = toIntegerForStringBuiltinArg(args[2]);
       pos = static_cast<size_t>(std::max(0.0, std::min(p, static_cast<double>(str.size()))));
     }
     if (pos + searchStr.size() > str.size()) return Value(false);
@@ -19984,15 +20331,13 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.endsWith
   installStringPrototypeMethod("endsWith", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "endsWith");
-    if (args.size() < 2) return Value(false);
-    if (args[1].isRegex()) {
+    if (args.size() >= 2 && args[1].isRegex()) {
       throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
     }
-    std::string searchStr = args[1].toString();
+    std::string searchStr = (args.size() < 2 || args[1].isUndefined()) ? "undefined" : toStringForStringBuiltinArg(args[1]);
     size_t endPos = str.size();
     if (args.size() > 2 && !args[2].isUndefined()) {
-      double e = args[2].toNumber();
-      if (std::isnan(e)) e = 0;
+      double e = toIntegerForStringBuiltinArg(args[2]);
       endPos = static_cast<size_t>(std::max(0.0, std::min(e, static_cast<double>(str.size()))));
     }
     if (searchStr.size() > endPos) return Value(false);
@@ -20002,23 +20347,23 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.includes
   installStringPrototypeMethod("includes", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "includes");
-    if (args.size() < 2) return Value(false);
-    if (args[1].isRegex()) {
+    if (args.size() >= 2 && args[1].isRegex()) {
       throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
     }
-    std::string searchStr = args[1].toString();
-    size_t pos = 0;
+    std::string searchStr = (args.size() < 2 || args[1].isUndefined()) ? "undefined" : toStringForStringBuiltinArg(args[1]);
+    double pos = 0;
     if (args.size() > 2 && !args[2].isUndefined()) {
-      double p = args[2].toNumber();
-      if (!std::isnan(p)) pos = static_cast<size_t>(std::max(0.0, p));
+      pos = toIntegerForStringBuiltinArg(args[2]);
+      if (pos < 0) pos = 0;
     }
-    return Value(str.find(searchStr, pos) != std::string::npos);
+    size_t start = static_cast<size_t>(std::min(pos, static_cast<double>(str.size())));
+    return Value(str.find(searchStr, start) != std::string::npos);
   }, false);
 
   // String.prototype.repeat
   installStringPrototypeMethod("repeat", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "repeat");
-    double count = args.size() > 1 ? args[1].toNumber() : 0;
+    double count = args.size() > 1 ? toNumberForStringBuiltinArg(args[1]) : 0;
     if (std::isnan(count) || count < 0 || count == std::numeric_limits<double>::infinity()) {
       throw std::runtime_error("RangeError: Invalid count value");
     }
@@ -20037,11 +20382,11 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.padStart
   installStringPrototypeMethod("padStart", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "padStart");
-    double maxLen = args.size() > 1 ? args[1].toNumber() : 0;
-    if (std::isnan(maxLen)) maxLen = 0;
+    double maxLen = args.size() > 1 ? toIntegerForStringBuiltinArg(args[1]) : 0;
+    if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
     size_t targetLen = static_cast<size_t>(maxLen);
     if (targetLen <= str.size()) return Value(str);
-    std::string filler = args.size() > 2 && !args[2].isUndefined() ? args[2].toString() : " ";
+    std::string filler = args.size() > 2 && !args[2].isUndefined() ? toStringForStringBuiltinArg(args[2]) : " ";
     if (filler.empty()) return Value(str);
     size_t padLen = targetLen - str.size();
     std::string padding;
@@ -20053,11 +20398,11 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.padEnd
   installStringPrototypeMethod("padEnd", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "padEnd");
-    double maxLen = args.size() > 1 ? args[1].toNumber() : 0;
-    if (std::isnan(maxLen)) maxLen = 0;
+    double maxLen = args.size() > 1 ? toIntegerForStringBuiltinArg(args[1]) : 0;
+    if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
     size_t targetLen = static_cast<size_t>(maxLen);
     if (targetLen <= str.size()) return Value(str);
-    std::string filler = args.size() > 2 && !args[2].isUndefined() ? args[2].toString() : " ";
+    std::string filler = args.size() > 2 && !args[2].isUndefined() ? toStringForStringBuiltinArg(args[2]) : " ";
     if (filler.empty()) return Value(str);
     size_t padLen = targetLen - str.size();
     std::string padding;
@@ -20069,6 +20414,21 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.search
   installStringPrototypeMethod("search", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "search");
+    // ES2020: Check for @@search on the argument
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (interp) {
+        const std::string& searchKey = WellKnownSymbols::searchKey();
+        auto [found, searcher] = interp->getPropertyForExternal(args[1], searchKey);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (found && !searcher.isUndefined() && !searcher.isNull()) {
+          if (!searcher.isFunction()) throw std::runtime_error("TypeError: @@search is not a function");
+          Value result = interp->callForHarness(searcher, {Value(str)}, args[1]);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          return result;
+        }
+      }
+    }
     if (args.size() < 2) return Value(-1.0);
     if (args[1].isRegex()) {
       // Use std::regex for matching
@@ -20085,15 +20445,29 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(-1.0);
 #endif
     }
-    std::string searchStr = args[1].toString();
+    std::string searchStr = toStringForStringBuiltinArg(args[1]);
     auto pos = str.find(searchStr);
     return Value(pos != std::string::npos ? static_cast<double>(pos) : -1.0);
   }, false);
 
-  // String.prototype.match — regex matching delegated to evaluateMember in interpreter
-  // Just register a basic version here for non-regex cases
+  // String.prototype.match
   installStringPrototypeMethod("match", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "match");
+    // ES2020: Check for @@match on the argument
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (interp) {
+        const std::string& matchKey = WellKnownSymbols::matchKey();
+        auto [found, matcher] = interp->getPropertyForExternal(args[1], matchKey);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (found && !matcher.isUndefined() && !matcher.isNull()) {
+          if (!matcher.isFunction()) throw std::runtime_error("TypeError: @@match is not a function");
+          Value result = interp->callForHarness(matcher, {Value(str)}, args[1]);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          return result;
+        }
+      }
+    }
     if (args.size() < 2 || args[1].isUndefined()) {
       auto result = makeArrayWithPrototype();
       result->elements.push_back(Value(std::string("")));
@@ -20164,6 +20538,42 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.replaceAll
   installStringPrototypeMethod("replaceAll", 2, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "replaceAll");
+    // ES2021: Check @@replace on the searchValue
+    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (interp) {
+        // IsRegExp check via @@match
+        const std::string& matchKey = WellKnownSymbols::matchKey();
+        auto [hasMatch, matchProp] = interp->getPropertyForExternal(args[1], matchKey);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        bool isRegExp = (hasMatch && !matchProp.isUndefined() && !matchProp.isNull()) || args[1].isRegex();
+        if (isRegExp) {
+          // Must have 'g' flag
+          if (args[1].isRegex()) {
+            auto rx = args[1].getGC<Regex>();
+            if (rx->flags.find('g') == std::string::npos)
+              throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
+          } else {
+            auto [hasFlags, flagsVal] = interp->getPropertyForExternal(args[1], "flags");
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            std::string flags = hasFlags ? flagsVal.toString() : "";
+            if (flags.find('g') == std::string::npos)
+              throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
+          }
+        }
+        // Check for @@replace
+        const std::string& replaceKey = WellKnownSymbols::replaceKey();
+        auto [found, replacer] = interp->getPropertyForExternal(args[1], replaceKey);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (found && !replacer.isUndefined() && !replacer.isNull()) {
+          if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
+          Value replaceValue = args.size() > 2 ? args[2] : Value(Undefined{});
+          Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[1]);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          return result;
+        }
+      }
+    }
     if (args.size() < 2) return Value(str);
     if (args[1].isRegex()) {
       auto rx = args[1].getGC<Regex>();
@@ -20201,14 +20611,17 @@ GCPtr<Environment> Environment::createGlobal() {
   }, false);
 
   // String.prototype.isWellFormed (ES2024)
+  // Operates on UTF-16 code units: lone surrogates = not well-formed, paired surrogates = well-formed
   installStringPrototypeMethod("isWellFormed", 0, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "isWellFormed");
+    // Decode all UTF-8 code points, then check for lone surrogates in UTF-16 model
+    std::vector<int32_t> cps;
     size_t i = 0;
     while (i < str.size()) {
       unsigned char ch = static_cast<unsigned char>(str[i]);
-      if (ch < 0x80) { i++; continue; }
-      int32_t cp = 0; int extra = 0; bool valid = true;
-      if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+      int32_t cp = 0; int extra = 0;
+      if (ch < 0x80) { cp = ch; extra = 0; }
+      else if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
       else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
       else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
       else { return Value(false); }
@@ -20219,7 +20632,22 @@ GCPtr<Environment> Environment::createGlobal() {
         cp = (cp << 6) | (static_cast<unsigned char>(str[i]) & 0x3F);
       }
       i++;
-      if (cp >= 0xD800 && cp <= 0xDFFF) return Value(false);
+      cps.push_back(cp);
+    }
+    // Check for lone surrogates (unpaired high or low surrogates)
+    for (size_t k = 0; k < cps.size(); k++) {
+      int32_t cp = cps[k];
+      if (cp >= 0xD800 && cp <= 0xDBFF) {
+        // High surrogate: must be followed by low surrogate
+        if (k + 1 < cps.size() && cps[k + 1] >= 0xDC00 && cps[k + 1] <= 0xDFFF) {
+          k++; // Skip the paired low surrogate
+          continue;
+        }
+        return Value(false);
+      } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        // Lone low surrogate
+        return Value(false);
+      }
     }
     return Value(true);
   }, true);
@@ -20227,14 +20655,16 @@ GCPtr<Environment> Environment::createGlobal() {
   // String.prototype.toWellFormed (ES2024)
   installStringPrototypeMethod("toWellFormed", 0, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "toWellFormed");
-    std::string result;
+    // First decode all code points with their byte spans
+    struct CpSpan { int32_t cp; size_t start; size_t end; };
+    std::vector<CpSpan> cps;
     size_t i = 0;
     while (i < str.size()) {
       unsigned char ch = static_cast<unsigned char>(str[i]);
-      if (ch < 0x80) { result += str[i]; i++; continue; }
       size_t start = i;
       int32_t cp = 0; int extra = 0; bool valid = true;
-      if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
+      if (ch < 0x80) { cp = ch; extra = 0; }
+      else if ((ch & 0xE0) == 0xC0) { cp = ch & 0x1F; extra = 1; }
       else if ((ch & 0xF0) == 0xE0) { cp = ch & 0x0F; extra = 2; }
       else if ((ch & 0xF8) == 0xF0) { cp = ch & 0x07; extra = 3; }
       else { valid = false; }
@@ -20246,10 +20676,30 @@ GCPtr<Environment> Environment::createGlobal() {
         }
         i++;
       } else { valid = false; i++; }
-      if (!valid || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      if (!valid) cp = 0xFFFD; // invalid byte -> replacement
+      cps.push_back({cp, start, i});
+    }
+    // Build result, replacing lone surrogates with U+FFFD and combining paired surrogates
+    std::string result;
+    for (size_t k = 0; k < cps.size(); k++) {
+      int32_t cp = cps[k].cp;
+      if (cp >= 0xD800 && cp <= 0xDBFF) {
+        // High surrogate: check for paired low surrogate
+        if (k + 1 < cps.size() && cps[k + 1].cp >= 0xDC00 && cps[k + 1].cp <= 0xDFFF) {
+          // Combine into real code point
+          int32_t combined = 0x10000 + ((cp - 0xD800) << 10) + (cps[k + 1].cp - 0xDC00);
+          result += unicode::encodeUTF8(static_cast<uint32_t>(combined));
+          k++; // Skip the low surrogate
+          continue;
+        }
+        result += "\xEF\xBF\xBD"; // Lone high surrogate -> replacement
+      } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        result += "\xEF\xBF\xBD"; // Lone low surrogate -> replacement
+      } else if (cp == 0xFFFD) {
         result += "\xEF\xBF\xBD";
       } else {
-        for (size_t j = start; j < i; j++) result += str[j];
+        // Copy original bytes
+        for (size_t j = cps[k].start; j < cps[k].end; j++) result += str[j];
       }
     }
     return Value(result);
