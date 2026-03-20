@@ -46,7 +46,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 125 | 165 | 75.8% |
 | `built-ins/String` | 1141 | 1223 | 93.3% |
-| `built-ins/Object` | 3045 | 3413 | 89.2% |
+| `built-ins/Object` | 3045 | 3413 | 89.3% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
 | `built-ins/parseFloat` | 54 | 54 | 100.0% |
@@ -54,9 +54,9 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/DataView` | 561 | 561 | 100.0% |
 | `built-ins/BigInt` | 77 | 77 | 100.0% |
 | `built-ins/Promise` | 631 | 652 | 96.8% |
-| `built-ins/Set` | 345 | 383 | 90.1% |
-| `built-ins/Map` | 182 | 204 | 89.2% |
-| `built-ins/Symbol` | 87 | 98 | 88.8% |
+| `built-ins/Set` | 349 | 383 | 91.1% |
+| `built-ins/Map` | 186 | 204 | 91.2% |
+| `built-ins/Symbol` | 88 | 98 | 89.8% |
 | `built-ins/Error` | 53 | 58 | 91.4% |
 | `built-ins/WeakSet` | 69 | 85 | 81.2% |
 | `built-ins/Function` | 380 | 509 | 74.7% |
