@@ -16595,6 +16595,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoHasOwnProperty = GarbageCollector::makeGC<Function>();
   objectProtoHasOwnProperty->isNative = true;
   objectProtoHasOwnProperty->properties["__uses_this_arg__"] = Value(true);
+  objectProtoHasOwnProperty->properties["name"] = Value(std::string("hasOwnProperty"));
+  objectProtoHasOwnProperty->properties["__non_writable_name"] = Value(true);
+  objectProtoHasOwnProperty->properties["__non_enum_name"] = Value(true);
+  objectProtoHasOwnProperty->properties["length"] = Value(1.0);
+  objectProtoHasOwnProperty->properties["__non_writable_length"] = Value(true);
+  objectProtoHasOwnProperty->properties["__non_enum_length"] = Value(true);
   objectProtoHasOwnProperty->nativeFunc = Object_hasOwnProperty;
   objectPrototype->properties["hasOwnProperty"] = Value(objectProtoHasOwnProperty);
   objectPrototype->properties["__non_enum_hasOwnProperty"] = Value(true);
@@ -16602,6 +16608,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoIsPrototypeOf = GarbageCollector::makeGC<Function>();
   objectProtoIsPrototypeOf->isNative = true;
   objectProtoIsPrototypeOf->properties["__uses_this_arg__"] = Value(true);
+  objectProtoIsPrototypeOf->properties["name"] = Value(std::string("isPrototypeOf"));
+  objectProtoIsPrototypeOf->properties["__non_writable_name"] = Value(true);
+  objectProtoIsPrototypeOf->properties["__non_enum_name"] = Value(true);
+  objectProtoIsPrototypeOf->properties["length"] = Value(1.0);
+  objectProtoIsPrototypeOf->properties["__non_writable_length"] = Value(true);
+  objectProtoIsPrototypeOf->properties["__non_enum_length"] = Value(true);
   objectProtoIsPrototypeOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto isObjectLikeValue = [](const Value& value) -> bool {
       return value.isObject() || value.isArray() || value.isFunction() || value.isRegex() ||
@@ -16727,6 +16739,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoValueOf = GarbageCollector::makeGC<Function>();
   objectProtoValueOf->isNative = true;
   objectProtoValueOf->properties["__uses_this_arg__"] = Value(true);
+  objectProtoValueOf->properties["name"] = Value(std::string("valueOf"));
+  objectProtoValueOf->properties["__non_writable_name"] = Value(true);
+  objectProtoValueOf->properties["__non_enum_name"] = Value(true);
+  objectProtoValueOf->properties["length"] = Value(0.0);
+  objectProtoValueOf->properties["__non_writable_length"] = Value(true);
+  objectProtoValueOf->properties["__non_enum_length"] = Value(true);
   objectProtoValueOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
@@ -16865,6 +16883,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoPropertyIsEnumerable = GarbageCollector::makeGC<Function>();
   objectProtoPropertyIsEnumerable->isNative = true;
   objectProtoPropertyIsEnumerable->properties["__uses_this_arg__"] = Value(true);
+  objectProtoPropertyIsEnumerable->properties["name"] = Value(std::string("propertyIsEnumerable"));
+  objectProtoPropertyIsEnumerable->properties["__non_writable_name"] = Value(true);
+  objectProtoPropertyIsEnumerable->properties["__non_enum_name"] = Value(true);
+  objectProtoPropertyIsEnumerable->properties["length"] = Value(1.0);
+  objectProtoPropertyIsEnumerable->properties["__non_writable_length"] = Value(true);
+  objectProtoPropertyIsEnumerable->properties["__non_enum_length"] = Value(true);
   objectProtoPropertyIsEnumerable->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(false);
     Value thisVal = args[0];
