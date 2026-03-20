@@ -45,7 +45,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 125 | 165 | 75.8% |
-| `built-ins/String` | 1126 | 1223 | 92.1% |
+| `built-ins/String` | 1141 | 1223 | 93.3% |
 | `built-ins/Object` | 2980 | 3413 | 87.4% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
@@ -388,7 +388,11 @@ Next targets for `built-ins` scope (by priority):
 - **Math** (99.4%): `Math.sumPrecise` rounding correction (1 test), `Math.f16round` value conversion (1 test)
 - **Number** (99.7%): `proto-from-ctor-realm` (1 remaining failure, requires multi-realm support)
 - **Boolean** (98.0%): `proto-from-ctor-realm` (1 remaining failure)
-- **String** (92.1%): 92 remaining — replace (15), replaceAll (15), split (11), match (8), normalize (6), search (3), toLocale/Case (12), other (22). Remaining: $1-$9 capture group substitution, regex $-patterns in @@replace, empty regex split, Unicode normalization.
+- **String** (93.3%): 77 remaining — replace (14), replaceAll (12), split (11), match (4), normalize (6), search (3), toLocale/Case (12), other (15). Remaining: $1-$9 capture groups, regex evaluation order, empty regex split, Unicode normalization.
+- **Promise** (96.8%): 21 remaining — allSettledKeyed/allKeyed proposals (12), finally species (5), then self-resolution (4)
+- **Set** (90.1%): 38 remaining — set methods proposals (24), Symbol.species (4), constructor iterator (10)
+- **Map** (89.2%): 22 remaining — Symbol.species (4), constructor iterator protocol (14), proposals (4)
+- **Function** (71.9%): 143 remaining — toString source text (73), bind (15), apply (7), other (48)
 - **Object**, **Array**, **Function**, **Promise**, **RegExp**: not yet baselined
 
 Next targets for remaining 11 `language` failures:
