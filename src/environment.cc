@@ -17970,8 +17970,9 @@ GCPtr<Environment> Environment::createGlobal() {
       props["__frozen__"] = Value(true);
       props["__sealed__"] = Value(true);
       props["__non_extensible__"] = Value(true);
-      // Mark all own data properties as non-writable and non-configurable
-      for (const auto& key : props.orderedKeys()) {
+      // Snapshot keys first to avoid modifying the map during iteration
+      auto keys = props.orderedKeys(); // copy
+      for (const auto& key : keys) {
         if (key.find("__") == 0) continue;
         props["__non_writable_" + key] = Value(true);
         props["__non_configurable_" + key] = Value(true);
@@ -18027,7 +18028,8 @@ GCPtr<Environment> Environment::createGlobal() {
     auto setSealed = [](OrderedMap<std::string, Value>& props) {
       props["__sealed__"] = Value(true);
       props["__non_extensible__"] = Value(true);
-      for (const auto& key : props.orderedKeys()) {
+      auto keys = props.orderedKeys(); // copy to avoid modification during iteration
+      for (const auto& key : keys) {
         if (key.find("__") == 0) continue;
         props["__non_configurable_" + key] = Value(true);
       }
