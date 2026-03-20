@@ -9201,24 +9201,27 @@ GCPtr<Environment> Environment::createGlobal() {
   auto uriErrorCtor = createErrorConstructor(ErrorType::URIError, "URIError");
   auto evalErrorCtor = createErrorConstructor(ErrorType::EvalError, "EvalError");
 
-  // Set sub-error prototypes' __proto__ to Error.prototype (for proper toString inheritance)
+  // Set sub-error prototypes' __proto__ to Error.prototype and
+  // sub-error constructors' __proto__ to Error constructor
   {
+    Value errorCtorVal = Value(errorCtor);
     auto errorProtoIt = errorCtor->properties.find("prototype");
-    if (errorProtoIt != errorCtor->properties.end()) {
-      Value errorProtoVal = errorProtoIt->second;
-      auto setProtoChain = [&](GCPtr<Function> sub) {
-        auto subProtoIt = sub->properties.find("prototype");
-        if (subProtoIt != sub->properties.end() && subProtoIt->second.isObject()) {
-          subProtoIt->second.getGC<Object>()->properties["__proto__"] = errorProtoVal;
-        }
-      };
-      setProtoChain(typeErrorCtor);
-      setProtoChain(referenceErrorCtor);
-      setProtoChain(rangeErrorCtor);
-      setProtoChain(syntaxErrorCtor);
-      setProtoChain(uriErrorCtor);
-      setProtoChain(evalErrorCtor);
-    }
+    Value errorProtoVal = (errorProtoIt != errorCtor->properties.end()) ? errorProtoIt->second : Value(Undefined{});
+    auto setProtoChain = [&](GCPtr<Function> sub) {
+      // Constructor chain: TypeError.__proto__ === Error
+      sub->properties["__proto__"] = errorCtorVal;
+      // Prototype chain: TypeError.prototype.__proto__ === Error.prototype
+      auto subProtoIt = sub->properties.find("prototype");
+      if (subProtoIt != sub->properties.end() && subProtoIt->second.isObject()) {
+        subProtoIt->second.getGC<Object>()->properties["__proto__"] = errorProtoVal;
+      }
+    };
+    setProtoChain(typeErrorCtor);
+    setProtoChain(referenceErrorCtor);
+    setProtoChain(rangeErrorCtor);
+    setProtoChain(syntaxErrorCtor);
+    setProtoChain(uriErrorCtor);
+    setProtoChain(evalErrorCtor);
   }
 
   // Error.isError (ES2025)
@@ -9240,6 +9243,14 @@ GCPtr<Environment> Environment::createGlobal() {
   }
 
   // Set Error.prototype.__proto__ = Object.prototype later (after objectPrototype is created)
+
+  // Set constructor __proto__ to Error BEFORE defining in environment
+  typeErrorCtor->properties["__proto__"] = Value(errorCtor);
+  referenceErrorCtor->properties["__proto__"] = Value(errorCtor);
+  rangeErrorCtor->properties["__proto__"] = Value(errorCtor);
+  syntaxErrorCtor->properties["__proto__"] = Value(errorCtor);
+  uriErrorCtor->properties["__proto__"] = Value(errorCtor);
+  evalErrorCtor->properties["__proto__"] = Value(errorCtor);
 
   env->define("Error", Value(errorCtor));
   env->define("TypeError", Value(typeErrorCtor));
@@ -22393,12 +22404,8 @@ GCPtr<Environment> Environment::createGlobal() {
     setFuncProto("Array");
     setFuncProto("RegExp");
     setFuncProto("Error");
-    setFuncProto("TypeError");
-    setFuncProto("RangeError");
-    setFuncProto("ReferenceError");
-    setFuncProto("SyntaxError");
-    setFuncProto("URIError");
-    setFuncProto("EvalError");
+    // Sub-error constructors: __proto__ = Error (not Function.prototype)
+    // Set by the error constructor chain setup code above
     setFuncProto("Date");
     setFuncProto("Map");
     setFuncProto("Set");
