@@ -17263,6 +17263,78 @@ GCPtr<Environment> Environment::createGlobal() {
   objectPrototype->properties["__lookupGetter__"] = Value(objectProtoLookupGetter);
   objectPrototype->properties["__non_enum___lookupGetter__"] = Value(true);
 
+  // Annex B: Object.prototype.__defineGetter__
+  {
+    auto fn = GarbageCollector::makeGC<Function>();
+    fn->isNative = true;
+    fn->properties["__uses_this_arg__"] = Value(true);
+    fn->properties["name"] = Value(std::string("__defineGetter__"));
+    fn->properties["__non_writable_name"] = Value(true);
+    fn->properties["__non_enum_name"] = Value(true);
+    fn->properties["length"] = Value(2.0);
+    fn->properties["__non_writable_length"] = Value(true);
+    fn->properties["__non_enum_length"] = Value(true);
+    fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.size() < 3) throw std::runtime_error("TypeError: __defineGetter__ requires 2 arguments");
+      if (args[0].isUndefined() || args[0].isNull()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+      }
+      if (!args[2].isFunction()) {
+        throw std::runtime_error("TypeError: getter must be a function");
+      }
+      std::string key = valueToPropertyKey(args[1]);
+      auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
+        props["__get_" + key] = args[2];
+        props.erase("__non_writable_" + key);
+        props.erase("__non_configurable_" + key);
+      };
+      if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
+      else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
+      else if (args[0].isFunction()) setOnProps(args[0].getGC<Function>()->properties);
+      else if (args[0].isRegex()) setOnProps(args[0].getGC<Regex>()->properties);
+      else if (args[0].isError()) setOnProps(args[0].getGC<Error>()->properties);
+      return Value(Undefined{});
+    };
+    objectPrototype->properties["__defineGetter__"] = Value(fn);
+    objectPrototype->properties["__non_enum___defineGetter__"] = Value(true);
+  }
+
+  // Annex B: Object.prototype.__defineSetter__
+  {
+    auto fn = GarbageCollector::makeGC<Function>();
+    fn->isNative = true;
+    fn->properties["__uses_this_arg__"] = Value(true);
+    fn->properties["name"] = Value(std::string("__defineSetter__"));
+    fn->properties["__non_writable_name"] = Value(true);
+    fn->properties["__non_enum_name"] = Value(true);
+    fn->properties["length"] = Value(2.0);
+    fn->properties["__non_writable_length"] = Value(true);
+    fn->properties["__non_enum_length"] = Value(true);
+    fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.size() < 3) throw std::runtime_error("TypeError: __defineSetter__ requires 2 arguments");
+      if (args[0].isUndefined() || args[0].isNull()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+      }
+      if (!args[2].isFunction()) {
+        throw std::runtime_error("TypeError: setter must be a function");
+      }
+      std::string key = valueToPropertyKey(args[1]);
+      auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
+        props["__set_" + key] = args[2];
+        props.erase("__non_writable_" + key);
+        props.erase("__non_configurable_" + key);
+      };
+      if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
+      else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
+      else if (args[0].isFunction()) setOnProps(args[0].getGC<Function>()->properties);
+      else if (args[0].isRegex()) setOnProps(args[0].getGC<Regex>()->properties);
+      else if (args[0].isError()) setOnProps(args[0].getGC<Error>()->properties);
+      return Value(Undefined{});
+    };
+    objectPrototype->properties["__defineSetter__"] = Value(fn);
+    objectPrototype->properties["__non_enum___defineSetter__"] = Value(true);
+  }
+
   // Annex B: Object.prototype.__lookupSetter__
   auto objectProtoLookupSetter = GarbageCollector::makeGC<Function>();
   objectProtoLookupSetter->isNative = true;
