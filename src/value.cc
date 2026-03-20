@@ -2186,8 +2186,8 @@ static bool isInternalProperty(const std::string& key) {
 Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
   auto result = makeArrayWithPrototype();
 
-  if (args.empty()) {
-    return Value(result);
+  if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
   }
 
   auto parseArrayIndexKey = [](const std::string& key, uint32_t& out) -> bool {
