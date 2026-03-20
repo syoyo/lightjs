@@ -8983,6 +8983,15 @@ GCPtr<Environment> Environment::createGlobal() {
       for (; it != endIt; ++it) {
         size_t matchStart = static_cast<size_t>(it->position(0));
         size_t matchLen = static_cast<size_t>(it->length(0));
+        // For empty match at lastEnd, split produces the char before advancing
+        if (matchLen == 0 && matchStart == lastEnd) {
+          if (lastEnd < str.size()) {
+            result->elements.push_back(Value(str.substr(lastEnd, 1)));
+            if (result->elements.size() >= limit) return Value(result);
+          }
+          lastEnd = matchStart + 1;
+          continue;
+        }
         result->elements.push_back(Value(str.substr(lastEnd, matchStart - lastEnd)));
         if (result->elements.size() >= limit) return Value(result);
         // Add capture groups
@@ -8992,9 +9001,10 @@ GCPtr<Environment> Environment::createGlobal() {
           if (result->elements.size() >= limit) return Value(result);
         }
         lastEnd = matchStart + matchLen;
-        if (matchLen == 0) lastEnd++; // Avoid infinite loop on empty match
       }
-      result->elements.push_back(Value(str.substr(lastEnd)));
+      if (lastEnd <= str.size()) {
+        result->elements.push_back(Value(str.substr(lastEnd)));
+      }
 #endif
       if (result->elements.size() > limit) {
         result->elements.resize(limit);
