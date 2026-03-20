@@ -16981,19 +16981,13 @@ GCPtr<Environment> Environment::createGlobal() {
       auto arr = O.getGC<Array>();
       if (arr->properties.count("__is_arguments_object__")) builtinTag = "Arguments";
     }
-    else if (O.isFunction()) {
+    else if (O.isFunction() || O.isClass()) {
       builtinTag = "Function";
-      auto fn = O.getGC<Function>();
-      if (fn->isGenerator) builtinTag = "GeneratorFunction";
     }
-    else if (O.isGenerator()) builtinTag = "Generator";
     else if (O.isRegex()) builtinTag = "RegExp";
     else if (O.isError()) builtinTag = "Error";
-    else if (O.isMap()) builtinTag = "Map";
-    else if (O.isSet()) builtinTag = "Set";
-    else if (O.isWeakMap()) builtinTag = "WeakMap";
-    else if (O.isWeakSet()) builtinTag = "WeakSet";
-    else if (O.isPromise()) builtinTag = "Promise";
+    // Map, Set, WeakMap, WeakSet, Promise, Generator, GeneratorFunction
+    // get their tags from @@toStringTag (not builtinTag per spec steps 4-14)
     else if (O.isTypedArray()) {
       auto ta = O.getGC<TypedArray>();
       switch (ta->type) {
@@ -22448,6 +22442,12 @@ GCPtr<Environment> Environment::createGlobal() {
   }
   // %GeneratorPrototype%.constructor is %GeneratorFunction.prototype%
   generatorPrototype->properties["constructor"] = Value(generatorFunctionPrototype);
+  // %GeneratorPrototype%[@@toStringTag] = "Generator"
+  generatorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Generator"));
+  generatorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  // %GeneratorFunction.prototype%[@@toStringTag] = "GeneratorFunction"
+  generatorFunctionPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("GeneratorFunction"));
+  generatorFunctionPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
 
   // GeneratorFunction constructor (not a global binding; reachable via
   // Object.getPrototypeOf(function*(){}).constructor)
