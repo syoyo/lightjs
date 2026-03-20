@@ -53,12 +53,20 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/ArrayBuffer` | 196 | 196 | 100.0% |
 | `built-ins/DataView` | 561 | 561 | 100.0% |
 | `built-ins/BigInt` | 77 | 77 | 100.0% |
+| `built-ins/Promise` | 631 | 652 | 96.8% |
+| `built-ins/Set` | 345 | 383 | 90.1% |
+| `built-ins/Map` | 182 | 204 | 89.2% |
+| `built-ins/Symbol` | 87 | 98 | 88.8% |
+| `built-ins/Error` | 50 | 58 | 86.2% |
+| `built-ins/WeakSet` | 69 | 85 | 81.2% |
+| `built-ins/Function` | 374 | 509 | 73.5% |
+| `built-ins/WeakMap` | 96 | 141 | 68.1% |
 
 Unit tests: 346/346 passing.
 
 #### Changes (2026-03-20 #4)
 
-145 String tests fixed (927→1072/1223), 0 regressions:
+214+ String tests fixed (927→1141/1223), 8 Function tests fixed (366→374/509), 0 regressions:
 
 - **String.raw** (`src/environment.cc`): spec-compliant ToObject validation, TypeError on null/undefined, JS toString() invocation via callForHarness, getter support, Symbol rejection. 30/30 passing.
 - **String.prototype.slice** (`src/interpreter.cc`, `src/string_methods.cc`): NaN/Infinity handling, double→int clamping via toIntegerForStringBuiltinArg. 38/38 passing.
