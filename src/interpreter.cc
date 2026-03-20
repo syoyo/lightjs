@@ -10720,9 +10720,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto includesFn = GarbageCollector::makeGC<Function>();
       includesFn->isNative = true;
       includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // ES spec: throw TypeError if searchString is a RegExp
-        if (!args.empty() && args[0].isRegex()) {
-          throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
+        // IsRegExp check via Symbol.match
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp && (args[0].isObject() || args[0].isRegex() || args[0].isArray() || args[0].isFunction())) {
+            const std::string& matchKey = WellKnownSymbols::matchKey();
+            auto [found, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !matchProp.isUndefined()) {
+              if (matchProp.isBool() ? std::get<bool>(matchProp.data) : true) {
+                throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
+              }
+            } else if (args[0].isRegex()) {
+              throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
+            }
+          } else if (args[0].isRegex()) {
+            throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
+          }
         }
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         double pos = 0;
@@ -10918,8 +10932,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (!args.empty() && args[0].isRegex()) {
-          throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+        // IsRegExp check: access Symbol.match, throw if getter throws or returns truthy
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp && (args[0].isObject() || args[0].isRegex() || args[0].isArray() || args[0].isFunction())) {
+            const std::string& matchKey = WellKnownSymbols::matchKey();
+            auto [found, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !matchProp.isUndefined()) {
+              if (matchProp.isBool() ? std::get<bool>(matchProp.data) : true) {
+                throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+              }
+            } else if (args[0].isRegex()) {
+              throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+            }
+          } else if (args[0].isRegex()) {
+            throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+          }
         }
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         double pos = 0;
@@ -10938,8 +10967,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (!args.empty() && args[0].isRegex()) {
-          throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+        // IsRegExp check
+        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp && (args[0].isObject() || args[0].isRegex() || args[0].isArray() || args[0].isFunction())) {
+            const std::string& matchKey = WellKnownSymbols::matchKey();
+            auto [found, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (found && !matchProp.isUndefined()) {
+              if (matchProp.isBool() ? std::get<bool>(matchProp.data) : true) {
+                throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+              }
+            } else if (args[0].isRegex()) {
+              throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+            }
+          } else if (args[0].isRegex()) {
+            throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+          }
         }
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         double e = static_cast<double>(str.length());
@@ -11066,8 +11110,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(0.0);
-        std::string other = args[0].toString();
+        std::string other = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         int result = str.compare(other);
         return Value(static_cast<double>(result < 0 ? -1 : (result > 0 ? 1 : 0)));
       };
@@ -11459,19 +11502,25 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         if (args.size() < 2) return Value(str);
         std::string search = toStringForStringBuiltinArg(args[0]);
-        std::string replacement = args[1].isFunction() ? "" : toStringForStringBuiltinArg(args[1]);
-        if (search.empty()) {
-          // Insert replacement between every character and at start/end
-          std::string result;
-          result += replacement;
-          for (size_t i = 0; i < str.size(); ++i) {
-            result += str[i];
-            result += replacement;
+        bool isFnReplacer = args[1].isFunction();
+        std::string replacement = isFnReplacer ? "" : toStringForStringBuiltinArg(args[1]);
+
+        // Helper: get replacement for a match
+        auto getReplacement = [&](const std::string& matched, size_t matchPos) -> std::string {
+          if (isFnReplacer) {
+            auto* interp = getGlobalInterpreter();
+            if (interp) {
+              std::vector<Value> cbArgs;
+              cbArgs.push_back(Value(matched));
+              cbArgs.push_back(Value(static_cast<double>(matchPos)));
+              cbArgs.push_back(Value(str));
+              Value result = interp->callForHarness(args[1], cbArgs, Value(Undefined{}));
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              return result.toString();
+            }
+            return "";
           }
-          return Value(result);
-        }
-        // GetSubstitution helper for replaceAll
-        auto getSubstitution = [&](const std::string& matched, size_t matchPos) -> std::string {
+          // GetSubstitution
           std::string sub;
           for (size_t i = 0; i < replacement.size(); i++) {
             if (replacement[i] == '$' && i + 1 < replacement.size()) {
@@ -11487,6 +11536,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           return sub;
         };
+
+        if (search.empty()) {
+          // Insert replacement between every character and at start/end
+          std::string result;
+          result += getReplacement("", 0);
+          for (size_t i = 0; i < str.size(); ++i) {
+            result += str[i];
+            result += getReplacement("", i + 1);
+          }
+          return Value(result);
+        }
         std::string result;
         size_t pos = 0;
         while (true) {
@@ -11496,7 +11556,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             break;
           }
           result += str.substr(pos, found - pos);
-          result += getSubstitution(search, found);
+          result += getReplacement(search, found);
           pos = found + search.size();
         }
         return Value(result);

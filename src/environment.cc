@@ -8946,8 +8946,8 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpConstructor->properties["name"] = Value(std::string("RegExp"));
   regExpConstructor->properties["length"] = Value(2.0);
   regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    std::string pattern = args.empty() ? std::string("") : args[0].toString();
-    std::string flags = args.size() > 1 ? args[1].toString() : "";
+    std::string pattern = (args.empty() || args[0].isUndefined()) ? std::string("") : args[0].toString();
+    std::string flags = (args.size() > 1 && !args[1].isUndefined()) ? args[1].toString() : "";
     auto rx = GarbageCollector::makeGC<Regex>(pattern, flags);
     // lastIndex: writable, non-enumerable, non-configurable
     rx->properties["lastIndex"] = Value(0.0);
@@ -20269,7 +20269,7 @@ GCPtr<Environment> Environment::createGlobal() {
   installStringPrototypeMethod("toLocaleUpperCase", 0, String_toUpperCase, true);
   installStringPrototypeMethod("localeCompare", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string self = thisToString(args, "localeCompare");
-    std::string that = args.size() > 1 ? args[1].toString() : "";
+    std::string that = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
     if (self < that) return Value(-1.0);
     if (self > that) return Value(1.0);
     return Value(0.0);
