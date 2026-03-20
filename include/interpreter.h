@@ -320,6 +320,8 @@ public:
                             const std::vector<Value>& args);
   std::pair<bool, Value> getPropertyForExternal(const Value& receiver,
                                                 const std::string& key);
+  // Look up a variable in the current scope chain (for native code access)
+  std::optional<Value> resolveVariable(const std::string& name);
 
   // Run a script string in the global scope (like a new <script> element).
   // Unlike eval, this uses proper GlobalDeclarationInstantiation semantics.

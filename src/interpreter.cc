@@ -802,6 +802,10 @@ Value Interpreter::callForHarness(const Value& callee,
   return callFunction(callee, args, thisValue);
 }
 
+std::optional<Value> Interpreter::resolveVariable(const std::string& name) {
+  return env_->get(name);
+}
+
 Value Interpreter::runScriptInGlobalScope(const std::string& source) {
   Lexer lexer(source);
   auto tokens = lexer.tokenize();
@@ -11220,24 +11224,30 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
           return Value(-1.0);
         }
-        // RegExpCreate fallback: create RegExp from ToString(arg), search with it
+        // RegExpCreate fallback: construct RegExp via constructor, invoke @@search
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
-        try {
-          auto rx = GarbageCollector::makeGC<Regex>(searchStr, "");
-#if USE_SIMPLE_REGEX
-          std::vector<simple_regex::Regex::Match> matches;
-          if (rx->regex->search(str, matches) && !matches.empty()) {
-            return Value(static_cast<double>(matches[0].start));
-          }
-#else
-          std::smatch m;
-          if (std::regex_search(str, m, rx->regex)) {
-            return Value(static_cast<double>(m.position(0)));
-          }
-#endif
-        } catch (...) {
-          // If regex creation fails, fall through to string search
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) {
+          try {
+            auto regexpCtor = interp2->resolveVariable("RegExp");
+            if (regexpCtor.has_value() && regexpCtor->isFunction()) {
+              Value rx = interp2->constructFromNative(*regexpCtor, {Value(searchStr)});
+              if (!interp2->hasError() && rx.isRegex()) {
+                const std::string& searchKey2 = WellKnownSymbols::searchKey();
+                auto [found2, searcher2] = interp2->getPropertyForExternal(rx, searchKey2);
+                if (found2 && searcher2.isFunction()) {
+                  Value result = interp2->callForHarness(searcher2, {Value(str)}, rx);
+                  if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
+                  return result;
+                }
+              }
+              if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
+            }
+          } catch (const JsValueException&) {
+            throw;
+          } catch (...) {}
         }
+        // Fallback string search
         size_t pos = str.find(searchStr);
         if (pos == std::string::npos) return Value(-1.0);
         return Value(static_cast<double>(pos));
@@ -11266,37 +11276,28 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
         }
         if (args.empty() || !args[0].isRegex()) {
-          // RegExpCreate fallback: create RegExp from ToString(arg), match with it
+          // RegExpCreate fallback: construct RegExp via constructor, invoke @@match
           std::string pattern = args.empty() ? "" : (args[0].isUndefined() ? "" : toStringForStringBuiltinArg(args[0]));
-          try {
-            auto rx = GarbageCollector::makeGC<Regex>(pattern, "");
-#if USE_SIMPLE_REGEX
-            std::vector<simple_regex::Regex::Match> matches;
-            if (rx->regex->search(str, matches)) {
-              auto result = makeArrayWithPrototype();
-              for (const auto& m : matches) result->elements.push_back(Value(m.str));
-              if (!matches.empty()) {
-                result->properties["index"] = Value(static_cast<double>(matches[0].start));
-                result->properties["input"] = Value(str);
+          auto* interp2 = getGlobalInterpreter();
+          if (interp2) {
+            try {
+              auto regexpCtor = interp2->resolveVariable("RegExp");
+              if (regexpCtor.has_value() && regexpCtor->isFunction()) {
+                Value rx = interp2->constructFromNative(*regexpCtor, {Value(pattern)});
+                if (!interp2->hasError() && rx.isRegex()) {
+                  const std::string& matchKey2 = WellKnownSymbols::matchKey();
+                  auto [found2, matcher2] = interp2->getPropertyForExternal(rx, matchKey2);
+                  if (found2 && matcher2.isFunction()) {
+                    Value result = interp2->callForHarness(matcher2, {Value(str)}, rx);
+                    if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
+                    return result;
+                  }
+                }
+                if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
               }
-              return Value(result);
-            }
-#else
-            std::smatch m;
-            if (std::regex_search(str, m, rx->regex)) {
-              auto result = makeArrayWithPrototype();
-              result->elements.push_back(Value(m.str(0)));
-              for (size_t i = 1; i < m.size(); ++i) {
-                if (m[i].matched) result->elements.push_back(Value(m.str(i)));
-                else result->elements.push_back(Value(Undefined{}));
-              }
-              result->properties["index"] = Value(static_cast<double>(m.position(0)));
-              result->properties["input"] = Value(str);
-              return Value(result);
-            }
-#endif
-          } catch (...) {
-            // If regex creation fails, return null
+            } catch (const JsValueException&) {
+              throw;
+            } catch (...) {}
           }
           return Value(Null{});
         }
