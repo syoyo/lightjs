@@ -17624,71 +17624,65 @@ GCPtr<Environment> Environment::createGlobal() {
   objectIsExtensible->isNative = true;
   objectIsExtensible->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) return Value(false);
-    if (args[0].isClass()) {
-      auto cls = args[0].getGC<Class>();
-      auto it = cls->properties.find("__non_extensible__");
-      bool nonExtensible = it != cls->properties.end() &&
-                           it->second.isBool() &&
-                           it->second.toBool();
-      return Value(!nonExtensible);
-    }
-    if (args[0].isFunction() || args[0].isArray()) {
-      return Value(true);  // Functions and arrays are always extensible
-    }
-    if (args[0].isTypedArray()) {
-      auto ta = args[0].getGC<TypedArray>();
-      return Value(ta->properties.find("__non_extensible__") == ta->properties.end());
-    }
-    if (args[0].isArrayBuffer()) {
-      auto ab = args[0].getGC<ArrayBuffer>();
-      return Value(ab->properties.find("__non_extensible__") == ab->properties.end());
-    }
-    if (args[0].isDataView()) {
-      auto dv = args[0].getGC<DataView>();
-      return Value(dv->properties.find("__non_extensible__") == dv->properties.end());
-    }
-    if (!args[0].isObject()) {
+    const Value& target = args[0];
+    // Primitives are not extensible
+    if (target.isUndefined() || target.isNull() || target.isBool() ||
+        target.isNumber() || target.isString() || target.isBigInt() || target.isSymbol()) {
       return Value(false);
     }
-    auto obj = args[0].getGC<Object>();
-    if (obj->isModuleNamespace) {
-      return Value(false);
+    // Check __non_extensible__ flag on properties
+    auto checkExtensible = [](const OrderedMap<std::string, Value>& props) -> bool {
+      auto it = props.find("__non_extensible__");
+      return !(it != props.end() && it->second.isBool() && it->second.toBool());
+    };
+    if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      if (obj->isModuleNamespace) return Value(false);
+      return Value(!obj->sealed && !obj->frozen && !obj->nonExtensible && checkExtensible(obj->properties));
     }
-    return Value(!obj->sealed && !obj->frozen && !obj->nonExtensible);
+    if (target.isFunction()) return Value(checkExtensible(target.getGC<Function>()->properties));
+    if (target.isClass()) return Value(checkExtensible(target.getGC<Class>()->properties));
+    if (target.isArray()) return Value(checkExtensible(target.getGC<Array>()->properties));
+    if (target.isRegex()) return Value(checkExtensible(target.getGC<Regex>()->properties));
+    if (target.isError()) return Value(checkExtensible(target.getGC<Error>()->properties));
+    if (target.isTypedArray()) return Value(checkExtensible(target.getGC<TypedArray>()->properties));
+    if (target.isArrayBuffer()) return Value(checkExtensible(target.getGC<ArrayBuffer>()->properties));
+    if (target.isDataView()) return Value(checkExtensible(target.getGC<DataView>()->properties));
+    if (target.isMap()) return Value(checkExtensible(target.getGC<Map>()->properties));
+    if (target.isSet()) return Value(checkExtensible(target.getGC<Set>()->properties));
+    if (target.isPromise()) return Value(checkExtensible(target.getGC<Promise>()->properties));
+    return Value(false);
   };
   objectConstructor->properties["isExtensible"] = Value(objectIsExtensible);
 
   auto objectPreventExtensions = GarbageCollector::makeGC<Function>();
   objectPreventExtensions->isNative = true;
   objectPreventExtensions->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty()) {
-      return args.empty() ? Value(Undefined{}) : args[0];
+    if (args.empty()) return Value(Undefined{});
+    const Value& target = args[0];
+    if (target.isUndefined() || target.isNull() || target.isBool() ||
+        target.isNumber() || target.isString() || target.isBigInt() || target.isSymbol()) {
+      return target;
     }
-    if (args[0].isClass()) {
-      auto cls = args[0].getGC<Class>();
-      cls->properties["__non_extensible__"] = Value(true);
-      return args[0];
-    }
-    if (args[0].isTypedArray()) {
-      args[0].getGC<TypedArray>()->properties["__non_extensible__"] = Value(true);
-      return args[0];
-    }
-    if (args[0].isArrayBuffer()) {
-      args[0].getGC<ArrayBuffer>()->properties["__non_extensible__"] = Value(true);
-      return args[0];
-    }
-    if (args[0].isDataView()) {
-      args[0].getGC<DataView>()->properties["__non_extensible__"] = Value(true);
-      return args[0];
-    }
-    if (!args[0].isObject()) {
-      return args[0];
-    }
-    auto obj = args[0].getGC<Object>();
-    if (!obj->isModuleNamespace) {
-      obj->nonExtensible = true;
-    }
-    return args[0];
+    auto setNonExtensible = [](OrderedMap<std::string, Value>& props) {
+      props["__non_extensible__"] = Value(true);
+    };
+    if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      if (!obj->isModuleNamespace) obj->nonExtensible = true;
+      setNonExtensible(obj->properties);
+    } else if (target.isArray()) { setNonExtensible(target.getGC<Array>()->properties); }
+    else if (target.isFunction()) { setNonExtensible(target.getGC<Function>()->properties); }
+    else if (target.isClass()) { setNonExtensible(target.getGC<Class>()->properties); }
+    else if (target.isRegex()) { setNonExtensible(target.getGC<Regex>()->properties); }
+    else if (target.isError()) { setNonExtensible(target.getGC<Error>()->properties); }
+    else if (target.isTypedArray()) { setNonExtensible(target.getGC<TypedArray>()->properties); }
+    else if (target.isArrayBuffer()) { setNonExtensible(target.getGC<ArrayBuffer>()->properties); }
+    else if (target.isDataView()) { setNonExtensible(target.getGC<DataView>()->properties); }
+    else if (target.isMap()) { setNonExtensible(target.getGC<Map>()->properties); }
+    else if (target.isSet()) { setNonExtensible(target.getGC<Set>()->properties); }
+    else if (target.isPromise()) { setNonExtensible(target.getGC<Promise>()->properties); }
+    return target;
   };
   objectConstructor->properties["preventExtensions"] = Value(objectPreventExtensions);
 
