@@ -8923,10 +8923,16 @@ GCPtr<Environment> Environment::createGlobal() {
         result += str.substr(lastEnd, matchStart - lastEnd);
         result += getSubstitution(matched, matchStart, captures);
         lastEnd = matchStart + matched.size();
-        if (!global) { lastEnd = matchStart + matched.size(); break; }
-        if (matched.empty()) lastEnd++; // Avoid infinite loop on empty match
+        if (!global) break;
+        if (matched.empty()) {
+          // Advance past one character to avoid infinite loop
+          if (lastEnd < str.size()) {
+            result += str[lastEnd];
+          }
+          lastEnd++;
+        }
       }
-      result += str.substr(lastEnd);
+      if (lastEnd <= str.size()) result += str.substr(lastEnd);
       return Value(result);
 #endif
     };
