@@ -1529,6 +1529,28 @@ Value Object_keys(const std::vector<Value>& args) {
     return Value(result);
   }
 
+  // For Arrays, include numeric indices first
+  if (arg.isArray()) {
+    auto arr = arg.getGC<Array>();
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+      std::string key = std::to_string(i);
+      if (!arr->properties.count("__non_enum_" + key)) {
+        result->elements.push_back(Value(key));
+      }
+    }
+    // Then add non-index enumerable properties
+    for (const auto& key : arr->properties.orderedKeys()) {
+      if (arr->properties.count("__non_enum_" + key)) continue;
+      if (key.find("__") == 0) continue; // skip internal markers
+      // Skip numeric indices already added
+      uint32_t idx = 0;
+      if (isArrayIndex(key, idx) && idx < arr->elements.size()) continue;
+      if (key == "length") continue; // length is not enumerable
+      result->elements.push_back(Value(key));
+    }
+    return Value(result);
+  }
+
   auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
@@ -1573,20 +1595,34 @@ Value Object_values(const std::vector<Value>& args) {
     return Value(result);
   }
 
+  // For Arrays, include element values
+  if (arg.isArray()) {
+    auto arr = arg.getGC<Array>();
+    Interpreter* interp = getGlobalInterpreter();
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+      std::string key = std::to_string(i);
+      if (!arr->properties.count("__non_enum_" + key)) {
+        if (interp) {
+          auto [found, val] = interp->getPropertyForExternal(arg, key);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (found) result->elements.push_back(val);
+        } else {
+          result->elements.push_back(arr->elements[i]);
+        }
+      }
+    }
+    return Value(result);
+  }
+
   auto* props = getPropertiesMap(arg);
   if (!props) return Value(result);
 
   Interpreter* interp = getGlobalInterpreter();
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
     if (props->count("__non_enum_" + key)) continue;
-    // Use getPropertyForExternal to invoke getters
     if (interp) {
       auto [found, val] = interp->getPropertyForExternal(arg, key);
-      if (interp->hasError()) {
-        Value err = interp->getError();
-        interp->clearError();
-        throw JsValueException(err);
-      }
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
       if (found) result->elements.push_back(val);
     } else {
       auto it = props->find(key);
@@ -1632,6 +1668,28 @@ Value Object_entries(const std::vector<Value>& args) {
   }
 
   if (arg.isNumber() || arg.isBool()) {
+    return Value(result);
+  }
+
+  // For Arrays, include element entries
+  if (arg.isArray()) {
+    auto arr = arg.getGC<Array>();
+    Interpreter* interp = getGlobalInterpreter();
+    for (size_t i = 0; i < arr->elements.size(); ++i) {
+      std::string key = std::to_string(i);
+      if (!arr->properties.count("__non_enum_" + key)) {
+        auto entry = makeArrayWithPrototype();
+        entry->elements.push_back(Value(key));
+        if (interp) {
+          auto [found, val] = interp->getPropertyForExternal(arg, key);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          entry->elements.push_back(found ? val : Value(Undefined{}));
+        } else {
+          entry->elements.push_back(arr->elements[i]);
+        }
+        result->elements.push_back(Value(entry));
+      }
+    }
     return Value(result);
   }
 
