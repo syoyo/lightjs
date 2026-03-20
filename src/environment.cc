@@ -8972,50 +8972,36 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty() || (!args[0].isObject() && !args[0].isError())) {
       throw std::runtime_error("TypeError: Error.prototype.toString requires that 'this' be an Object");
     }
-    // Get name property
-    std::string name = "Error";
-    std::string msg = "";
-    if (args[0].isError()) {
-      auto err = args[0].getGC<Error>();
-      // Look for 'name' in own properties first
-      auto nameIt = err->properties.find("name");
-      if (nameIt != err->properties.end()) {
-        if (!nameIt->second.isUndefined()) name = nameIt->second.toString();
+    auto* interp = getGlobalInterpreter();
+
+    // Helper: get property with getter support and Symbol/toString checks
+    auto getPropString = [&](const Value& thisVal, const std::string& key, const std::string& defaultVal) -> std::string {
+      Value val;
+      if (interp) {
+        auto [found, v] = interp->getPropertyForExternal(thisVal, key);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!found) return defaultVal;
+        val = v;
       } else {
-        // Walk prototype chain for 'name'
-        auto protoIt = err->properties.find("__proto__");
-        bool foundName = false;
-        int depth = 0;
-        while (protoIt != err->properties.end() && protoIt->second.isObject() && depth < 16) {
-          auto proto = protoIt->second.getGC<Object>();
-          auto pNameIt = proto->properties.find("name");
-          if (pNameIt != proto->properties.end() && !pNameIt->second.isUndefined()) {
-            name = pNameIt->second.toString();
-            foundName = true;
-            break;
-          }
-          protoIt = proto->properties.find("__proto__");
-          depth++;
-        }
-        if (!foundName) {
-          name = err->getName();
-        }
+        // Fallback without interpreter
+        if (thisVal.isError()) {
+          auto it = thisVal.getGC<Error>()->properties.find(key);
+          if (it == thisVal.getGC<Error>()->properties.end()) return defaultVal;
+          val = it->second;
+        } else if (thisVal.isObject()) {
+          auto it = thisVal.getGC<Object>()->properties.find(key);
+          if (it == thisVal.getGC<Object>()->properties.end()) return defaultVal;
+          val = it->second;
+        } else return defaultVal;
       }
-      auto msgIt = err->properties.find("message");
-      if (msgIt != err->properties.end()) {
-        if (!msgIt->second.isUndefined()) msg = msgIt->second.toString();
-      }
-    } else {
-      auto obj = args[0].getGC<Object>();
-      auto nameIt = obj->properties.find("name");
-      if (nameIt != obj->properties.end()) {
-        if (!nameIt->second.isUndefined()) name = nameIt->second.toString();
-      }
-      auto msgIt = obj->properties.find("message");
-      if (msgIt != obj->properties.end()) {
-        if (!msgIt->second.isUndefined()) msg = msgIt->second.toString();
-      }
-    }
+      if (val.isUndefined()) return defaultVal;
+      if (val.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      return val.toString();
+    };
+
+    std::string name = getPropString(args[0], "name", "Error");
+    std::string msg = getPropString(args[0], "message", "");
+
     if (name.empty() && msg.empty()) return Value(std::string(""));
     if (name.empty()) return Value(msg);
     if (msg.empty()) return Value(name);
@@ -16764,21 +16750,17 @@ GCPtr<Environment> Environment::createGlobal() {
     std::string tag = "Object";
     if (args[0].isObject()) {
       auto obj = args[0].getGC<Object>();
+      // Determine builtinTag first
+      auto primIt = obj->properties.find("__primitive_value__");
+      if (primIt != obj->properties.end()) {
+        if (primIt->second.isString()) tag = "String";
+        else if (primIt->second.isNumber()) tag = "Number";
+        else if (primIt->second.isBool()) tag = "Boolean";
+      }
+      // Step 15-16: If @@toStringTag is a string, use it; otherwise use builtinTag
       auto toStringTagIt = obj->properties.find(WellKnownSymbols::toStringTagKey());
-      if (toStringTagIt != obj->properties.end()) {
-        tag = toStringTagIt->second.toString();
-      } else {
-        // Check for primitive wrapper objects
-        auto primIt = obj->properties.find("__primitive_value__");
-        if (primIt != obj->properties.end()) {
-          if (primIt->second.isString()) {
-            tag = "String";
-          } else if (primIt->second.isNumber()) {
-            tag = "Number";
-          } else if (primIt->second.isBool()) {
-            tag = "Boolean";
-          }
-        }
+      if (toStringTagIt != obj->properties.end() && toStringTagIt->second.isString()) {
+        tag = std::get<std::string>(toStringTagIt->second.data);
       }
     } else if (args[0].isArray()) {
       tag = "Array";
