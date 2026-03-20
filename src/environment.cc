@@ -17111,8 +17111,8 @@ GCPtr<Environment> Environment::createGlobal() {
   objectGetOwnPropertySymbols->isNative = true;
   objectGetOwnPropertySymbols->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto result = makeArrayWithPrototype();
-    if (args.empty()) {
-      return Value(result);
+    if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
     }
     Value target = args[0];
     OrderedMap<std::string, Value>* props = nullptr;
@@ -17176,6 +17176,85 @@ GCPtr<Environment> Environment::createGlobal() {
   objectFromEntries->isNative = true;
   objectFromEntries->nativeFunc = Object_fromEntries;
   objectConstructor->properties["fromEntries"] = Value(objectFromEntries);
+
+  // Object.groupBy(items, callbackfn) - ES2024
+  {
+    auto objectGroupBy = GarbageCollector::makeGC<Function>();
+    objectGroupBy->isNative = true;
+    objectGroupBy->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("TypeError: Object.groupBy requires a callback function");
+      }
+      Value items = args[0];
+      if (items.isNull() || items.isUndefined()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+      }
+      Value callback = args[1];
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+
+      // Create null-prototype result object
+      auto result = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      // No __proto__ = null prototype
+
+      // Iterate items
+      if (items.isArray()) {
+        auto arr = items.getGC<Array>();
+        for (size_t i = 0; i < arr->elements.size(); ++i) {
+          Value element = arr->elements[i];
+          Value keyVal = interp->callForHarness(callback, {element, Value(static_cast<double>(i))}, Value(Undefined{}));
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          std::string key = valueToPropertyKey(keyVal);
+          auto groupIt = result->properties.find(key);
+          GCPtr<Array> group;
+          if (groupIt != result->properties.end() && groupIt->second.isArray()) {
+            group = groupIt->second.getGC<Array>();
+          } else {
+            group = makeArrayWithPrototype();
+            result->properties[key] = Value(group);
+          }
+          group->elements.push_back(element);
+        }
+      } else if (items.isString()) {
+        const std::string& str = std::get<std::string>(items.data);
+        size_t idx = 0;
+        size_t bytePos = 0;
+        while (bytePos < str.size()) {
+          unsigned char c = str[bytePos];
+          size_t len = 1;
+          if (c >= 0x80) {
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else len = 4;
+          }
+          Value element(str.substr(bytePos, len));
+          Value keyVal = interp->callForHarness(callback, {element, Value(static_cast<double>(idx))}, Value(Undefined{}));
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          std::string key = valueToPropertyKey(keyVal);
+          auto groupIt = result->properties.find(key);
+          GCPtr<Array> group;
+          if (groupIt != result->properties.end() && groupIt->second.isArray()) {
+            group = groupIt->second.getGC<Array>();
+          } else {
+            group = makeArrayWithPrototype();
+            result->properties[key] = Value(group);
+          }
+          group->elements.push_back(element);
+          bytePos += len;
+          idx++;
+        }
+      }
+      return Value(result);
+    };
+    objectGroupBy->properties["name"] = Value(std::string("groupBy"));
+    objectGroupBy->properties["__non_writable_name"] = Value(true);
+    objectGroupBy->properties["__non_enum_name"] = Value(true);
+    objectGroupBy->properties["length"] = Value(2.0);
+    objectGroupBy->properties["__non_writable_length"] = Value(true);
+    objectGroupBy->properties["__non_enum_length"] = Value(true);
+    objectConstructor->properties["groupBy"] = Value(objectGroupBy);
+  }
 
   // Object.hasOwn - checks if object has own property
   auto objectHasOwn = GarbageCollector::makeGC<Function>();
@@ -21643,8 +21722,38 @@ GCPtr<Environment> Environment::createGlobal() {
   fpToString->properties["name"] = Value(std::string("toString"));
   fpToString->properties["length"] = Value(0.0);
   fpToString->properties["__uses_this_arg__"] = Value(true);
-  fpToString->nativeFunc = [](const std::vector<Value>&) -> Value {
-    return Value(std::string("[Function]"));
+  fpToString->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) {
+      throw std::runtime_error("TypeError: Function.prototype.toString requires that 'this' be a Function");
+    }
+    // Get function name
+    std::string name;
+    if (args[0].isFunction()) {
+      auto fn = args[0].getGC<Function>();
+      auto nameIt = fn->properties.find("name");
+      if (nameIt != fn->properties.end() && nameIt->second.isString()) {
+        name = std::get<std::string>(nameIt->second.data);
+      }
+      // For native functions, return standard NativeFunction format
+      if (fn->isNative) {
+        return Value("function " + name + "() { [native code] }");
+      }
+      // For user-defined functions with source text
+      auto srcIt = fn->properties.find("__source_text__");
+      if (srcIt != fn->properties.end() && srcIt->second.isString()) {
+        return Value(std::get<std::string>(srcIt->second.data));
+      }
+      return Value("function " + name + "() { [native code] }");
+    } else if (args[0].isClass()) {
+      auto cls = args[0].getGC<Class>();
+      name = cls->name;
+      auto srcIt = cls->properties.find("__source_text__");
+      if (srcIt != cls->properties.end() && srcIt->second.isString()) {
+        return Value(std::get<std::string>(srcIt->second.data));
+      }
+      return Value("function " + name + "() { [native code] }");
+    }
+    throw std::runtime_error("TypeError: Function.prototype.toString requires that 'this' be a Function");
   };
   functionPrototype->properties["toString"] = Value(fpToString);
   functionPrototype->properties["__non_enum_toString"] = Value(true);

@@ -2494,7 +2494,7 @@ Value Object_create(const std::vector<Value>& args) {
 }
 
 Value Object_fromEntries(const std::vector<Value>& args) {
-  auto newObj = GarbageCollector::makeGC<Object>();
+  auto newObj = makeObjectWithPrototype();
 
   if (args.empty()) {
     throw std::runtime_error("TypeError: Object.fromEntries requires an iterable argument");
