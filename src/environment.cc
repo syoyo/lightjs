@@ -8961,6 +8961,26 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpConstructor->properties["__non_configurable_prototype"] = Value(true);
   regExpPrototype->properties["constructor"] = Value(regExpConstructor);
   regExpPrototype->properties["__non_enum_constructor"] = Value(true);
+  // Add Symbol.species getter to RegExp
+  {
+    auto speciesGetter = GarbageCollector::makeGC<Function>();
+    speciesGetter->isNative = true;
+    speciesGetter->isConstructor = false;
+    speciesGetter->properties["name"] = Value(std::string("get [Symbol.species]"));
+    speciesGetter->properties["__non_writable_name"] = Value(true);
+    speciesGetter->properties["__non_enum_name"] = Value(true);
+    speciesGetter->properties["length"] = Value(0.0);
+    speciesGetter->properties["__non_writable_length"] = Value(true);
+    speciesGetter->properties["__non_enum_length"] = Value(true);
+    speciesGetter->properties["__uses_this_arg__"] = Value(true);
+    speciesGetter->properties["__throw_on_new__"] = Value(true);
+    speciesGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    const auto& speciesKey = WellKnownSymbols::speciesKey();
+    regExpConstructor->properties["__get_" + speciesKey] = Value(speciesGetter);
+    regExpConstructor->properties["__non_enum_" + speciesKey] = Value(true);
+  }
   env->define("RegExp", Value(regExpConstructor));
 
   // Error constructors
@@ -9500,6 +9520,26 @@ GCPtr<Environment> Environment::createGlobal() {
     mapConstructor->properties["groupBy"] = Value(groupByFn);
   }
 
+  // Add Symbol.species getter to Map
+  {
+    auto speciesGetter = GarbageCollector::makeGC<Function>();
+    speciesGetter->isNative = true;
+    speciesGetter->isConstructor = false;
+    speciesGetter->properties["name"] = Value(std::string("get [Symbol.species]"));
+    speciesGetter->properties["__non_writable_name"] = Value(true);
+    speciesGetter->properties["__non_enum_name"] = Value(true);
+    speciesGetter->properties["length"] = Value(0.0);
+    speciesGetter->properties["__non_writable_length"] = Value(true);
+    speciesGetter->properties["__non_enum_length"] = Value(true);
+    speciesGetter->properties["__uses_this_arg__"] = Value(true);
+    speciesGetter->properties["__throw_on_new__"] = Value(true);
+    speciesGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    const auto& speciesKey = WellKnownSymbols::speciesKey();
+    mapConstructor->properties["__get_" + speciesKey] = Value(speciesGetter);
+    mapConstructor->properties["__non_enum_" + speciesKey] = Value(true);
+  }
   env->define("Map", Value(mapConstructor));
 
   // Set constructor
@@ -9921,6 +9961,26 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(true);
   });
 
+  // Add Symbol.species getter to Set
+  {
+    auto speciesGetter = GarbageCollector::makeGC<Function>();
+    speciesGetter->isNative = true;
+    speciesGetter->isConstructor = false;
+    speciesGetter->properties["name"] = Value(std::string("get [Symbol.species]"));
+    speciesGetter->properties["__non_writable_name"] = Value(true);
+    speciesGetter->properties["__non_enum_name"] = Value(true);
+    speciesGetter->properties["length"] = Value(0.0);
+    speciesGetter->properties["__non_writable_length"] = Value(true);
+    speciesGetter->properties["__non_enum_length"] = Value(true);
+    speciesGetter->properties["__uses_this_arg__"] = Value(true);
+    speciesGetter->properties["__throw_on_new__"] = Value(true);
+    speciesGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    const auto& speciesKey = WellKnownSymbols::speciesKey();
+    setConstructor->properties["__get_" + speciesKey] = Value(speciesGetter);
+    setConstructor->properties["__non_enum_" + speciesKey] = Value(true);
+  }
   env->define("Set", Value(setConstructor));
 
   // WeakMap constructor
@@ -16332,6 +16392,26 @@ GCPtr<Environment> Environment::createGlobal() {
   // Expose Promise as a callable constructor with static methods.
   for (const auto& [k, v] : promiseConstructor->properties) {
     promiseFunc->properties[k] = v;
+  }
+  // Add Symbol.species getter to Promise
+  {
+    auto speciesGetter = GarbageCollector::makeGC<Function>();
+    speciesGetter->isNative = true;
+    speciesGetter->isConstructor = false;
+    speciesGetter->properties["name"] = Value(std::string("get [Symbol.species]"));
+    speciesGetter->properties["__non_writable_name"] = Value(true);
+    speciesGetter->properties["__non_enum_name"] = Value(true);
+    speciesGetter->properties["length"] = Value(0.0);
+    speciesGetter->properties["__non_writable_length"] = Value(true);
+    speciesGetter->properties["__non_enum_length"] = Value(true);
+    speciesGetter->properties["__uses_this_arg__"] = Value(true);
+    speciesGetter->properties["__throw_on_new__"] = Value(true);
+    speciesGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    const auto& speciesKey = WellKnownSymbols::speciesKey();
+    promiseFunc->properties["__get_" + speciesKey] = Value(speciesGetter);
+    promiseFunc->properties["__non_enum_" + speciesKey] = Value(true);
   }
   env->define("Promise", Value(promiseFunc));
   // Keep intrinsic Promise reachable even if global Promise is overwritten.
