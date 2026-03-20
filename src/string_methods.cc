@@ -549,9 +549,11 @@ Value String_split(const std::vector<Value>& args) {
     // Handle limit parameter (ToUint32 per spec) - args[2] since args[0] is this
     uint32_t limit = 0xFFFFFFFF; // max uint32 = no limit
     if (args.size() > 2 && !args[2].isUndefined()) {
-        double lim = args[2].toNumber();
-        if (std::isnan(lim) || !std::isfinite(lim) || lim == 0.0) {
+        double lim = toNumberForStringBuiltinArg(args[2]);
+        if (std::isnan(lim) || lim == 0.0) {
             limit = 0;
+        } else if (!std::isfinite(lim)) {
+            limit = (lim > 0) ? 0xFFFFFFFF : 0;
         } else {
             double integer = std::trunc(lim);
             double mod = std::fmod(integer, 4294967296.0);
@@ -571,7 +573,7 @@ Value String_split(const std::vector<Value>& args) {
         return Value(result);
     }
 
-    std::string separator = args[1].toString();
+    std::string separator = toStringForStringBuiltinArg(args[1]);
 
     if (separator.empty()) {
         // Split into individual characters (UTF-8 aware)

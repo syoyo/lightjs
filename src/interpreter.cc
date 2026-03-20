@@ -10865,9 +10865,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         // Handle limit parameter (ToUint32 per spec)
         uint32_t limit = 0xFFFFFFFF;
         if (args.size() > 1 && !args[1].isUndefined()) {
-          double lim = args[1].toNumber();
-          if (std::isnan(lim) || !std::isfinite(lim) || lim == 0.0) {
+          double lim = toNumberForStringBuiltinArg(args[1]);
+          if (std::isnan(lim) || lim == 0.0) {
             limit = 0;
+          } else if (!std::isfinite(lim)) {
+            limit = (lim > 0) ? 0xFFFFFFFF : 0;
           } else {
             // ToUint32: truncate and modulo 2^32
             double integer = std::trunc(lim);
@@ -10885,7 +10887,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           return Value(result);
         }
 
-        std::string separator = args[0].toString();
+        std::string separator = toStringForStringBuiltinArg(args[0]);
 
         if (separator.empty()) {
           // Split into individual characters
@@ -11365,7 +11367,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           return Value(std::regex_replace(str, regexPtr->regex, replacement));
 #endif
         } else {
-          std::string search = args[0].toString();
+          std::string search = toStringForStringBuiltinArg(args[0]);
           if (args[1].isFunction()) {
             // Function callback for string replace
             std::string result = str;
