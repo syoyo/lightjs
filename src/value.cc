@@ -1534,15 +1534,18 @@ Value Object_keys(const std::vector<Value>& args) {
     auto arr = arg.getGC<Array>();
     for (size_t i = 0; i < arr->elements.size(); ++i) {
       std::string key = std::to_string(i);
-      if (!arr->properties.count("__non_enum_" + key)) {
-        result->elements.push_back(Value(key));
-      }
+      // Skip non-enumerable
+      if (arr->properties.count("__non_enum_" + key)) continue;
+      // Skip holes (deleted or never-set elements)
+      if (arr->properties.count("__deleted_" + key + "__")) continue;
+      if (arr->properties.count("__hole_" + key + "__")) continue;
+      result->elements.push_back(Value(key));
     }
-    // Then add non-index enumerable properties
+    // Then add non-index enumerable properties (including large indices stored as properties)
     for (const auto& key : arr->properties.orderedKeys()) {
       if (arr->properties.count("__non_enum_" + key)) continue;
       if (key.find("__") == 0) continue; // skip internal markers
-      // Skip numeric indices already added
+      // Skip numeric indices already added from elements array
       uint32_t idx = 0;
       if (isArrayIndex(key, idx) && idx < arr->elements.size()) continue;
       if (key == "length") continue; // length is not enumerable

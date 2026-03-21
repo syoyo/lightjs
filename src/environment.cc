@@ -355,7 +355,11 @@ std::pair<bool, Value> getOwnPropertyLike(const Value& receiver,
   }
   if (receiver.isArray()) {
     auto arr = receiver.getGC<Array>();
-    if (name == "length") return {true, Value(static_cast<double>(arr->elements.size()))};
+    if (name == "length") {
+      auto storedLen = arr->properties.find("__array_length__");
+      if (storedLen != arr->properties.end()) return {true, storedLen->second};
+      return {true, Value(static_cast<double>(arr->elements.size()))};
+    }
     auto getterIt = arr->properties.find("__get_" + name);
     if (getterIt != arr->properties.end()) {
       if (getterIt->second.isFunction()) return {true, callGetter(getterIt->second)};
@@ -16587,6 +16591,11 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       auto obj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
+      // Set __proto__ to Object.prototype
+      if (auto objProtoVal = env->get("__object_prototype__");
+          objProtoVal && objProtoVal->isObject()) {
+        obj->properties["__proto__"] = *objProtoVal;
+      }
       return Value(obj);
     }
 
@@ -19119,80 +19128,13 @@ GCPtr<Environment> Environment::createGlobal() {
     }
 
     {
+      // ToPropertyDescriptor: use getPropertyLike to properly invoke getters
+      // on the descriptor object per ES spec 8.10.5
       auto readDescriptorField = [&](const std::string& name) -> std::optional<Value> {
         const Value& desc = args[2];
-
-        // Walk prototype chain from a starting value
-        auto walkProto = [&](Value proto) -> std::optional<Value> {
-          int depth = 0;
-          while (!proto.isNull() && !proto.isUndefined() && depth < 100) {
-            ++depth;
-            if (proto.isObject()) {
-              auto protoObj = proto.getGC<Object>();
-              auto propIt = protoObj->properties.find(name);
-              if (propIt != protoObj->properties.end()) return propIt->second;
-              auto nextIt = protoObj->properties.find("__proto__");
-              if (nextIt != protoObj->properties.end()) proto = nextIt->second;
-              else break;
-            } else if (proto.isFunction()) {
-              auto protoFn = proto.getGC<Function>();
-              auto propIt = protoFn->properties.find(name);
-              if (propIt != protoFn->properties.end()) return propIt->second;
-              auto nextIt = protoFn->properties.find("__proto__");
-              if (nextIt != protoFn->properties.end()) proto = nextIt->second;
-              else break;
-            } else break;
-          }
-          return std::nullopt;
-        };
-
-        // Check own props + walk proto chain (auto& to support both unordered_map and OrderedMap)
-        auto readFromProps = [&](const auto& props) -> std::optional<Value> {
-          auto it = props.find(name);
-          if (it != props.end()) return it->second;
-          auto protoIt = props.find("__proto__");
-          if (protoIt != props.end()) return walkProto(protoIt->second);
-          return std::nullopt;
-        };
-
-        if (desc.isObject()) {
-          auto obj = desc.getGC<Object>();
-          auto it = obj->properties.find(name);
-          if (it != obj->properties.end()) return it->second;
-          if (obj->shape) {
-            int offset = obj->shape->getPropertyOffset(name);
-            if (offset >= 0) {
-              Value slotValue;
-              if (obj->getSlot(offset, slotValue)) return slotValue;
-            }
-          }
-          auto protoIt = obj->properties.find("__proto__");
-          if (protoIt != obj->properties.end()) return walkProto(protoIt->second);
-          return std::nullopt;
-        } else if (desc.isFunction()) {
-          return readFromProps(desc.getGC<Function>()->properties);
-        } else if (desc.isArray()) {
-          return readFromProps(desc.getGC<Array>()->properties);
-        } else if (desc.isError()) {
-          return readFromProps(desc.getGC<Error>()->properties);
-        } else if (desc.isRegex()) {
-          return readFromProps(desc.getGC<Regex>()->properties);
-        } else if (desc.isClass()) {
-          return readFromProps(desc.getGC<Class>()->properties);
-        } else if (desc.isMap()) {
-          return readFromProps(desc.getGC<Map>()->properties);
-        } else if (desc.isSet()) {
-          return readFromProps(desc.getGC<Set>()->properties);
-        } else if (desc.isPromise()) {
-          return readFromProps(desc.getGC<Promise>()->properties);
-        } else if (desc.isWeakMap()) {
-          return readFromProps(desc.getGC<WeakMap>()->properties);
-        } else if (desc.isWeakSet()) {
-          return readFromProps(desc.getGC<WeakSet>()->properties);
-        } else if (desc.isTypedArray()) {
-          return readFromProps(desc.getGC<TypedArray>()->properties);
-        }
-        return std::nullopt;
+        auto [found, val] = getPropertyLike(desc, name, desc);
+        if (!found) return std::nullopt;
+        return val;
       };
       // Validate descriptor per ES spec ToPropertyDescriptor (8.10.5)
       {
@@ -19625,7 +19567,45 @@ GCPtr<Environment> Environment::createGlobal() {
           }
 
           if (valueField.has_value()) {
-            double numVal = valueField->toNumber();
+            // ToNumber with ToPrimitive for objects (valueOf/toString)
+            Value lenVal = *valueField;
+            auto* interp = getGlobalInterpreter();
+            if (interp && (lenVal.isObject() || lenVal.isArray() || lenVal.isFunction())) {
+              // Try valueOf() first, then toString()
+              auto [hasVO, voFn] = getPropertyLike(lenVal, "valueOf", lenVal);
+              if (hasVO && voFn.isFunction()) {
+                Value result = interp->callForHarness(voFn, {}, lenVal);
+                if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+                  lenVal = result;
+                } else {
+                  // valueOf returned non-primitive, try toString
+                  auto [hasTS, tsFn] = getPropertyLike(lenVal, "toString", lenVal);
+                  if (hasTS && tsFn.isFunction()) {
+                    Value tsResult = interp->callForHarness(tsFn, {}, lenVal);
+                    if (!tsResult.isObject() && !tsResult.isArray() && !tsResult.isFunction()) {
+                      lenVal = tsResult;
+                    } else {
+                      throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                    }
+                  } else {
+                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                  }
+                }
+              } else {
+                auto [hasTS, tsFn] = getPropertyLike(lenVal, "toString", lenVal);
+                if (hasTS && tsFn.isFunction()) {
+                  Value tsResult = interp->callForHarness(tsFn, {}, lenVal);
+                  if (!tsResult.isObject() && !tsResult.isArray() && !tsResult.isFunction()) {
+                    lenVal = tsResult;
+                  } else {
+                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                  }
+                } else {
+                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                }
+              }
+            }
+            double numVal = lenVal.toNumber();
             uint32_t newLen = static_cast<uint32_t>(numVal);
             if (static_cast<double>(newLen) != numVal || std::isinf(numVal) || std::isnan(numVal)) {
               throw std::runtime_error("RangeError: Invalid array length");
@@ -19635,11 +19615,41 @@ GCPtr<Environment> Environment::createGlobal() {
               throw std::runtime_error("TypeError: Cannot redefine property: length");
             }
 
-            size_t oldLen = arr->elements.size();
+            // Get effective length (may be stored as __array_length__ for sparse arrays)
+            auto storedLenIt = arr->properties.find("__array_length__");
+            size_t oldLen = storedLenIt != arr->properties.end() ?
+              static_cast<size_t>(storedLenIt->second.toNumber()) : arr->elements.size();
             if (newLen < oldLen) {
-              arr->elements.resize(newLen);
+              // Check for non-configurable elements blocking length decrease
+              // Per spec 15.4.5.1 step 3.l: find last non-deletable index
+              size_t effectiveOldLen = std::min(oldLen, arr->elements.size());
+              for (size_t i = effectiveOldLen; i > newLen; --i) {
+                size_t idx = i - 1;
+                std::string idxStr = std::to_string(idx);
+                if (arr->properties.find("__non_configurable_" + idxStr) != arr->properties.end()) {
+                  // Cannot delete this element; set length to idx+1
+                  arr->elements.resize(idx + 1);
+                  arr->properties.erase("__array_length__");
+                  // If writable was requested to be false, set it
+                  if (writableField.has_value() && !writableField->toBool()) {
+                    arr->properties["__non_writable_length"] = Value(true);
+                  }
+                  throw std::runtime_error("TypeError: Cannot redefine property: length");
+                }
+              }
+              if (newLen < arr->elements.size()) {
+                arr->elements.resize(newLen);
+              }
+              arr->properties.erase("__array_length__");
             } else if (newLen > oldLen) {
-              arr->elements.resize(newLen, Value(Undefined{}));
+              // For very large arrays, don't materialize - store as __array_length__
+              static const size_t kMaxMaterialize = 1024 * 1024; // 1M elements
+              if (newLen <= kMaxMaterialize) {
+                arr->elements.resize(newLen, Value(Undefined{}));
+                arr->properties.erase("__array_length__");
+              } else {
+                arr->properties["__array_length__"] = Value(static_cast<double>(newLen));
+              }
             }
           }
 
@@ -19686,7 +19696,15 @@ GCPtr<Environment> Environment::createGlobal() {
           try {
             size_t idx = std::stoul(key);
             hadExistingProperty = (idx < arr->elements.size());
-          } catch (...) {}
+            // Array spec 15.4.5.1 step 4: if index >= oldLen and length is non-writable, reject
+            if (!hadExistingProperty && idx >= arr->elements.size()) {
+              bool lengthNonWritableNow = arr->properties.find("__non_writable_length") != arr->properties.end();
+              if (lengthNonWritableNow) {
+                throw std::runtime_error("TypeError: Cannot define property: " + key + ", length is not writable");
+              }
+            }
+          } catch (const std::runtime_error&) { throw; }
+          catch (...) {}
         }
         if (!hadExistingProperty) {
           hadExistingProperty = arr->properties.count(key) > 0 ||
@@ -19828,12 +19846,24 @@ GCPtr<Environment> Environment::createGlobal() {
           }
           if (isNumeric && idx < arr->elements.size()) {
             arr->elements[idx] = *valueField;
-          } else if (isNumeric && idx < arr->elements.size() + 1024) {
-            // Extend elements array for nearby numeric indices
+          } else if (isNumeric && idx < arr->elements.size() + 1024 && idx < 1024 * 1024) {
+            // Extend elements array for nearby numeric indices (but cap at 1M)
             arr->elements.resize(idx + 1, Value(Undefined{}));
             arr->elements[idx] = *valueField;
           } else {
             arr->properties[key] = *valueField;
+          }
+          // Update length if defining an index >= current length
+          if (isNumeric) {
+            auto storedLenIt = arr->properties.find("__array_length__");
+            size_t currentLen = storedLenIt != arr->properties.end() ?
+              static_cast<size_t>(storedLenIt->second.toNumber()) : arr->elements.size();
+            if (idx >= currentLen) {
+              size_t newLen = idx + 1;
+              if (newLen > arr->elements.size()) {
+                arr->properties["__array_length__"] = Value(static_cast<double>(newLen));
+              }
+            }
           }
         }
 
@@ -20012,8 +20042,9 @@ GCPtr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Object.defineProperties called on non-object");
     }
     // Iterate enumerable own properties of the descriptor object
-    auto iterateOwnEnumerable = [&](const auto& properties) {
-      for (const auto& [key, descriptor] : properties) {
+    // Use getOwnPropertyLike to properly invoke getters per spec
+    auto iterateOwnEnumerable = [&](const Value& propsObj, const auto& properties) {
+      for (const auto& [key, rawVal] : properties) {
         // Skip internal markers
         if (key.size() >= 4 && key.substr(0, 2) == "__" && key.substr(key.size() - 2) == "__") continue;
         if (key.rfind("__non_writable_", 0) == 0) continue;
@@ -20024,19 +20055,23 @@ GCPtr<Environment> Environment::createGlobal() {
         if (key.rfind("__set_", 0) == 0) continue;
         // Skip non-enumerable properties
         if (properties.find("__non_enum_" + key) != properties.end()) continue;
-        objectDefineProperty->nativeFunc({target, Value(key), descriptor});
+        // Use getOwnPropertyLike to invoke getters
+        auto [found, descriptor] = getOwnPropertyLike(propsObj, key, propsObj);
+        if (found) {
+          objectDefineProperty->nativeFunc({target, Value(key), descriptor});
+        }
       }
     };
     if (args[1].isObject()) {
-      iterateOwnEnumerable(args[1].getGC<Object>()->properties);
+      iterateOwnEnumerable(args[1], args[1].getGC<Object>()->properties);
     } else if (args[1].isFunction()) {
-      iterateOwnEnumerable(args[1].getGC<Function>()->properties);
+      iterateOwnEnumerable(args[1], args[1].getGC<Function>()->properties);
     } else if (args[1].isArray()) {
       auto arr = args[1].getGC<Array>();
       for (size_t i = 0; i < arr->elements.size(); ++i) {
         objectDefineProperty->nativeFunc({target, Value(std::to_string(i)), arr->elements[i]});
       }
-      iterateOwnEnumerable(arr->properties);
+      iterateOwnEnumerable(args[1], arr->properties);
     }
     return args[0];
   };

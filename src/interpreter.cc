@@ -1194,6 +1194,11 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
       if (overriddenIt != arr->properties.end()) {
         return {true, overriddenIt->second};
       }
+      // Sparse arrays store length in __array_length__
+      auto storedLen = arr->properties.find("__array_length__");
+      if (storedLen != arr->properties.end()) {
+        return {true, storedLen->second};
+      }
       return {true, Value(static_cast<double>(arr->elements.size()))};
     }
 
@@ -9309,6 +9314,11 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       if (overriddenIt != arrPtr->properties.end()) {
         LIGHTJS_RETURN(overriddenIt->second);
       }
+      // Sparse arrays store length in __array_length__
+      auto storedLen = arrPtr->properties.find("__array_length__");
+      if (storedLen != arrPtr->properties.end()) {
+        LIGHTJS_RETURN(storedLen->second);
+      }
       LIGHTJS_RETURN(Value(static_cast<double>(arrPtr->elements.size())));
     }
 
@@ -12514,6 +12524,18 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
           wrapper->properties["__non_writable_length"] = Value(true);
           wrapper->properties["__non_enum_length"] = Value(true);
           wrapper->properties["__non_configurable_length"] = Value(true);
+        }
+        // Set __proto__ to the appropriate prototype
+        const char* ctorName = "Object";
+        if (boundThis.isString()) ctorName = "String";
+        else if (boundThis.isNumber()) ctorName = "Number";
+        else if (boundThis.isBool()) ctorName = "Boolean";
+        else if (boundThis.isBigInt()) ctorName = "BigInt";
+        if (auto ctor = targetEnv->get(ctorName); ctor && ctor->isFunction()) {
+          auto protoIt = ctor->getGC<Function>()->properties.find("prototype");
+          if (protoIt != ctor->getGC<Function>()->properties.end()) {
+            wrapper->properties["__proto__"] = protoIt->second;
+          }
         }
         // valueOf for the wrapper
         auto valueOfFn = GarbageCollector::makeGC<Function>();
