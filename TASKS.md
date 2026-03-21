@@ -54,8 +54,8 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/DataView` | 561 | 561 | 100.0% |
 | `built-ins/BigInt` | 77 | 77 | 100.0% |
 | `built-ins/Promise` | 631 | 652 | 96.8% |
-| `built-ins/Set` | 349 | 383 | 91.1% |
-| `built-ins/Map` | 186 | 204 | 91.2% |
+| `built-ins/Set` | 358 | 383 | 93.5% |
+| `built-ins/Map` | 187 | 204 | 91.7% |
 | `built-ins/Symbol` | 88 | 98 | 89.8% |
 | `built-ins/Error` | 53 | 58 | 91.4% |
 | `built-ins/WeakSet` | 69 | 85 | 81.2% |
