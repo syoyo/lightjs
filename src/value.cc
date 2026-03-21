@@ -1862,17 +1862,35 @@ static void assignToTarget(Value& target, const std::string& key, const Value& v
 
   if (!props) return;
 
-  // Check non-writable
+  // Check if target has a setter for this property (accessor property)
+  // Setter invocation happens even on sealed/frozen objects per spec
+  auto setterIt = props->find("__set_" + key);
+  if (setterIt != props->end() && setterIt->second.isFunction()) {
+    auto* interp = getGlobalInterpreter();
+    if (interp) {
+      interp->callForHarness(setterIt->second, {value}, target);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+    }
+    return;
+  }
+
+  // Data property: check non-writable
   if (props->count("__non_writable_" + key)) {
     throw std::runtime_error("TypeError: Cannot assign to read only property '" + key + "'");
   }
 
-  // Check if target has a setter for this property (accessor property)
-  if (props->count("__set_" + key)) {
-    // For accessor properties, we'd need to call the setter - for now just set the value
-    // In test262, accessor properties with setters should invoke them
-    (*props)[key] = value;
-    return;
+  // Check non-extensible: reject new properties
+  if (props->find(key) == props->end() &&
+      props->find("__get_" + key) == props->end() &&
+      props->find("__set_" + key) == props->end()) {
+    if (props->count("__non_extensible__") ||
+        (target.isObject() && (target.getGC<Object>()->sealed || target.getGC<Object>()->nonExtensible || target.getGC<Object>()->frozen))) {
+      throw std::runtime_error("TypeError: Cannot add property " + key + ", object is not extensible");
+    }
   }
 
   (*props)[key] = value;

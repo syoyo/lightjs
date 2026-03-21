@@ -18158,7 +18158,12 @@ GCPtr<Environment> Environment::createGlobal() {
       auto keys = props.orderedKeys(); // copy
       for (const auto& key : keys) {
         if (key.find("__") == 0) continue;
-        props["__non_writable_" + key] = Value(true);
+        // Accessor properties (with __get_ or __set_) don't get writable marker
+        bool isAccessor = props.find("__get_" + key) != props.end() ||
+                          props.find("__set_" + key) != props.end();
+        if (!isAccessor) {
+          props["__non_writable_" + key] = Value(true);
+        }
         props["__non_configurable_" + key] = Value(true);
       }
     };
