@@ -2004,10 +2004,20 @@ Value Object_assign(const std::vector<Value>& args) {
 
 Value Object_hasOwnProperty(const std::vector<Value>& args) {
   if (args.size() < 2) {
+    // Still need to check this value
+    if (!args.empty() && (args[0].isUndefined() || args[0].isNull())) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
     return Value(false);
   }
 
+  // Step 1: ToPropertyKey(V) - must happen before ToObject(this)
   std::string key = valueToPropertyKey(args[1]);
+
+  // Step 2: ToObject(this) - throw TypeError for undefined/null
+  if (args[0].isUndefined() || args[0].isNull()) {
+    throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+  }
 
   // Handle Function objects
   if (args[0].isFunction()) {
