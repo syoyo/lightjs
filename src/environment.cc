@@ -17088,11 +17088,11 @@ GCPtr<Environment> Environment::createGlobal() {
     const Value& O = args[0];
 
     // Primitive types (auto-boxed for toString)
+    // Per spec steps 4-14, only specific types get builtinTag.
+    // BigInt and Symbol are NOT listed - they get "Object" and rely on @@toStringTag.
     if (O.isBool()) builtinTag = "Boolean";
     else if (O.isNumber()) builtinTag = "Number";
     else if (O.isString()) builtinTag = "String";
-    else if (O.isBigInt()) builtinTag = "BigInt";
-    else if (O.isSymbol()) builtinTag = "Symbol";
     else if (O.isArray()) {
       builtinTag = "Array";
       // Check for Arguments object
@@ -17133,8 +17133,8 @@ GCPtr<Environment> Environment::createGlobal() {
         if (primIt->second.isString()) builtinTag = "String";
         else if (primIt->second.isNumber()) builtinTag = "Number";
         else if (primIt->second.isBool()) builtinTag = "Boolean";
-        else if (primIt->second.isBigInt()) builtinTag = "BigInt";
-        else if (primIt->second.isSymbol()) builtinTag = "Symbol";
+        // BigInt and Symbol wrappers get builtinTag "Object" per spec;
+        // their tag comes from @@toStringTag on their prototype
       }
       // Check for Date objects
       if (obj->properties.count("__date_ms__") || obj->properties.count("__date_value__")) {
