@@ -17402,9 +17402,23 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       std::string key = valueToPropertyKey(args[1]);
       auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
+        // Check non-configurable: cannot redefine
+        if (props.find("__non_configurable_" + key) != props.end()) {
+          throw std::runtime_error("TypeError: Cannot redefine property: " + key);
+        }
+        // Check non-extensible: cannot add new property
+        bool isNew = props.find(key) == props.end() &&
+                     props.find("__get_" + key) == props.end() &&
+                     props.find("__set_" + key) == props.end();
+        if (isNew && props.find("__non_extensible__") != props.end()) {
+          throw std::runtime_error("TypeError: Cannot define property " + key + ", object is not extensible");
+        }
         props["__get_" + key] = args[2];
         props.erase("__non_writable_" + key);
-        props.erase("__non_configurable_" + key);
+        // Add visible key for enumeration (if not already present)
+        if (props.find(key) == props.end()) {
+          props[key] = Value(Undefined{});
+        }
       };
       if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
       else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
@@ -17438,9 +17452,23 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       std::string key = valueToPropertyKey(args[1]);
       auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
+        // Check non-configurable: cannot redefine
+        if (props.find("__non_configurable_" + key) != props.end()) {
+          throw std::runtime_error("TypeError: Cannot redefine property: " + key);
+        }
+        // Check non-extensible: cannot add new property
+        bool isNew = props.find(key) == props.end() &&
+                     props.find("__get_" + key) == props.end() &&
+                     props.find("__set_" + key) == props.end();
+        if (isNew && props.find("__non_extensible__") != props.end()) {
+          throw std::runtime_error("TypeError: Cannot define property " + key + ", object is not extensible");
+        }
         props["__set_" + key] = args[2];
         props.erase("__non_writable_" + key);
-        props.erase("__non_configurable_" + key);
+        // Add visible key for enumeration (if not already present)
+        if (props.find(key) == props.end()) {
+          props[key] = Value(Undefined{});
+        }
       };
       if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
       else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
