@@ -15322,7 +15322,11 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         }
       }
       if (isObjectLike(protoFromNewTarget)) {
-        setProtoOnValue(constructed, protoFromNewTarget);
+        // Skip for Object constructor: it already sets the correct __proto__
+        // based on the primitive type (Number.prototype, String.prototype, etc.)
+        if (ctorName != "Object") {
+          setProtoOnValue(constructed, protoFromNewTarget);
+        }
       }
       setConstructorTag(constructed);
       LIGHTJS_RETURN(constructed);

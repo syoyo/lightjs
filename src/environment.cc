@@ -16773,10 +16773,17 @@ GCPtr<Environment> Environment::createGlobal() {
 
     if (!ctorName.empty()) {
       if (auto ctor = env->get(ctorName)) {
+        OrderedMap<std::string, Value>* ctorProps = nullptr;
         if (ctor->isFunction()) {
-          auto ctorFn = std::get<GCPtr<Function>>(ctor->data);
-          auto protoIt = ctorFn->properties.find("prototype");
-          if (protoIt != ctorFn->properties.end() && protoIt->second.isObject()) {
+          ctorProps = &ctor->getGC<Function>()->properties;
+        } else if (ctor->isObject()) {
+          ctorProps = &ctor->getGC<Object>()->properties;
+        } else if (ctor->isClass()) {
+          ctorProps = &ctor->getGC<Class>()->properties;
+        }
+        if (ctorProps) {
+          auto protoIt = ctorProps->find("prototype");
+          if (protoIt != ctorProps->end() && protoIt->second.isObject()) {
             wrapped->properties["__proto__"] = protoIt->second;
           }
         }
