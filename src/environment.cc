@@ -9439,6 +9439,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(Value(pair), false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9457,6 +9459,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(entry.first, false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9475,6 +9479,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(entry.second, false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9779,6 +9785,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(Value(pair), false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9797,6 +9805,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(elem, false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9815,6 +9825,8 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(elem, false);
     };
     iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
+    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -13328,6 +13340,8 @@ GCPtr<Environment> Environment::createGlobal() {
         return Value(result);
       };
       iterObj->properties["next"] = Value(nextFn);
+      iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Array Iterator"));
+      iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
       return Value(iterObj);
     };
     arrayPrototype->properties[iterKey] = Value(arrayProtoIterator);
@@ -13580,6 +13594,10 @@ GCPtr<Environment> Environment::createGlobal() {
   promiseConstructor->properties["__non_writable_prototype"] = Value(true);
   promiseConstructor->properties["__non_enum_prototype"] = Value(true);
   promiseConstructor->properties["__non_configurable_prototype"] = Value(true);
+  promiseFunc->properties["prototype"] = Value(promisePrototype);
+  promiseFunc->properties["__non_writable_prototype"] = Value(true);
+  promiseFunc->properties["__non_enum_prototype"] = Value(true);
+  promiseFunc->properties["__non_configurable_prototype"] = Value(true);
   promisePrototype->properties["constructor"] = Value(promiseFunc);
   promisePrototype->properties["__non_enum_constructor"] = Value(true);
   promisePrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Promise"));

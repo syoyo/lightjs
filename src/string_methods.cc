@@ -356,6 +356,8 @@ Value String_iterator(const std::vector<Value>& args) {
         return Value(result);
     };
     iteratorObj->properties["next"] = Value(nextFn);
+    iteratorObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("String Iterator"));
+    iteratorObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iteratorObj);
 }
 

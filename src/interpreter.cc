@@ -1263,6 +1263,11 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
     return getFromPropertyBag(ws->properties);
   }
 
+  if (receiver.isPromise()) {
+    auto p = receiver.getGC<Promise>();
+    return getFromPropertyBag(p->properties);
+  }
+
   if (receiver.isTypedArray()) {
     auto ta = receiver.getGC<TypedArray>();
     const std::string getterKey = "__get_" + key;
