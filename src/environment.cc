@@ -9103,6 +9103,28 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       if (val.isUndefined()) return defaultVal;
       if (val.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      // ToPrimitive for objects
+      if (interp && (val.isObject() || val.isArray() || val.isFunction())) {
+        auto [hasTS, tsFn] = interp->getPropertyForExternal(val, "toString");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasTS && tsFn.isFunction()) {
+          Value result = interp->callForHarness(tsFn, {}, val);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+            return result.toString();
+          }
+        }
+        auto [hasVO, voFn] = interp->getPropertyForExternal(val, "valueOf");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasVO && voFn.isFunction()) {
+          Value voResult = interp->callForHarness(voFn, {}, val);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
+            return voResult.toString();
+          }
+        }
+        throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+      }
       return val.toString();
     };
 
@@ -9132,7 +9154,52 @@ GCPtr<Environment> Environment::createGlobal() {
       if (hasMessage && args[0].isSymbol()) {
         throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
       }
-      std::string message = hasMessage ? args[0].toString() : "";
+      std::string message;
+      if (hasMessage) {
+        // ToString with ToPrimitive for objects
+        Value msgVal = args[0];
+        if (msgVal.isObject() || msgVal.isArray() || msgVal.isFunction()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            // ToPrimitive(string hint): toString first, then valueOf
+            auto [hasTS, tsFn] = interp->getPropertyForExternal(msgVal, "toString");
+            if (hasTS && tsFn.isFunction()) {
+              Value result = interp->callForHarness(tsFn, {}, msgVal);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+                msgVal = result;
+              } else {
+                auto [hasVO, voFn] = interp->getPropertyForExternal(msgVal, "valueOf");
+                if (hasVO && voFn.isFunction()) {
+                  Value voResult = interp->callForHarness(voFn, {}, msgVal);
+                  if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+                  if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
+                    msgVal = voResult;
+                  } else {
+                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                  }
+                } else {
+                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                }
+              }
+            } else {
+              auto [hasVO, voFn] = interp->getPropertyForExternal(msgVal, "valueOf");
+              if (hasVO && voFn.isFunction()) {
+                Value voResult = interp->callForHarness(voFn, {}, msgVal);
+                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+                if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
+                  msgVal = voResult;
+                } else {
+                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+                }
+              } else {
+                throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+              }
+            }
+          }
+        }
+        message = msgVal.toString();
+      }
       auto err = GarbageCollector::makeGC<Error>(type, message);
       if (hasMessage) {
         err->properties["message"] = Value(message);
