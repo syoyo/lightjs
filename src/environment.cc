@@ -17345,6 +17345,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoLookupGetter = GarbageCollector::makeGC<Function>();
   objectProtoLookupGetter->isNative = true;
   objectProtoLookupGetter->properties["__uses_this_arg__"] = Value(true);
+  objectProtoLookupGetter->properties["name"] = Value(std::string("__lookupGetter__"));
+  objectProtoLookupGetter->properties["__non_writable_name"] = Value(true);
+  objectProtoLookupGetter->properties["__non_enum_name"] = Value(true);
+  objectProtoLookupGetter->properties["length"] = Value(1.0);
+  objectProtoLookupGetter->properties["__non_writable_length"] = Value(true);
+  objectProtoLookupGetter->properties["__non_enum_length"] = Value(true);
   objectProtoLookupGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
     Value current = args[0];
@@ -17485,6 +17491,12 @@ GCPtr<Environment> Environment::createGlobal() {
   auto objectProtoLookupSetter = GarbageCollector::makeGC<Function>();
   objectProtoLookupSetter->isNative = true;
   objectProtoLookupSetter->properties["__uses_this_arg__"] = Value(true);
+  objectProtoLookupSetter->properties["name"] = Value(std::string("__lookupSetter__"));
+  objectProtoLookupSetter->properties["__non_writable_name"] = Value(true);
+  objectProtoLookupSetter->properties["__non_enum_name"] = Value(true);
+  objectProtoLookupSetter->properties["length"] = Value(1.0);
+  objectProtoLookupSetter->properties["__non_writable_length"] = Value(true);
+  objectProtoLookupSetter->properties["__non_enum_length"] = Value(true);
   objectProtoLookupSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
     Value current = args[0];
