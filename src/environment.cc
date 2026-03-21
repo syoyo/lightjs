@@ -9455,9 +9455,25 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   });
 
-  defineMapMethod("entries", 0, [validateMapThis](const std::vector<Value>& args) -> Value {
+  // %IteratorPrototype% - base prototype for all built-in iterators
+  auto iteratorPrototype = GarbageCollector::makeGC<Object>();
+  iteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Iterator"));
+  iteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  if (auto objProtoVal = env->get("__object_prototype__"); objProtoVal && objProtoVal->isObject()) {
+    iteratorPrototype->properties["__proto__"] = *objProtoVal;
+  }
+  env->define("__iterator_prototype__", Value(iteratorPrototype));
+
+  // %MapIteratorPrototype% - shared prototype for Map iterator instances
+  auto mapIteratorPrototype = GarbageCollector::makeGC<Object>();
+  mapIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
+  mapIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  mapIteratorPrototype->properties["__proto__"] = Value(iteratorPrototype);
+
+  defineMapMethod("entries", 0, [validateMapThis, mapIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto m = validateMapThis(args, "entries");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9473,14 +9489,13 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(Value(pair), false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
-  defineMapMethod("keys", 0, [validateMapThis](const std::vector<Value>& args) -> Value {
+  defineMapMethod("keys", 0, [validateMapThis, mapIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto m = validateMapThis(args, "keys");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9493,14 +9508,13 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(entry.first, false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
-  defineMapMethod("values", 0, [validateMapThis](const std::vector<Value>& args) -> Value {
+  defineMapMethod("values", 0, [validateMapThis, mapIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto m = validateMapThis(args, "values");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9513,8 +9527,6 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(entry.second, false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -9801,9 +9813,16 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(Undefined{});
   });
 
-  defineSetMethod("entries", 0, [validateSetThis](const std::vector<Value>& args) -> Value {
+  // %SetIteratorPrototype% - shared prototype for Set iterator instances
+  auto setIteratorPrototype = GarbageCollector::makeGC<Object>();
+  setIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
+  setIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  setIteratorPrototype->properties["__proto__"] = Value(iteratorPrototype);
+
+  defineSetMethod("entries", 0, [validateSetThis, setIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "entries");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(setIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9819,14 +9838,13 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(Value(pair), false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
-  defineSetMethod("keys", 0, [validateSetThis](const std::vector<Value>& args) -> Value {
+  defineSetMethod("keys", 0, [validateSetThis, setIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "keys");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(setIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9839,14 +9857,13 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(elem, false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
-  defineSetMethod("values", 0, [validateSetThis](const std::vector<Value>& args) -> Value {
+  defineSetMethod("values", 0, [validateSetThis, setIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "values");
     auto iterObj = GarbageCollector::makeGC<Object>();
+    iterObj->properties["__proto__"] = Value(setIteratorPrototype);
     auto indexPtr = std::make_shared<size_t>(0);
     auto nextFn = GarbageCollector::makeGC<Function>();
     nextFn->isNative = true;
@@ -9859,8 +9876,6 @@ GCPtr<Environment> Environment::createGlobal() {
       return makeIteratorResultObject(elem, false);
     };
     iterObj->properties["next"] = Value(nextFn);
-    iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
-    iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
     return Value(iterObj);
   });
 
@@ -13365,16 +13380,25 @@ GCPtr<Environment> Environment::createGlobal() {
   // Array.prototype[Symbol.iterator] - values iterator
   {
     const auto& iterKey = WellKnownSymbols::iteratorKey();
+    // %ArrayIteratorPrototype%
+    auto arrayIteratorPrototype = GarbageCollector::makeGC<Object>();
+    arrayIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Array Iterator"));
+    arrayIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+    if (auto iterProto = env->get("__iterator_prototype__"); iterProto && iterProto->isObject()) {
+      arrayIteratorPrototype->properties["__proto__"] = *iterProto;
+    }
+
     auto arrayProtoIterator = GarbageCollector::makeGC<Function>();
     arrayProtoIterator->isNative = true;
     arrayProtoIterator->properties["__uses_this_arg__"] = Value(true);
     arrayProtoIterator->properties["__builtin_array_iterator__"] = Value(true);
-    arrayProtoIterator->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    arrayProtoIterator->nativeFunc = [arrayIteratorPrototype](const std::vector<Value>& args) -> Value {
       if (args.empty() || !args[0].isArray()) {
         return Value(Undefined{});
       }
       Value arrayValue = args[0];
       auto iterObj = GarbageCollector::makeGC<Object>();
+      iterObj->properties["__proto__"] = Value(arrayIteratorPrototype);
       auto indexPtr = std::make_shared<size_t>(0);
       auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
@@ -13394,8 +13418,6 @@ GCPtr<Environment> Environment::createGlobal() {
         return Value(result);
       };
       iterObj->properties["next"] = Value(nextFn);
-      iterObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Array Iterator"));
-      iterObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
       return Value(iterObj);
     };
     arrayPrototype->properties[iterKey] = Value(arrayProtoIterator);
