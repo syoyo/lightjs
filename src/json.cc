@@ -921,16 +921,44 @@ static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
     if (auto objProto = interp->resolveVariable("__object_prototype__"); objProto.has_value()) {
         context->properties["__proto__"] = *objProto;
     }
-    // Look up source annotation on the holder
-    std::string sourceKey = "__json_source_" + name;
-    OrderedMap<std::string, Value>* holderProps = nullptr;
-    if (holder.isObject()) holderProps = &holder.getGC<Object>()->properties;
-    else if (holder.isArray()) holderProps = &holder.getGC<Array>()->properties;
-    if (holderProps) {
+    // Look up source annotation on the holder — only for primitive values
+    // If the value was forward-modified, source should not be included
+    if (val.isNumber() || val.isString() || val.isBool() || val.isNull() || val.isBigInt()) {
+      std::string sourceKey = "__json_source_" + name;
+      OrderedMap<std::string, Value>* holderProps = nullptr;
+      if (holder.isObject()) holderProps = &holder.getGC<Object>()->properties;
+      else if (holder.isArray()) holderProps = &holder.getGC<Array>()->properties;
+      if (holderProps) {
         auto srcIt = holderProps->find(sourceKey);
         if (srcIt != holderProps->end() && srcIt->second.isString()) {
+          // Verify source matches current value (detects forward modifications)
+          const std::string& src = std::get<std::string>(srcIt->second.data);
+          bool matches = false;
+          if (val.isNull() && src == "null") matches = true;
+          else if (val.isBool() && ((val.toBool() && src == "true") || (!val.toBool() && src == "false"))) matches = true;
+          else if (val.isNumber()) {
+            // Parse source and compare
+            try {
+              double parsed = std::stod(src);
+              double actual = std::get<double>(val.data);
+              if (parsed == actual || (std::isnan(parsed) && std::isnan(actual))) matches = true;
+            } catch (...) {}
+          } else if (val.isString()) {
+            // Source includes quotes; parse it
+            if (src.size() >= 2 && src.front() == '"' && src.back() == '"') {
+              try {
+                JSONParser srcParser(src);
+                Value parsed = srcParser.parse();
+                if (parsed.isString() && std::get<std::string>(parsed.data) == std::get<std::string>(val.data))
+                  matches = true;
+              } catch (...) {}
+            }
+          }
+          if (matches) {
             context->properties["source"] = srcIt->second;
+          }
         }
+      }
     }
     return interp->callForHarness(reviverFn, {Value(name), val, Value(context)}, holder);
 }
