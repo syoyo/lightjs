@@ -9888,14 +9888,43 @@ GCPtr<Environment> Environment::createGlobal() {
     double sizeVal = 0;
     if (interp) {
       auto [found, sizeRaw] = interp->getPropertyForExternal(other, "size");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
       if (!found) {
         throw std::runtime_error("TypeError: property 'size' is not a function");
       }
+      // Step 3: Let numSize be ? ToNumber(rawSize)
+      if (sizeRaw.isBigInt()) {
+        throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
+      }
       if (sizeRaw.isNumber()) {
         sizeVal = std::get<double>(sizeRaw.data);
+      } else if (sizeRaw.isObject() || sizeRaw.isArray() || sizeRaw.isFunction()) {
+        // ToPrimitive(number hint) then ToNumber
+        // Try valueOf first, then toString
+        auto [hasVO, voFn] = interp->getPropertyForExternal(sizeRaw, "valueOf");
+        Value prim = sizeRaw;
+        if (hasVO && voFn.isFunction()) {
+          Value result = interp->callForHarness(voFn, {}, sizeRaw);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!result.isObject() && !result.isArray() && !result.isFunction()) {
+            prim = result;
+          } else {
+            auto [hasTS, tsFn] = interp->getPropertyForExternal(sizeRaw, "toString");
+            if (hasTS && tsFn.isFunction()) {
+              Value tsResult = interp->callForHarness(tsFn, {}, sizeRaw);
+              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+              prim = tsResult;
+            }
+          }
+        }
+        if (prim.isBigInt()) {
+          throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
+        }
+        sizeVal = prim.toNumber();
       } else {
         sizeVal = sizeRaw.toNumber();
       }
+      // Step 5: If numSize is NaN, throw a TypeError exception
       if (std::isnan(sizeVal)) {
         throw std::runtime_error("TypeError: 'size' is NaN");
       }
@@ -9905,6 +9934,7 @@ GCPtr<Environment> Environment::createGlobal() {
     Value hasMethod;
     if (interp) {
       auto [found, val] = interp->getPropertyForExternal(other, "has");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
       if (found) hasMethod = val;
     }
     if (!hasMethod.isFunction()) {
@@ -9915,6 +9945,7 @@ GCPtr<Environment> Environment::createGlobal() {
     Value keysMethod;
     if (interp) {
       auto [found, val] = interp->getPropertyForExternal(other, "keys");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
       if (found) keysMethod = val;
     }
     if (!keysMethod.isFunction()) {
