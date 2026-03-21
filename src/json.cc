@@ -28,33 +28,41 @@ private:
         }
     }
 
-    Value parseValue() {
+    // Parse a value and optionally capture its source text
+    Value parseValue(std::string* outSource = nullptr) {
         skipWhitespace();
         if (pos_ >= str_.size()) {
             throw std::runtime_error("Unexpected end of JSON input");
         }
 
+        size_t startPos = pos_;
         char ch = str_[pos_];
+        Value result;
+        bool isPrimitive = false;
         switch (ch) {
             case '"':
-                return parseString();
+                result = parseString(); isPrimitive = true; break;
             case 't':
-                return parseTrue();
+                result = parseTrue(); isPrimitive = true; break;
             case 'f':
-                return parseFalse();
+                result = parseFalse(); isPrimitive = true; break;
             case 'n':
-                return parseNull();
+                result = parseNull(); isPrimitive = true; break;
             case '{':
-                return parseObject();
+                result = parseObject(); break;
             case '[':
-                return parseArray();
+                result = parseArray(); break;
             case '-':
             case '0': case '1': case '2': case '3': case '4':
             case '5': case '6': case '7': case '8': case '9':
-                return parseNumber();
+                result = parseNumber(); isPrimitive = true; break;
             default:
                 throw std::runtime_error("Unexpected character in JSON");
         }
+        if (outSource && isPrimitive) {
+            *outSource = str_.substr(startPos, pos_ - startPos);
+        }
+        return result;
     }
 
     Value parseString() {
@@ -257,16 +265,15 @@ private:
             }
             pos_++; // Skip colon
 
-            // Parse value
-            Value value = parseValue();
+            // Parse value with source tracking
+            std::string valSource;
+            Value value = parseValue(&valSource);
             if (key == "__proto__") {
-                // JSON.parse must treat __proto__ as a regular data property
-                // (not a prototype setter) per ES spec §24.5.1
-                // Store value as own property data, keep real __proto__ as Object.prototype
                 obj->properties["__own_prop___proto__"] = value;
-                // Don't set obj->properties["__proto__"] = value which would change the prototype
+                if (!valSource.empty()) obj->properties["__json_source___proto__"] = Value(valSource);
             } else {
                 obj->properties[key] = value;
+                if (!valSource.empty()) obj->properties["__json_source_" + key] = Value(valSource);
             }
 
             skipWhitespace();
@@ -303,8 +310,13 @@ private:
         }
 
         while (true) {
-            Value value = parseValue();
+            std::string valSource;
+            Value value = parseValue(&valSource);
+            size_t idx = arr->elements.size();
             arr->elements.push_back(value);
+            if (!valSource.empty()) {
+                arr->properties["__json_source_" + std::to_string(idx)] = Value(valSource);
+            }
 
             skipWhitespace();
             if (pos_ >= str_.size()) {
@@ -328,8 +340,8 @@ private:
 public:
     JSONParser(const std::string& str) : str_(str), pos_(0) {}
 
-    Value parse() {
-        Value result = parseValue();
+    Value parse(std::string* outSource = nullptr) {
+        Value result = parseValue(outSource);
         skipWhitespace();
         if (pos_ < str_.size()) {
             throw std::runtime_error("Unexpected trailing characters");
@@ -475,6 +487,18 @@ private:
             checkCircular(value);
             serializeArray(value);
         } else if (value.isObject() || value.isError()) {
+            // Check for rawJSON marker (JSON.rawJSON result)
+            if (value.isObject()) {
+              auto obj = value.getGC<Object>();
+              auto rawIt = obj->properties.find("__is_raw_json__");
+              if (rawIt != obj->properties.end() && rawIt->second.isBool() && rawIt->second.toBool()) {
+                auto valIt = obj->properties.find("rawJSON");
+                if (valIt != obj->properties.end() && valIt->second.isString()) {
+                  out_ << std::get<std::string>(valIt->second.data);
+                  return true;
+                }
+              }
+            }
             checkCircular(value);
             serializeObject(value);
         } else if (value.isRegex() || value.isMap() || value.isSet() ||
@@ -880,6 +904,8 @@ static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
             if (newElement.isUndefined()) {
                 if (!isNonConfigurable) {
                     arr->elements[i] = Value(Undefined{});
+                    // Mark as deleted/hole so prototype chain lookup works
+                    arr->properties["__deleted_" + idxStr + "__"] = Value(true);
                 }
             } else {
                 if (!isNonConfigurable) {
@@ -889,8 +915,24 @@ static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
         }
     }
 
-    // Step 3: Call reviver(name, val)
-    return interp->callForHarness(reviverFn, {Value(name), val}, holder);
+    // Step 3: Call reviver(name, val, context)
+    // ES2024: context is {source: <original JSON text>} for primitives, {} for objects/arrays
+    auto context = GarbageCollector::makeGC<Object>();
+    if (auto objProto = interp->resolveVariable("__object_prototype__"); objProto.has_value()) {
+        context->properties["__proto__"] = *objProto;
+    }
+    // Look up source annotation on the holder
+    std::string sourceKey = "__json_source_" + name;
+    OrderedMap<std::string, Value>* holderProps = nullptr;
+    if (holder.isObject()) holderProps = &holder.getGC<Object>()->properties;
+    else if (holder.isArray()) holderProps = &holder.getGC<Array>()->properties;
+    if (holderProps) {
+        auto srcIt = holderProps->find(sourceKey);
+        if (srcIt != holderProps->end() && srcIt->second.isString()) {
+            context->properties["source"] = srcIt->second;
+        }
+    }
+    return interp->callForHarness(reviverFn, {Value(name), val, Value(context)}, holder);
 }
 
 // JSON object implementation
@@ -924,15 +966,18 @@ Value JSON_parse(const std::vector<Value>& args) {
     }
 
     JSONParser parser(jsonStr);
-    Value result = parser.parse();
+    std::string rootSource;
+    Value result = parser.parse(&rootSource);
 
     // Apply reviver if provided
     if (args.size() > 1 && args[1].isFunction()) {
         Interpreter* interp = getGlobalInterpreter();
         if (interp) {
-            // Create wrapper object { "": result } with Object.prototype
             auto wrapper = makeObjectWithPrototype();
             wrapper->properties[""] = result;
+            if (!rootSource.empty()) {
+                wrapper->properties["__json_source_"] = Value(rootSource);
+            }
             result = internalizeJSONProperty(interp, Value(wrapper), "", args[1]);
         }
     }

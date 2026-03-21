@@ -2230,7 +2230,8 @@ static bool isInternalProperty(const std::string& key) {
   }
   if (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_" ||
       key.substr(0, 11) == "__non_enum_" || key.substr(0, 15) == "__non_writable_" ||
-      key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_") return true;
+      key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_" ||
+      key.substr(0, 14) == "__json_source_") return true;
   return false;
 }
 
@@ -2452,7 +2453,8 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     if (rawKey.rfind("__non_enum_", 0) == 0 ||
         rawKey.rfind("__non_writable_", 0) == 0 ||
         rawKey.rfind("__non_configurable_", 0) == 0 ||
-        rawKey.rfind("__enum_", 0) == 0) {
+        rawKey.rfind("__enum_", 0) == 0 ||
+        rawKey.rfind("__json_source_", 0) == 0) {
       continue;
     }
     std::string exposed = rawKey;

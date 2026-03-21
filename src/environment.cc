@@ -143,6 +143,7 @@ bool isInternalPropertyKeyForReflection(const std::string& key) {
   if (key.rfind("__mapped_arg_index_", 0) == 0) return true;
   if (key.rfind("__mapped_arg_name_", 0) == 0) return true;
   if (key.rfind("__deleted_", 0) == 0) return true;
+  if (key.rfind("__json_source_", 0) == 0) return true;
 
   static const std::unordered_set<std::string> internalKeys = {
     "__callable_object__",
@@ -16661,6 +16662,100 @@ GCPtr<Environment> Environment::createGlobal() {
   jsonObj->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("JSON"));
   jsonObj->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
   jsonObj->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+
+  // JSON.rawJSON(value) - ES2024
+  {
+    auto rawJSONFn = GarbageCollector::makeGC<Function>();
+    rawJSONFn->isNative = true;
+    rawJSONFn->properties["name"] = Value(std::string("rawJSON"));
+    rawJSONFn->properties["length"] = Value(1.0);
+    rawJSONFn->properties["__non_writable_name"] = Value(true);
+    rawJSONFn->properties["__non_enum_name"] = Value(true);
+    rawJSONFn->properties["__non_writable_length"] = Value(true);
+    rawJSONFn->properties["__non_enum_length"] = Value(true);
+    rawJSONFn->properties["__throw_on_new__"] = Value(true);
+    rawJSONFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty()) {
+        throw std::runtime_error("SyntaxError: JSON.rawJSON requires a value");
+      }
+      if (args[0].isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      }
+      // Step 1: ToString(value)
+      std::string jsonStr = args[0].toString();
+      // Step 2: empty string or leading/trailing whitespace → SyntaxError
+      if (jsonStr.empty()) {
+        throw std::runtime_error("SyntaxError: JSON.rawJSON cannot be an empty string");
+      }
+      char first = jsonStr.front(), last = jsonStr.back();
+      if (first == '\t' || first == '\n' || first == '\r' || first == ' ' ||
+          last == '\t' || last == '\n' || last == '\r' || last == ' ') {
+        throw std::runtime_error("SyntaxError: JSON.rawJSON has illegal whitespace");
+      }
+      // Step 3: Must be valid JSON and not an object or array at outermost level
+      if (first == '{' || first == '[') {
+        throw std::runtime_error("SyntaxError: JSON.rawJSON value must not be an object or array");
+      }
+      // Validate it's valid JSON primitive (string, number, true, false, null)
+      // Quick validation: try to parse it
+      if (jsonStr != "true" && jsonStr != "false" && jsonStr != "null") {
+        if (first == '"') {
+          // String: basic validation (starts and ends with quote)
+          if (jsonStr.size() < 2 || last != '"') {
+            throw std::runtime_error("SyntaxError: Invalid JSON string in rawJSON");
+          }
+        } else if ((first >= '0' && first <= '9') || first == '-') {
+          // Number: basic validation
+          char* end = nullptr;
+          std::strtod(jsonStr.c_str(), &end);
+          if (end != jsonStr.c_str() + jsonStr.size()) {
+            throw std::runtime_error("SyntaxError: Invalid JSON number in rawJSON");
+          }
+        } else {
+          throw std::runtime_error("SyntaxError: Invalid JSON text in rawJSON");
+        }
+      }
+      // Create result: OrdinaryObjectCreate(null) with { rawJSON: jsonStr }
+      auto result = GarbageCollector::makeGC<Object>();
+      result->properties["__proto__"] = Value(Null{});
+      result->properties["rawJSON"] = Value(jsonStr);
+      result->properties["__non_writable_rawJSON"] = Value(true);
+      result->properties["__non_configurable_rawJSON"] = Value(true);
+      // Mark as rawJSON for JSON.stringify and JSON.isRawJSON
+      result->properties["__is_raw_json__"] = Value(true);
+      // Freeze: non-extensible
+      result->frozen = true;
+      result->sealed = true;
+      result->nonExtensible = true;
+      result->properties["__frozen__"] = Value(true);
+      result->properties["__sealed__"] = Value(true);
+      result->properties["__non_extensible__"] = Value(true);
+      return Value(result);
+    };
+    jsonObj->properties["rawJSON"] = Value(rawJSONFn);
+    jsonObj->properties["__non_enum_rawJSON"] = Value(true);
+  }
+
+  // JSON.isRawJSON(value) - ES2024
+  {
+    auto isRawJSONFn = GarbageCollector::makeGC<Function>();
+    isRawJSONFn->isNative = true;
+    isRawJSONFn->properties["name"] = Value(std::string("isRawJSON"));
+    isRawJSONFn->properties["length"] = Value(1.0);
+    isRawJSONFn->properties["__non_writable_name"] = Value(true);
+    isRawJSONFn->properties["__non_enum_name"] = Value(true);
+    isRawJSONFn->properties["__non_writable_length"] = Value(true);
+    isRawJSONFn->properties["__non_enum_length"] = Value(true);
+    isRawJSONFn->properties["__throw_on_new__"] = Value(true);
+    isRawJSONFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isObject()) return Value(false);
+      auto obj = args[0].getGC<Object>();
+      auto it = obj->properties.find("__is_raw_json__");
+      return Value(it != obj->properties.end() && it->second.isBool() && it->second.toBool());
+    };
+    jsonObj->properties["isRawJSON"] = Value(isRawJSONFn);
+    jsonObj->properties["__non_enum_isRawJSON"] = Value(true);
+  }
 
   // Make parse/stringify non-enumerable
   jsonObj->properties["__non_enum_parse"] = Value(true);
