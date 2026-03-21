@@ -2578,13 +2578,16 @@ Value Object_fromEntries(const std::vector<Value>& args) {
     nextFn = fn;
   }
 
-  // Helper: close iterator
+  // Cache return method for iterator closing
+  Value returnFn;
+  if (!isGen) {
+    auto [hr, rf] = interp->getPropertyForExternal(iteratorObj, "return");
+    if (interp->hasError()) interp->clearError();
+    if (hr && rf.isFunction()) returnFn = rf;
+  }
   auto closeIter = [&]() {
-    if (isGen) return;
-    auto [hr, retFn] = interp->getPropertyForExternal(iteratorObj, "return");
-    if (interp->hasError()) { interp->clearError(); return; }
-    if (hr && retFn.isFunction()) {
-      interp->callForHarness(retFn, {}, iteratorObj);
+    if (returnFn.isFunction()) {
+      interp->callForHarness(returnFn, {}, iteratorObj);
       if (interp->hasError()) interp->clearError();
     }
   };

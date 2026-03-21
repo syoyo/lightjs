@@ -107,6 +107,30 @@ bool isTypedArrayConstructorName(const std::string& name) {
   return kTypedArrayNames.count(name) > 0;
 }
 
+// ToPrimitive conversion for native code contexts.
+// preferString=true: try toString first, then valueOf (string hint)
+// preferString=false: try valueOf first, then toString (number hint)
+static Value toPrimitiveFromNative(const Value& val, bool preferString) {
+  if (!val.isObject() && !val.isArray() && !val.isFunction())
+    return val;
+  auto* interp = getGlobalInterpreter();
+  if (!interp)
+    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+  const char* first = preferString ? "toString" : "valueOf";
+  const char* second = preferString ? "valueOf" : "toString";
+  for (const char* method : {first, second}) {
+    auto [has, fn] = interp->getPropertyForExternal(val, method);
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+    if (has && fn.isFunction()) {
+      Value result = interp->callForHarness(fn, {}, val);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!result.isObject() && !result.isArray() && !result.isFunction())
+        return result;
+    }
+  }
+  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+}
+
 bool isInternalPropertyKeyForReflection(const std::string& key) {
   // Hide LightJS internal bookkeeping keys from reflection APIs.
   // Do NOT hide arbitrary "__user__" property names: Test262 relies on them.
@@ -9103,27 +9127,8 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       if (val.isUndefined()) return defaultVal;
       if (val.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
-      // ToPrimitive for objects
-      if (interp && (val.isObject() || val.isArray() || val.isFunction())) {
-        auto [hasTS, tsFn] = interp->getPropertyForExternal(val, "toString");
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        if (hasTS && tsFn.isFunction()) {
-          Value result = interp->callForHarness(tsFn, {}, val);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          if (!result.isObject() && !result.isArray() && !result.isFunction()) {
-            return result.toString();
-          }
-        }
-        auto [hasVO, voFn] = interp->getPropertyForExternal(val, "valueOf");
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        if (hasVO && voFn.isFunction()) {
-          Value voResult = interp->callForHarness(voFn, {}, val);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
-            return voResult.toString();
-          }
-        }
-        throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+      if (val.isObject() || val.isArray() || val.isFunction()) {
+        return toPrimitiveFromNative(val, true).toString();
       }
       return val.toString();
     };
@@ -9156,47 +9161,9 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       std::string message;
       if (hasMessage) {
-        // ToString with ToPrimitive for objects
         Value msgVal = args[0];
         if (msgVal.isObject() || msgVal.isArray() || msgVal.isFunction()) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            // ToPrimitive(string hint): toString first, then valueOf
-            auto [hasTS, tsFn] = interp->getPropertyForExternal(msgVal, "toString");
-            if (hasTS && tsFn.isFunction()) {
-              Value result = interp->callForHarness(tsFn, {}, msgVal);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              if (!result.isObject() && !result.isArray() && !result.isFunction()) {
-                msgVal = result;
-              } else {
-                auto [hasVO, voFn] = interp->getPropertyForExternal(msgVal, "valueOf");
-                if (hasVO && voFn.isFunction()) {
-                  Value voResult = interp->callForHarness(voFn, {}, msgVal);
-                  if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-                  if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
-                    msgVal = voResult;
-                  } else {
-                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                  }
-                } else {
-                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                }
-              }
-            } else {
-              auto [hasVO, voFn] = interp->getPropertyForExternal(msgVal, "valueOf");
-              if (hasVO && voFn.isFunction()) {
-                Value voResult = interp->callForHarness(voFn, {}, msgVal);
-                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-                if (!voResult.isObject() && !voResult.isArray() && !voResult.isFunction()) {
-                  msgVal = voResult;
-                } else {
-                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                }
-              } else {
-                throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-              }
-            }
-          }
+          msgVal = toPrimitiveFromNative(msgVal, true);
         }
         message = msgVal.toString();
       }
@@ -9966,24 +9933,7 @@ GCPtr<Environment> Environment::createGlobal() {
       if (sizeRaw.isNumber()) {
         sizeVal = std::get<double>(sizeRaw.data);
       } else if (sizeRaw.isObject() || sizeRaw.isArray() || sizeRaw.isFunction()) {
-        // ToPrimitive(number hint) then ToNumber
-        // Try valueOf first, then toString
-        auto [hasVO, voFn] = interp->getPropertyForExternal(sizeRaw, "valueOf");
-        Value prim = sizeRaw;
-        if (hasVO && voFn.isFunction()) {
-          Value result = interp->callForHarness(voFn, {}, sizeRaw);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          if (!result.isObject() && !result.isArray() && !result.isFunction()) {
-            prim = result;
-          } else {
-            auto [hasTS, tsFn] = interp->getPropertyForExternal(sizeRaw, "toString");
-            if (hasTS && tsFn.isFunction()) {
-              Value tsResult = interp->callForHarness(tsFn, {}, sizeRaw);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              prim = tsResult;
-            }
-          }
-        }
+        Value prim = toPrimitiveFromNative(sizeRaw, false);
         if (prim.isBigInt()) {
           throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
         }
@@ -16713,7 +16663,6 @@ GCPtr<Environment> Environment::createGlobal() {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       auto obj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
-      // Set __proto__ to Object.prototype
       if (auto objProtoVal = env->get("__object_prototype__");
           objProtoVal && objProtoVal->isObject()) {
         obj->properties["__proto__"] = *objProtoVal;
@@ -17184,10 +17133,16 @@ GCPtr<Environment> Environment::createGlobal() {
       else if (v.isBool()) ctorName = "Boolean";
       else if (v.isBigInt()) ctorName = "BigInt";
       else if (v.isSymbol()) ctorName = "Symbol";
-      if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
-        auto protoIt = ctor->getGC<Function>()->properties.find("prototype");
-        if (protoIt != ctor->getGC<Function>()->properties.end()) {
-          wrapper->properties["__proto__"] = protoIt->second;
+      if (auto ctor = env->get(ctorName)) {
+        OrderedMap<std::string, Value>* ctorProps = nullptr;
+        if (ctor->isFunction()) ctorProps = &ctor->getGC<Function>()->properties;
+        else if (ctor->isObject()) ctorProps = &ctor->getGC<Object>()->properties;
+        else if (ctor->isClass()) ctorProps = &ctor->getGC<Class>()->properties;
+        if (ctorProps) {
+          auto protoIt = ctorProps->find("prototype");
+          if (protoIt != ctorProps->end()) {
+            wrapper->properties["__proto__"] = protoIt->second;
+          }
         }
       }
       return Value(wrapper);
@@ -17518,6 +17473,42 @@ GCPtr<Environment> Environment::createGlobal() {
   objectPrototype->properties["__lookupGetter__"] = Value(objectProtoLookupGetter);
   objectPrototype->properties["__non_enum___lookupGetter__"] = Value(true);
 
+  // Shared implementation for __defineGetter__/__defineSetter__ (Annex B)
+  auto defineAccessorImpl = [](const std::vector<Value>& args, bool isGetter) -> Value {
+    const char* kind = isGetter ? "getter" : "setter";
+    if (args.size() < 3) throw std::runtime_error(std::string("TypeError: __define") + (isGetter ? "Getter" : "Setter") + "__ requires 2 arguments");
+    if (args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+    if (!args[2].isFunction()) {
+      throw std::runtime_error(std::string("TypeError: ") + kind + " must be a function");
+    }
+    std::string key = valueToPropertyKey(args[1]);
+    std::string markerPrefix = isGetter ? "__get_" : "__set_";
+    auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
+      if (props.find("__non_configurable_" + key) != props.end()) {
+        throw std::runtime_error("TypeError: Cannot redefine property: " + key);
+      }
+      bool isNew = props.find(key) == props.end() &&
+                   props.find("__get_" + key) == props.end() &&
+                   props.find("__set_" + key) == props.end();
+      if (isNew && props.find("__non_extensible__") != props.end()) {
+        throw std::runtime_error("TypeError: Cannot define property " + key + ", object is not extensible");
+      }
+      props[markerPrefix + key] = args[2];
+      props.erase("__non_writable_" + key);
+      if (props.find(key) == props.end()) {
+        props[key] = Value(Undefined{});
+      }
+    };
+    if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
+    else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
+    else if (args[0].isFunction()) setOnProps(args[0].getGC<Function>()->properties);
+    else if (args[0].isRegex()) setOnProps(args[0].getGC<Regex>()->properties);
+    else if (args[0].isError()) setOnProps(args[0].getGC<Error>()->properties);
+    return Value(Undefined{});
+  };
+
   // Annex B: Object.prototype.__defineGetter__
   {
     auto fn = GarbageCollector::makeGC<Function>();
@@ -17529,40 +17520,8 @@ GCPtr<Environment> Environment::createGlobal() {
     fn->properties["length"] = Value(2.0);
     fn->properties["__non_writable_length"] = Value(true);
     fn->properties["__non_enum_length"] = Value(true);
-    fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.size() < 3) throw std::runtime_error("TypeError: __defineGetter__ requires 2 arguments");
-      if (args[0].isUndefined() || args[0].isNull()) {
-        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
-      }
-      if (!args[2].isFunction()) {
-        throw std::runtime_error("TypeError: getter must be a function");
-      }
-      std::string key = valueToPropertyKey(args[1]);
-      auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
-        // Check non-configurable: cannot redefine
-        if (props.find("__non_configurable_" + key) != props.end()) {
-          throw std::runtime_error("TypeError: Cannot redefine property: " + key);
-        }
-        // Check non-extensible: cannot add new property
-        bool isNew = props.find(key) == props.end() &&
-                     props.find("__get_" + key) == props.end() &&
-                     props.find("__set_" + key) == props.end();
-        if (isNew && props.find("__non_extensible__") != props.end()) {
-          throw std::runtime_error("TypeError: Cannot define property " + key + ", object is not extensible");
-        }
-        props["__get_" + key] = args[2];
-        props.erase("__non_writable_" + key);
-        // Add visible key for enumeration (if not already present)
-        if (props.find(key) == props.end()) {
-          props[key] = Value(Undefined{});
-        }
-      };
-      if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
-      else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
-      else if (args[0].isFunction()) setOnProps(args[0].getGC<Function>()->properties);
-      else if (args[0].isRegex()) setOnProps(args[0].getGC<Regex>()->properties);
-      else if (args[0].isError()) setOnProps(args[0].getGC<Error>()->properties);
-      return Value(Undefined{});
+    fn->nativeFunc = [defineAccessorImpl](const std::vector<Value>& args) -> Value {
+      return defineAccessorImpl(args, true);
     };
     objectPrototype->properties["__defineGetter__"] = Value(fn);
     objectPrototype->properties["__non_enum___defineGetter__"] = Value(true);
@@ -17579,40 +17538,8 @@ GCPtr<Environment> Environment::createGlobal() {
     fn->properties["length"] = Value(2.0);
     fn->properties["__non_writable_length"] = Value(true);
     fn->properties["__non_enum_length"] = Value(true);
-    fn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.size() < 3) throw std::runtime_error("TypeError: __defineSetter__ requires 2 arguments");
-      if (args[0].isUndefined() || args[0].isNull()) {
-        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
-      }
-      if (!args[2].isFunction()) {
-        throw std::runtime_error("TypeError: setter must be a function");
-      }
-      std::string key = valueToPropertyKey(args[1]);
-      auto setOnProps = [&](OrderedMap<std::string, Value>& props) {
-        // Check non-configurable: cannot redefine
-        if (props.find("__non_configurable_" + key) != props.end()) {
-          throw std::runtime_error("TypeError: Cannot redefine property: " + key);
-        }
-        // Check non-extensible: cannot add new property
-        bool isNew = props.find(key) == props.end() &&
-                     props.find("__get_" + key) == props.end() &&
-                     props.find("__set_" + key) == props.end();
-        if (isNew && props.find("__non_extensible__") != props.end()) {
-          throw std::runtime_error("TypeError: Cannot define property " + key + ", object is not extensible");
-        }
-        props["__set_" + key] = args[2];
-        props.erase("__non_writable_" + key);
-        // Add visible key for enumeration (if not already present)
-        if (props.find(key) == props.end()) {
-          props[key] = Value(Undefined{});
-        }
-      };
-      if (args[0].isObject()) setOnProps(args[0].getGC<Object>()->properties);
-      else if (args[0].isArray()) setOnProps(args[0].getGC<Array>()->properties);
-      else if (args[0].isFunction()) setOnProps(args[0].getGC<Function>()->properties);
-      else if (args[0].isRegex()) setOnProps(args[0].getGC<Regex>()->properties);
-      else if (args[0].isError()) setOnProps(args[0].getGC<Error>()->properties);
-      return Value(Undefined{});
+    fn->nativeFunc = [defineAccessorImpl](const std::vector<Value>& args) -> Value {
+      return defineAccessorImpl(args, false);
     };
     objectPrototype->properties["__defineSetter__"] = Value(fn);
     objectPrototype->properties["__non_enum___defineSetter__"] = Value(true);
@@ -19852,43 +19779,9 @@ GCPtr<Environment> Environment::createGlobal() {
           }
 
           if (valueField.has_value()) {
-            // ToNumber with ToPrimitive for objects (valueOf/toString)
             Value lenVal = *valueField;
-            auto* interp = getGlobalInterpreter();
-            if (interp && (lenVal.isObject() || lenVal.isArray() || lenVal.isFunction())) {
-              // Try valueOf() first, then toString()
-              auto [hasVO, voFn] = getPropertyLike(lenVal, "valueOf", lenVal);
-              if (hasVO && voFn.isFunction()) {
-                Value result = interp->callForHarness(voFn, {}, lenVal);
-                if (!result.isObject() && !result.isArray() && !result.isFunction()) {
-                  lenVal = result;
-                } else {
-                  // valueOf returned non-primitive, try toString
-                  auto [hasTS, tsFn] = getPropertyLike(lenVal, "toString", lenVal);
-                  if (hasTS && tsFn.isFunction()) {
-                    Value tsResult = interp->callForHarness(tsFn, {}, lenVal);
-                    if (!tsResult.isObject() && !tsResult.isArray() && !tsResult.isFunction()) {
-                      lenVal = tsResult;
-                    } else {
-                      throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                    }
-                  } else {
-                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                  }
-                }
-              } else {
-                auto [hasTS, tsFn] = getPropertyLike(lenVal, "toString", lenVal);
-                if (hasTS && tsFn.isFunction()) {
-                  Value tsResult = interp->callForHarness(tsFn, {}, lenVal);
-                  if (!tsResult.isObject() && !tsResult.isArray() && !tsResult.isFunction()) {
-                    lenVal = tsResult;
-                  } else {
-                    throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                  }
-                } else {
-                  throw std::runtime_error("TypeError: Cannot convert object to primitive value");
-                }
-              }
+            if (lenVal.isObject() || lenVal.isArray() || lenVal.isFunction()) {
+              lenVal = toPrimitiveFromNative(lenVal, false);
             }
             double numVal = lenVal.toNumber();
             uint32_t newLen = static_cast<uint32_t>(numVal);
