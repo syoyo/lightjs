@@ -10231,6 +10231,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto weakMapPrototype = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     weakMapConstructor->properties["prototype"] = Value(weakMapPrototype);
+    weakMapConstructor->properties["__non_writable_prototype"] = Value(true);
+    weakMapConstructor->properties["__non_enum_prototype"] = Value(true);
+    weakMapConstructor->properties["__non_configurable_prototype"] = Value(true);
     weakMapPrototype->properties["constructor"] = Value(weakMapConstructor);
     weakMapPrototype->properties["__non_enum_constructor"] = Value(true);
     weakMapPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("WeakMap"));
@@ -10304,6 +10307,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto weakSetPrototype = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     weakSetConstructor->properties["prototype"] = Value(weakSetPrototype);
+    weakSetConstructor->properties["__non_writable_prototype"] = Value(true);
+    weakSetConstructor->properties["__non_enum_prototype"] = Value(true);
+    weakSetConstructor->properties["__non_configurable_prototype"] = Value(true);
     weakSetPrototype->properties["constructor"] = Value(weakSetConstructor);
     weakSetPrototype->properties["__non_enum_constructor"] = Value(true);
     weakSetPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("WeakSet"));
