@@ -2508,29 +2508,121 @@ Value Object_fromEntries(const std::vector<Value>& args) {
     throw std::runtime_error("TypeError: Object.fromEntries requires an iterable argument");
   }
 
-  // Support Map input
-  if (args[0].isMap()) {
-    auto map = args[0].getGC<Map>();
-    for (const auto& [key, val] : map->entries) {
-      newObj->properties[valueToPropertyKey(key)] = val;
+  auto* interp = getGlobalInterpreter();
+  if (!interp) {
+    throw std::runtime_error("TypeError: Object.fromEntries requires an interpreter");
+  }
+
+  const Value& iterable = args[0];
+
+  // Get @@iterator method
+  const auto& iterKey = WellKnownSymbols::iteratorKey();
+  auto [hasIter, iterMethod] = interp->getPropertyForExternal(iterable, iterKey);
+  if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+  if (!hasIter || !iterMethod.isFunction()) {
+    throw std::runtime_error("TypeError: object is not iterable");
+  }
+
+  // Call @@iterator to get iterator object
+  Value iteratorObj = interp->callForHarness(iterMethod, {}, iterable);
+  if (interp->hasError()) {
+    Value err = interp->getError(); interp->clearError();
+    throw JsValueException(err);
+  }
+
+  // Get next method
+  Value nextFn;
+  bool isGen = iteratorObj.isGenerator();
+  if (!isGen) {
+    auto [nf, fn] = interp->getPropertyForExternal(iteratorObj, "next");
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+    if (!nf || !fn.isFunction()) {
+      throw std::runtime_error("TypeError: iterator result is not an object");
     }
-    return Value(newObj);
+    nextFn = fn;
   }
 
-  if (!args[0].isArray()) {
-    return Value(newObj);
-  }
+  // Helper: close iterator
+  auto closeIter = [&]() {
+    if (isGen) return;
+    auto [hr, retFn] = interp->getPropertyForExternal(iteratorObj, "return");
+    if (interp->hasError()) { interp->clearError(); return; }
+    if (hr && retFn.isFunction()) {
+      interp->callForHarness(retFn, {}, iteratorObj);
+      if (interp->hasError()) interp->clearError();
+    }
+  };
 
-  auto arr = args[0].getGC<Array>();
-  for (const auto& entry : arr->elements) {
-    // Each entry should be an array with [key, value]
-    if (entry.isArray()) {
-      auto pair = entry.getGC<Array>();
-      if (pair->elements.size() >= 2) {
-        std::string key = valueToPropertyKey(pair->elements[0]);
-        newObj->properties[key] = pair->elements[1];
+  // Iterate
+  for (int i = 0; i < 100000; ++i) {
+    Value step;
+    if (isGen) {
+      step = interp->generatorNext(iteratorObj, Value(Undefined{}));
+    } else {
+      step = interp->callForHarness(nextFn, {}, iteratorObj);
+    }
+    if (interp->hasError()) {
+      Value err = interp->getError(); interp->clearError();
+      throw JsValueException(err);
+    }
+
+    // Check done
+    auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+    if (interp->hasError()) {
+      Value err = interp->getError(); interp->clearError();
+      throw JsValueException(err);
+    }
+    if (hasDone && doneVal.toBool()) break;
+
+    // Get value
+    auto [hasVal, entry] = interp->getPropertyForExternal(step, "value");
+    if (interp->hasError()) {
+      Value err = interp->getError(); interp->clearError();
+      throw JsValueException(err);
+    }
+
+    // Entry must be an object (array-like with [0] and [1])
+    if (entry.isNull() || entry.isUndefined() || entry.isBool() ||
+        entry.isNumber() || entry.isBigInt() || entry.isSymbol()) {
+      closeIter();
+      throw std::runtime_error("TypeError: Iterator value " + entry.toString() + " is not an entry object");
+    }
+
+    // String entries: "ab" → key=0, value=1 (char at index 0 and 1)
+    if (entry.isString()) {
+      const std::string& str = std::get<std::string>(entry.data);
+      // Strings are array-like; access [0] and [1] via getPropertyForExternal
+      auto [k0, key] = interp->getPropertyForExternal(entry, "0");
+      auto [k1, val] = interp->getPropertyForExternal(entry, "1");
+      if (interp->hasError()) {
+        Value err = interp->getError(); interp->clearError();
+        closeIter();
+        throw JsValueException(err);
       }
+      if (!k0 || !k1) {
+        closeIter();
+        throw std::runtime_error("TypeError: Iterator value " + str + " is not an entry object");
+      }
+      newObj->properties[valueToPropertyKey(key)] = val;
+      continue;
     }
+
+    // Get key (entry[0]) and value (entry[1]) via property access
+    auto [k0, keyVal] = interp->getPropertyForExternal(entry, "0");
+    if (interp->hasError()) {
+      Value err = interp->getError(); interp->clearError();
+      closeIter();
+      throw JsValueException(err);
+    }
+    auto [k1, valVal] = interp->getPropertyForExternal(entry, "1");
+    if (interp->hasError()) {
+      Value err = interp->getError(); interp->clearError();
+      closeIter();
+      throw JsValueException(err);
+    }
+
+    std::string key = valueToPropertyKey(keyVal);
+    newObj->properties[key] = valVal;
   }
 
   return Value(newObj);
