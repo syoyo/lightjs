@@ -2199,7 +2199,15 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
 
 static bool isInternalProperty(const std::string& key) {
   if (key.size() >= 4 && key.substr(0, 2) == "__" &&
-      key.substr(key.size() - 2) == "__") return true;
+      key.substr(key.size() - 2) == "__") {
+    // Annex B properties are NOT internal
+    static const std::unordered_set<std::string> annexBProps = {
+      "__defineGetter__", "__defineSetter__",
+      "__lookupGetter__", "__lookupSetter__",
+    };
+    if (annexBProps.count(key)) return false;
+    return true;
+  }
   if (key.substr(0, 6) == "__get_" || key.substr(0, 6) == "__set_" ||
       key.substr(0, 11) == "__non_enum_" || key.substr(0, 15) == "__non_writable_" ||
       key.substr(0, 19) == "__non_configurable_" || key.substr(0, 7) == "__enum_") return true;
