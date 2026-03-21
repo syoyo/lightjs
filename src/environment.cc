@@ -17161,11 +17161,31 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoValueOf->properties["length"] = Value(0.0);
   objectProtoValueOf->properties["__non_writable_length"] = Value(true);
   objectProtoValueOf->properties["__non_enum_length"] = Value(true);
-  objectProtoValueOf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+  objectProtoValueOf->nativeFunc = [env](const std::vector<Value>& args) -> Value {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
     }
-    return args[0];
+    // ToObject: box primitives
+    const Value& v = args[0];
+    if (v.isBool() || v.isNumber() || v.isString() || v.isBigInt() || v.isSymbol()) {
+      auto wrapper = GarbageCollector::makeGC<Object>();
+      wrapper->properties["__primitive_value__"] = v;
+      // Set __proto__
+      std::string ctorName;
+      if (v.isString()) ctorName = "String";
+      else if (v.isNumber()) ctorName = "Number";
+      else if (v.isBool()) ctorName = "Boolean";
+      else if (v.isBigInt()) ctorName = "BigInt";
+      else if (v.isSymbol()) ctorName = "Symbol";
+      if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
+        auto protoIt = ctor->getGC<Function>()->properties.find("prototype");
+        if (protoIt != ctor->getGC<Function>()->properties.end()) {
+          wrapper->properties["__proto__"] = protoIt->second;
+        }
+      }
+      return Value(wrapper);
+    }
+    return v;
   };
   objectPrototype->properties["valueOf"] = Value(objectProtoValueOf);
   objectPrototype->properties["__non_enum_valueOf"] = Value(true);
