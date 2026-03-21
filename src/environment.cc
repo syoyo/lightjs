@@ -16672,6 +16672,97 @@ GCPtr<Environment> Environment::createGlobal() {
   objectConstructor->properties["__non_configurable_prototype"] = Value(true);
   objectPrototype->properties["constructor"] = Value(objectConstructor);
   objectPrototype->properties["__non_enum_constructor"] = Value(true);
+
+  // Object.prototype.__proto__ accessor (Annex B, but spec-required)
+  {
+    auto protoGetter = GarbageCollector::makeGC<Function>();
+    protoGetter->isNative = true;
+    protoGetter->properties["__uses_this_arg__"] = Value(true);
+    protoGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+        throw std::runtime_error("TypeError: Cannot read properties of " +
+          std::string(args.empty() || args[0].isUndefined() ? "undefined" : "null"));
+      }
+      const Value& thisVal = args[0];
+      auto proto = getPrototypeValue(thisVal);
+      if (proto.has_value()) return *proto;
+      return Value(Null{});
+    };
+    protoGetter->properties["name"] = Value(std::string("get __proto__"));
+    protoGetter->properties["__non_writable_name"] = Value(true);
+    protoGetter->properties["__non_enum_name"] = Value(true);
+    objectPrototype->properties["__get___proto__"] = Value(protoGetter);
+
+    auto protoSetter = GarbageCollector::makeGC<Function>();
+    protoSetter->isNative = true;
+    protoSetter->properties["__uses_this_arg__"] = Value(true);
+    protoSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.size() < 2) return Value(Undefined{});
+      const Value& thisVal = args[0];
+      const Value& proto = args[1];
+      // RequireObjectCoercible(O)
+      if (thisVal.isUndefined() || thisVal.isNull()) {
+        throw std::runtime_error("TypeError: Object.prototype.__proto__ called on null or undefined");
+      }
+      // If proto is not Object or null, return undefined (no-op)
+      if (!proto.isNull() && !proto.isObject() && !proto.isFunction() &&
+          !proto.isArray() && !proto.isClass() && !proto.isRegex() &&
+          !proto.isError() && !proto.isPromise() && !proto.isMap() &&
+          !proto.isSet() && !proto.isProxy()) {
+        return Value(Undefined{});
+      }
+      // If O is not object, return undefined
+      if (!thisVal.isObject() && !thisVal.isFunction() && !thisVal.isArray() &&
+          !thisVal.isClass() && !thisVal.isRegex() && !thisVal.isError() &&
+          !thisVal.isPromise() && !thisVal.isMap() && !thisVal.isSet() &&
+          !thisVal.isProxy()) {
+        return Value(Undefined{});
+      }
+      // Check for cycles
+      Value checkProto = proto;
+      int depth = 0;
+      while (!checkProto.isNull() && !checkProto.isUndefined() && depth < 100) {
+        // If checkProto === O, throw TypeError (cycle)
+        if (thisVal.isObject() && checkProto.isObject() &&
+            thisVal.getGC<Object>().get() == checkProto.getGC<Object>().get()) {
+          throw std::runtime_error("TypeError: Cyclic __proto__ value");
+        }
+        auto nextProto = getPrototypeValue(checkProto);
+        if (!nextProto.has_value() || nextProto->isNull() || nextProto->isUndefined()) break;
+        checkProto = *nextProto;
+        depth++;
+      }
+      // Check extensibility
+      if (thisVal.isObject()) {
+        auto obj = thisVal.getGC<Object>();
+        if (obj->nonExtensible || obj->sealed || obj->frozen ||
+            obj->properties.find("__non_extensible__") != obj->properties.end()) {
+          throw std::runtime_error("TypeError: #<Object> is not extensible");
+        }
+        obj->properties["__proto__"] = proto;
+      } else if (thisVal.isArray()) {
+        auto arr = thisVal.getGC<Array>();
+        if (arr->properties.find("__non_extensible__") != arr->properties.end()) {
+          throw std::runtime_error("TypeError: #<Array> is not extensible");
+        }
+        arr->properties["__proto__"] = proto;
+      } else if (thisVal.isFunction()) {
+        auto fn = thisVal.getGC<Function>();
+        if (fn->properties.find("__non_extensible__") != fn->properties.end()) {
+          throw std::runtime_error("TypeError: is not extensible");
+        }
+        fn->properties["__proto__"] = proto;
+      }
+      return Value(Undefined{});
+    };
+    protoSetter->properties["name"] = Value(std::string("set __proto__"));
+    protoSetter->properties["__non_writable_name"] = Value(true);
+    protoSetter->properties["__non_enum_name"] = Value(true);
+    objectPrototype->properties["__set___proto__"] = Value(protoSetter);
+    objectPrototype->properties["__non_enum___proto__"] = Value(true);
+    // Don't set __non_configurable___proto__ - it defaults to configurable: true
+  }
+
   env->define("__object_prototype__", Value(objectPrototype));
   setGlobalObjectPrototype(Value(objectPrototype));
   // Set JSON/Reflect [[Prototype]] to Object.prototype (defined earlier but before objectPrototype)

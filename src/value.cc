@@ -2170,10 +2170,12 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
   if (key == "__proto__" && obj->properties.find("__own_prop___proto__") != obj->properties.end()) {
     return Value(true);
   }
-  if (isInternalProperty(key)) return Value(false);
-  if (obj->properties.find(key) != obj->properties.end()) return Value(true);
+  // Check for accessor properties before isInternalProperty check
+  // (e.g., Object.prototype has __get___proto__ / __set___proto__)
   if (obj->properties.find("__get_" + key) != obj->properties.end()) return Value(true);
   if (obj->properties.find("__set_" + key) != obj->properties.end()) return Value(true);
+  if (isInternalProperty(key)) return Value(false);
+  if (obj->properties.find(key) != obj->properties.end()) return Value(true);
   return Value(false);
 }
 
