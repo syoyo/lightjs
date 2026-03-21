@@ -2231,6 +2231,27 @@ Value Object_getOwnPropertyNames(const std::vector<Value>& args) {
     throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
   }
 
+  // Primitives: ToObject then get own property names
+  if (args[0].isNumber() || args[0].isBool() || args[0].isBigInt() || args[0].isSymbol()) {
+    return Value(result); // No own string-keyed properties
+  }
+  if (args[0].isString()) {
+    const auto& str = std::get<std::string>(args[0].data);
+    // String objects have indices 0..n-1 and "length"
+    size_t cpIdx = 0, bytePos = 0;
+    while (bytePos < str.size()) {
+      result->elements.push_back(Value(std::to_string(cpIdx)));
+      unsigned char c = str[bytePos];
+      if (c < 0x80) bytePos += 1;
+      else if ((c & 0xE0) == 0xC0) bytePos += 2;
+      else if ((c & 0xF0) == 0xE0) bytePos += 3;
+      else bytePos += 4;
+      cpIdx++;
+    }
+    result->elements.push_back(Value(std::string("length")));
+    return Value(result);
+  }
+
   auto parseArrayIndexKey = [](const std::string& key, uint32_t& out) -> bool {
     if (key.empty()) return false;
     if (key.size() > 1 && key[0] == '0') return false;

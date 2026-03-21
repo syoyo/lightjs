@@ -17015,11 +17015,13 @@ GCPtr<Environment> Environment::createGlobal() {
       return false;
     };
 
+    // Step 1: If V is not Object, return false (before ToObject(this))
+    if (args.size() < 2 || !isObjectLikeValue(args[1])) {
+      return Value(false);
+    }
+    // Step 2: Let O be ToObject(this)
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
-    }
-    if (args.size() < 2) {
-      return Value(false);
     }
     Value protoVal = args[0];
     if (!isObjectLikeValue(protoVal)) {
@@ -17027,9 +17029,6 @@ GCPtr<Environment> Environment::createGlobal() {
     }
 
     Value v = args[1];
-    if (v.isUndefined() || v.isNull()) {
-      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
-    }
 
     auto nextProtoValue = [&](const Value& cur) -> Value {
       if (cur.isObject()) {
@@ -18076,11 +18075,16 @@ GCPtr<Environment> Environment::createGlobal() {
       else if (args[0].isString()) ctorName = "String";
       else if (args[0].isNumber()) ctorName = "Number";
       else ctorName = "Boolean";
-      if (auto ctor = env->get(ctorName); ctor && ctor->isFunction()) {
-        auto ctorFn = std::get<GCPtr<Function>>(ctor->data);
-        auto protoIt = ctorFn->properties.find("prototype");
-        if (protoIt != ctorFn->properties.end()) {
-          return protoIt->second;
+      if (auto ctor = env->get(ctorName)) {
+        OrderedMap<std::string, Value>* ctorProps = nullptr;
+        if (ctor->isFunction()) ctorProps = &ctor->getGC<Function>()->properties;
+        else if (ctor->isObject()) ctorProps = &ctor->getGC<Object>()->properties;
+        else if (ctor->isClass()) ctorProps = &ctor->getGC<Class>()->properties;
+        if (ctorProps) {
+          auto protoIt = ctorProps->find("prototype");
+          if (protoIt != ctorProps->end()) {
+            return protoIt->second;
+          }
         }
       }
       return Value(Null{});
