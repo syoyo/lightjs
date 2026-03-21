@@ -20353,8 +20353,23 @@ GCPtr<Environment> Environment::createGlobal() {
           doIterate(propsArg.getGC<Set>()->properties);
         } else if (propsArg.isPromise()) {
           doIterate(propsArg.getGC<Promise>()->properties);
+        } else if (propsArg.isString()) {
+          // ToObject(string) → String object with indexed chars as enumerable own properties
+          const std::string& str = std::get<std::string>(propsArg.data);
+          size_t cpIdx = 0, bytePos = 0;
+          while (bytePos < str.size()) {
+            unsigned char c = str[bytePos];
+            size_t charLen = 1;
+            if ((c & 0xE0) == 0xC0) charLen = 2;
+            else if ((c & 0xF0) == 0xE0) charLen = 3;
+            else if ((c & 0xF8) == 0xF0) charLen = 4;
+            Value charVal(str.substr(bytePos, charLen));
+            applyDescriptor(std::to_string(cpIdx), charVal);
+            bytePos += charLen;
+            cpIdx++;
+          }
         }
-        // Primitives other than undefined are silently ignored
+        // Number/boolean/symbol primitives have no enumerable own string-keyed properties
       }
 
       return Value(newObj);
