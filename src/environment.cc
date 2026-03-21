@@ -16775,62 +16775,91 @@ GCPtr<Environment> Environment::createGlobal() {
     protoSetter->isNative = true;
     protoSetter->properties["__uses_this_arg__"] = Value(true);
     protoSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.size() < 2) return Value(Undefined{});
-      const Value& thisVal = args[0];
-      const Value& proto = args[1];
-      // RequireObjectCoercible(O)
+      // Step 1: RequireObjectCoercible(O) — must happen even without proto arg
+      const Value& thisVal = args.empty() ? Value(Undefined{}) : args[0];
       if (thisVal.isUndefined() || thisVal.isNull()) {
         throw std::runtime_error("TypeError: Object.prototype.__proto__ called on null or undefined");
       }
-      // If proto is not Object or null, return undefined (no-op)
-      if (!proto.isNull() && !proto.isObject() && !proto.isFunction() &&
-          !proto.isArray() && !proto.isClass() && !proto.isRegex() &&
-          !proto.isError() && !proto.isPromise() && !proto.isMap() &&
-          !proto.isSet() && !proto.isProxy()) {
+      if (args.size() < 2) return Value(Undefined{});
+      const Value& proto = args[1];
+      // Step 3: If proto is not Object or null, return undefined
+      auto isObjLike = [](const Value& v) -> bool {
+        return v.isObject() || v.isFunction() || v.isArray() || v.isClass() ||
+               v.isRegex() || v.isError() || v.isPromise() || v.isMap() ||
+               v.isSet() || v.isProxy() || v.isWeakMap() || v.isWeakSet() ||
+               v.isTypedArray() || v.isArrayBuffer() || v.isDataView() ||
+               v.isGenerator();
+      };
+      if (!proto.isNull() && !isObjLike(proto)) {
         return Value(Undefined{});
       }
-      // If O is not object, return undefined
-      if (!thisVal.isObject() && !thisVal.isFunction() && !thisVal.isArray() &&
-          !thisVal.isClass() && !thisVal.isRegex() && !thisVal.isError() &&
-          !thisVal.isPromise() && !thisVal.isMap() && !thisVal.isSet() &&
-          !thisVal.isProxy()) {
+      // Step 4: If O is not object, return undefined
+      if (!isObjLike(thisVal)) {
         return Value(Undefined{});
       }
-      // Check for cycles
+      // Step 5: SetPrototypeOf(O, proto)
+      // 5a: Check extensibility — if not extensible and proto differs, throw
+      auto currentProto = getPrototypeValue(thisVal);
+      auto isSameProto = [&]() -> bool {
+        if (!currentProto.has_value()) return proto.isNull();
+        if (currentProto->isNull() && proto.isNull()) return true;
+        if (currentProto->data.index() != proto.data.index()) return false;
+        if (currentProto->isObject() && proto.isObject())
+          return currentProto->getGC<Object>().get() == proto.getGC<Object>().get();
+        if (currentProto->isFunction() && proto.isFunction())
+          return currentProto->getGC<Function>().get() == proto.getGC<Function>().get();
+        if (currentProto->isArray() && proto.isArray())
+          return currentProto->getGC<Array>().get() == proto.getGC<Array>().get();
+        return false;
+      };
+      // Check non-extensible
+      auto checkExtensible = [](const Value& v) -> bool {
+        if (v.isObject()) {
+          auto o = v.getGC<Object>();
+          return !o->nonExtensible && !o->sealed && !o->frozen &&
+                 o->properties.find("__non_extensible__") == o->properties.end();
+        }
+        auto getProps = [](const Value& val) -> const OrderedMap<std::string, Value>* {
+          if (val.isArray()) return &val.getGC<Array>()->properties;
+          if (val.isFunction()) return &val.getGC<Function>()->properties;
+          if (val.isClass()) return &val.getGC<Class>()->properties;
+          return nullptr;
+        };
+        auto* props = getProps(v);
+        if (!props) return true;
+        return props->find("__non_extensible__") == props->end();
+      };
+      if (!checkExtensible(thisVal)) {
+        if (!isSameProto()) {
+          throw std::runtime_error("TypeError: #<Object> is not extensible");
+        }
+        return Value(Undefined{});
+      }
+      // 5b: Cycle detection - walk proto chain to check if O appears
       Value checkProto = proto;
-      int depth = 0;
-      while (!checkProto.isNull() && !checkProto.isUndefined() && depth < 100) {
-        // If checkProto === O, throw TypeError (cycle)
-        if (thisVal.isObject() && checkProto.isObject() &&
-            thisVal.getGC<Object>().get() == checkProto.getGC<Object>().get()) {
-          throw std::runtime_error("TypeError: Cyclic __proto__ value");
+      for (int depth = 0; depth < 100 && !checkProto.isNull() && !checkProto.isUndefined(); ++depth) {
+        // SameValue(p, O)
+        if (checkProto.data.index() == thisVal.data.index()) {
+          bool same = false;
+          if (checkProto.isObject() && thisVal.isObject())
+            same = checkProto.getGC<Object>().get() == thisVal.getGC<Object>().get();
+          else if (checkProto.isFunction() && thisVal.isFunction())
+            same = checkProto.getGC<Function>().get() == thisVal.getGC<Function>().get();
+          else if (checkProto.isArray() && thisVal.isArray())
+            same = checkProto.getGC<Array>().get() == thisVal.getGC<Array>().get();
+          if (same) throw std::runtime_error("TypeError: Cyclic __proto__ value");
         }
         auto nextProto = getPrototypeValue(checkProto);
         if (!nextProto.has_value() || nextProto->isNull() || nextProto->isUndefined()) break;
         checkProto = *nextProto;
-        depth++;
       }
-      // Check extensibility
-      if (thisVal.isObject()) {
-        auto obj = thisVal.getGC<Object>();
-        if (obj->nonExtensible || obj->sealed || obj->frozen ||
-            obj->properties.find("__non_extensible__") != obj->properties.end()) {
-          throw std::runtime_error("TypeError: #<Object> is not extensible");
-        }
-        obj->properties["__proto__"] = proto;
-      } else if (thisVal.isArray()) {
-        auto arr = thisVal.getGC<Array>();
-        if (arr->properties.find("__non_extensible__") != arr->properties.end()) {
-          throw std::runtime_error("TypeError: #<Array> is not extensible");
-        }
-        arr->properties["__proto__"] = proto;
-      } else if (thisVal.isFunction()) {
-        auto fn = thisVal.getGC<Function>();
-        if (fn->properties.find("__non_extensible__") != fn->properties.end()) {
-          throw std::runtime_error("TypeError: is not extensible");
-        }
-        fn->properties["__proto__"] = proto;
-      }
+      // Step 5c: Set the prototype
+      auto setPropOnValue = [&](const Value& target) {
+        if (target.isObject()) target.getGC<Object>()->properties["__proto__"] = proto;
+        else if (target.isArray()) target.getGC<Array>()->properties["__proto__"] = proto;
+        else if (target.isFunction()) target.getGC<Function>()->properties["__proto__"] = proto;
+      };
+      setPropOnValue(thisVal);
       return Value(Undefined{});
     };
     protoSetter->properties["name"] = Value(std::string("set __proto__"));
