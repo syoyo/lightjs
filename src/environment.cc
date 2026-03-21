@@ -17627,10 +17627,10 @@ GCPtr<Environment> Environment::createGlobal() {
       auto* interp = getGlobalInterpreter();
       if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
 
-      // Create null-prototype result object
+      // Create null-prototype result object per spec: OrdinaryObjectCreate(null)
       auto result = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));
-      // No __proto__ = null prototype
+      result->properties["__proto__"] = Value(Null{});
 
       // Iterate items
       if (items.isArray()) {
