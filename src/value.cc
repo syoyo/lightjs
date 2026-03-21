@@ -1095,6 +1095,16 @@ static bool valuesEqual(const Value& a, const Value& b) {
   if (a.isFunction()) return a.getGC<Function>() == b.getGC<Function>();
   if (a.isMap()) return a.getGC<Map>() == b.getGC<Map>();
   if (a.isSet()) return a.getGC<Set>() == b.getGC<Set>();
+  if (a.isWeakMap()) return a.getGC<WeakMap>() == b.getGC<WeakMap>();
+  if (a.isWeakSet()) return a.getGC<WeakSet>() == b.getGC<WeakSet>();
+  if (a.isPromise()) return a.getGC<Promise>() == b.getGC<Promise>();
+  if (a.isRegex()) return a.getGC<Regex>() == b.getGC<Regex>();
+  if (a.isError()) return a.getGC<Error>() == b.getGC<Error>();
+  if (a.isTypedArray()) return a.getGC<TypedArray>() == b.getGC<TypedArray>();
+  if (a.isArrayBuffer()) return a.getGC<ArrayBuffer>() == b.getGC<ArrayBuffer>();
+  if (a.isDataView()) return a.getGC<DataView>() == b.getGC<DataView>();
+  if (a.isGenerator()) return a.getGC<Generator>() == b.getGC<Generator>();
+  if (a.isClass()) return a.getGC<Class>() == b.getGC<Class>();
 
   return false;
 }
