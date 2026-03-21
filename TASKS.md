@@ -36,7 +36,7 @@ This document tracks planned enhancements and future work for LightJS.
 
 - Note: runner may print `Failed to read module: .../syntax/foo.js` because that file is intentionally absent in the suite.
 
-### Latest Status (2026-03-20)
+### Latest Status (2026-03-21)
 
 | Scope | Pass | Total | Rate |
 |---|---|---|---|
@@ -44,9 +44,9 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Math` | 325 | 327 | 99.4% |
 | `built-ins/Number` | 337 | 338 | 99.7% |
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
-| `built-ins/JSON` | 125 | 165 | 75.8% |
-| `built-ins/String` | 1159 | 1223 | 94.8% |
-| `built-ins/Object` | 3070 | 3413 | 90.0% |
+| `built-ins/JSON` | 126 | 165 | 76.4% |
+| `built-ins/String` | 1164 | 1223 | 95.2% |
+| `built-ins/Object` | 3192 | 3411 | 93.6% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
 | `built-ins/parseFloat` | 54 | 54 | 100.0% |
@@ -63,6 +63,21 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakMap` | 96 | 141 | 68.1% |
 
 Unit tests: 346/346 passing.
+
+#### Changes (2026-03-21)
+
+122 Object tests fixed (3070→3192/3411), 5 String tests fixed, 1 JSON test fixed, 0 regressions:
+
+- **ToPropertyDescriptor getter invocation** (`src/environment.cc`): readDescriptorField now uses getPropertyLike() to properly invoke accessor getters on descriptor objects per ES spec 8.10.5. Fixes defineProperty/defineProperties tests where descriptor attributes were defined as getters.
+- **defineProperties getter invocation** (`src/environment.cc`): getOwnPropertyLike() in iterateOwnEnumerable to invoke getters when reading property descriptors.
+- **Object() constructor prototype** (`src/environment.cc`): Set __proto__ to Object.prototype on objects created by Object(undefined/null).
+- **Primitive wrapper __proto__** (`src/interpreter.cc`): Set correct __proto__ (String.prototype, Number.prototype, etc.) on primitive wrapper objects created for `this` binding.
+- **Array length ToPrimitive** (`src/environment.cc`): Handle object values for array length via valueOf()/toString().
+- **Array length non-configurable blocking** (`src/environment.cc`): Check for non-configurable elements blocking length decrease per spec 15.4.5.1.
+- **Array sparse length** (`src/environment.cc`, `src/interpreter.cc`): __array_length__ property for lengths >1M without materializing elements. Fixes 2^32-1/2^32-2 boundary tests.
+- **Array index auto-extend length** (`src/environment.cc`): Update length when defining index >= current length.
+- **Non-writable length rejection** (`src/environment.cc`): Reject defineProperty on indices >= length when non-writable.
+- **Object.keys hole skipping** (`src/value.cc`): Skip __hole__/__deleted__ markers for sparse arrays.
 
 #### Changes (2026-03-20 #4)
 
