@@ -17438,6 +17438,9 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoLookupGetter->properties["__non_enum_length"] = Value(true);
   objectProtoLookupGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
+    if (args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
     Value current = args[0];
     std::string key = valueToPropertyKey(args[1]);
 
@@ -17496,6 +17499,9 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       props[markerPrefix + key] = args[2];
       props.erase("__non_writable_" + key);
+      // Per spec: descriptor is {[[Get/Set]], [[Enumerable]]: true, [[Configurable]]: true}
+      props.erase("__non_enum_" + key);
+      props.erase("__non_configurable_" + key);
       if (props.find(key) == props.end()) {
         props[key] = Value(Undefined{});
       }
@@ -17556,6 +17562,9 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoLookupSetter->properties["__non_enum_length"] = Value(true);
   objectProtoLookupSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.size() < 2) return Value(Undefined{});
+    if (args[0].isUndefined() || args[0].isNull()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
     Value current = args[0];
     std::string key = valueToPropertyKey(args[1]);
 
