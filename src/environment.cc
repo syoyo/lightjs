@@ -9340,33 +9340,90 @@ GCPtr<Environment> Environment::createGlobal() {
   mapConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto mapObj = GarbageCollector::makeGC<Map>();
     GarbageCollector::instance().reportAllocation(sizeof(Map));
+    Value mapVal(mapObj);
 
-    if (!args.empty() && args[0].isArray()) {
-      auto entriesArr = args[0].getGC<Array>();
-      for (const auto& entryVal : entriesArr->elements) {
-        Value k(Undefined{});
-        Value v(Undefined{});
-        if (entryVal.isArray()) {
-          auto entryArr = entryVal.getGC<Array>();
-          if (entryArr->elements.size() >= 1) k = entryArr->elements[0];
-          if (entryArr->elements.size() >= 2) v = entryArr->elements[1];
-          mapObj->set(k, v);
-          continue;
+    if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return mapVal;
+
+      // Set __proto__ early so method lookup works
+      auto mapCtor = interp->resolveVariable("Map");
+      if (mapCtor) {
+        auto [hasP, proto] = interp->getPropertyForExternal(*mapCtor, "prototype");
+        if (hasP && (proto.isObject() || proto.isNull())) {
+          mapObj->properties["__proto__"] = proto;
         }
-        if (entryVal.isObject()) {
-          auto entryObj = entryVal.getGC<Object>();
-          if (auto it0 = entryObj->properties.find("0"); it0 != entryObj->properties.end()) {
-            k = it0->second;
+      }
+
+      // Step 7: Get adder = Get(map, "set")
+      auto [hasSet, setMethod] = interp->getPropertyForExternal(mapVal, "set");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasSet || !setMethod.isFunction()) {
+        throw std::runtime_error("TypeError: Map.prototype.set is not a function");
+      }
+
+      // Get iterator
+      auto [hasIter, iterFn] = interp->getPropertyForExternal(args[0], WellKnownSymbols::iteratorKey());
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasIter || !iterFn.isFunction()) {
+        throw std::runtime_error("TypeError: object is not iterable");
+      }
+      Value iterator = interp->callForHarness(iterFn, {}, args[0]);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+      int limit = 100000;
+      while (limit-- > 0) {
+        auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!hasNext || !nextMethod.isFunction()) break;
+        Value step = interp->callForHarness(nextMethod, {}, iterator);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasDone && doneVal.toBool()) break;
+
+        auto [hasVal, itemVal] = interp->getPropertyForExternal(step, "value");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        // Each item must be an object [key, value]
+        if (!itemVal.isObject() && !itemVal.isArray()) {
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
           }
-          if (auto it1 = entryObj->properties.find("1"); it1 != entryObj->properties.end()) {
-            v = it1->second;
+          throw std::runtime_error("TypeError: Iterator value is not an entry object");
+        }
+
+        auto [hasK, keyVal] = interp->getPropertyForExternal(itemVal, "0");
+        if (interp->hasError()) {
+          Value err = interp->getError(); interp->clearError();
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) interp->callForHarness(returnFn, {}, iterator);
+          throw JsValueException(err);
+        }
+        auto [hasV, valVal] = interp->getPropertyForExternal(itemVal, "1");
+        if (interp->hasError()) {
+          Value err = interp->getError(); interp->clearError();
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) interp->callForHarness(returnFn, {}, iterator);
+          throw JsValueException(err);
+        }
+
+        try {
+          interp->callForHarness(setMethod, {keyVal, valVal}, mapVal);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        } catch (...) {
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
           }
-          mapObj->set(k, v);
+          throw;
         }
       }
     }
 
-    return Value(mapObj);
+    return mapVal;
   };
   auto mapPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
@@ -9577,17 +9634,20 @@ GCPtr<Environment> Environment::createGlobal() {
   defineMapMethod("getOrInsertComputed", 2, [validateMapThis](const std::vector<Value>& args) -> Value {
     auto m = validateMapThis(args, "getOrInsertComputed");
     Value key = args.size() > 1 ? args[1] : Value(Undefined{});
+    Value callback = args.size() > 2 ? args[2] : Value(Undefined{});
+    // Validate callback BEFORE checking key existence (per spec)
+    if (!callback.isFunction()) {
+      throw std::runtime_error("TypeError: callbackfn is not a function");
+    }
     // Normalize -0 to +0
     if (key.isNumber() && key.toNumber() == 0.0) key = Value(0.0);
     if (m->has(key)) {
       return m->get(key);
     }
-    if (args.size() < 3 || !args[2].isFunction()) {
-      throw std::runtime_error("TypeError: callbackfn is not a function");
-    }
     auto* interp = getGlobalInterpreter();
     if (!interp) return Value(Undefined{});
-    Value val = interp->callForHarness(Value(args[2].getGC<Function>()), {key});
+    Value val = interp->callForHarness(callback, {key}, Value(Undefined{}));
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
     m->set(key, val);
     return val;
   });
@@ -9728,15 +9788,66 @@ GCPtr<Environment> Environment::createGlobal() {
   setConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
     auto setObj = GarbageCollector::makeGC<Set>();
     GarbageCollector::instance().reportAllocation(sizeof(Set));
+    Value setVal(setObj);
 
-    if (!args.empty() && args[0].isArray()) {
-      auto entriesArr = args[0].getGC<Array>();
-      for (const auto& entryVal : entriesArr->elements) {
-        setObj->add(entryVal);
+    if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return setVal;
+
+      // Set __proto__ early so method lookup works
+      auto setCtor = interp->resolveVariable("Set");
+      if (setCtor) {
+        auto [hasP, proto] = interp->getPropertyForExternal(*setCtor, "prototype");
+        if (hasP && (proto.isObject() || proto.isNull())) {
+          setObj->properties["__proto__"] = proto;
+        }
+      }
+
+      // Get adder = Get(set, "add")
+      auto [hasAdd, addMethod] = interp->getPropertyForExternal(setVal, "add");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasAdd || !addMethod.isFunction()) {
+        throw std::runtime_error("TypeError: Set.prototype.add is not a function");
+      }
+
+      // Get iterator
+      auto [hasIter, iterFn] = interp->getPropertyForExternal(args[0], WellKnownSymbols::iteratorKey());
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasIter || !iterFn.isFunction()) {
+        throw std::runtime_error("TypeError: object is not iterable");
+      }
+      Value iterator = interp->callForHarness(iterFn, {}, args[0]);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+      int limit = 100000;
+      while (limit-- > 0) {
+        auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!hasNext || !nextMethod.isFunction()) break;
+        Value step = interp->callForHarness(nextMethod, {}, iterator);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasDone && doneVal.toBool()) break;
+
+        auto [hasVal, itemVal] = interp->getPropertyForExternal(step, "value");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        try {
+          interp->callForHarness(addMethod, {itemVal}, setVal);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        } catch (...) {
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
+          }
+          throw;
+        }
       }
     }
 
-    return Value(setObj);
+    return setVal;
   };
   auto setPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
@@ -9996,44 +10107,68 @@ GCPtr<Environment> Environment::createGlobal() {
     return result.toBool();
   };
 
-  // Helper: iterate keys from a SetRecord
-  auto setRecordKeys = [](const SetRecord& rec) -> std::vector<Value> {
+  // Helper: iterate keys from a SetRecord, storing iter and returnFn for early close
+  struct SetKeysIterator {
+    std::vector<Value> keys;
+    Value iter;
+    Value returnFn;
+    bool isGen = false;
+  };
+  auto setRecordKeysIter = [](const SetRecord& rec) -> SetKeysIterator {
     auto* interp = getGlobalInterpreter();
-    if (!interp) return {};
-    std::vector<Value> result;
+    SetKeysIterator result;
+    if (!interp) return result;
     // If it's a Set, get values directly
     if (rec.obj.isSet()) {
       auto s = rec.obj.getGC<Set>();
-      return s->values;
+      result.keys = s->values;
+      return result;
     }
     // Otherwise call keys() and iterate
-    Value iter = interp->callForHarness(rec.keys, {}, rec.obj);
-    if (interp->hasError()) {
-      interp->clearError();
-      return {};
+    result.iter = interp->callForHarness(rec.keys, {}, rec.obj);
+    if (interp->hasError()) { interp->clearError(); return result; }
+
+    result.isGen = result.iter.isGenerator();
+
+    // Get next method ONCE before the loop (spec requirement)
+    Value nextMethod;
+    if (!result.isGen) {
+      auto [hasNext, nm] = interp->getPropertyForExternal(result.iter, "next");
+      if (interp->hasError()) { interp->clearError(); return result; }
+      if (!hasNext || !nm.isFunction()) return result;
+      nextMethod = nm;
     }
-    // Iterate the returned iterator
+
+    // Get return method for early close support
+    if (!result.isGen) {
+      auto [hasReturn, rm] = interp->getPropertyForExternal(result.iter, "return");
+      if (!interp->hasError() && hasReturn && rm.isFunction()) {
+        result.returnFn = rm;
+      }
+      if (interp->hasError()) interp->clearError();
+    }
+
     int limit = 10000;
     while (limit-- > 0) {
       Value nextResult;
-      if (iter.isObject()) {
-        auto iterObj = iter.getGC<Object>();
-        auto nextIt = iterObj->properties.find("next");
-        if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
-          nextResult = interp->callForHarness(nextIt->second, {}, iter);
-        } else break;
-      } else break;
-      if (interp->hasError()) { interp->clearError(); break; }
-      if (!nextResult.isObject()) break;
-      auto resultObj = nextResult.getGC<Object>();
-      auto doneIt = resultObj->properties.find("done");
-      if (doneIt != resultObj->properties.end() && doneIt->second.toBool()) break;
-      auto valueIt = resultObj->properties.find("value");
-      if (valueIt != resultObj->properties.end()) {
-        result.push_back(valueIt->second);
+      if (result.isGen) {
+        nextResult = interp->generatorNext(result.iter, Value(Undefined{}));
+      } else {
+        nextResult = interp->callForHarness(nextMethod, {}, result.iter);
+        if (interp->hasError()) { interp->clearError(); break; }
       }
+      auto [hasDone, doneVal] = interp->getPropertyForExternal(nextResult, "done");
+      if (interp->hasError()) { interp->clearError(); break; }
+      if (hasDone && doneVal.toBool()) break;
+      auto [hasVal, val] = interp->getPropertyForExternal(nextResult, "value");
+      if (interp->hasError()) { interp->clearError(); break; }
+      result.keys.push_back(hasVal ? val : Value(Undefined{}));
     }
     return result;
+  };
+  // Simple version that just returns keys
+  auto setRecordKeys = [&setRecordKeysIter](const SetRecord& rec) -> std::vector<Value> {
+    return setRecordKeysIter(rec).keys;
   };
 
   // Helper to create a new Set with proper prototype
@@ -10125,20 +10260,76 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(true);
   });
 
+  // Helper: lazily iterate other's keys, calling fn(value) for each; close iterator early if fn returns true
+  auto iterateSetRecordKeys = [&setRecordKeysIter](const SetRecord& rec, std::function<bool(const Value&)> fn) -> void {
+    auto* interp = getGlobalInterpreter();
+    if (!interp) return;
+    if (rec.obj.isSet()) {
+      auto s = rec.obj.getGC<Set>();
+      for (const auto& v : s->values) {
+        if (fn(v)) return;
+      }
+      return;
+    }
+    Value iter = interp->callForHarness(rec.keys, {}, rec.obj);
+    if (interp->hasError()) { interp->clearError(); return; }
+
+    bool isGen = iter.isGenerator();
+    Value nextMethod;
+    Value returnFn;
+    if (!isGen) {
+      auto [hasNext, nm] = interp->getPropertyForExternal(iter, "next");
+      if (interp->hasError()) { interp->clearError(); return; }
+      if (!hasNext || !nm.isFunction()) return;
+      nextMethod = nm;
+      auto [hasReturn, rm] = interp->getPropertyForExternal(iter, "return");
+      if (!interp->hasError() && hasReturn && rm.isFunction()) returnFn = rm;
+      if (interp->hasError()) interp->clearError();
+    }
+
+    int limit = 10000;
+    while (limit-- > 0) {
+      Value nextResult;
+      if (isGen) {
+        nextResult = interp->generatorNext(iter, Value(Undefined{}));
+      } else {
+        nextResult = interp->callForHarness(nextMethod, {}, iter);
+        if (interp->hasError()) { interp->clearError(); break; }
+      }
+      auto [hasDone, doneVal] = interp->getPropertyForExternal(nextResult, "done");
+      if (interp->hasError()) { interp->clearError(); break; }
+      if (hasDone && doneVal.toBool()) break;
+      auto [hasVal, val] = interp->getPropertyForExternal(nextResult, "value");
+      if (interp->hasError()) { interp->clearError(); break; }
+      Value v = hasVal ? val : Value(Undefined{});
+      if (fn(v)) {
+        // Close iterator early
+        if (!isGen && returnFn.isFunction()) {
+          interp->callForHarness(returnFn, {}, iter);
+          if (interp->hasError()) interp->clearError();
+        }
+        return;
+      }
+    }
+  };
+
   // Set.prototype.isSupersetOf(other)
-  defineSetMethod("isSupersetOf", 1, [validateSetThis, getSetRecord, setRecordHas, setRecordKeys](const std::vector<Value>& args) -> Value {
+  defineSetMethod("isSupersetOf", 1, [validateSetThis, getSetRecord, setRecordHas, iterateSetRecordKeys](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "isSupersetOf");
     if (args.size() < 2) throw std::runtime_error("TypeError: isSupersetOf requires an argument");
     auto rec = getSetRecord(args[1]);
-    auto otherKeys = setRecordKeys(rec);
-    for (const auto& v : otherKeys) {
-      if (!s->has(v)) return Value(false);
-    }
-    return Value(true);
+    // Step 3: If thisSize < otherRec.[[Size]], return false
+    if (static_cast<double>(s->values.size()) < rec.size) return Value(false);
+    bool isSuperset = true;
+    iterateSetRecordKeys(rec, [&](const Value& v) -> bool {
+      if (!s->has(v)) { isSuperset = false; return true; }
+      return false;
+    });
+    return Value(isSuperset);
   });
 
   // Set.prototype.isDisjointFrom(other)
-  defineSetMethod("isDisjointFrom", 1, [validateSetThis, getSetRecord, setRecordHas, setRecordKeys](const std::vector<Value>& args) -> Value {
+  defineSetMethod("isDisjointFrom", 1, [validateSetThis, getSetRecord, setRecordHas, iterateSetRecordKeys](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "isDisjointFrom");
     if (args.size() < 2) throw std::runtime_error("TypeError: isDisjointFrom requires an argument");
     auto rec = getSetRecord(args[1]);
@@ -10147,10 +10338,12 @@ GCPtr<Environment> Environment::createGlobal() {
         if (setRecordHas(rec, v)) return Value(false);
       }
     } else {
-      auto otherKeys = setRecordKeys(rec);
-      for (const auto& v : otherKeys) {
-        if (s->has(v)) return Value(false);
-      }
+      bool disjoint = true;
+      iterateSetRecordKeys(rec, [&](const Value& v) -> bool {
+        if (s->has(v)) { disjoint = false; return true; }
+        return false;
+      });
+      if (!disjoint) return Value(false);
     }
     return Value(true);
   });
@@ -10177,6 +10370,23 @@ GCPtr<Environment> Environment::createGlobal() {
   }
   env->define("Set", Value(setConstructor));
 
+  // Shared canBeHeldWeakly check for WeakMap/WeakSet/WeakRef
+  auto canBeHeldWeakly = [&globalSymbolRegistry](const Value& v) -> bool {
+    if (v.isSymbol()) {
+      const auto& sym = std::get<Symbol>(v.data);
+      for (const auto& [key, val] : globalSymbolRegistry) {
+        if (val.isSymbol() && std::get<Symbol>(val.data).id == sym.id) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return v.isObject() || v.isArray() || v.isFunction() ||
+           v.isClass() || v.isMap() || v.isSet() || v.isError() || v.isRegex() ||
+           v.isProxy() || v.isPromise() || v.isGenerator() || v.isTypedArray() ||
+           v.isArrayBuffer() || v.isDataView() || v.isWeakMap() || v.isWeakSet();
+  };
+
   // WeakMap constructor
   auto weakMapConstructor = GarbageCollector::makeGC<Function>();
   weakMapConstructor->isNative = true;
@@ -10188,10 +10398,100 @@ GCPtr<Environment> Environment::createGlobal() {
   weakMapConstructor->properties["__non_writable_length"] = Value(true);
   weakMapConstructor->properties["__non_enum_length"] = Value(true);
   weakMapConstructor->properties["__require_new__"] = Value(true);
-  weakMapConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+  weakMapConstructor->nativeFunc = [canBeHeldWeakly](const std::vector<Value>& args) -> Value {
     auto wm = GarbageCollector::makeGC<WeakMap>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakMap));
-    return Value(wm);
+    Value wmVal(wm);
+
+    // If iterable argument provided, process it
+    if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return wmVal;
+
+      // Set __proto__ early so method lookup works
+      auto wmCtor = interp->resolveVariable("WeakMap");
+      if (wmCtor) {
+        auto [hasP, proto] = interp->getPropertyForExternal(*wmCtor, "prototype");
+        if (hasP && (proto.isObject() || proto.isNull())) {
+          wm->properties["__proto__"] = proto;
+        }
+      }
+
+      // Step 7: Get adder = Get(map, "set")
+      auto [hasSet, setMethod] = interp->getPropertyForExternal(wmVal, "set");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasSet || !setMethod.isFunction()) {
+        throw std::runtime_error("TypeError: WeakMap.prototype.set is not a function");
+      }
+
+      // Step 9: Get iterator
+      auto [hasIter, iterFn] = interp->getPropertyForExternal(args[0], WellKnownSymbols::iteratorKey());
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasIter || !iterFn.isFunction()) {
+        throw std::runtime_error("TypeError: object is not iterable");
+      }
+      Value iterator = interp->callForHarness(iterFn, {}, args[0]);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+      int limit = 100000;
+      while (limit-- > 0) {
+        // Get next
+        auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!hasNext || !nextMethod.isFunction()) break;
+        Value step = interp->callForHarness(nextMethod, {}, iterator);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        // Check done
+        auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasDone && doneVal.toBool()) break;
+
+        // Get value (should be [key, value] pair)
+        auto [hasVal, itemVal] = interp->getPropertyForExternal(step, "value");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        if (!itemVal.isObject() && !itemVal.isArray()) {
+          // Close iterator and throw
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
+          }
+          throw std::runtime_error("TypeError: Iterator value is not an entry object");
+        }
+
+        // Get key and value from the pair (close iterator on error)
+        auto [hasK, keyVal] = interp->getPropertyForExternal(itemVal, "0");
+        if (interp->hasError()) {
+          Value err = interp->getError(); interp->clearError();
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) interp->callForHarness(returnFn, {}, iterator);
+          throw JsValueException(err);
+        }
+        auto [hasV, valVal] = interp->getPropertyForExternal(itemVal, "1");
+        if (interp->hasError()) {
+          Value err = interp->getError(); interp->clearError();
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) interp->callForHarness(returnFn, {}, iterator);
+          throw JsValueException(err);
+        }
+
+        // Call adder (set) via JS dispatch
+        try {
+          interp->callForHarness(setMethod, {keyVal, valVal}, wmVal);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        } catch (...) {
+          // Close iterator on failure
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
+          }
+          throw;
+        }
+      }
+    }
+
+    return wmVal;
   };
   {
     auto weakMapPrototype = GarbageCollector::makeGC<Object>();
@@ -10233,9 +10533,12 @@ GCPtr<Environment> Environment::createGlobal() {
       if (args.size() < 2) return Value(Undefined{});
       return wm->get(args[1]);
     });
-    defineWMMethod("set", 2, [validateWeakMapThis](const std::vector<Value>& args) -> Value {
+    defineWMMethod("set", 2, [validateWeakMapThis, canBeHeldWeakly](const std::vector<Value>& args) -> Value {
       auto wm = validateWeakMapThis(args, "set");
       Value key = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!canBeHeldWeakly(key)) {
+        throw std::runtime_error("TypeError: Invalid value used as weak map key");
+      }
       Value val = args.size() > 2 ? args[2] : Value(Undefined{});
       wm->set(key, val);
       return Value(wm);
@@ -10250,8 +10553,44 @@ GCPtr<Environment> Environment::createGlobal() {
       if (args.size() < 2) return Value(false);
       return Value(wm->deleteKey(args[1]));
     });
+    defineWMMethod("getOrInsert", 2, [validateWeakMapThis, canBeHeldWeakly](const std::vector<Value>& args) -> Value {
+      auto wm = validateWeakMapThis(args, "getOrInsert");
+      Value key = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!canBeHeldWeakly(key)) {
+        throw std::runtime_error("TypeError: Invalid value used as weak map key");
+      }
+      if (wm->has(key)) return wm->get(key);
+      Value val = args.size() > 2 ? args[2] : Value(Undefined{});
+      wm->set(key, val);
+      return val;
+    });
+    defineWMMethod("getOrInsertComputed", 2, [validateWeakMapThis, canBeHeldWeakly](const std::vector<Value>& args) -> Value {
+      auto wm = validateWeakMapThis(args, "getOrInsertComputed");
+      Value key = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!canBeHeldWeakly(key)) {
+        throw std::runtime_error("TypeError: Invalid value used as weak map key");
+      }
+      Value callback = args.size() > 2 ? args[2] : Value(Undefined{});
+      if (!callback.isFunction()) {
+        throw std::runtime_error("TypeError: WeakMap.prototype.getOrInsertComputed callback is not a function");
+      }
+      if (wm->has(key)) return wm->get(key);
+      auto* interp = getGlobalInterpreter();
+      Value val = interp->callForHarness(callback, {key}, Value(Undefined{}));
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      wm->set(key, val);
+      return val;
+    });
   }
   env->define("WeakMap", Value(weakMapConstructor));
+  // Mark as non-enumerable on globalThis
+  {
+    auto it = env->bindings_.find("globalThis");
+    if (it != env->bindings_.end() && it->second.isObject()) {
+      auto gobj = it->second.getGC<Object>();
+      gobj->properties["__non_enum_WeakMap"] = Value(true);
+    }
+  }
 
   // WeakSet constructor
   auto weakSetConstructor = GarbageCollector::makeGC<Function>();
@@ -10264,10 +10603,69 @@ GCPtr<Environment> Environment::createGlobal() {
   weakSetConstructor->properties["__non_writable_length"] = Value(true);
   weakSetConstructor->properties["__non_enum_length"] = Value(true);
   weakSetConstructor->properties["__require_new__"] = Value(true);
-  weakSetConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+  weakSetConstructor->nativeFunc = [canBeHeldWeakly](const std::vector<Value>& args) -> Value {
     auto ws = GarbageCollector::makeGC<WeakSet>();
     GarbageCollector::instance().reportAllocation(sizeof(WeakSet));
-    return Value(ws);
+    Value wsVal(ws);
+
+    if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return wsVal;
+
+      // Set __proto__ early so method lookup works
+      auto wsCtor = interp->resolveVariable("WeakSet");
+      if (wsCtor) {
+        auto [hasP, proto] = interp->getPropertyForExternal(*wsCtor, "prototype");
+        if (hasP && (proto.isObject() || proto.isNull())) {
+          ws->properties["__proto__"] = proto;
+        }
+      }
+
+      // Get adder = Get(set, "add")
+      auto [hasAdd, addMethod] = interp->getPropertyForExternal(wsVal, "add");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasAdd || !addMethod.isFunction()) {
+        throw std::runtime_error("TypeError: WeakSet.prototype.add is not a function");
+      }
+
+      // Get iterator
+      auto [hasIter, iterFn] = interp->getPropertyForExternal(args[0], WellKnownSymbols::iteratorKey());
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (!hasIter || !iterFn.isFunction()) {
+        throw std::runtime_error("TypeError: object is not iterable");
+      }
+      Value iterator = interp->callForHarness(iterFn, {}, args[0]);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+      int limit = 100000;
+      while (limit-- > 0) {
+        auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!hasNext || !nextMethod.isFunction()) break;
+        Value step = interp->callForHarness(nextMethod, {}, iterator);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasDone && doneVal.toBool()) break;
+
+        auto [hasVal, itemVal] = interp->getPropertyForExternal(step, "value");
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+        try {
+          interp->callForHarness(addMethod, {itemVal}, wsVal);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        } catch (...) {
+          auto [hasReturn, returnFn] = interp->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnFn.isFunction()) {
+            interp->callForHarness(returnFn, {}, iterator);
+          }
+          throw;
+        }
+      }
+    }
+
+    return wsVal;
   };
   {
     auto weakSetPrototype = GarbageCollector::makeGC<Object>();
@@ -10304,10 +10702,13 @@ GCPtr<Environment> Environment::createGlobal() {
       weakSetPrototype->properties["__non_enum_" + name] = Value(true);
     };
 
-    defineWSMethod("add", 1, [validateWeakSetThis](const std::vector<Value>& args) -> Value {
+    defineWSMethod("add", 1, [validateWeakSetThis, canBeHeldWeakly](const std::vector<Value>& args) -> Value {
       auto ws = validateWeakSetThis(args, "add");
-      if (args.size() < 2) throw std::runtime_error("TypeError: Invalid value used in weak set");
-      ws->add(args[1]);
+      Value val = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!canBeHeldWeakly(val)) {
+        throw std::runtime_error("TypeError: Invalid value used in weak set");
+      }
+      ws->add(val);
       return Value(ws);
     });
     defineWSMethod("has", 1, [validateWeakSetThis](const std::vector<Value>& args) -> Value {
@@ -10322,6 +10723,13 @@ GCPtr<Environment> Environment::createGlobal() {
     });
   }
   env->define("WeakSet", Value(weakSetConstructor));
+  {
+    auto it = env->bindings_.find("globalThis");
+    if (it != env->bindings_.end() && it->second.isObject()) {
+      auto gobj = it->second.getGC<Object>();
+      gobj->properties["__non_enum_WeakSet"] = Value(true);
+    }
+  }
 
   // WeakRef (ES2021)
   auto weakRefConstructor = GarbageCollector::makeGC<Function>();

@@ -167,13 +167,14 @@ struct Set : public GCObject {
 // A full implementation would use weak_ptr or custom GC weak references
 struct WeakMap : public GCObject {
   std::unordered_map<GCObject*, Value> entries;  // Map from object pointer to value
+  std::unordered_map<size_t, Value> symbolEntries;  // Map from Symbol::id to value
   OrderedMap<std::string, Value> properties;
 
   void set(const Value& key, const Value& value);
   bool has(const Value& key) const;
   Value get(const Value& key) const;
   bool deleteKey(const Value& key);
-  size_t size() const { return entries.size(); }
+  size_t size() const { return entries.size() + symbolEntries.size(); }
 
   // GCObject interface
   const char* typeName() const override { return "WeakMap"; }
@@ -183,12 +184,13 @@ struct WeakMap : public GCObject {
 // WeakSet - weak references to objects
 struct WeakSet : public GCObject {
   std::unordered_set<GCObject*> values;  // Set of object pointers
+  std::unordered_set<size_t> symbolValues;  // Set of Symbol::id values
   OrderedMap<std::string, Value> properties;
 
   bool add(const Value& value);
   bool has(const Value& value) const;
   bool deleteValue(const Value& value);
-  size_t size() const { return values.size(); }
+  size_t size() const { return values.size() + symbolValues.size(); }
 
   // GCObject interface
   const char* typeName() const override { return "WeakSet"; }

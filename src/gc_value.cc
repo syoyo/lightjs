@@ -162,64 +162,64 @@ void Proxy::getReferences(std::vector<GCObject*>& refs) const {
 }
 
 // WeakMap implementation
-void WeakMap::set(const Value& key, const Value& value) {
-    // WeakMap only accepts objects as keys
-    GCObject* keyObj = nullptr;
-    if (key.isObject()) {
-        keyObj = key.getGC<Object>().get();
-    } else if (key.isArray()) {
-        keyObj = key.getGC<Array>().get();
-    } else if (key.isFunction()) {
-        keyObj = key.getGC<Function>().get();
-    }
+// Helper to extract GCObject* from any GC-held value type
+static GCObject* extractGCObject(const Value& key) {
+    if (key.isObject()) return key.getGC<Object>().get();
+    if (key.isArray()) return key.getGC<Array>().get();
+    if (key.isFunction()) return key.getGC<Function>().get();
+    if (key.isClass()) return key.getGC<Class>().get();
+    if (key.isMap()) return key.getGC<Map>().get();
+    if (key.isSet()) return key.getGC<Set>().get();
+    if (key.isError()) return key.getGC<Error>().get();
+    if (key.isRegex()) return key.getGC<Regex>().get();
+    if (key.isPromise()) return key.getGC<Promise>().get();
+    if (key.isGenerator()) return key.getGC<Generator>().get();
+    if (key.isTypedArray()) return key.getGC<TypedArray>().get();
+    if (key.isArrayBuffer()) return key.getGC<ArrayBuffer>().get();
+    if (key.isDataView()) return key.getGC<DataView>().get();
+    if (key.isWeakMap()) return key.getGC<WeakMap>().get();
+    if (key.isWeakSet()) return key.getGC<WeakSet>().get();
+    return nullptr;
+}
 
+void WeakMap::set(const Value& key, const Value& value) {
+    if (key.isSymbol()) {
+        symbolEntries[std::get<Symbol>(key.data).id] = value;
+        return;
+    }
+    GCObject* keyObj = extractGCObject(key);
     if (keyObj) {
         entries[keyObj] = value;
     }
 }
 
 bool WeakMap::has(const Value& key) const {
-    GCObject* keyObj = nullptr;
-    if (key.isObject()) {
-        keyObj = key.getGC<Object>().get();
-    } else if (key.isArray()) {
-        keyObj = key.getGC<Array>().get();
-    } else if (key.isFunction()) {
-        keyObj = key.getGC<Function>().get();
+    if (key.isSymbol()) {
+        return symbolEntries.find(std::get<Symbol>(key.data).id) != symbolEntries.end();
     }
-
+    GCObject* keyObj = extractGCObject(key);
     return keyObj && entries.find(keyObj) != entries.end();
 }
 
 Value WeakMap::get(const Value& key) const {
-    GCObject* keyObj = nullptr;
-    if (key.isObject()) {
-        keyObj = key.getGC<Object>().get();
-    } else if (key.isArray()) {
-        keyObj = key.getGC<Array>().get();
-    } else if (key.isFunction()) {
-        keyObj = key.getGC<Function>().get();
+    if (key.isSymbol()) {
+        auto it = symbolEntries.find(std::get<Symbol>(key.data).id);
+        if (it != symbolEntries.end()) return it->second;
+        return Value(Undefined{});
     }
-
+    GCObject* keyObj = extractGCObject(key);
     if (keyObj) {
         auto it = entries.find(keyObj);
-        if (it != entries.end()) {
-            return it->second;
-        }
+        if (it != entries.end()) return it->second;
     }
     return Value(Undefined{});
 }
 
 bool WeakMap::deleteKey(const Value& key) {
-    GCObject* keyObj = nullptr;
-    if (key.isObject()) {
-        keyObj = key.getGC<Object>().get();
-    } else if (key.isArray()) {
-        keyObj = key.getGC<Array>().get();
-    } else if (key.isFunction()) {
-        keyObj = key.getGC<Function>().get();
+    if (key.isSymbol()) {
+        return symbolEntries.erase(std::get<Symbol>(key.data).id) > 0;
     }
-
+    GCObject* keyObj = extractGCObject(key);
     if (keyObj) {
         return entries.erase(keyObj) > 0;
     }
@@ -227,9 +227,10 @@ bool WeakMap::deleteKey(const Value& key) {
 }
 
 void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
-    // Note: WeakMap uses weak references for keys, so we don't add them
-    // We only add the values
     for (const auto& [key, value] : entries) {
+        addValueReferences(value, refs);
+    }
+    for (const auto& [key, value] : symbolEntries) {
         addValueReferences(value, refs);
     }
     for (const auto& [key, value] : properties) {
@@ -240,15 +241,11 @@ void WeakMap::getReferences(std::vector<GCObject*>& refs) const {
 
 // WeakSet implementation
 bool WeakSet::add(const Value& value) {
-    GCObject* obj = nullptr;
-    if (value.isObject()) {
-        obj = value.getGC<Object>().get();
-    } else if (value.isArray()) {
-        obj = value.getGC<Array>().get();
-    } else if (value.isFunction()) {
-        obj = value.getGC<Function>().get();
+    if (value.isSymbol()) {
+        symbolValues.insert(std::get<Symbol>(value.data).id);
+        return true;
     }
-
+    GCObject* obj = extractGCObject(value);
     if (obj) {
         values.insert(obj);
         return true;
@@ -257,28 +254,18 @@ bool WeakSet::add(const Value& value) {
 }
 
 bool WeakSet::has(const Value& value) const {
-    GCObject* obj = nullptr;
-    if (value.isObject()) {
-        obj = value.getGC<Object>().get();
-    } else if (value.isArray()) {
-        obj = value.getGC<Array>().get();
-    } else if (value.isFunction()) {
-        obj = value.getGC<Function>().get();
+    if (value.isSymbol()) {
+        return symbolValues.find(std::get<Symbol>(value.data).id) != symbolValues.end();
     }
-
+    GCObject* obj = extractGCObject(value);
     return obj && values.find(obj) != values.end();
 }
 
 bool WeakSet::deleteValue(const Value& value) {
-    GCObject* obj = nullptr;
-    if (value.isObject()) {
-        obj = value.getGC<Object>().get();
-    } else if (value.isArray()) {
-        obj = value.getGC<Array>().get();
-    } else if (value.isFunction()) {
-        obj = value.getGC<Function>().get();
+    if (value.isSymbol()) {
+        return symbolValues.erase(std::get<Symbol>(value.data).id) > 0;
     }
-
+    GCObject* obj = extractGCObject(value);
     if (obj) {
         return values.erase(obj) > 0;
     }
@@ -286,8 +273,6 @@ bool WeakSet::deleteValue(const Value& value) {
 }
 
 void WeakSet::getReferences(std::vector<GCObject*>& refs) const {
-    // WeakSet uses weak references, so we don't add them to refs
-    // This allows the GC to collect objects in the WeakSet
     for (const auto& [key, value] : properties) {
         (void)key;
         addValueReferences(value, refs);
