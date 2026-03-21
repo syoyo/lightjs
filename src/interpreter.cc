@@ -1215,7 +1215,11 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
 
     size_t index = 0;
     if (parseArrayIndex(key, index) && index < arr->elements.size()) {
-      return {true, arr->elements[index]};
+      // Check if element was deleted/is a hole — fall through to prototype
+      if (arr->properties.find("__deleted_" + key + "__") == arr->properties.end() &&
+          arr->properties.find("__hole_" + key + "__") == arr->properties.end()) {
+        return {true, arr->elements[index]};
+      }
     }
 
     auto it = arr->properties.find(key);
@@ -15322,9 +15326,18 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         }
       }
       if (isObjectLike(protoFromNewTarget)) {
-        // Skip for Object constructor: it already sets the correct __proto__
-        // based on the primitive type (Number.prototype, String.prototype, etc.)
-        if (ctorName != "Object") {
+        // Skip for Object constructor when it wraps primitives (Number/String/etc.)
+        // The Object constructor already sets __proto__ to the type-specific prototype.
+        // But DON'T skip for subclassing (newTargetOverride is not undefined).
+        bool skipProtoSet = false;
+        if (ctorName == "Object" && newTargetOverride.isUndefined() &&
+            constructed.isObject()) {
+          auto cobj = constructed.getGC<Object>();
+          if (cobj->properties.find("__primitive_value__") != cobj->properties.end()) {
+            skipProtoSet = true;
+          }
+        }
+        if (!skipProtoSet) {
           setProtoOnValue(constructed, protoFromNewTarget);
         }
       }

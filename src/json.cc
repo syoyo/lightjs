@@ -910,6 +910,9 @@ static Value internalizeJSONProperty(Interpreter* interp, const Value& holder,
             } else {
                 if (!isNonConfigurable) {
                     arr->elements[i] = newElement;
+                    // Clear deleted/hole markers since we're creating a new data property
+                    arr->properties.erase("__deleted_" + idxStr + "__");
+                    arr->properties.erase("__hole_" + idxStr + "__");
                 }
             }
         }
