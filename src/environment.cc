@@ -22750,11 +22750,26 @@ GCPtr<Environment> Environment::createGlobal() {
     std::vector<std::string> params;
     std::string body;
 
+    // Per spec: ToString() on each argument, which invokes ToPrimitive for objects
+    auto argToString = [](const Value& v) -> std::string {
+      if (v.isString()) return std::get<std::string>(v.data);
+      if (v.isUndefined()) return "undefined";
+      if (v.isNull()) return "null";
+      if (v.isBool()) return v.toBool() ? "true" : "false";
+      if (v.isNumber()) return v.toString();
+      if (v.isBigInt()) return v.toString();
+      if (v.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      // For objects: invoke ToPrimitive (string hint) then ToString
+      Value prim = toPrimitiveFromNative(v, true);
+      if (prim.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+      return prim.toString();
+    };
+
     if (!args.empty()) {
       for (size_t i = 0; i + 1 < args.size(); ++i) {
-        params.push_back(args[i].toString());
+        params.push_back(argToString(args[i]));
       }
-      body = args.back().toString();
+      body = argToString(args.back());
     }
 
     std::string source = "function anonymous(";
@@ -23019,7 +23034,15 @@ GCPtr<Environment> Environment::createGlobal() {
   fpBind->properties["__uses_this_arg__"] = Value(true);
   fpBind->nativeFunc = [](const std::vector<Value>& args) -> Value {
     // args[0] = this (the function to bind), args[1] = boundThis, args[2+] = bound args
-    if (args.empty() || (!args[0].isFunction() && !args[0].isClass())) {
+    auto isCallable = [](const Value& v) -> bool {
+      if (v.isFunction() || v.isClass()) return true;
+      if (v.isObject()) {
+        auto obj = v.getGC<Object>();
+        return obj->properties.find("__callable_object__") != obj->properties.end();
+      }
+      return false;
+    };
+    if (args.empty() || !isCallable(args[0])) {
       throw std::runtime_error("TypeError: Function.prototype.bind called on non-function");
     }
     Value target = args[0];
@@ -23032,6 +23055,9 @@ GCPtr<Environment> Environment::createGlobal() {
     } else if (target.isClass()) {
       targetCls = target.getGC<Class>();
       targetIsConstructor = true;
+    } else if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      targetIsConstructor = obj->properties.find("__constructor_wrapper__") != obj->properties.end();
     }
     Value boundThis = args.size() > 1 ? args[1] : Value(Undefined{});
     std::vector<Value> boundArgs;
@@ -23060,6 +23086,12 @@ GCPtr<Environment> Environment::createGlobal() {
       } else {
         targetName = targetCls->name;
       }
+    } else if (target.isObject()) {
+      auto obj = target.getGC<Object>();
+      auto it = obj->properties.find("name");
+      if (it != obj->properties.end() && it->second.isString()) {
+        targetName = std::get<std::string>(it->second.data);
+      }
     }
     boundFn->properties["name"] = Value(std::string("bound " + targetName));
     boundFn->properties["__non_writable_name"] = Value(true);
@@ -23067,14 +23099,13 @@ GCPtr<Environment> Environment::createGlobal() {
 
     // ES2020 19.2.3.2 step 4: Set bound function length
     double targetLen = 0.0;
-    if (targetFn) {
-      auto lenIt = targetFn->properties.find("length");
-      if (lenIt != targetFn->properties.end() && lenIt->second.isNumber()) {
-        targetLen = std::get<double>(lenIt->second.data);
-      }
-    } else if (targetCls) {
-      auto lenIt = targetCls->properties.find("length");
-      if (lenIt != targetCls->properties.end() && lenIt->second.isNumber()) {
+    OrderedMap<std::string, Value>* targetProps = nullptr;
+    if (targetFn) targetProps = &targetFn->properties;
+    else if (targetCls) targetProps = &targetCls->properties;
+    else if (target.isObject()) targetProps = &target.getGC<Object>()->properties;
+    if (targetProps) {
+      auto lenIt = targetProps->find("length");
+      if (lenIt != targetProps->end() && lenIt->second.isNumber()) {
         targetLen = std::get<double>(lenIt->second.data);
       }
     }
@@ -23095,31 +23126,34 @@ GCPtr<Environment> Environment::createGlobal() {
 
     boundFn->nativeFunc = [target, boundThis, boundArgs](const std::vector<Value>& callArgs) -> Value {
       // [[Call]] of a bound function: call target with boundThis and boundArgs + callArgs.
-      // Bound class constructors are not callable without 'new'.
       if (target.isClass()) {
         throw std::runtime_error("TypeError: Class constructor cannot be invoked without 'new'");
       }
-      auto targetFn = target.getGC<Function>();
-      if (!targetFn) {
-        throw std::runtime_error("TypeError: Bound target is not callable");
-      }
       std::vector<Value> finalArgs = boundArgs;
       finalArgs.insert(finalArgs.end(), callArgs.begin(), callArgs.end());
-      if (targetFn->isNative) {
-        auto itUsesThis = targetFn->properties.find("__uses_this_arg__");
-        if (itUsesThis != targetFn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
-          std::vector<Value> nativeArgs;
-          nativeArgs.push_back(boundThis);
-          nativeArgs.insert(nativeArgs.end(), finalArgs.begin(), finalArgs.end());
-          return targetFn->nativeFunc(nativeArgs);
+      if (target.isFunction()) {
+        auto targetFn = target.getGC<Function>();
+        if (!targetFn) {
+          throw std::runtime_error("TypeError: Bound target is not callable");
         }
-        return targetFn->nativeFunc(finalArgs);
+        if (targetFn->isNative) {
+          auto itUsesThis = targetFn->properties.find("__uses_this_arg__");
+          if (itUsesThis != targetFn->properties.end() && itUsesThis->second.isBool() && itUsesThis->second.toBool()) {
+            std::vector<Value> nativeArgs;
+            nativeArgs.push_back(boundThis);
+            nativeArgs.insert(nativeArgs.end(), finalArgs.begin(), finalArgs.end());
+            return targetFn->nativeFunc(nativeArgs);
+          }
+          return targetFn->nativeFunc(finalArgs);
+        }
+        Interpreter* interpreter = getGlobalInterpreter();
+        if (!interpreter) throw std::runtime_error("TypeError: Interpreter unavailable");
+        return interpreter->callForHarness(Value(targetFn), finalArgs, boundThis);
       }
+      // Object-based callable (e.g. String, Number constructors stored as Objects)
       Interpreter* interpreter = getGlobalInterpreter();
-      if (!interpreter) {
-        throw std::runtime_error("TypeError: Interpreter unavailable");
-      }
-      return interpreter->callForHarness(Value(targetFn), finalArgs, boundThis);
+      if (!interpreter) throw std::runtime_error("TypeError: Interpreter unavailable");
+      return interpreter->callForHarness(target, finalArgs, boundThis);
     };
     return Value(boundFn);
   };

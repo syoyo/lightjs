@@ -59,12 +59,17 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Symbol` | 88 | 98 | 89.8% |
 | `built-ins/Error` | 56 | 58 | 96.6% |
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
-| `built-ins/Function` | 382 | 509 | 75.0% |
+| `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
 
 Unit tests: 346/346 passing.
 
 #### Changes (2026-03-22)
+
+**Batch 3:** +10 tests: Function +10 (382→392), 0 regressions:
+
+- **Function constructor ToString coercion** (`src/environment.cc`): Function constructor now calls ToPrimitive (string hint) on arguments via `toPrimitiveFromNative()` before parsing, enabling objects with custom toString() to work as expected per spec.
+- **Function.prototype.bind Object callables** (`src/environment.cc`): Extended bind to accept Object-based callables (those with `__callable_object__` marker, e.g. String constructor). Handles name, length, and call dispatch for bound Object targets.
 
 **Batch 2:** +13 tests: Promise +9 (631→640), Object +4 (3268→3272), 0 regressions:
 
