@@ -13466,58 +13466,73 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.flat
-  installArrayMethod("flat", 0, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.flat called on non-array");
-    }
-    auto arr = args[0].getGC<Array>();
+  installArrayMethod("flat", 0, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "flat");
     double depth = 1;
     if (args.size() > 1 && !args[1].isUndefined()) {
       depth = args[1].toNumber();
       if (std::isnan(depth) || depth < 0) depth = 0;
       depth = std::floor(depth);
     }
-    auto result = GarbageCollector::makeGC<Array>();
-    std::function<void(const GCPtr<Array>&, double)> flatten;
-    flatten = [&](const GCPtr<Array>& src, double d) {
-      for (const auto& elem : src->elements) {
-        if (d > 0 && elem.isArray()) {
-          flatten(elem.getGC<Array>(), d - 1);
-        } else {
-          result->elements.push_back(elem);
+    auto result = makeArrayWithPrototype();
+    std::function<void(const Value&, double)> flatten;
+    flatten = [&](const Value& src, double d) {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return;
+      size_t len = 0;
+      auto [found, lenVal] = interp->getPropertyForExternal(src, "length");
+      if (found) {
+        double dl = lenVal.toNumber();
+        if (!std::isnan(dl) && dl >= 0) len = static_cast<size_t>(dl);
+      }
+      for (size_t i = 0; i < len; i++) {
+        auto [exists, elem] = interp->getPropertyForExternal(src, std::to_string(i));
+        if (!exists) {
+          result->elements.push_back(Value(Undefined{}));
+          result->properties["__hole_" + std::to_string(result->elements.size() - 1) + "__"] = Value(true);
+          continue;
         }
+        if (d > 0 && (elem.isArray() || (isObjectLikeValue(elem) && !elem.isFunction()))) {
+          // Check if element is array-like (has length)
+          auto [hasLen, eLenVal] = interp->getPropertyForExternal(elem, "length");
+          if (elem.isArray() || (hasLen && eLenVal.isNumber())) {
+            flatten(elem, d - 1);
+            continue;
+          }
+        }
+        result->elements.push_back(elem);
       }
     };
-    flatten(arr, depth);
+    flatten(thisVal, depth);
     return Value(result);
   });
 
   // Array.prototype.flatMap
-  installArrayMethod("flatMap", 1, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.flatMap called on non-array");
-    }
+  installArrayMethod("flatMap", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "flatMap");
     if (args.size() < 2 || !args[1].isFunction()) {
       throw std::runtime_error("TypeError: Array.prototype.flatMap requires a callback function");
     }
-    auto arr = args[0].getGC<Array>();
     Value callback = args[1];
     Value thisArg = args.size() > 2 ? args[2] : Value(Undefined{});
-    auto result = GarbageCollector::makeGC<Array>();
+    size_t len = getArrayLikeLength(thisVal);
+    auto result = makeArrayWithPrototype();
     Interpreter* interpreter = getGlobalInterpreter();
     if (!interpreter) throw std::runtime_error("TypeError: Interpreter unavailable");
-    for (size_t i = 0; i < arr->elements.size(); ++i) {
-      std::vector<Value> callArgs = {arr->elements[i], Value(static_cast<double>(i)), args[0]};
+    for (size_t i = 0; i < len; ++i) {
+      auto [exists, elem] = getArrayLikeElement(thisVal, i);
+      if (!exists) continue;
+      std::vector<Value> callArgs = {elem, Value(static_cast<double>(i)), thisVal};
       Value mapped = interpreter->callForHarness(callback, callArgs, thisArg);
       if (interpreter->hasError()) {
         Value err = interpreter->getError();
         interpreter->clearError();
-        throw std::runtime_error(err.toString());
+        throw JsValueException(err);
       }
       if (mapped.isArray()) {
         auto mappedArr = mapped.getGC<Array>();
-        for (const auto& elem : mappedArr->elements) {
-          result->elements.push_back(elem);
+        for (const auto& e : mappedArr->elements) {
+          result->elements.push_back(e);
         }
       } else {
         result->elements.push_back(mapped);
@@ -13527,8 +13542,9 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.fill
-  installArrayMethod("fill", 1, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
+  installArrayMethod("fill", 1, [toObjectChecked](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "fill");
+    if (!thisVal.isArray()) {
       throw std::runtime_error("TypeError: Array.prototype.fill called on non-array");
     }
     auto arr = args[0].getGC<Array>();
@@ -13578,36 +13594,38 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.at
-  installArrayMethod("at", 1, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.at called on non-array");
-    }
-    auto arr = args[0].getGC<Array>();
+  installArrayMethod("at", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "at");
+    size_t len = getArrayLikeLength(thisVal);
     double index = args.size() > 1 ? args[1].toNumber() : 0;
-    int len = static_cast<int>(arr->elements.size());
-    int idx = static_cast<int>(index);
-    if (idx < 0) idx = len + idx;
-    if (idx < 0 || idx >= len) return Value(Undefined{});
-    return arr->elements[idx];
+    int idx = std::isnan(index) ? 0 : static_cast<int>(index);
+    if (idx < 0) idx = static_cast<int>(len) + idx;
+    if (idx < 0 || static_cast<size_t>(idx) >= len) return Value(Undefined{});
+    auto [exists, elem] = getArrayLikeElement(thisVal, static_cast<size_t>(idx));
+    return exists ? elem : Value(Undefined{});
   });
 
   // Array.prototype.with
-  installArrayMethod("with", 2, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.with called on non-array");
-    }
-    auto arr = args[0].getGC<Array>();
+  installArrayMethod("with", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "with");
+    size_t len = getArrayLikeLength(thisVal);
     double index = args.size() > 1 ? args[1].toNumber() : 0;
     Value value = args.size() > 2 ? args[2] : Value(Undefined{});
-    int len = static_cast<int>(arr->elements.size());
-    int idx = static_cast<int>(index);
-    if (idx < 0) idx = len + idx;
-    if (idx < 0 || idx >= len) {
+    int iLen = static_cast<int>(len);
+    int idx = std::isnan(index) ? 0 : static_cast<int>(index);
+    if (idx < 0) idx = iLen + idx;
+    if (idx < 0 || idx >= iLen) {
       throw std::runtime_error("RangeError: Invalid index");
     }
-    auto result = GarbageCollector::makeGC<Array>();
-    result->elements = arr->elements;
-    result->elements[idx] = value;
+    auto result = makeArrayWithPrototype();
+    for (size_t i = 0; i < len; i++) {
+      if (static_cast<int>(i) == idx) {
+        result->elements.push_back(value);
+      } else {
+        auto [exists, elem] = getArrayLikeElement(thisVal, i);
+        result->elements.push_back(exists ? elem : Value(Undefined{}));
+      }
+    }
     return Value(result);
   });
 
@@ -13833,25 +13851,26 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.toReversed
-  installArrayMethod("toReversed", 0, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.toReversed called on non-array");
+  installArrayMethod("toReversed", 0, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "toReversed");
+    size_t len = getArrayLikeLength(thisVal);
+    auto result = makeArrayWithPrototype();
+    for (size_t i = len; i > 0; i--) {
+      auto [exists, elem] = getArrayLikeElement(thisVal, i - 1);
+      result->elements.push_back(exists ? elem : Value(Undefined{}));
     }
-    auto arr = args[0].getGC<Array>();
-    auto result = GarbageCollector::makeGC<Array>();
-    result->elements = arr->elements;
-    std::reverse(result->elements.begin(), result->elements.end());
     return Value(result);
   });
 
   // Array.prototype.toSorted
-  installArrayMethod("toSorted", 1, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.toSorted called on non-array");
+  installArrayMethod("toSorted", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "toSorted");
+    size_t len = getArrayLikeLength(thisVal);
+    auto result = makeArrayWithPrototype();
+    for (size_t i = 0; i < len; i++) {
+      auto [exists, elem] = getArrayLikeElement(thisVal, i);
+      result->elements.push_back(exists ? elem : Value(Undefined{}));
     }
-    auto arr = args[0].getGC<Array>();
-    auto result = GarbageCollector::makeGC<Array>();
-    result->elements = arr->elements;
     bool hasCompareFn = args.size() > 1 && args[1].isFunction();
     Value compareFn = hasCompareFn ? args[1] : Value(Undefined{});
     Interpreter* interpreter = hasCompareFn ? getGlobalInterpreter() : nullptr;
@@ -13874,25 +13893,29 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.toSpliced
-  installArrayMethod("toSpliced", 2, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.toSpliced called on non-array");
+  installArrayMethod("toSpliced", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "toSpliced");
+    size_t len = getArrayLikeLength(thisVal);
+    auto result = makeArrayWithPrototype();
+    // Read all elements
+    for (size_t i = 0; i < len; i++) {
+      auto [exists, elem] = getArrayLikeElement(thisVal, i);
+      result->elements.push_back(exists ? elem : Value(Undefined{}));
     }
-    auto arr = args[0].getGC<Array>();
-    auto result = GarbageCollector::makeGC<Array>();
-    result->elements = arr->elements;
-    int len = static_cast<int>(result->elements.size());
+    int iLen = static_cast<int>(len);
     if (args.size() < 2) return Value(result);
-    int start = static_cast<int>(args[1].toNumber());
-    if (start < 0) start = std::max(0, len + start);
-    if (start > len) start = len;
+    double startD = args[1].toNumber();
+    int start = std::isnan(startD) ? 0 : static_cast<int>(startD);
+    if (start < 0) start = std::max(0, iLen + start);
+    if (start > iLen) start = iLen;
     int deleteCount = 0;
     if (args.size() >= 3) {
-      deleteCount = static_cast<int>(args[2].toNumber());
+      double dcD = args[2].toNumber();
+      deleteCount = std::isnan(dcD) ? 0 : static_cast<int>(dcD);
       if (deleteCount < 0) deleteCount = 0;
-      if (deleteCount > len - start) deleteCount = len - start;
+      if (deleteCount > iLen - start) deleteCount = iLen - start;
     } else {
-      deleteCount = len - start;
+      deleteCount = iLen - start;
     }
     std::vector<Value> newItems;
     for (size_t i = 3; i < args.size(); ++i) {
