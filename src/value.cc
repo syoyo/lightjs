@@ -393,8 +393,21 @@ std::string valueToPropertyKey(const Value& value) {
   if (value.isNumber()) {
     return ecmaNumberToString(value.toNumber());
   }
-  // ToPrimitive for objects: call toString/valueOf
-  if (value.isObject()) {
+  // ToPrimitive for objects: check @@toPrimitive, then toString/valueOf
+  if (value.isObject() || value.isArray() || value.isFunction()) {
+    auto* interp = getGlobalInterpreter();
+    // Check @@toPrimitive first
+    if (interp) {
+      auto [hasToPrim, toPrimFn] = interp->getPropertyForExternal(value, WellKnownSymbols::toPrimitiveKey());
+      if (interp->hasError()) interp->clearError();
+      if (hasToPrim && toPrimFn.isFunction()) {
+        Value result = interp->callForHarness(toPrimFn, {Value(std::string("string"))}, value);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (result.isSymbol()) return symbolToPropertyKey(std::get<Symbol>(result.data));
+        return result.toString();
+      }
+    }
+    if (value.isObject()) {
     auto obj = value.getGC<Object>();
     auto primIt = obj->properties.find("__primitive_value__");
     if (primIt != obj->properties.end()) {
@@ -404,7 +417,6 @@ std::string valueToPropertyKey(const Value& value) {
       return primIt->second.toString();
     }
     // Try calling toString() then valueOf() via the interpreter
-    auto* interp = getGlobalInterpreter();
     if (interp) {
       // Check for own toString method first, then prototype chain
       auto findMethod = [&](const std::string& methodName) -> Value {
@@ -454,6 +466,7 @@ std::string valueToPropertyKey(const Value& value) {
       // Both returned objects: throw TypeError
       throw std::runtime_error("TypeError: Cannot convert object to primitive value");
     }
+    } // end if (value.isObject())
   }
   if (value.isArray()) {
     // Arrays: try toString via join
