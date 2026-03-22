@@ -12369,7 +12369,12 @@ GCPtr<Environment> Environment::createGlobal() {
       if (!std::isfinite(lengthNum) || lengthNum < 0 || std::floor(lengthNum) != lengthNum) {
         throw std::runtime_error("RangeError: Invalid array length");
       }
-      result->elements.resize(static_cast<size_t>(lengthNum), Value(Undefined{}));
+      size_t len = static_cast<size_t>(lengthNum);
+      result->elements.resize(len, Value(Undefined{}));
+      // Mark all indices as holes (never-assigned)
+      for (size_t i = 0; i < len; i++) {
+        result->properties["__hole_" + std::to_string(i) + "__"] = Value(true);
+      }
       return Value(result);
     }
 
@@ -13810,32 +13815,29 @@ GCPtr<Environment> Environment::createGlobal() {
   installArrayMethod("concat", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "concat");
     auto result = makeArrayWithPrototype();
-    // Helper: spread an array-like into result
-    auto spreadInto = [&](const Value& val) {
-      // Check Symbol.isConcatSpreadable or isArray
-      bool spreadable = val.isArray();
-      if (val.isObject()) {
-        Interpreter* interp = getGlobalInterpreter();
-        if (interp) {
-          auto [found, iCS] = interp->getPropertyForExternal(val, "__Symbol.isConcatSpreadable__");
-          if (found && !iCS.isUndefined()) {
-            spreadable = iCS.toBool();
-          }
+    Interpreter* interp = getGlobalInterpreter();
+    // Helper: check if value is concat-spreadable per spec
+    auto isConcatSpreadable = [interp](const Value& val) -> bool {
+      if (!isObjectLikeValue(val) && !val.isArray()) return false;
+      if (interp) {
+        auto [found, spreadable] = interp->getPropertyForExternal(val, WellKnownSymbols::isConcatSpreadableKey());
+        if (interp->hasError()) { interp->clearError(); }
+        if (found && !spreadable.isUndefined()) {
+          return spreadable.toBool();
         }
       }
-      if (spreadable) {
+      return val.isArray();
+    };
+    // Helper: spread an array-like into result
+    auto spreadInto = [&](const Value& val) {
+      if (isConcatSpreadable(val)) {
         size_t len = getArrayLikeLength(val);
         for (size_t i = 0; i < len; ++i) {
           auto [exists, elem] = getArrayLikeElement(val, i);
           if (exists) {
-            // Ensure result has enough elements
-            while (result->elements.size() <= result->elements.size()) {
-              result->elements.push_back(exists ? elem : Value(Undefined{}));
-              break;
-            }
+            result->elements.push_back(elem);
           } else {
             result->elements.push_back(Value(Undefined{}));
-            // Mark as hole
             result->properties["__hole_" + std::to_string(result->elements.size() - 1) + "__"] = Value(true);
           }
         }
@@ -22806,6 +22808,11 @@ GCPtr<Environment> Environment::createGlobal() {
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       for (const auto& elem : arr->elements) {
         newArr->elements.push_back((*deepClone)(elem));
+      }
+      // Copy __proto__ so prototype chain works
+      auto protoIt = arr->properties.find("__proto__");
+      if (protoIt != arr->properties.end()) {
+        newArr->properties["__proto__"] = protoIt->second;
       }
       return Value(newArr);
     }

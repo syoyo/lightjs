@@ -9366,8 +9366,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(Undefined{}));
     }
 
-    // Array higher-order methods (map, filter, forEach, reduce, etc.)
-    // are now on Array.prototype and will be resolved via prototype chain lookup
+    // Array methods are on Array.prototype and resolved via prototype chain lookup.
+    // This ensures proper [[Get]]/[[HasProperty]] semantics, accessor property support,
+    // and array-like object handling per ES spec.
+    // Skip the fast path for methods that have proper Array.prototype implementations.
+    static const std::unordered_set<std::string> protoMethods = {
+      "push", "pop", "shift", "unshift", "slice", "splice", "toSpliced",
+      "join", "indexOf", "lastIndexOf", "at", "reverse", "sort",
+      "toSorted", "toReversed", "with", "concat", "flat", "flatMap",
+      "fill", "copyWithin", "keys", "entries", "values",
+      "map", "filter", "forEach", "reduce", "reduceRight",
+      "some", "every", "find", "findIndex", "findLast", "findLastIndex",
+      "includes", "flatMap", "toLocaleString"
+    };
+    if (protoMethods.count(propName)) {
+      // Fall through to prototype chain lookup below
+      goto arrayProtoLookup;
+    }
 
     if (propName == "push") {
       auto fn = GarbageCollector::makeGC<Function>();
@@ -10132,6 +10147,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(fn));
     }
 
+    arrayProtoLookup:
     auto getterIt = arrPtr->properties.find("__get_" + propName);
     if (getterIt != arrPtr->properties.end() && getterIt->second.isFunction()) {
       LIGHTJS_RETURN(callFunction(getterIt->second, {}, obj));
@@ -10143,7 +10159,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
     size_t idx = 0;
     if (parseArrayIndex(propName, idx) && idx < arrPtr->elements.size()) {
-      LIGHTJS_RETURN(arrPtr->elements[idx]);
+      // Check for hole markers
+      if (arrPtr->properties.count("__hole_" + propName + "__") ||
+          arrPtr->properties.count("__deleted_" + propName + "__")) {
+        // Fall through to prototype chain
+      } else {
+        LIGHTJS_RETURN(arrPtr->elements[idx]);
+      }
     }
     auto propIt = arrPtr->properties.find(propName);
     if (propIt != arrPtr->properties.end()) {
@@ -10152,26 +10174,39 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
     // Walk prototype chain (__proto__) for arrays
     {
+      GCPtr<Object> proto;
       auto protoIt = arrPtr->properties.find("__proto__");
       if (protoIt != arrPtr->properties.end() && protoIt->second.isObject()) {
-        auto proto = protoIt->second.getGC<Object>();
-        int depth = 0;
-        while (proto && depth < 50) {
-          // Check getter on prototype
-          auto protoGetterIt = proto->properties.find("__get_" + propName);
-          if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
-            auto getter = protoGetterIt->second.getGC<Function>();
-            LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+        proto = protoIt->second.getGC<Object>();
+      } else {
+        // Fallback: look up Array.prototype from environment
+        if (auto arrayCtor = env_->get("Array")) {
+          OrderedMap<std::string, Value>* ctorProps = nullptr;
+          if (arrayCtor->isObject()) ctorProps = &arrayCtor->getGC<Object>()->properties;
+          else if (arrayCtor->isFunction()) ctorProps = &arrayCtor->getGC<Function>()->properties;
+          if (ctorProps) {
+            auto apIt = ctorProps->find("prototype");
+            if (apIt != ctorProps->end() && apIt->second.isObject()) {
+              proto = apIt->second.getGC<Object>();
+            }
           }
-          auto found = proto->properties.find(propName);
-          if (found != proto->properties.end()) {
-            LIGHTJS_RETURN(found->second);
-          }
-          auto nextProto = proto->properties.find("__proto__");
-          if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
-          proto = nextProto->second.getGC<Object>();
-          depth++;
         }
+      }
+      int depth = 0;
+      while (proto && depth < 50) {
+        auto protoGetterIt = proto->properties.find("__get_" + propName);
+        if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
+          auto getter = protoGetterIt->second.getGC<Function>();
+          LIGHTJS_RETURN(invokeFunction(getter, {}, obj));
+        }
+        auto found = proto->properties.find(propName);
+        if (found != proto->properties.end()) {
+          LIGHTJS_RETURN(found->second);
+        }
+        auto nextProto = proto->properties.find("__proto__");
+        if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
+        proto = nextProto->second.getGC<Object>();
+        depth++;
       }
     }
   }
