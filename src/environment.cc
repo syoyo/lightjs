@@ -12775,15 +12775,40 @@ GCPtr<Environment> Environment::createGlobal() {
       if (isObjectLikeValue(input)) {
         return input;
       }
-      if (input.isString()) {
-        const std::string& text = input.toString();
-        auto obj = GarbageCollector::makeGC<Object>();
-        GarbageCollector::instance().reportAllocation(sizeof(Object));
-        obj->properties["length"] = Value(static_cast<double>(text.size()));
-        for (size_t i = 0; i < text.size(); ++i) {
-          obj->properties[std::to_string(i)] = Value(std::string(1, text[i]));
+      // Box primitives per spec ToObject
+      if (input.isBool() || input.isNumber() || input.isString() || input.isSymbol() || input.isBigInt()) {
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+          std::string ctorName;
+          if (input.isBool()) ctorName = "Boolean";
+          else if (input.isNumber()) ctorName = "Number";
+          else if (input.isString()) ctorName = "String";
+          else if (input.isSymbol()) ctorName = "Symbol";
+          else ctorName = "BigInt";
+          auto wrapper = GarbageCollector::makeGC<Object>();
+          GarbageCollector::instance().reportAllocation(sizeof(Object));
+          wrapper->properties["__primitive_value__"] = input;
+          auto ctor = interp->resolveVariable(ctorName);
+          if (ctor) {
+            auto [hasProto, proto] = interp->getPropertyForExternal(*ctor, "prototype");
+            if (hasProto && (proto.isObject() || proto.isNull())) {
+              wrapper->properties["__proto__"] = proto;
+            }
+          }
+          if (input.isString()) {
+            const std::string& str = std::get<std::string>(input.data);
+            size_t cpLen = 0, bytePos = 0;
+            while (bytePos < str.size()) {
+              unsigned char c = str[bytePos];
+              size_t charLen = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+              wrapper->properties[std::to_string(cpLen)] = Value(str.substr(bytePos, charLen));
+              bytePos += charLen;
+              cpLen++;
+            }
+            wrapper->properties["length"] = Value(static_cast<double>(cpLen));
+          }
+          return Value(wrapper);
         }
-        return Value(obj);
       }
       auto obj = GarbageCollector::makeGC<Object>();
       GarbageCollector::instance().reportAllocation(sizeof(Object));

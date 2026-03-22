@@ -9865,19 +9865,54 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "concat") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [arrPtr](const std::vector<Value>& args) -> Value {
+      fn->nativeFunc = [arrPtr, this](const std::vector<Value>& args) -> Value {
         auto result = makeArrayWithPrototype();
 
-        // Copy original array elements
-        result->elements = arrPtr->elements;
+        // Helper: check if value is concat-spreadable per spec
+        auto isConcatSpreadable = [this](const Value& val) -> bool {
+          if (!isObjectLike(val)) return false;
+          // Check Symbol.isConcatSpreadable
+          auto [found, spreadable] = getPropertyForExternal(val, WellKnownSymbols::isConcatSpreadableKey());
+          if (hasError()) { clearError(); }
+          if (found && !spreadable.isUndefined()) {
+            return spreadable.toBool();
+          }
+          // Default: true for arrays
+          return val.isArray();
+        };
 
-        // Add all arguments
-        for (const auto& arg : args) {
-          if (arg.isArray()) {
-            auto otherArr = arg.getGC<Array>();
+        // Helper: spread a value into result
+        auto spreadInto = [this, &result](const Value& val) {
+          if (val.isArray()) {
+            auto otherArr = val.getGC<Array>();
             result->elements.insert(result->elements.end(),
                                   otherArr->elements.begin(),
                                   otherArr->elements.end());
+          } else {
+            // Array-like: read length and index properties
+            auto [foundLen, lenVal] = getPropertyForExternal(val, "length");
+            if (hasError()) { clearError(); return; }
+            double len = foundLen ? lenVal.toNumber() : 0;
+            if (std::isnan(len) || len < 0) len = 0;
+            for (size_t i = 0; i < static_cast<size_t>(len); i++) {
+              auto [found, elem] = getPropertyForExternal(val, std::to_string(i));
+              if (hasError()) { clearError(); break; }
+              result->elements.push_back(found ? elem : Value(Undefined{}));
+            }
+          }
+        };
+
+        // Process this array
+        if (isConcatSpreadable(Value(arrPtr))) {
+          spreadInto(Value(arrPtr));
+        } else {
+          result->elements.push_back(Value(arrPtr));
+        }
+
+        // Process arguments
+        for (const auto& arg : args) {
+          if (isConcatSpreadable(arg)) {
+            spreadInto(arg);
           } else {
             result->elements.push_back(arg);
           }
