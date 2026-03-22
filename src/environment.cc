@@ -12566,18 +12566,38 @@ GCPtr<Environment> Environment::createGlobal() {
   arrayProtoSort->properties["__non_writable_length"] = Value(true);
   arrayProtoSort->properties["__non_enum_length"] = Value(true);
   arrayProtoSort->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.sort called on non-array");
-    }
-
-    auto arr = args[0].getGC<Array>();
-    if (arr->elements.size() <= 1) {
-      return args[0];
+    if (args.empty() || args[0].isNull() || args[0].isUndefined()) {
+      throw std::runtime_error("TypeError: Array.prototype.sort called on null or undefined");
     }
 
     Value compareFn = args.size() > 1 ? args[1] : Value(Undefined{});
+    // Step 1: Validate comparefn before anything else
     if (!compareFn.isUndefined() && !compareFn.isFunction()) {
-      throw std::runtime_error("TypeError: Array.prototype.sort comparator must be a function");
+      throw std::runtime_error("TypeError: Array.prototype.sort comparator must be a function or undefined");
+    }
+
+    Value thisVal = args[0];
+    Interpreter* interpreter = getGlobalInterpreter();
+
+    // Get length
+    size_t len = 0;
+    if (interpreter) {
+      auto [found, lenVal] = interpreter->getPropertyForExternal(thisVal, "length");
+      if (found) {
+        double d = lenVal.toNumber();
+        if (!std::isnan(d) && d >= 0) len = static_cast<size_t>(d);
+      }
+    }
+    if (len <= 1) return thisVal;
+
+    // Collect elements using [[Get]]
+    std::vector<std::pair<size_t, Value>> items;
+    for (size_t i = 0; i < len; i++) {
+      auto [found, val] = interpreter->getPropertyForExternal(thisVal, std::to_string(i));
+      if (interpreter->hasError()) { Value err = interpreter->getError(); interpreter->clearError(); throw JsValueException(err); }
+      if (found) {
+        items.push_back({i, val});
+      }
     }
 
     auto elementToString = [toPrimitive](const Value& value) -> std::string {
@@ -12589,12 +12609,15 @@ GCPtr<Environment> Environment::createGlobal() {
       return primitive.toString();
     };
 
-    Interpreter* interpreter = getGlobalInterpreter();
-    std::stable_sort(arr->elements.begin(), arr->elements.end(),
-      [&](const Value& lhs, const Value& rhs) {
+    std::stable_sort(items.begin(), items.end(),
+      [&](const std::pair<size_t, Value>& lhs, const std::pair<size_t, Value>& rhs) {
+        // Undefined sorts to end
+        if (lhs.second.isUndefined() && rhs.second.isUndefined()) return false;
+        if (lhs.second.isUndefined()) return false;
+        if (rhs.second.isUndefined()) return true;
         if (compareFn.isFunction()) {
           if (!interpreter) return false;
-          Value result = interpreter->callForHarness(compareFn, {lhs, rhs}, Value(Undefined{}));
+          Value result = interpreter->callForHarness(compareFn, {lhs.second, rhs.second}, Value(Undefined{}));
           if (interpreter->hasError()) {
             Value err = interpreter->getError();
             interpreter->clearError();
@@ -12604,10 +12627,41 @@ GCPtr<Environment> Environment::createGlobal() {
           if (std::isnan(number) || number == 0.0) return false;
           return number < 0.0;
         }
-        return elementToString(lhs) < elementToString(rhs);
+        return elementToString(lhs.second) < elementToString(rhs.second);
       });
 
-    return args[0];
+    // Write sorted elements back using [[Set]]
+    if (thisVal.isArray()) {
+      auto arr = thisVal.getGC<Array>();
+      // Fast path for arrays
+      for (size_t i = 0; i < items.size(); i++) {
+        if (i < arr->elements.size()) {
+          arr->elements[i] = items[i].second;
+        }
+      }
+      // Delete excess elements (holes after sorted items)
+      for (size_t i = items.size(); i < len && i < arr->elements.size(); i++) {
+        arr->elements[i] = Value(Undefined{});
+        arr->properties["__hole_" + std::to_string(i) + "__"] = Value(true);
+      }
+    } else if (interpreter) {
+      // Generic: write back via [[Set]]
+      for (size_t i = 0; i < items.size(); i++) {
+        interpreter->callForHarness(Value(Undefined{}), {}, Value(Undefined{})); // dummy to check
+        // Use direct property set for objects
+        if (thisVal.isObject()) {
+          thisVal.getGC<Object>()->properties[std::to_string(i)] = items[i].second;
+        }
+      }
+      // Delete remaining indices
+      for (size_t i = items.size(); i < len; i++) {
+        if (thisVal.isObject()) {
+          thisVal.getGC<Object>()->properties.erase(std::to_string(i));
+        }
+      }
+    }
+
+    return thisVal;
   };
   arrayPrototype->properties["sort"] = Value(arrayProtoSort);
   arrayPrototype->properties["__non_enum_sort"] = Value(true);
@@ -13865,24 +13919,34 @@ GCPtr<Environment> Environment::createGlobal() {
     arrayProtoIterator->properties["__uses_this_arg__"] = Value(true);
     arrayProtoIterator->properties["__builtin_array_iterator__"] = Value(true);
     arrayProtoIterator->nativeFunc = [arrayIteratorPrototype](const std::vector<Value>& args) -> Value {
-      if (args.empty() || !args[0].isArray()) {
-        return Value(Undefined{});
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (thisVal.isNull() || thisVal.isUndefined()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
       }
-      Value arrayValue = args[0];
       auto iterObj = GarbageCollector::makeGC<Object>();
       iterObj->properties["__proto__"] = Value(arrayIteratorPrototype);
       auto indexPtr = std::make_shared<size_t>(0);
+      auto capturedThis = std::make_shared<Value>(thisVal);
       auto nextFn = GarbageCollector::makeGC<Function>();
       nextFn->isNative = true;
-      nextFn->nativeFunc = [arrayValue, indexPtr](const std::vector<Value>&) -> Value {
-        auto arr = arrayValue.getGC<Array>();
+      nextFn->nativeFunc = [capturedThis, indexPtr](const std::vector<Value>&) -> Value {
+        auto* interp = getGlobalInterpreter();
         auto result = GarbageCollector::makeGC<Object>();
-        if (*indexPtr >= arr->elements.size()) {
+        // Re-read length each time (mutable iteration)
+        size_t len = 0;
+        if (interp) {
+          auto [found, lenVal] = interp->getPropertyForExternal(*capturedThis, "length");
+          if (found) {
+            double d = lenVal.toNumber();
+            if (!std::isnan(d) && d >= 0) len = static_cast<size_t>(d);
+          }
+        }
+        if (*indexPtr >= len) {
           result->properties["value"] = Value(Undefined{});
           result->properties["done"] = Value(true);
         } else {
-          std::string indexKey = std::to_string(*indexPtr);
-          auto [found, value] = getOwnPropertyLike(arrayValue, indexKey, arrayValue);
+          auto [found, value] = interp ? interp->getPropertyForExternal(*capturedThis, std::to_string(*indexPtr))
+                                       : std::pair<bool, Value>{false, Value(Undefined{})};
           result->properties["value"] = found ? value : Value(Undefined{});
           result->properties["done"] = Value(false);
           (*indexPtr)++;
@@ -13893,6 +13957,120 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(iterObj);
     };
     arrayPrototype->properties[iterKey] = Value(arrayProtoIterator);
+    arrayPrototype->properties["__non_enum_" + iterKey] = Value(true);
+
+    // Array.prototype.values = Array.prototype[Symbol.iterator]
+    arrayProtoIterator->properties["name"] = Value(std::string("values"));
+    arrayProtoIterator->properties["length"] = Value(0.0);
+    arrayProtoIterator->properties["__non_writable_name"] = Value(true);
+    arrayProtoIterator->properties["__non_enum_name"] = Value(true);
+    arrayProtoIterator->properties["__non_writable_length"] = Value(true);
+    arrayProtoIterator->properties["__non_enum_length"] = Value(true);
+    arrayPrototype->properties["values"] = Value(arrayProtoIterator);
+    arrayPrototype->properties["__non_enum_values"] = Value(true);
+
+    // Array.prototype.keys
+    auto arrayProtoKeys = GarbageCollector::makeGC<Function>();
+    arrayProtoKeys->isNative = true;
+    arrayProtoKeys->properties["__uses_this_arg__"] = Value(true);
+    arrayProtoKeys->properties["name"] = Value(std::string("keys"));
+    arrayProtoKeys->properties["length"] = Value(0.0);
+    arrayProtoKeys->properties["__non_writable_name"] = Value(true);
+    arrayProtoKeys->properties["__non_enum_name"] = Value(true);
+    arrayProtoKeys->properties["__non_writable_length"] = Value(true);
+    arrayProtoKeys->properties["__non_enum_length"] = Value(true);
+    arrayProtoKeys->nativeFunc = [arrayIteratorPrototype](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (thisVal.isNull() || thisVal.isUndefined()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+      }
+      auto* interp = getGlobalInterpreter();
+      auto iterObj = GarbageCollector::makeGC<Object>();
+      iterObj->properties["__proto__"] = Value(arrayIteratorPrototype);
+      // Get length via [[Get]]
+      size_t len = 0;
+      if (interp) {
+        auto [found, lenVal] = interp->getPropertyForExternal(thisVal, "length");
+        if (found) {
+          double d = lenVal.toNumber();
+          if (!std::isnan(d) && d >= 0) len = static_cast<size_t>(d);
+        }
+      }
+      auto indexPtr = std::make_shared<size_t>(0);
+      auto lenPtr = std::make_shared<size_t>(len);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [indexPtr, lenPtr](const std::vector<Value>&) -> Value {
+        auto result = GarbageCollector::makeGC<Object>();
+        if (*indexPtr >= *lenPtr) {
+          result->properties["value"] = Value(Undefined{});
+          result->properties["done"] = Value(true);
+        } else {
+          result->properties["value"] = Value(static_cast<double>(*indexPtr));
+          result->properties["done"] = Value(false);
+          (*indexPtr)++;
+        }
+        return Value(result);
+      };
+      iterObj->properties["next"] = Value(nextFn);
+      return Value(iterObj);
+    };
+    arrayPrototype->properties["keys"] = Value(arrayProtoKeys);
+    arrayPrototype->properties["__non_enum_keys"] = Value(true);
+
+    // Array.prototype.entries
+    auto arrayProtoEntries = GarbageCollector::makeGC<Function>();
+    arrayProtoEntries->isNative = true;
+    arrayProtoEntries->properties["__uses_this_arg__"] = Value(true);
+    arrayProtoEntries->properties["name"] = Value(std::string("entries"));
+    arrayProtoEntries->properties["length"] = Value(0.0);
+    arrayProtoEntries->properties["__non_writable_name"] = Value(true);
+    arrayProtoEntries->properties["__non_enum_name"] = Value(true);
+    arrayProtoEntries->properties["__non_writable_length"] = Value(true);
+    arrayProtoEntries->properties["__non_enum_length"] = Value(true);
+    arrayProtoEntries->nativeFunc = [arrayIteratorPrototype](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (thisVal.isNull() || thisVal.isUndefined()) {
+        throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+      }
+      auto iterObj = GarbageCollector::makeGC<Object>();
+      iterObj->properties["__proto__"] = Value(arrayIteratorPrototype);
+      auto indexPtr = std::make_shared<size_t>(0);
+      auto capturedThis = std::make_shared<Value>(thisVal);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [indexPtr, capturedThis](const std::vector<Value>&) -> Value {
+        auto* interp = getGlobalInterpreter();
+        auto result = GarbageCollector::makeGC<Object>();
+        // Re-read length each time (mutable iteration)
+        size_t len = 0;
+        if (interp) {
+          auto [found, lenVal] = interp->getPropertyForExternal(*capturedThis, "length");
+          if (found) {
+            double d = lenVal.toNumber();
+            if (!std::isnan(d) && d >= 0) len = static_cast<size_t>(d);
+          }
+        }
+        if (*indexPtr >= len) {
+          result->properties["value"] = Value(Undefined{});
+          result->properties["done"] = Value(true);
+        } else {
+          auto entry = GarbageCollector::makeGC<Array>();
+          entry->elements.push_back(Value(static_cast<double>(*indexPtr)));
+          auto [found, val] = interp ? interp->getPropertyForExternal(*capturedThis, std::to_string(*indexPtr))
+                                     : std::pair<bool, Value>{false, Value(Undefined{})};
+          entry->elements.push_back(found ? val : Value(Undefined{}));
+          result->properties["value"] = Value(entry);
+          result->properties["done"] = Value(false);
+          (*indexPtr)++;
+        }
+        return Value(result);
+      };
+      iterObj->properties["next"] = Value(nextFn);
+      return Value(iterObj);
+    };
+    arrayPrototype->properties["entries"] = Value(arrayProtoEntries);
+    arrayPrototype->properties["__non_enum_entries"] = Value(true);
   }
 
   // Array.isArray
