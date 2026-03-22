@@ -639,17 +639,23 @@ Value String_replace(const std::vector<Value>& args) {
     }
 
     std::string searchValue = toStringForStringBuiltinArg(args[1]);
+    bool isFunctionalReplace = args[2].isFunction();
 
-    // Check if replaceValue is a function
-    if (args[2].isFunction()) {
+    // Step 6: If not callable, ToString(replaceValue) BEFORE searching
+    std::string replaceTemplate;
+    if (!isFunctionalReplace) {
+        replaceTemplate = toStringForStringBuiltinArg(args[2]);
+    }
+
+    if (isFunctionalReplace) {
         size_t pos = str.find(searchValue);
         if (pos != std::string::npos) {
             auto* interp = getGlobalInterpreter();
             if (interp) {
                 std::vector<Value> cbArgs;
-                cbArgs.push_back(Value(searchValue));  // matched substring
-                cbArgs.push_back(Value(static_cast<double>(pos)));  // offset
-                cbArgs.push_back(Value(str));  // original string
+                cbArgs.push_back(Value(searchValue));
+                cbArgs.push_back(Value(static_cast<double>(pos)));
+                cbArgs.push_back(Value(str));
                 Value replacement = interp->callForHarness(args[2], cbArgs, Value(Undefined{}));
                 if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
                 str.replace(pos, searchValue.length(), replacement.toString());
@@ -657,8 +663,6 @@ Value String_replace(const std::vector<Value>& args) {
         }
         return Value(str);
     }
-
-    std::string replaceTemplate = toStringForStringBuiltinArg(args[2]);
 
     size_t pos = str.find(searchValue);
     if (pos != std::string::npos) {

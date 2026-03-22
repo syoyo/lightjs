@@ -11511,21 +11511,25 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 #endif
         } else {
           std::string search = toStringForStringBuiltinArg(args[0]);
-          if (args[1].isFunction()) {
-            // Function callback for string replace
+          bool isFnReplace = args[1].isFunction();
+          // Step 6: If not callable, ToString(replaceValue) BEFORE searching
+          std::string replaceTemplate;
+          if (!isFnReplace) {
+            replaceTemplate = toStringForStringBuiltinArg(args[1]);
+          }
+          if (isFnReplace) {
             std::string result = str;
             size_t pos = result.find(search);
             if (pos != std::string::npos) {
               std::vector<Value> cbArgs;
-              cbArgs.push_back(Value(search));  // match
-              cbArgs.push_back(Value(static_cast<double>(pos)));  // offset
-              cbArgs.push_back(Value(str));  // string
+              cbArgs.push_back(Value(search));
+              cbArgs.push_back(Value(static_cast<double>(pos)));
+              cbArgs.push_back(Value(str));
               Value replacement = interp->callForHarness(args[1], cbArgs, Value(Undefined{}));
               result.replace(pos, search.length(), replacement.toString());
             }
             return Value(result);
           }
-          std::string replaceTemplate = args[1].toString();
           std::string result = str;
           size_t pos = result.find(search);
           if (pos != std::string::npos) {

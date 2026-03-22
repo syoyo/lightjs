@@ -18249,9 +18249,23 @@ GCPtr<Environment> Environment::createGlobal() {
   objectProtoToLocaleString->properties["__non_writable_length"] = Value(true);
   objectProtoToLocaleString->properties["__non_enum_length"] = Value(true);
   objectProtoToLocaleString->properties["__uses_this_arg__"] = Value(true);
-  objectProtoToLocaleString->nativeFunc = [objectProtoToString](const std::vector<Value>& args) -> Value {
-    // toLocaleString calls toString
-    return objectProtoToString->nativeFunc(args);
+  objectProtoToLocaleString->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // Per spec: Let O = ToObject(this). Then Invoke(O, "toString")
+    if (args.empty() || args[0].isNull() || args[0].isUndefined()) {
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+    }
+    Value thisVal = args[0];
+    auto* interp = getGlobalInterpreter();
+    if (interp) {
+      auto [found, toStringFn] = interp->getPropertyForExternal(thisVal, "toString");
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (found && toStringFn.isFunction()) {
+        Value result = interp->callForHarness(toStringFn, {}, thisVal);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        return result;
+      }
+    }
+    return Value(thisVal.toString());
   };
   objectPrototype->properties["toLocaleString"] = Value(objectProtoToLocaleString);
   objectPrototype->properties["__non_enum_toLocaleString"] = Value(true);
