@@ -62,6 +62,7 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
 | `built-ins/Array` (partial) | ~2260 | ~2644 | ~85.5% |
+Note: Array prototype methods at 2193/2549 (86.0%), plus non-proto tests.
 
 Unit tests: 346/346 passing.
 
