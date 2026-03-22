@@ -61,13 +61,17 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
-| `built-ins/Array` (partial) | ~2230 | ~2644 | ~84.3% |
+| `built-ins/Array` (partial) | ~2250 | ~2644 | ~85.1% |
 
 Unit tests: 346/346 passing.
 
 Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
 
 #### Changes (2026-03-22)
+
+**Batch 7:** ArraySpeciesCreate for map/filter/slice/concat: +33 tests:
+
+- **ArraySpeciesCreate** (`src/environment.cc`): Per spec 9.4.2.3, map/filter/slice/concat check `originalArray.constructor[@@species]` to determine which constructor to use for result arrays. Validates species is constructor, handles null species fallback.
 
 **Batch 6:** Route Array methods through prototype for accessor/hole support: +60 tests:
 
