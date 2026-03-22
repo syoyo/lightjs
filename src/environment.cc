@@ -13069,6 +13069,68 @@ GCPtr<Environment> Environment::createGlobal() {
     return {found, val};
   };
 
+  // ArraySpeciesCreate per spec 9.4.2.3
+  // Creates result array using species constructor if available
+  auto arraySpeciesCreate = [](const Value& originalArray, size_t length) -> Value {
+    // Step 2: If originalArray is not an array, return ArrayCreate(length)
+    if (!originalArray.isArray()) {
+      auto result = makeArrayWithPrototype();
+      result->elements.resize(length, Value(Undefined{}));
+      for (size_t i = 0; i < length; i++) {
+        result->properties["__hole_" + std::to_string(i) + "__"] = Value(true);
+      }
+      return Value(result);
+    }
+
+    Interpreter* interp = getGlobalInterpreter();
+    if (!interp) {
+      auto result = makeArrayWithPrototype();
+      return Value(result);
+    }
+
+    // Step 5: Let C = Get(originalArray, "constructor")
+    auto [hasCtor, ctorVal] = interp->getPropertyForExternal(originalArray, "constructor");
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+
+    if (hasCtor && !ctorVal.isUndefined()) {
+      // Step 6: If IsConstructor(C), check cross-realm (skip for now)
+
+      // Step 7: If C is an Object, get @@species
+      if (isObjectLikeValue(ctorVal)) {
+        auto [hasSpecies, speciesVal] = interp->getPropertyForExternal(ctorVal, WellKnownSymbols::speciesKey());
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (hasSpecies && !speciesVal.isUndefined()) {
+          if (speciesVal.isNull()) {
+            // null means use default
+          } else if (speciesVal.isFunction() || speciesVal.isClass() ||
+                     (speciesVal.isObject() && speciesVal.getGC<Object>()->properties.count("__callable_object__"))) {
+            // Step 10: Construct(C, [length])
+            Value result = interp->constructFromNative(speciesVal, {Value(static_cast<double>(length))});
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            return result;
+          } else {
+            throw std::runtime_error("TypeError: Species is not a constructor");
+          }
+        }
+      } else if (!ctorVal.isFunction() && !ctorVal.isClass() && !ctorVal.isNull()) {
+        // Step 6 check: constructor must be Object or undefined
+        if (ctorVal.isNumber() || ctorVal.isString() || ctorVal.isBool() || ctorVal.isSymbol() || ctorVal.isBigInt()) {
+          throw std::runtime_error("TypeError: constructor is not an object");
+        }
+      }
+    }
+
+    // Default: create regular array
+    auto result = makeArrayWithPrototype();
+    if (length > 0) {
+      result->elements.resize(length, Value(Undefined{}));
+      for (size_t i = 0; i < length; i++) {
+        result->properties["__hole_" + std::to_string(i) + "__"] = Value(true);
+      }
+    }
+    return Value(result);
+  };
+
   // Helper lambda for installing Array prototype methods that need callback support
   auto installArrayMethod = [&](const std::string& name, int length,
       std::function<Value(const std::vector<Value>&)> impl) {
@@ -13087,7 +13149,7 @@ GCPtr<Environment> Environment::createGlobal() {
   };
 
   // Array.prototype.map - generic (works on any array-like)
-  installArrayMethod("map", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+  installArrayMethod("map", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement, arraySpeciesCreate](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "map");
     if (args.size() < 2 || !args[1].isFunction()) {
       throw std::runtime_error("TypeError: undefined is not a function");
@@ -13095,8 +13157,7 @@ GCPtr<Environment> Environment::createGlobal() {
     Value callback = args[1];
     Value thisArg = args.size() > 2 ? args[2] : Value(Undefined{});
     size_t len = getArrayLikeLength(thisVal);
-    auto result = makeArrayWithPrototype();
-    result->elements.resize(len, Value(Undefined{}));
+    Value resultVal = arraySpeciesCreate(thisVal, len);
     Interpreter* interpreter = getGlobalInterpreter();
     if (!interpreter) throw std::runtime_error("TypeError: Interpreter unavailable");
     for (size_t i = 0; i < len; ++i) {
@@ -13107,15 +13168,27 @@ GCPtr<Environment> Environment::createGlobal() {
       if (interpreter->hasError()) {
         Value err = interpreter->getError();
         interpreter->clearError();
-        throw std::runtime_error(err.toString());
+        throw JsValueException(err);
       }
-      result->elements[i] = mapped;
+      // Set on result via [[DefineOwnProperty]]
+      if (resultVal.isArray()) {
+        auto resultArr = resultVal.getGC<Array>();
+        if (i < resultArr->elements.size()) {
+          resultArr->elements[i] = mapped;
+          resultArr->properties.erase("__hole_" + std::to_string(i) + "__");
+        } else {
+          while (resultArr->elements.size() < i) resultArr->elements.push_back(Value(Undefined{}));
+          resultArr->elements.push_back(mapped);
+        }
+      } else if (resultVal.isObject()) {
+        resultVal.getGC<Object>()->properties[std::to_string(i)] = mapped;
+      }
     }
-    return Value(result);
+    return resultVal;
   });
 
   // Array.prototype.filter - generic
-  installArrayMethod("filter", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+  installArrayMethod("filter", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement, arraySpeciesCreate](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "filter");
     if (args.size() < 2 || !args[1].isFunction()) {
       throw std::runtime_error("TypeError: undefined is not a function");
@@ -13123,9 +13196,10 @@ GCPtr<Environment> Environment::createGlobal() {
     Value callback = args[1];
     Value thisArg = args.size() > 2 ? args[2] : Value(Undefined{});
     size_t len = getArrayLikeLength(thisVal);
-    auto result = makeArrayWithPrototype();
+    Value resultVal = arraySpeciesCreate(thisVal, 0);
     Interpreter* interpreter = getGlobalInterpreter();
     if (!interpreter) throw std::runtime_error("TypeError: Interpreter unavailable");
+    size_t to = 0;
     for (size_t i = 0; i < len; ++i) {
       auto [exists, elem] = getArrayLikeElement(thisVal, i);
       if (!exists) continue;
@@ -13134,13 +13208,18 @@ GCPtr<Environment> Environment::createGlobal() {
       if (interpreter->hasError()) {
         Value err = interpreter->getError();
         interpreter->clearError();
-        throw std::runtime_error(err.toString());
+        throw JsValueException(err);
       }
       if (keep.toBool()) {
-        result->elements.push_back(elem);
+        if (resultVal.isArray()) {
+          resultVal.getGC<Array>()->elements.push_back(elem);
+        } else if (resultVal.isObject()) {
+          resultVal.getGC<Object>()->properties[std::to_string(to)] = elem;
+        }
+        to++;
       }
     }
-    return Value(result);
+    return resultVal;
   });
 
   // Array.prototype.forEach - generic
@@ -13635,19 +13714,21 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.splice
-  installArrayMethod("splice", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+  installArrayMethod("splice", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement, arraySpeciesCreate](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "splice");
     if (thisVal.isArray()) {
       auto arr = thisVal.getGC<Array>();
       int len = static_cast<int>(arr->elements.size());
       auto result = makeArrayWithPrototype();
       if (args.size() < 2) return Value(result);
-      int start = static_cast<int>(args[1].toNumber());
+      double startD = args[1].toNumber();
+      int start = std::isnan(startD) ? 0 : static_cast<int>(startD);
       if (start < 0) start = std::max(0, len + start);
       if (start > len) start = len;
       int deleteCount = 0;
       if (args.size() >= 3) {
-        deleteCount = static_cast<int>(args[2].toNumber());
+        double dcD = args[2].toNumber();
+        deleteCount = std::isnan(dcD) ? 0 : static_cast<int>(dcD);
         if (deleteCount < 0) deleteCount = 0;
         if (deleteCount > len - start) deleteCount = len - start;
       } else {
@@ -13681,7 +13762,7 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.slice
-  installArrayMethod("slice", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+  installArrayMethod("slice", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement, arraySpeciesCreate](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "slice");
     int len = static_cast<int>(getArrayLikeLength(thisVal));
     int start = 0, end = len;
@@ -13697,17 +13778,28 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     start = std::min(start, len);
     end = std::min(end, len);
-    auto result = makeArrayWithPrototype();
+    int count = std::max(0, end - start);
+    Value resultVal = arraySpeciesCreate(thisVal, static_cast<size_t>(count));
+    size_t n = 0;
     for (int i = start; i < end; ++i) {
       auto [exists, elem] = getArrayLikeElement(thisVal, static_cast<size_t>(i));
-      if (exists) {
-        result->elements.push_back(elem);
-      } else {
-        result->elements.push_back(Value(Undefined{}));
-        result->properties["__hole_" + std::to_string(result->elements.size() - 1) + "__"] = Value(true);
+      if (resultVal.isArray()) {
+        auto resultArr = resultVal.getGC<Array>();
+        if (n < resultArr->elements.size()) {
+          if (exists) { resultArr->elements[n] = elem; resultArr->properties.erase("__hole_" + std::to_string(n) + "__"); }
+        } else {
+          if (exists) resultArr->elements.push_back(elem);
+          else {
+            resultArr->elements.push_back(Value(Undefined{}));
+            resultArr->properties["__hole_" + std::to_string(n) + "__"] = Value(true);
+          }
+        }
+      } else if (exists && resultVal.isObject()) {
+        resultVal.getGC<Object>()->properties[std::to_string(n)] = elem;
       }
+      n++;
     }
-    return Value(result);
+    return resultVal;
   });
 
   // Array.prototype.pop - generic
@@ -13812,9 +13904,10 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.concat
-  installArrayMethod("concat", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+  installArrayMethod("concat", 1, [toObjectChecked, getArrayLikeLength, getArrayLikeElement, arraySpeciesCreate](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "concat");
-    auto result = makeArrayWithPrototype();
+    Value resultVal = arraySpeciesCreate(thisVal, 0);
+    auto result = resultVal.isArray() ? resultVal.getGC<Array>() : makeArrayWithPrototype();
     Interpreter* interp = getGlobalInterpreter();
     // Helper: check if value is concat-spreadable per spec
     auto isConcatSpreadable = [interp](const Value& val) -> bool {
