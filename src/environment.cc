@@ -13635,41 +13635,50 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.fill
-  installArrayMethod("fill", 1, [toObjectChecked](const std::vector<Value>& args) -> Value {
+  installArrayMethod("fill", 1, [toObjectChecked, getArrayLikeLength](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "fill");
-    if (!thisVal.isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.fill called on non-array");
-    }
-    auto arr = args[0].getGC<Array>();
+    int len = static_cast<int>(getArrayLikeLength(thisVal));
     Value fillValue = args.size() > 1 ? args[1] : Value(Undefined{});
-    int len = static_cast<int>(arr->elements.size());
     int start = 0, end = len;
     if (args.size() > 2 && !args[2].isUndefined()) {
-      start = static_cast<int>(args[2].toNumber());
+      double s = args[2].toNumber();
+      start = std::isnan(s) ? 0 : static_cast<int>(s);
       if (start < 0) start = std::max(0, len + start);
     }
     if (args.size() > 3 && !args[3].isUndefined()) {
-      end = static_cast<int>(args[3].toNumber());
+      double e = args[3].toNumber();
+      end = std::isnan(e) ? 0 : static_cast<int>(e);
       if (end < 0) end = std::max(0, len + end);
     }
     start = std::min(start, len);
     end = std::min(end, len);
-    for (int i = start; i < end; ++i) {
-      arr->elements[i] = fillValue;
+    if (thisVal.isArray()) {
+      auto arr = thisVal.getGC<Array>();
+      for (int i = start; i < end; ++i) {
+        if (i < static_cast<int>(arr->elements.size())) {
+          arr->elements[i] = fillValue;
+          arr->properties.erase("__hole_" + std::to_string(i) + "__");
+        }
+      }
+    } else if (thisVal.isObject()) {
+      auto obj = thisVal.getGC<Object>();
+      for (int i = start; i < end; ++i) {
+        obj->properties[std::to_string(i)] = fillValue;
+      }
     }
-    return args[0]; // Return the array
+    return thisVal;
   });
 
   // Array.prototype.copyWithin
-  installArrayMethod("copyWithin", 2, [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isArray()) {
-      throw std::runtime_error("TypeError: Array.prototype.copyWithin called on non-array");
-    }
-    auto arr = args[0].getGC<Array>();
-    int len = static_cast<int>(arr->elements.size());
-    int target = args.size() > 1 ? static_cast<int>(args[1].toNumber()) : 0;
-    int start = args.size() > 2 ? static_cast<int>(args[2].toNumber()) : 0;
-    int end = args.size() > 3 && !args[3].isUndefined() ? static_cast<int>(args[3].toNumber()) : len;
+  installArrayMethod("copyWithin", 2, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
+    Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "copyWithin");
+    int len = static_cast<int>(getArrayLikeLength(thisVal));
+    double tD = args.size() > 1 ? args[1].toNumber() : 0;
+    double sD = args.size() > 2 ? args[2].toNumber() : 0;
+    double eD = args.size() > 3 && !args[3].isUndefined() ? args[3].toNumber() : len;
+    int target = std::isnan(tD) ? 0 : static_cast<int>(tD);
+    int start = std::isnan(sD) ? 0 : static_cast<int>(sD);
+    int end = std::isnan(eD) ? 0 : static_cast<int>(eD);
     if (target < 0) target = std::max(0, len + target);
     if (start < 0) start = std::max(0, len + start);
     if (end < 0) end = std::max(0, len + end);
@@ -13677,13 +13686,32 @@ GCPtr<Environment> Environment::createGlobal() {
     start = std::min(start, len);
     end = std::min(end, len);
     int count = std::min(end - start, len - target);
-    if (count <= 0) return args[0];
-    // Use temporary copy to handle overlapping
-    std::vector<Value> temp(arr->elements.begin() + start, arr->elements.begin() + start + count);
+    if (count <= 0) return thisVal;
+    // Read source elements via [[Get]]
+    std::vector<std::pair<bool, Value>> temp;
     for (int i = 0; i < count; ++i) {
-      arr->elements[target + i] = temp[i];
+      temp.push_back(getArrayLikeElement(thisVal, start + i));
     }
-    return args[0];
+    // Write to target positions
+    if (thisVal.isArray()) {
+      auto arr = thisVal.getGC<Array>();
+      for (int i = 0; i < count; ++i) {
+        if (target + i < static_cast<int>(arr->elements.size())) {
+          arr->elements[target + i] = temp[i].first ? temp[i].second : Value(Undefined{});
+        }
+      }
+    } else if (thisVal.isObject()) {
+      auto obj = thisVal.getGC<Object>();
+      for (int i = 0; i < count; ++i) {
+        std::string key = std::to_string(target + i);
+        if (temp[i].first) {
+          obj->properties[key] = temp[i].second;
+        } else {
+          obj->properties.erase(key);
+        }
+      }
+    }
+    return thisVal;
   });
 
   // Array.prototype.at
