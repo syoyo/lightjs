@@ -14922,16 +14922,25 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     wrapper->properties["__primitive_value__"] = primitive;
     if (primitive.isString()) {
-      // String objects have an own, non-writable/non-enumerable/non-configurable `length`.
+      // String exotic object: numeric indexed properties + length
       const std::string& s = std::get<std::string>(primitive.data);
-      wrapper->properties["length"] = Value(static_cast<double>(String_utf16Length(s)));
+      size_t cpLen = 0, bytePos = 0;
+      while (bytePos < s.size()) {
+        unsigned char c = s[bytePos];
+        size_t charLen = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        std::string idx = std::to_string(cpLen);
+        wrapper->properties[idx] = Value(s.substr(bytePos, charLen));
+        wrapper->properties["__non_writable_" + idx] = Value(true);
+        wrapper->properties["__non_configurable_" + idx] = Value(true);
+        bytePos += charLen;
+        cpLen++;
+      }
+      wrapper->properties["length"] = Value(static_cast<double>(cpLen));
       wrapper->properties["__non_writable_length"] = Value(true);
       wrapper->properties["__non_enum_length"] = Value(true);
       wrapper->properties["__non_configurable_length"] = Value(true);
     }
 
-    // valueOf comes from the prototype chain (Number.prototype.valueOf, etc.)
-    // not as an own property on the wrapper
     return Value(wrapper);
   };
 
