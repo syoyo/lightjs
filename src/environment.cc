@@ -12411,8 +12411,17 @@ GCPtr<Environment> Environment::createGlobal() {
       throw std::runtime_error("TypeError: Array.prototype.push called on null or undefined");
     }
     Value thisVal = args[0];
+    if (thisVal.isNull() || thisVal.isUndefined()) {
+      throw std::runtime_error("TypeError: Array.prototype.push called on null or undefined");
+    }
+    if (thisVal.isString()) {
+      throw std::runtime_error("TypeError: Cannot assign to read only property 'length' of string");
+    }
     if (thisVal.isArray()) {
       auto arr = thisVal.getGC<Array>();
+      if (arr->properties.count("__non_writable_length")) {
+        throw std::runtime_error("TypeError: Cannot assign to read only property 'length'");
+      }
       for (size_t i = 1; i < args.size(); ++i) {
         arr->elements.push_back(args[i]);
       }
@@ -13757,7 +13766,51 @@ GCPtr<Environment> Environment::createGlobal() {
       auto [exists, elem] = getArrayLikeElement(thisVal, start + i);
       result->elements.push_back(exists ? elem : Value(Undefined{}));
     }
-    // For generic objects, modifying properties is complex; for now return deleted
+    // Collect items to insert
+    std::vector<Value> newItems;
+    for (size_t i = 3; i < args.size(); ++i) {
+      newItems.push_back(args[i]);
+    }
+    int insertCount = static_cast<int>(newItems.size());
+    int itemDelta = insertCount - deleteCount;
+    // Shift elements for generic objects
+    if (thisVal.isObject()) {
+      auto obj = thisVal.getGC<Object>();
+      if (itemDelta > 0) {
+        // Shift right
+        for (int i = len - 1; i >= start + deleteCount; --i) {
+          auto fromKey = std::to_string(i);
+          auto toKey = std::to_string(i + itemDelta);
+          auto it = obj->properties.find(fromKey);
+          if (it != obj->properties.end()) {
+            obj->properties[toKey] = it->second;
+          } else {
+            obj->properties.erase(toKey);
+          }
+        }
+      } else if (itemDelta < 0) {
+        // Shift left
+        for (int i = start + deleteCount; i < len; ++i) {
+          auto fromKey = std::to_string(i);
+          auto toKey = std::to_string(i + itemDelta);
+          auto it = obj->properties.find(fromKey);
+          if (it != obj->properties.end()) {
+            obj->properties[toKey] = it->second;
+          } else {
+            obj->properties.erase(toKey);
+          }
+        }
+        // Delete trailing
+        for (int i = len + itemDelta; i < len; ++i) {
+          obj->properties.erase(std::to_string(i));
+        }
+      }
+      // Insert new items
+      for (int i = 0; i < insertCount; ++i) {
+        obj->properties[std::to_string(start + i)] = newItems[i];
+      }
+      obj->properties["length"] = Value(static_cast<double>(len + itemDelta));
+    }
     return Value(result);
   });
 
@@ -13803,21 +13856,31 @@ GCPtr<Environment> Environment::createGlobal() {
   });
 
   // Array.prototype.pop - generic
-  installArrayMethod("pop", 0, [toObjectChecked, getArrayLikeLength](const std::vector<Value>& args) -> Value {
+  installArrayMethod("pop", 0, [toObjectChecked, getArrayLikeLength, getArrayLikeElement](const std::vector<Value>& args) -> Value {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "pop");
-    if (thisVal.isArray()) {
-      auto arr = thisVal.getGC<Array>();
-      if (arr->elements.empty()) return Value(Undefined{});
-      Value last = arr->elements.back();
-      arr->elements.pop_back();
-      return last;
-    }
-    // Generic object
     size_t len = getArrayLikeLength(thisVal);
     if (len == 0) {
+      // Set length to 0
+      if (thisVal.isArray()) {
+        auto arr = thisVal.getGC<Array>();
+        if (arr->properties.count("__non_writable_length")) {
+          throw std::runtime_error("TypeError: Cannot assign to read only property 'length'");
+        }
+      }
       if (thisVal.isObject()) thisVal.getGC<Object>()->properties["length"] = Value(0.0);
       return Value(Undefined{});
     }
+    if (thisVal.isArray()) {
+      auto arr = thisVal.getGC<Array>();
+      if (arr->properties.count("__non_writable_length")) {
+        throw std::runtime_error("TypeError: Cannot assign to read only property 'length'");
+      }
+      // Use [[Get]] for last element (accessor support)
+      auto [exists, last] = getArrayLikeElement(thisVal, len - 1);
+      arr->elements.pop_back();
+      return exists ? last : Value(Undefined{});
+    }
+    // Generic object
     Interpreter* interp = getGlobalInterpreter();
     std::string lastKey = std::to_string(len - 1);
     Value result(Undefined{});
@@ -13837,6 +13900,12 @@ GCPtr<Environment> Environment::createGlobal() {
     Value thisVal = toObjectChecked(args.empty() ? Value(Undefined{}) : args[0], "shift");
     if (thisVal.isArray()) {
       auto arr = thisVal.getGC<Array>();
+      if (arr->properties.count("__non_writable_length")) {
+        if (arr->elements.empty()) {
+          throw std::runtime_error("TypeError: Cannot assign to read only property 'length'");
+        }
+        throw std::runtime_error("TypeError: Cannot assign to read only property 'length'");
+      }
       if (arr->elements.empty()) return Value(Undefined{});
       Value first = arr->elements.front();
       arr->elements.erase(arr->elements.begin());
