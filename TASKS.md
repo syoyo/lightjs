@@ -61,10 +61,20 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
+| `built-ins/Array` (partial) | ~2112 | ~2644 | ~79.9% |
 
 Unit tests: 346/346 passing.
 
+Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
+
 #### Changes (2026-03-22)
+
+**Batch 4:** Array prototype methods rewrite: +150+ tests across reduce/map/filter/every/some/forEach/concat etc.:
+
+- **ToObject primitive boxing** (`src/environment.cc`): `toObjectChecked` now boxes primitives (Boolean/Number/String/Symbol/BigInt) to proper wrapper objects with correct prototypes, enabling `Array.prototype.method.call(primitive, ...)` to work per spec.
+- **Generic [[Get]]/[[HasProperty]]** (`src/environment.cc`): `getArrayLikeLength` and `getArrayLikeElement` now use `getPropertyForExternal` for ALL types (including arrays), enabling getter invocation, prototype chain lookups, and array-like object support.
+- **Symbol.isConcatSpreadable** (`src/interpreter.cc`): `concat` checks `Symbol.isConcatSpreadable` per spec, supporting spreadable non-Array objects and non-spreadable arrays.
+- **indexOf primitive boxing** (`src/environment.cc`): `toArrayLikeObject` properly boxes primitives for `indexOf`/`lastIndexOf`.
 
 **Batch 3:** +10 tests: Function +10 (382→392), 0 regressions:
 
