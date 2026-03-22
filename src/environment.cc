@@ -14245,24 +14245,13 @@ GCPtr<Environment> Environment::createGlobal() {
     Value onFulfilledValue = args.size() > 1 ? args[1] : Value(Undefined{});
     Value onRejectedValue = args.size() > 2 ? args[2] : Value(Undefined{});
 
+    // Per spec (25.4.2.1 PromiseReactionJob step 8): Call capResolve with the handler result.
+    // capResolve is the Promise Resolve Function which handles self-resolution, thenables, etc.
     std::function<Value(Value)> onFulfilled = [callChecked, capResolve, capReject, onFulfilledValue](Value v) -> Value {
       try {
         if (onFulfilledValue.isFunction()) {
           Value callbackResult = callChecked(onFulfilledValue, {v}, Value(Undefined{}));
-          if (callbackResult.isPromise()) {
-            auto returnedPromise = callbackResult.getGC<Promise>();
-            returnedPromise->then(
-              [callChecked, capResolve](Value settled) -> Value {
-                callChecked(*capResolve, {settled}, Value(Undefined{}));
-                return settled;
-              },
-              [callChecked, capReject](Value reason) -> Value {
-                callChecked(*capReject, {reason}, Value(Undefined{}));
-                return reason;
-              });
-          } else {
-            callChecked(*capResolve, {callbackResult}, Value(Undefined{}));
-          }
+          callChecked(*capResolve, {callbackResult}, Value(Undefined{}));
         } else {
           callChecked(*capResolve, {v}, Value(Undefined{}));
         }
@@ -14278,20 +14267,7 @@ GCPtr<Environment> Environment::createGlobal() {
       try {
         if (onRejectedValue.isFunction()) {
           Value callbackResult = callChecked(onRejectedValue, {v}, Value(Undefined{}));
-          if (callbackResult.isPromise()) {
-            auto returnedPromise = callbackResult.getGC<Promise>();
-            returnedPromise->then(
-              [callChecked, capResolve](Value settled) -> Value {
-                callChecked(*capResolve, {settled}, Value(Undefined{}));
-                return settled;
-              },
-              [callChecked, capReject](Value reason) -> Value {
-                callChecked(*capReject, {reason}, Value(Undefined{}));
-                return reason;
-              });
-          } else {
-            callChecked(*capResolve, {callbackResult}, Value(Undefined{}));
-          }
+          callChecked(*capResolve, {callbackResult}, Value(Undefined{}));
         } else {
           callChecked(*capReject, {v}, Value(Undefined{}));
         }
@@ -18294,14 +18270,14 @@ GCPtr<Environment> Environment::createGlobal() {
     auto objectGroupBy = GarbageCollector::makeGC<Function>();
     objectGroupBy->isNative = true;
     objectGroupBy->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.size() < 2 || !args[1].isFunction()) {
-        throw std::runtime_error("TypeError: Object.groupBy requires a callback function");
-      }
-      Value items = args[0];
+      Value items = args.size() > 0 ? args[0] : Value(Undefined{});
+      Value callback = args.size() > 1 ? args[1] : Value(Undefined{});
       if (items.isNull() || items.isUndefined()) {
         throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
       }
-      Value callback = args[1];
+      if (!callback.isFunction()) {
+        throw std::runtime_error("TypeError: Object.groupBy requires a callback function");
+      }
       auto* interp = getGlobalInterpreter();
       if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
 
@@ -18310,52 +18286,46 @@ GCPtr<Environment> Environment::createGlobal() {
       GarbageCollector::instance().reportAllocation(sizeof(Object));
       result->properties["__proto__"] = Value(Null{});
 
-      // Iterate items
-      if (items.isArray()) {
-        auto arr = items.getGC<Array>();
-        for (size_t i = 0; i < arr->elements.size(); ++i) {
-          Value element = arr->elements[i];
-          Value keyVal = interp->callForHarness(callback, {element, Value(static_cast<double>(i))}, Value(Undefined{}));
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          std::string key = valueToPropertyKey(keyVal);
-          auto groupIt = result->properties.find(key);
-          GCPtr<Array> group;
-          if (groupIt != result->properties.end() && groupIt->second.isArray()) {
-            group = groupIt->second.getGC<Array>();
-          } else {
-            group = makeArrayWithPrototype();
-            result->properties[key] = Value(group);
-          }
-          group->elements.push_back(element);
+      auto addToGroup = [&](const Value& element, const Value& keyVal) {
+        std::string key = valueToPropertyKey(keyVal);
+        auto groupIt = result->properties.find(key);
+        GCPtr<Array> group;
+        if (groupIt != result->properties.end() && groupIt->second.isArray()) {
+          group = groupIt->second.getGC<Array>();
+        } else {
+          group = makeArrayWithPrototype();
+          result->properties[key] = Value(group);
         }
-      } else if (items.isString()) {
-        const std::string& str = std::get<std::string>(items.data);
+        group->elements.push_back(element);
+      };
+
+      // Use iterator protocol
+      auto [hasIter, iterFn] = interp->getPropertyForExternal(items, WellKnownSymbols::iteratorKey());
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      if (hasIter && iterFn.isFunction()) {
+        Value iterator = interp->callForHarness(iterFn, {}, items);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
         size_t idx = 0;
-        size_t bytePos = 0;
-        while (bytePos < str.size()) {
-          unsigned char c = str[bytePos];
-          size_t len = 1;
-          if (c >= 0x80) {
-            if ((c & 0xE0) == 0xC0) len = 2;
-            else if ((c & 0xF0) == 0xE0) len = 3;
-            else len = 4;
-          }
-          Value element(str.substr(bytePos, len));
+        int limit = 100000;
+        while (limit-- > 0) {
+          auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!hasNext || !nextMethod.isFunction()) break;
+          Value step = interp->callForHarness(nextMethod, {}, iterator);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (hasDone && doneVal.toBool()) break;
+          auto [hasVal, val] = interp->getPropertyForExternal(step, "value");
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          Value element = hasVal ? val : Value(Undefined{});
           Value keyVal = interp->callForHarness(callback, {element, Value(static_cast<double>(idx))}, Value(Undefined{}));
           if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          std::string key = valueToPropertyKey(keyVal);
-          auto groupIt = result->properties.find(key);
-          GCPtr<Array> group;
-          if (groupIt != result->properties.end() && groupIt->second.isArray()) {
-            group = groupIt->second.getGC<Array>();
-          } else {
-            group = makeArrayWithPrototype();
-            result->properties[key] = Value(group);
-          }
-          group->elements.push_back(element);
-          bytePos += len;
+          addToGroup(element, keyVal);
           idx++;
         }
+      } else {
+        throw std::runtime_error("TypeError: object is not iterable");
       }
       return Value(result);
     };
@@ -18449,7 +18419,7 @@ GCPtr<Environment> Environment::createGlobal() {
   objectGetPrototypeOf->isNative = true;
   objectGetPrototypeOf->nativeFunc = [promisePrototype, env](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
-      return Value(Null{});
+      throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
     }
     if (args[0].isPromise()) {
       auto p = args[0].getGC<Promise>();

@@ -46,14 +46,14 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Boolean` | 50 | 51 | 98.0% |
 | `built-ins/JSON` | 146 | 165 | 88.5% |
 | `built-ins/String` | 1159 | 1223 | 94.8% (59 fail, 5 skipped) |
-| `built-ins/Object` | 3268 | 3411 | 95.8% |
+| `built-ins/Object` | 3272 | 3411 | 95.9% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
 | `built-ins/parseInt` | 55 | 55 | 100.0% |
 | `built-ins/parseFloat` | 54 | 54 | 100.0% |
 | `built-ins/ArrayBuffer` | 196 | 196 | 100.0% |
 | `built-ins/DataView` | 561 | 561 | 100.0% |
 | `built-ins/BigInt` | 77 | 77 | 100.0% |
-| `built-ins/Promise` | 631 | 652 | 96.8% |
+| `built-ins/Promise` | 640 | 652 | 98.2% |
 | `built-ins/Set` | 378 | 383 | 98.7% |
 | `built-ins/Map` | 201 | 204 | 98.5% |
 | `built-ins/Symbol` | 88 | 98 | 89.8% |
@@ -66,7 +66,14 @@ Unit tests: 346/346 passing.
 
 #### Changes (2026-03-22)
 
-+73 tests: Map +14 (187→201), Set +20 (358→378), WeakMap +42 (97→139), WeakSet +13 (70→83), 0 regressions:
+**Batch 2:** +13 tests: Promise +9 (631→640), Object +4 (3268→3272), 0 regressions:
+
+- **Promise.prototype.then PromiseReactionJob** (`src/environment.cc`): Changed then handler to call capResolve (Promise Resolve Function) with callback result instead of directly calling C++ Promise::then(). This enables self-resolution detection, custom .then support, and proper thenable resolution per spec 25.4.2.1 step 8.
+- **Object.groupBy iterator protocol** (`src/environment.cc`): Rewrote to use full iterator protocol (Symbol.iterator/.next) instead of only handling Arrays/Strings. Fixes invalid-iterable, iterator-next-throws, null-prototype tests.
+- **Object.getPrototypeOf no-args TypeError** (`src/environment.cc`): Throw TypeError when called with no arguments instead of returning null.
+- **Null-prototype hasOwnProperty** (`src/interpreter.cc`): Skip hardcoded Object.prototype method dispatch (hasOwnProperty, propertyIsEnumerable) for objects with null __proto__.
+
+**Batch 1:** +73 tests: Map +14 (187→201), Set +20 (358→378), WeakMap +42 (97→139), WeakSet +13 (70→83), 0 regressions:
 
 - **Collection constructor iterator protocol** (`src/environment.cc`): Rewrote Map/Set/WeakMap/WeakSet constructors to use full ES spec iterator protocol: get adder method (set/add) from instance, verify callable, iterate via Symbol.iterator/.next(), call adder via JS dispatch (not internal insert). Set __proto__ early in constructor so method lookup works before constructValue sets it.
 - **Symbol key support in WeakMap/WeakSet** (`include/value.h`, `src/gc_value.cc`): Added `symbolEntries`/`symbolValues` parallel storage keyed by Symbol::id. All 4 methods (set/get/has/delete for WeakMap, add/has/delete for WeakSet) now handle Symbol keys. Extracted `extractGCObject()` helper to handle all 15+ GC types.

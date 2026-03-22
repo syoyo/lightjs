@@ -8733,7 +8733,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     // Object.prototype methods - hasOwnProperty / propertyIsEnumerable
-    if (propName == "hasOwnProperty") {
+    // Skip for null-prototype objects
+    auto hasNullProto = [&]() -> bool {
+      if (obj.isObject()) {
+        auto o = obj.getGC<Object>();
+        auto it = o->properties.find("__proto__");
+        if (it != o->properties.end() && it->second.isNull()) return true;
+      }
+      return false;
+    };
+    if (propName == "hasOwnProperty" && !hasNullProto()) {
       auto hopFn = GarbageCollector::makeGC<Function>();
       hopFn->isNative = true;
       hopFn->properties["__uses_this_arg__"] = Value(true);
@@ -8830,7 +8839,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       LIGHTJS_RETURN(Value(hopFn));
     }
 
-    if (propName == "propertyIsEnumerable") {
+    if (propName == "propertyIsEnumerable" && !hasNullProto()) {
       auto pieFn = GarbageCollector::makeGC<Function>();
       pieFn->isNative = true;
       pieFn->properties["__uses_this_arg__"] = Value(true);
