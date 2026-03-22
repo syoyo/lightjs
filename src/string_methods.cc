@@ -686,26 +686,204 @@ Value String_replace(const std::vector<Value>& args) {
     return Value(str);
 }
 
-// String.prototype.toLowerCase
+// Helper: decode UTF-8 code points from a string
+static std::vector<uint32_t> decodeCodePoints(const std::string& str) {
+    std::vector<uint32_t> cps;
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = str[i];
+        uint32_t cp = 0;
+        size_t len = 1;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        for (size_t j = 1; j < len && i + j < str.size(); j++) {
+            cp = (cp << 6) | (str[i + j] & 0x3F);
+        }
+        cps.push_back(cp);
+        i += len;
+    }
+    return cps;
+}
+
+// Helper: encode code point to UTF-8
+static std::string encodeCP(uint32_t cp) {
+    std::string result;
+    if (cp < 0x80) { result += static_cast<char>(cp); }
+    else if (cp < 0x800) {
+        result += static_cast<char>(0xC0 | (cp >> 6));
+        result += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        result += static_cast<char>(0xE0 | (cp >> 12));
+        result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        result += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        result += static_cast<char>(0xF0 | (cp >> 18));
+        result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        result += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    return result;
+}
+
+// Helper: is code point a cased letter (for final sigma)
+static bool isCased(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return true;
+    if (cp >= 'a' && cp <= 'z') return true;
+    if (cp >= 0xC0 && cp <= 0x024F) return true; // Latin Extended
+    if (cp >= 0x0370 && cp <= 0x03FF) return true; // Greek
+    if (cp >= 0x0400 && cp <= 0x04FF) return true; // Cyrillic
+    if (cp >= 0x0500 && cp <= 0x052F) return true; // Cyrillic Supplement
+    if (cp >= 0x0531 && cp <= 0x0587) return true; // Armenian
+    if (cp >= 0x10400 && cp <= 0x1044F) return true; // Deseret
+    if (cp >= 0x1D400 && cp <= 0x1D7FF) return true; // Mathematical Alphanumeric Symbols
+    if (cp >= 0x1F100 && cp <= 0x1F1FF) return true; // Enclosed Alphanumeric Supplement
+    return false;
+}
+
+// String.prototype.toLowerCase - with Unicode SpecialCasing
 Value String_toLowerCase(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.toLowerCase called on non-string");
     }
-
-    std::string str = std::get<std::string>(args[0].data);
-    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
-    return Value(str);
+    auto cps = decodeCodePoints(std::get<std::string>(args[0].data));
+    std::string result;
+    for (size_t i = 0; i < cps.size(); i++) {
+        uint32_t cp = cps[i];
+        // SpecialCasing: İ (U+0130) → i + combining dot above
+        if (cp == 0x0130) {
+            result += encodeCP(0x0069); // i
+            result += encodeCP(0x0307); // combining dot above
+            continue;
+        }
+        // SpecialCasing: Σ (U+03A3) → ς (U+03C2) at word-final position, σ (U+03C3) otherwise
+        if (cp == 0x03A3) {
+            // Final sigma: preceded by cased, not followed by cased
+            bool precededByCased = false;
+            for (int j = static_cast<int>(i) - 1; j >= 0; j--) {
+                if (isCased(cps[j])) { precededByCased = true; break; }
+                uint32_t c = cps[j];
+                // Case-ignorable: soft hyphen, zero-width chars, combining marks, format chars
+                bool caseIgnorable = (c == 0x00AD || c == 0x200B || c == 0x200C || c == 0x200D ||
+                    c == 0x180E || c == 0x00B7 || c == 0x0387 || c == 0x05F4 ||
+                    (c >= 0x0300 && c <= 0x036F) || // combining diacritical marks
+                    (c >= 0x0483 && c <= 0x0489) || // cyrillic combining
+                    c == 0x2019 || c == 0xFE00 || c == 0xFE01);
+                if (!caseIgnorable) break;
+            }
+            bool followedByCased = false;
+            for (size_t j = i + 1; j < cps.size(); j++) {
+                if (isCased(cps[j])) { followedByCased = true; break; }
+                uint32_t c = cps[j];
+                bool caseIgnorable = (c == 0x00AD || c == 0x200B || c == 0x200C || c == 0x200D ||
+                    c == 0x180E || c == 0x00B7 || c == 0x0387 || c == 0x05F4 ||
+                    (c >= 0x0300 && c <= 0x036F) || (c >= 0x0483 && c <= 0x0489) ||
+                    c == 0x2019 || c == 0xFE00 || c == 0xFE01);
+                if (!caseIgnorable) break;
+            }
+            if (precededByCased && !followedByCased) {
+                result += encodeCP(0x03C2); // final sigma ς
+            } else {
+                result += encodeCP(0x03C3); // sigma σ
+            }
+            continue;
+        }
+        // Supplementary plane: Deseret U+10400-U+10427 → U+10428-U+1044F
+        if (cp >= 0x10400 && cp <= 0x10427) {
+            result += encodeCP(cp + 0x28);
+            continue;
+        }
+        // Basic Latin/Latin-1
+        if (cp < 0x80) { result += static_cast<char>(::tolower(cp)); continue; }
+        if (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7) { result += encodeCP(cp + 0x20); continue; }
+        // Greek capitals U+0391-U+03A9 (excluding U+03A2)
+        if (cp >= 0x0391 && cp <= 0x03A1) { result += encodeCP(cp + 0x20); continue; }
+        if (cp >= 0x03A3 && cp <= 0x03A9) { result += encodeCP(cp + 0x20); continue; }
+        // Cyrillic U+0410-U+042F → U+0430-U+044F
+        if (cp >= 0x0410 && cp <= 0x042F) { result += encodeCP(cp + 0x20); continue; }
+        // Fallback: keep as-is
+        result += encodeCP(cp);
+    }
+    return Value(result);
 }
 
-// String.prototype.toUpperCase
+// String.prototype.toUpperCase - with Unicode SpecialCasing
 Value String_toUpperCase(const std::vector<Value>& args) {
     if (args.empty() || !args[0].isString()) {
         throw std::runtime_error("String.toUpperCase called on non-string");
     }
-
-    std::string str = std::get<std::string>(args[0].data);
-    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
-    return Value(str);
+    auto cps = decodeCodePoints(std::get<std::string>(args[0].data));
+    std::string result;
+    for (size_t i = 0; i < cps.size(); i++) {
+        uint32_t cp = cps[i];
+        // SpecialCasing: ß (U+00DF) → SS
+        if (cp == 0x00DF) { result += "SS"; continue; }
+        // Latin ligatures
+        if (cp == 0xFB00) { result += "FF"; continue; }
+        if (cp == 0xFB01) { result += "FI"; continue; }
+        if (cp == 0xFB02) { result += "FL"; continue; }
+        if (cp == 0xFB03) { result += "FFI"; continue; }
+        if (cp == 0xFB04) { result += "FFL"; continue; }
+        if (cp == 0xFB05) { result += "ST"; continue; }
+        if (cp == 0xFB06) { result += "ST"; continue; }
+        // Armenian ligatures
+        if (cp == 0x0587) { result += encodeCP(0x0535); result += encodeCP(0x0552); continue; }
+        if (cp == 0xFB13) { result += encodeCP(0x0544); result += encodeCP(0x0546); continue; }
+        if (cp == 0xFB14) { result += encodeCP(0x0544); result += encodeCP(0x0535); continue; }
+        if (cp == 0xFB15) { result += encodeCP(0x0544); result += encodeCP(0x053B); continue; }
+        if (cp == 0xFB16) { result += encodeCP(0x054E); result += encodeCP(0x0546); continue; }
+        if (cp == 0xFB17) { result += encodeCP(0x0544); result += encodeCP(0x053D); continue; }
+        // İ stays as İ in uppercase
+        if (cp == 0x0130) { result += encodeCP(0x0130); continue; }
+        // ʼn (U+0149) → ʼN
+        if (cp == 0x0149) { result += encodeCP(0x02BC); result += encodeCP(0x004E); continue; }
+        // ǰ (U+01F0) → J + combining caron
+        if (cp == 0x01F0) { result += encodeCP(0x004A); result += encodeCP(0x030C); continue; }
+        // Greek with iota subscript → uppercase + IOTA
+        if (cp == 0x1F80) { result += encodeCP(0x1F08); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F81) { result += encodeCP(0x1F09); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F82) { result += encodeCP(0x1F0A); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F83) { result += encodeCP(0x1F0B); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F84) { result += encodeCP(0x1F0C); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F85) { result += encodeCP(0x1F0D); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F86) { result += encodeCP(0x1F0E); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F87) { result += encodeCP(0x1F0F); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F88) { result += encodeCP(0x1F08); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F89) { result += encodeCP(0x1F09); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8A) { result += encodeCP(0x1F0A); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8B) { result += encodeCP(0x1F0B); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8C) { result += encodeCP(0x1F0C); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8D) { result += encodeCP(0x1F0D); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8E) { result += encodeCP(0x1F0E); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1F8F) { result += encodeCP(0x1F0F); result += encodeCP(0x0399); continue; }
+        // ᾳ ῃ ῳ → Α+Ι, Η+Ι, Ω+Ι
+        if (cp == 0x1FB3) { result += encodeCP(0x0391); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1FC3) { result += encodeCP(0x0397); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1FF3) { result += encodeCP(0x03A9); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1FBC) { result += encodeCP(0x0391); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1FCC) { result += encodeCP(0x0397); result += encodeCP(0x0399); continue; }
+        if (cp == 0x1FFC) { result += encodeCP(0x03A9); result += encodeCP(0x0399); continue; }
+        // Supplementary plane: Deseret U+10428-U+1044F → U+10400-U+10427
+        if (cp >= 0x10428 && cp <= 0x1044F) {
+            result += encodeCP(cp - 0x28);
+            continue;
+        }
+        // Basic Latin
+        if (cp < 0x80) { result += static_cast<char>(::toupper(cp)); continue; }
+        // Latin-1 lowercase U+E0-U+FE (except U+F7) → U+C0-U+DE
+        if (cp >= 0xE0 && cp <= 0xFE && cp != 0xF7) { result += encodeCP(cp - 0x20); continue; }
+        // Greek smalls U+03B1-U+03C1 → U+0391-U+03A1
+        if (cp >= 0x03B1 && cp <= 0x03C1) { result += encodeCP(cp - 0x20); continue; }
+        if (cp >= 0x03C3 && cp <= 0x03C9) { result += encodeCP(cp - 0x20); continue; }
+        // ς (U+03C2 final sigma) → Σ (U+03A3)
+        if (cp == 0x03C2) { result += encodeCP(0x03A3); continue; }
+        // Cyrillic U+0430-U+044F → U+0410-U+042F
+        if (cp >= 0x0430 && cp <= 0x044F) { result += encodeCP(cp - 0x20); continue; }
+        // Fallback: keep as-is
+        result += encodeCP(cp);
+    }
+    return Value(result);
 }
 
 // String.prototype.trim

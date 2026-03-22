@@ -11850,9 +11850,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        std::string result = str;
-        std::transform(result.begin(), result.end(), result.begin(), ::toupper);
-        return Value(result);
+        return String_toUpperCase({Value(str)});
       };
       setNativeFnProps(fn, propName, 0);
       LIGHTJS_RETURN(Value(fn));
@@ -11862,9 +11860,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        std::string result = str;
-        std::transform(result.begin(), result.end(), result.begin(), ::tolower);
-        return Value(result);
+        return String_toLowerCase({Value(str)});
       };
       setNativeFnProps(fn, propName, 0);
       LIGHTJS_RETURN(Value(fn));
