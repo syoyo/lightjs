@@ -61,13 +61,18 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
-| `built-ins/Array` (partial) | ~2250 | ~2644 | ~85.1% |
+| `built-ins/Array` (partial) | ~2260 | ~2644 | ~85.5% |
 
 Unit tests: 346/346 passing.
 
 Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
 
 #### Changes (2026-03-22)
+
+**Batch 8:** Splice generic path, frozen array checks: +11 tests:
+
+- **splice generic object** (`src/environment.cc`): Generic splice path now properly shifts and inserts elements on plain objects, updates length.
+- **Frozen array checks** (`src/environment.cc`): pop/push/shift check `__non_writable_length` and throw TypeError for frozen/sealed arrays. push validates null/undefined/string this.
 
 **Batch 7:** ArraySpeciesCreate for map/filter/slice/concat: +33 tests:
 
