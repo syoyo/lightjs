@@ -12904,47 +12904,85 @@ GCPtr<Environment> Environment::createGlobal() {
     if (thisVal.isNull() || thisVal.isUndefined()) {
       throw std::runtime_error("TypeError: Array.prototype." + methodName + " called on null or undefined");
     }
+    // Box primitives to wrapper objects per spec ToObject
+    if (thisVal.isBool() || thisVal.isNumber() || thisVal.isString() || thisVal.isSymbol() || thisVal.isBigInt()) {
+      auto* interp = getGlobalInterpreter();
+      if (interp) {
+        std::string ctorName;
+        if (thisVal.isBool()) ctorName = "Boolean";
+        else if (thisVal.isNumber()) ctorName = "Number";
+        else if (thisVal.isString()) ctorName = "String";
+        else if (thisVal.isSymbol()) ctorName = "Symbol";
+        else ctorName = "BigInt";
+        auto wrapper = GarbageCollector::makeGC<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+        wrapper->properties["__primitive_value__"] = thisVal;
+        auto ctor = interp->resolveVariable(ctorName);
+        if (ctor) {
+          auto [hasProto, proto] = interp->getPropertyForExternal(*ctor, "prototype");
+          if (hasProto && (proto.isObject() || proto.isNull())) {
+            wrapper->properties["__proto__"] = proto;
+          }
+        }
+        // For String, set length and indexed properties
+        if (thisVal.isString()) {
+          const std::string& str = std::get<std::string>(thisVal.data);
+          size_t cpLen = 0;
+          size_t bytePos = 0;
+          while (bytePos < str.size()) {
+            unsigned char c = str[bytePos];
+            size_t charLen = 1;
+            if ((c & 0x80) == 0) charLen = 1;
+            else if ((c & 0xE0) == 0xC0) charLen = 2;
+            else if ((c & 0xF0) == 0xE0) charLen = 3;
+            else if ((c & 0xF8) == 0xF0) charLen = 4;
+            wrapper->properties[std::to_string(cpLen)] = Value(str.substr(bytePos, charLen));
+            wrapper->properties["__non_writable_" + std::to_string(cpLen)] = Value(true);
+            wrapper->properties["__non_enum_" + std::to_string(cpLen)] = Value(true);
+            wrapper->properties["__non_configurable_" + std::to_string(cpLen)] = Value(true);
+            bytePos += charLen;
+            cpLen++;
+          }
+          wrapper->properties["length"] = Value(static_cast<double>(cpLen));
+          wrapper->properties["__non_writable_length"] = Value(true);
+          wrapper->properties["__non_enum_length"] = Value(true);
+          wrapper->properties["__non_configurable_length"] = Value(true);
+        }
+        return Value(wrapper);
+      }
+    }
     return thisVal;
   };
 
-  // Get length from any array-like value
+  // Get length from any array-like value using [[Get]]
   auto getArrayLikeLength = [](const Value& obj) -> size_t {
-    if (obj.isArray()) {
-      return obj.getGC<Array>()->elements.size();
-    }
-    if (obj.isString()) {
-      // String length = code point count
-      return obj.toString().size(); // byte count for simple impl; proper would be utf8 length
-    }
-    // Generic object: read .length property
     Interpreter* interp = getGlobalInterpreter();
-    if (interp) {
-      auto [found, lenVal] = interp->getPropertyForExternal(obj, "length");
-      if (found) {
-        double d = lenVal.toNumber();
-        if (std::isnan(d) || d < 0) return 0;
-        return static_cast<size_t>(d);
-      }
-    }
-    return 0;
+    if (!interp) return 0;
+    auto [found, lenVal] = interp->getPropertyForExternal(obj, "length");
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+    if (!found) return 0;
+    double d = lenVal.toNumber();
+    if (std::isnan(d) || d < 0) return 0;
+    if (d > 4294967295.0) return 4294967295u;
+    return static_cast<size_t>(d);
   };
 
-  // Get element at index from array-like value
-  auto getArrayLikeElement = [](const Value& obj, size_t idx) -> std::pair<bool, Value> {
-    if (obj.isArray()) {
-      auto arr = obj.getGC<Array>();
-      if (idx >= arr->elements.size()) return {false, Value(Undefined{})};
-      auto iStr = std::to_string(idx);
-      if (arr->properties.count("__hole_" + iStr + "__")) return {false, Value(Undefined{})};
-      if (arr->properties.count("__deleted_" + iStr + "__")) return {false, Value(Undefined{})};
-      return {true, arr->elements[idx]};
-    }
+  // Check if index exists on array-like value using [[HasProperty]]
+  auto hasArrayLikeElement = [](const Value& obj, size_t idx) -> bool {
     Interpreter* interp = getGlobalInterpreter();
-    if (interp) {
-      auto [found, val] = interp->getPropertyForExternal(obj, std::to_string(idx));
-      return {found, val};
-    }
-    return {false, Value(Undefined{})};
+    if (!interp) return false;
+    auto [found, val] = interp->getPropertyForExternal(obj, std::to_string(idx));
+    if (interp->hasError()) { interp->clearError(); return false; }
+    return found;
+  };
+
+  // Get element at index from array-like value using [[Get]]
+  auto getArrayLikeElement = [](const Value& obj, size_t idx) -> std::pair<bool, Value> {
+    Interpreter* interp = getGlobalInterpreter();
+    if (!interp) return {false, Value(Undefined{})};
+    auto [found, val] = interp->getPropertyForExternal(obj, std::to_string(idx));
+    if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+    return {found, val};
   };
 
   // Helper lambda for installing Array prototype methods that need callback support
@@ -13320,7 +13358,7 @@ GCPtr<Environment> Environment::createGlobal() {
       if (interpreter->hasError()) {
         Value err = interpreter->getError();
         interpreter->clearError();
-        throw std::runtime_error(err.toString());
+        throw JsValueException(err);
       }
     }
     return accumulator;
