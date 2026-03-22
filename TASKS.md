@@ -61,13 +61,21 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
-| `built-ins/Array` (partial) | ~2160 | ~2644 | ~81.7% |
+| `built-ins/Array` (partial) | ~2230 | ~2644 | ~84.3% |
 
 Unit tests: 346/346 passing.
 
 Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
 
 #### Changes (2026-03-22)
+
+**Batch 6:** Route Array methods through prototype for accessor/hole support: +60 tests:
+
+- **Bypass interpreter fast path** (`src/interpreter.cc`): Array methods now use prototype versions that properly handle accessor properties (getters/setters), sparse array holes, and array-like objects. Interpreter fast path skipped for all methods that have proper Array.prototype implementations.
+- **Array prototype chain fallback** (`src/interpreter.cc`): When array has no `__proto__` set, falls back to looking up `Array.prototype` from environment.
+- **new Array(n) holes** (`src/environment.cc`): `new Array(10)` creates hole-marked elements (never-assigned indices) so `in` operator and `[[HasProperty]]` work correctly.
+- **structuredClone __proto__** (`src/environment.cc`): Cloned arrays preserve `__proto__` for prototype chain.
+- **concat Symbol.isConcatSpreadable** (`src/environment.cc`): Fixed prototype concat to use `WellKnownSymbols::isConcatSpreadableKey()`.
 
 **Batch 5:** Array iterator properties + generic methods: +40+ tests:
 
