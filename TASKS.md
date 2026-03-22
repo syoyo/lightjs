@@ -61,13 +61,19 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/WeakSet` | 83 | 85 | 97.6% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
-| `built-ins/Array` (partial) | ~2112 | ~2644 | ~79.9% |
+| `built-ins/Array` (partial) | ~2160 | ~2644 | ~81.7% |
 
 Unit tests: 346/346 passing.
 
 Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
 
 #### Changes (2026-03-22)
+
+**Batch 5:** Array iterator properties + generic methods: +40+ tests:
+
+- **Array.prototype.keys/entries/values** (`src/environment.cc`): Defined as proper Function objects on Array.prototype with correct name/length properties. values uses mutable length re-read, entries returns [index, value] pairs, keys returns indices. All use [[Get]] for element access.
+- **Array.prototype.sort generic** (`src/environment.cc`): Sort accepts array-like this, validates comparefn before reading length, collects elements via [[Get]], writes back after sorting. Handles holes properly.
+- **Generic flat/flatMap/at/with/toReversed/toSorted/toSpliced** (`src/environment.cc`): All methods now use toObjectChecked + getArrayLikeLength + getArrayLikeElement for array-like support.
 
 **Batch 4:** Array prototype methods rewrite: +150+ tests across reduce/map/filter/every/some/forEach/concat etc.:
 
