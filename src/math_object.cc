@@ -410,83 +410,14 @@ Value Math_f16round(const std::vector<Value>& args) {
     double x = toNumberES(args[0]);
     if (std::isnan(x)) return Value(std::numeric_limits<double>::quiet_NaN());
     if (std::isinf(x) || x == 0.0) return Value(x);
-
-    // Convert double to float16 and back
-    // IEEE 754 half precision: 1 sign, 5 exponent, 10 mantissa bits
-    float f = static_cast<float>(x);
-    uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-
-    uint32_t sign = (bits >> 31) & 1;
-    int32_t exp = ((bits >> 23) & 0xFF) - 127;
-    uint32_t mant = bits & 0x7FFFFF;
-
-    uint16_t h;
-    if (exp > 15) {
-        h = (sign << 15) | (0x1F << 10); // Infinity
-    } else if (exp < -14) {
-        // Subnormal or zero
-        int shift = -14 - exp;
-        uint32_t fullMant = (1 << 23) | mant;
-        if (shift < 24) {
-            uint32_t roundBit = (fullMant >> (shift + 12)) & 1;
-            uint32_t stickyBit = (fullMant & ((1 << (shift + 12)) - 1)) ? 1 : 0;
-            uint32_t halfMant = fullMant >> (shift + 13);
-            // Round to nearest, ties to even
-            if (roundBit && (stickyBit || (halfMant & 1))) {
-                halfMant++;
-            }
-            h = (sign << 15) | (halfMant & 0x3FF);
-        } else {
-            h = sign << 15; // Zero
-        }
-    } else {
-        uint32_t roundBit = (mant >> 12) & 1;
-        uint32_t stickyBit = (mant & 0xFFF) ? 1 : 0;
-        uint32_t halfMant = mant >> 13;
-        // Round to nearest, ties to even
-        if (roundBit && (stickyBit || (halfMant & 1))) {
-            halfMant++;
-            if (halfMant >= 0x400) {
-                halfMant = 0;
-                exp++;
-                if (exp > 15) {
-                    h = (sign << 15) | (0x1F << 10);
-                    goto done;
-                }
-            }
-        }
-        h = (sign << 15) | ((exp + 15) << 10) | (halfMant & 0x3FF);
-    }
-done:
-    // Convert back to double
-    uint32_t hSign = (h >> 15) & 1;
-    uint32_t hExp = (h >> 10) & 0x1F;
-    uint32_t hMant = h & 0x3FF;
-
-    double result;
-    if (hExp == 0) {
-        if (hMant == 0) {
-            result = hSign ? -0.0 : 0.0;
-        } else {
-            result = std::ldexp(static_cast<double>(hMant), -24);
-            if (hSign) result = -result;
-        }
-    } else if (hExp == 0x1F) {
-        result = hMant ? std::numeric_limits<double>::quiet_NaN()
-                       : (hSign ? -std::numeric_limits<double>::infinity()
-                                : std::numeric_limits<double>::infinity());
-    } else {
-        result = std::ldexp(1.0 + static_cast<double>(hMant) / 1024.0, hExp - 15);
-        if (hSign) result = -result;
-    }
-    return Value(result);
+    uint16_t halfBits = float64_to_float16(x);
+    return Value(static_cast<double>(float16_to_float32(halfBits)));
 }
 
 // Two-sum: exact computation of a + b = hi + lo where hi = fl(a+b)
-static inline void twoSum(double a, double b, double& hi, double& lo) {
+static inline void twoSum(long double a, long double b, long double& hi, long double& lo) {
     hi = a + b;
-    double v = hi - a;
+    long double v = hi - a;
     lo = (a - (hi - v)) + (b - v);
 }
 
@@ -510,18 +441,18 @@ static Value shewchukSum(const std::vector<double>& numbers) {
 
     // Sort values by magnitude descending, then interleave pos/neg
     // to minimize intermediate overflow in Shewchuk algorithm
-    std::vector<double> pos, neg;
+    std::vector<long double> pos, neg;
     for (double val : numbers) {
         if (!std::isfinite(val) || val == 0.0) continue;
-        if (val > 0) pos.push_back(val);
-        else neg.push_back(-val);
+        if (val > 0) pos.push_back(static_cast<long double>(val));
+        else neg.push_back(-static_cast<long double>(val));
     }
-    std::sort(pos.begin(), pos.end(), std::greater<double>());
-    std::sort(neg.begin(), neg.end(), std::greater<double>());
+    std::sort(pos.begin(), pos.end(), std::greater<long double>());
+    std::sort(neg.begin(), neg.end(), std::greater<long double>());
 
     // Interleave: alternate pos/neg, picking the larger magnitude first
     // This ensures consecutive values tend to cancel rather than overflow
-    std::vector<double> ordered;
+    std::vector<long double> ordered;
     ordered.reserve(pos.size() + neg.size());
     size_t pi = 0, ni = 0;
     while (pi < pos.size() || ni < neg.size()) {
@@ -530,12 +461,12 @@ static Value shewchukSum(const std::vector<double>& numbers) {
         if (ni < neg.size()) ordered.push_back(-neg[ni++]);
     }
 
-    std::vector<double> partials;
-    for (double x : ordered) {
+    std::vector<long double> partials;
+    for (long double x : ordered) {
         size_t i = 0;
         for (size_t j = 0; j < partials.size(); j++) {
-            double y = partials[j];
-            double hi, lo;
+            long double y = partials[j];
+            long double hi, lo;
             if (std::abs(x) < std::abs(y)) std::swap(x, y);
             twoSum(x, y, hi, lo);
             if (lo != 0.0) partials[i++] = lo;
@@ -546,7 +477,7 @@ static Value shewchukSum(const std::vector<double>& numbers) {
             partials.push_back(x);
         } else {
             // Overflow in intermediate sum
-            return Value(x);
+            return Value(static_cast<double>(x));
         }
     }
     if (partials.empty()) {
@@ -556,53 +487,9 @@ static Value shewchukSum(const std::vector<double>& numbers) {
         return Value(0.0);
     }
 
-    // Sum the partials with correct rounding (CPython fsum algorithm)
-    size_t n = partials.size();
-    double hi = partials[n - 1];
-    double lo = 0.0;
-    int roundingIdx = -1;
-
-    if (n >= 2) {
-        for (int i = static_cast<int>(n) - 2; i >= 0; i--) {
-            double x = hi;
-            double y = partials[i];
-            hi = x + y;
-            lo = y - (hi - x);
-            if (lo != 0.0) {
-                roundingIdx = i;
-                break;
-            }
-        }
-    }
-
-    double sum;
-    if (lo != 0.0 && roundingIdx > 0) {
-        // Check if we need rounding correction:
-        // If lo and the next lower partial have the same sign,
-        // and hi + lo rounds to hi, we need to adjust
-        double nextPartial = partials[roundingIdx - 1];
-        // Test if lo is at the midpoint between two consecutive doubles
-        // and the tiebreaker should go in the direction of nextPartial
-        double y = lo * 2.0;
-        double x = hi + y;
-        if (x == hi + lo + lo) {
-            // x rounded the same way - check if we're at a tie
-            double yr = x - hi;
-            if (yr == y && // no rounding occurred
-                ((lo < 0.0 && nextPartial < 0.0) || (lo > 0.0 && nextPartial > 0.0))) {
-                // Correction needed
-                // hi rounds to the wrong direction
-                sum = x;
-            } else {
-                sum = hi + lo;
-            }
-        } else {
-            sum = hi + lo;
-        }
-    } else if (lo != 0.0) {
-        sum = hi + lo;
-    } else {
-        sum = hi;
+    long double sum = 0.0L;
+    for (long double partial : partials) {
+        sum += partial;
     }
 
     if (sum == 0.0) {
@@ -612,8 +499,8 @@ static Value shewchukSum(const std::vector<double>& numbers) {
         return Value(0.0);
     }
 
-    if (!std::isfinite(sum)) return Value(sum);
-    return Value(sum);
+    if (!std::isfinite(sum)) return Value(static_cast<double>(sum));
+    return Value(static_cast<double>(sum));
 }
 
 // Helper: get iterator from a value, returns {iteratorObj, nextFn}

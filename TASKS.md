@@ -41,10 +41,10 @@ This document tracks planned enhancements and future work for LightJS.
 | Scope | Pass | Total | Rate |
 |---|---|---|---|
 | `language` | 23194 | 23629 | 98.2% (11 fail, 424 skipped) |
-| `built-ins/Math` | 325 | 327 | 99.4% |
-| `built-ins/Number` | 337 | 338 | 99.7% |
-| `built-ins/Boolean` | 50 | 51 | 98.0% |
-| `built-ins/JSON` | 146 | 165 | 88.5% |
+| `built-ins/Math` | 326 | 327 | 99.7% |
+| `built-ins/Number` | 338 | 338 | 100.0% |
+| `built-ins/Boolean` | 51 | 51 | 100.0% |
+| `built-ins/JSON` | 165 | 165 | 100.0% |
 | `built-ins/String` | 1168 | 1223 | 95.5% (50 fail, 5 skipped) |
 | `built-ins/Object` | 3283 | 3411 | 96.2% |
 | `built-ins/eval` | 10 | 10 | 100.0% |
@@ -56,9 +56,10 @@ This document tracks planned enhancements and future work for LightJS.
 | `built-ins/Promise` | 640 | 652 | 98.2% |
 | `built-ins/Set` | 378 | 383 | 98.7% |
 | `built-ins/Map` | 201 | 204 | 98.5% |
-| `built-ins/Symbol` | 88 | 98 | 89.8% |
-| `built-ins/Error` | 56 | 58 | 96.6% |
-| `built-ins/WeakSet` | 83 | 85 | 97.6% |
+| `built-ins/Symbol` | 92 | 98 | 93.9% |
+| `built-ins/Error` | 58 | 58 | 100.0% |
+| `built-ins/WeakSet` | 85 | 85 | 100.0% |
+| `built-ins/Reflect` | 153 | 153 | 100.0% |
 | `built-ins/Function` | 392 | 509 | 77.0% |
 | `built-ins/WeakMap` | 139 | 141 | 98.6% |
 | `built-ins/Array` (partial) | ~2260 | ~2644 | ~85.5% |
@@ -67,8 +68,43 @@ Note: Array prototype methods at 2193/2549 (86.0%), plus non-proto tests.
 Unit tests: 346/346 passing.
 
 Note: Array total excludes reverse/lastIndexOf/from (timeout on sparse array tests).
+Note: Broad URI legacy shards (`decodeURI` / `decodeURIComponent`) still contain timeout-heavy Sputnik loops; defer those while focusing on deterministic runtime failures in other built-ins.
 
 #### Changes (2026-03-22)
+
+**Batch 13:** Reflect 100.0% (153/153), Number 100.0% (338/338), Boolean 100.0% (51/51), Math +1 (`f16round`) to 326/327:
+
+- **Reflect completion** (`src/environment.cc`, `src/interpreter.cc`): finished `Reflect.defineProperty`, `set`, `deleteProperty`, `setPrototypeOf`, `isExtensible`, and `construct` so they now validate targets correctly, preserve abrupt proxy/property-key/descriptor failures, return booleans on ordinary failure, follow receiver/prototype setter behavior, and accept callable-wrapper constructors such as `Array` as `newTarget`.
+- **Math f16round** (`src/math_object.cc`): switched `Math.f16round` to the engine’s shared binary16 conversion helpers, fixing subnormal/tie-to-even behavior against the Float16 Test262 conversion table.
+- **Small shard follow-up**: full reruns confirm `built-ins/Reflect`, `built-ins/Number`, and `built-ins/Boolean` are now green. `built-ins/Math` is down to a single remaining `Math.sumPrecise/sum.js` precision failure.
+- **Next bounded item**: replace the current approximate `Math.sumPrecise` partial-sum finalization with an exact finite-double accumulator so the remaining large-magnitude cancellation case rounds to `9.565271205476347e+307` instead of `9.565271205476349e+307`.
+
+**Batch 10:** Error 100.0% (58/58), WeakSet 100.0% (85/85), Symbol +4 (88->92/98), ArrayIteratorPrototype 100.0% (27/27):
+
+- **Error `cause` abrupt propagation** (`src/environment.cc`): `new Error(message, options)` now uses proxy-aware `HasProperty`/`Get` semantics for `options.cause`, so Proxy `has` traps and abrupt getters propagate correctly.
+- **Global built-in descriptors** (`src/environment.cc`): Added missing non-enumerable `WeakMap`/`WeakSet` globals during `globalThis` finalization and installed Array constructor `@@species` as a real accessor with the correct getter name.
+- **Primitive write semantics and Symbol wrapper coercion** (`src/interpreter.cc`, `src/environment.cc`, `src/date_object.cc`): property assignment on primitive bases now keeps the primitive receiver for `[[Set]]`, `Object(Symbol())` no longer installs ad hoc own `valueOf`/`toString`, and single-argument `Date` construction / `getTime()` no longer treat invalid coerced strings as "now".
+- **%ArrayIteratorPrototype% normalization** (`src/environment.cc`): moved `next` onto `%ArrayIteratorPrototype%`, stored iterator state in internal-slot markers, latched exhaustion, fixed descriptor/name/length metadata, and made detached typed-array iteration throw instead of silently exhausting.
+
+**Batch 11:** Date constructor/parse/display follow-up:
+
+- **Date construction and receiver validation** (`src/environment.cc`, `src/date_object.cc`): `new Date(dateObj)` now preserves `[[DateValue]]` without invoking user-defined coercion hooks, explicit `undefined` in multi-arg construction yields `NaN` instead of omitted-argument defaults, and prototype methods now reject incompatible receivers instead of silently accepting arbitrary objects.
+- **Date local/UTC separation** (`src/date_object.cc`): multi-argument `new Date(y, m, ...)` now constructs local-time values, while `Date.UTC` keeps UTC arithmetic and correct omitted argument defaults.
+- **Date parse/display round-tripping** (`src/environment.cc`, `src/date_object.cc`): `Date()` as a function now returns a current date string, `Date.parse` accepts year-only ISO strings, extended signed ISO years, and the engine’s own `toString`/`toUTCString` outputs, and `toISOString` no longer relies on platform `gmtime` for extreme-range dates.
+- **Date completion** (`src/date_object.cc`, `src/environment.cc`, `include/date_object.h`): `built-ins/Date` is now `594/594` passing after implementing the mutator families, `toJSON`, `toTimeString`, arithmetic `toUTCString`, `toTemporalInstant`, extended-year rejection for `-000000`, and IEEE-754-ordered `Date.UTC` arithmetic.
+
+**Batch 12:** Reflect runtime pass:
+
+- **Reflect metadata and dispatch** (`src/environment.cc`): added proper `name` / `length` / non-enumerability / non-constructibility for the `Reflect` methods, plus `Reflect[Symbol.toStringTag] = "Reflect"` with the correct descriptor shape.
+- **Reflect operation routing** (`src/environment.cc`): `Reflect.get`, `has`, `apply`, `getPrototypeOf`, `isExtensible`, `preventExtensions`, `ownKeys`, and `getOwnPropertyDescriptor` now route through the runtime’s property/prototype helpers or `Object.*` statics, including proxy trap abrupt propagation for the focused `getPrototypeOf` / `ownKeys` / `preventExtensions` / `getOwnPropertyDescriptor` cases.
+- **Current Reflect status**: focused `Reflect` metadata/type-check/get/has/apply/ownKeys/getPrototypeOf/isExtensible/preventExtensions/getOwnPropertyDescriptor` cases are green, and a full `built-ins/Reflect` rerun is now `124/153` passing.
+- **Remaining Reflect work**: `defineProperty`, `set`, `deleteProperty`, `setPrototypeOf`, `isExtensible` proxy abrupts, and `construct` array-like / `newTarget` handling are the next bounded runtime cluster before revisiting broader `built-ins/*`.
+
+**Batch 9:** JSON 100.0% (165/165), +19 tests:
+
+- **JSON.parse proxy-aware reviver walk** (`src/json.cc`): InternalizeJSONProperty now uses proxy-aware `[[Get]]`, `IsArray`, `LengthOfArrayLike`, enumerable own-key enumeration, `[[Delete]]`, and `CreateDataProperty`, including revoked proxy and trap abrupt propagation.
+- **JSON.stringify proxy support** (`src/json.cc`): proxy arrays now serialize via `LengthOfArrayLike` + indexed `[[Get]]`, proxy objects via enumerable own property names, and proxy array replacers work as property filters with abrupt/revoked handling.
+- **JSON.stringify BigInt `toJSON` receiver** (`src/json.cc`): BigInt primitive `toJSON` lookup now preserves the primitive receiver for accessor-defined methods on `BigInt.prototype`.
 
 **Batch 8:** Splice generic path, frozen array checks: +11 tests:
 

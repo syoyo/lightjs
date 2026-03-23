@@ -77,6 +77,19 @@ bool isTypedArrayConstructorName(const std::string& name) {
   return kTypedArrayNames.count(name) > 0;
 }
 
+static GCPtr<Function> getRealmThrowTypeErrorAccessor(Environment* env) {
+  if (!env) return nullptr;
+  auto* root = env->getRoot();
+  if (!root) return nullptr;
+  auto globalObj = root->getGlobal();
+  if (!globalObj) return nullptr;
+  auto it = globalObj->properties.find("__throw_type_error__");
+  if (it != globalObj->properties.end() && it->second.isFunction()) {
+    return it->second.getGC<Function>();
+  }
+  return nullptr;
+}
+
 bool typedArrayConstructorNameToType(const std::string& name, TypedArrayType& outType) {
   if (name == "Int8Array") {
     outType = TypedArrayType::Int8;
@@ -5548,6 +5561,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     }
 
     bool usedPrimitiveWrapper = false;
+    Value primitiveBaseValue = obj;
 
     // PutValue on a primitive base: ToObject(base) then [[Set]].
     if (obj.isNumber() || obj.isString() || obj.isBool() || obj.isSymbol() || obj.isBigInt()) {
@@ -5577,7 +5591,7 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
     // if no own property, delegate to prototype's [[Set]] (important for Proxy
     // prototypes used by Test262 PutValue tests).
     if (expr.op == AssignmentExpr::Op::Assign && usedPrimitiveWrapper) {
-      Value receiver = obj;
+      Value receiver = usedPrimitiveWrapper ? primitiveBaseValue : obj;
       if (isSuperTarget && superReceiver.isObject()) {
         receiver = superReceiver;
       }
@@ -12548,6 +12562,17 @@ void Interpreter::iteratorClose(IteratorRecord& record) {
 }
 
 Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& args, const Value& thisValue) {
+  // Handle Object-based callables (e.g. String, Number constructors stored as Objects)
+  if (callee.isObject()) {
+    auto obj = callee.getGC<Object>();
+    if (obj->properties.find("__callable_object__") != obj->properties.end()) {
+      auto ctorIt = obj->properties.find("constructor");
+      if (ctorIt != obj->properties.end() && ctorIt->second.isFunction()) {
+        return callFunction(ctorIt->second, args, thisValue);
+      }
+    }
+    return Value(Undefined{});
+  }
   if (!callee.isFunction()) {
     return Value(Undefined{});
   }
@@ -12619,10 +12644,13 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         else if (boundThis.isNumber()) ctorName = "Number";
         else if (boundThis.isBool()) ctorName = "Boolean";
         else if (boundThis.isBigInt()) ctorName = "BigInt";
-        if (auto ctor = targetEnv->get(ctorName); ctor && ctor->isFunction()) {
-          auto protoIt = ctor->getGC<Function>()->properties.find("prototype");
-          if (protoIt != ctor->getGC<Function>()->properties.end()) {
-            wrapper->properties["__proto__"] = protoIt->second;
+        if (auto ctor = targetEnv->get(ctorName); ctor) {
+          auto [foundProto, protoVal] = getPropertyForExternal(*ctor, "prototype");
+          if (flow_.type == ControlFlow::Type::Throw) {
+            return;
+          }
+          if (foundProto && isObjectLike(protoVal)) {
+            wrapper->properties["__proto__"] = protoVal;
           }
         }
         // valueOf for the wrapper
@@ -12712,11 +12740,14 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         }
       }
       if (func->isStrict) {
-        auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
-        throwTypeErrorAccessor->isNative = true;
-        throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
-          throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
-        };
+        auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
+        if (!throwTypeErrorAccessor) {
+          throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+          throwTypeErrorAccessor->isNative = true;
+          throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+            throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+          };
+        }
         argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
         argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
         argumentsArray->properties["__non_configurable_callee"] = Value(true);
@@ -12846,24 +12877,78 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     if (itReflectConstruct != func->properties.end() &&
         itReflectConstruct->second.isBool() &&
         itReflectConstruct->second.toBool()) {
+      auto isReflectConstructorTarget = [&](const Value& value, const auto& self) -> bool {
+        if (value.isClass()) {
+          return true;
+        }
+        if (value.isFunction()) {
+          return value.getGC<Function>()->isConstructor;
+        }
+        if (value.isProxy()) {
+          auto proxy = value.getGC<Proxy>();
+          return proxy->target && self(*proxy->target, self);
+        }
+        if (value.isObject()) {
+          auto obj = value.getGC<Object>();
+          auto callableIt = obj->properties.find("__callable_object__");
+          auto wrapperIt = obj->properties.find("__constructor_wrapper__");
+          auto ctorIt = obj->properties.find("constructor");
+          return callableIt != obj->properties.end() &&
+                 callableIt->second.isBool() &&
+                 callableIt->second.toBool() &&
+                 wrapperIt != obj->properties.end() &&
+                 wrapperIt->second.isBool() &&
+                 wrapperIt->second.toBool() &&
+                 ctorIt != obj->properties.end() &&
+                 self(ctorIt->second, self);
+        }
+        return false;
+      };
       if (args.size() < 2) {
         throwError(ErrorType::TypeError, "Reflect.construct target is not a function");
         return Value(Undefined{});
       }
 
       Value target = args[0];
-      if (!target.isFunction() && !target.isClass() && !target.isProxy()) {
+      if (!isReflectConstructorTarget(target, isReflectConstructorTarget)) {
         throwError(ErrorType::TypeError, "Reflect.construct target is not a function");
         return Value(Undefined{});
       }
 
       std::vector<Value> constructArgs;
-      if (args[1].isArray()) {
-        auto arr = args[1].getGC<Array>();
+      const Value& argumentsList = args[1];
+      if (!isObjectLike(argumentsList)) {
+        throwError(ErrorType::TypeError, "CreateListFromArrayLike called on non-object");
+        return Value(Undefined{});
+      }
+      if (argumentsList.isArray()) {
+        auto arr = argumentsList.getGC<Array>();
         constructArgs = arr->elements;
+      } else {
+        auto [foundLen, lenValue] = getPropertyForExternal(argumentsList, "length");
+        if (flow_.type == ControlFlow::Type::Throw) {
+          return Value(Undefined{});
+        }
+        double len = foundLen ? lenValue.toNumber() : 0.0;
+        if (std::isnan(len) || len < 0) {
+          len = 0.0;
+        }
+        size_t count = static_cast<size_t>(std::min(len, 4294967295.0));
+        constructArgs.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          auto [foundElem, elemValue] = getPropertyForExternal(argumentsList, std::to_string(i));
+          if (flow_.type == ControlFlow::Type::Throw) {
+            return Value(Undefined{});
+          }
+          constructArgs.push_back(foundElem ? elemValue : Value(Undefined{}));
+        }
       }
 
       Value newTarget = (args.size() >= 3) ? args[2] : target;
+      if (!isReflectConstructorTarget(newTarget, isReflectConstructorTarget)) {
+        throwError(ErrorType::TypeError, "newTarget is not a constructor");
+        return Value(Undefined{});
+      }
       auto constructTask = constructValue(target, constructArgs, newTarget);
       Value constructed;
       LIGHTJS_RUN_TASK_SYNC(constructTask, constructed);
@@ -14456,6 +14541,10 @@ GCPtr<Environment> Interpreter::getRealmRootEnvFromConstructorValue(const Value&
   // to current interpreter realm.
   if (ctorValue.isFunction()) {
     auto fn = ctorValue.getGC<Function>();
+    auto boundTargetIt = fn->properties.find("__bound_target__");
+    if (boundTargetIt != fn->properties.end()) {
+      return getRealmRootEnvFromConstructorValue(boundTargetIt->second);
+    }
     if (fn && fn->closure) return fn->closure->getRoot();
   }
   if (ctorValue.isClass()) {
@@ -14758,18 +14847,36 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     LIGHTJS_RETURN(Value(Undefined{}));
   }
 
-  if (!newTargetOverride.isUndefined()) {
-    bool validNewTarget = false;
-    if (newTargetOverride.isClass()) {
-      validNewTarget = true;
-    } else if (newTargetOverride.isFunction()) {
-      auto fn = newTargetOverride.getGC<Function>();
-      validNewTarget = fn->isConstructor;
-    } else if (newTargetOverride.isProxy()) {
-      validNewTarget = true;
+  auto isConstructorLikeValue = [&](const Value& value, const auto& self) -> bool {
+    if (value.isClass()) {
+      return true;
     }
-
-    if (!validNewTarget) {
+    if (value.isFunction()) {
+      auto fn = value.getGC<Function>();
+      return fn->isConstructor;
+    }
+    if (value.isProxy()) {
+      auto proxy = value.getGC<Proxy>();
+      return proxy->target && self(*proxy->target, self);
+    }
+    if (value.isObject()) {
+      auto obj = value.getGC<Object>();
+      auto callableIt = obj->properties.find("__callable_object__");
+      auto wrapperIt = obj->properties.find("__constructor_wrapper__");
+      auto ctorIt = obj->properties.find("constructor");
+      return callableIt != obj->properties.end() &&
+             callableIt->second.isBool() &&
+             callableIt->second.toBool() &&
+             wrapperIt != obj->properties.end() &&
+             wrapperIt->second.isBool() &&
+             wrapperIt->second.toBool() &&
+             ctorIt != obj->properties.end() &&
+             self(ctorIt->second, self);
+    }
+    return false;
+  };
+  if (!newTargetOverride.isUndefined()) {
+    if (!isConstructorLikeValue(newTargetOverride, isConstructorLikeValue)) {
       throwError(ErrorType::TypeError, "newTarget is not a constructor");
       LIGHTJS_RETURN(Value(Undefined{}));
     }
@@ -15057,12 +15164,15 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       auto argumentsArray = GarbageCollector::makeGC<Array>();
       GarbageCollector::instance().reportAllocation(sizeof(Array));
       argumentsArray->elements = args;
-      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
-      throwTypeErrorAccessor->isNative = true;
-      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
-        throw std::runtime_error(
-          "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
-      };
+      auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
+      if (!throwTypeErrorAccessor) {
+        throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+        throwTypeErrorAccessor->isNative = true;
+        throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+          throw std::runtime_error(
+            "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+        };
+      }
       argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__non_enum_callee"] = Value(true);
@@ -15334,6 +15444,21 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       // and preserves the original newTarget.
       auto boundTargetIt = func->properties.find("__bound_target__");
       if (boundTargetIt != func->properties.end()) {
+        auto sameConstructorIdentity = [](const Value& lhs, const Value& rhs) -> bool {
+          if (lhs.isFunction() && rhs.isFunction()) {
+            return lhs.getGC<Function>().get() == rhs.getGC<Function>().get();
+          }
+          if (lhs.isClass() && rhs.isClass()) {
+            return lhs.getGC<Class>().get() == rhs.getGC<Class>().get();
+          }
+          if (lhs.isObject() && rhs.isObject()) {
+            return lhs.getGC<Object>().get() == rhs.getGC<Object>().get();
+          }
+          if (lhs.isProxy() && rhs.isProxy()) {
+            return lhs.getGC<Proxy>().get() == rhs.getGC<Proxy>().get();
+          }
+          return false;
+        };
         std::vector<Value> finalArgs;
         if (auto boundArgsIt = func->properties.find("__bound_args__");
             boundArgsIt != func->properties.end() && boundArgsIt->second.isArray()) {
@@ -15345,7 +15470,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         // Bound functions should forward the default newTarget to the bound target so
         // derived default constructors use the target's prototype as the fallback.
         Value forwardedNewTarget = effectiveNewTarget;
-        if (newTargetOverride.isUndefined()) {
+        if (sameConstructorIdentity(callee, effectiveNewTarget)) {
           forwardedNewTarget = boundTargetIt->second;
         }
         Value constructed;
@@ -15384,15 +15509,12 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         }
       } else {
         protoFromNewTarget = this->getPrototypeFromConstructorValue(effectiveNewTarget);
-        if ((ctorName == "Promise" || ctorName == "ArrayBuffer" || ctorName == "SharedArrayBuffer" || ctorName == "DataView" ||
-             isTypedArrayConstructorName(ctorName)) &&
-            !protoFromNewTarget.isObject()) {
+        if (!ctorName.empty() && !protoFromNewTarget.isObject()) {
           protoFromNewTarget = getIntrinsicPrototypeForCtorNamed(effectiveNewTarget, ctorName);
         }
       }
       if (newTargetOverride.isUndefined() &&
-          (ctorName == "Promise" || ctorName == "ArrayBuffer" || ctorName == "SharedArrayBuffer" || ctorName == "DataView" ||
-           isTypedArrayConstructorName(ctorName)) &&
+          !ctorName.empty() &&
           !protoFromNewTarget.isObject()) {
         protoFromNewTarget = getIntrinsicPrototypeForCtorNamed(callee, ctorName);
       }
@@ -15463,11 +15585,14 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     GarbageCollector::instance().reportAllocation(sizeof(Array));
     argumentsArray->elements = args;
     if (func->isStrict) {
-      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
-      throwTypeErrorAccessor->isNative = true;
-      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
-        throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
-      };
+      auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
+      if (!throwTypeErrorAccessor) {
+        throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+        throwTypeErrorAccessor->isNative = true;
+        throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+          throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+        };
+      }
       argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
     } else {
@@ -17597,12 +17722,15 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
       }
     }
     if (func->isStrict) {
-      auto throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
-      throwTypeErrorAccessor->isNative = true;
-      throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
-        throw std::runtime_error(
-          "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
-      };
+      auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
+      if (!throwTypeErrorAccessor) {
+        throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
+        throwTypeErrorAccessor->isNative = true;
+        throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
+          throw std::runtime_error(
+            "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
+        };
+      }
       argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
     } else {
