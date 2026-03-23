@@ -23,19 +23,6 @@ This document tracks planned enhancements and future work for LightJS.
    - `build/test262_runner ./test262-suite --no-temp-skips --test language/expressions/dynamic-import`
    - `build/test262_runner ./test262-suite --no-temp-skips --test language --filter "tco"`
 
-### Current Status (2026-02-14)
-
-| Feature | Pass | Total | Rate |
-|---|---|---|---|
-| Top-Level Await | 251 | 251 | 100.0% |
-| Optional Chaining | 38 | 38 | 100.0% |
-| Nullish Coalescing | 24 | 24 | 100.0% |
-| Dynamic Import | 939 | 939 | 100.0% |
-| BigInt Literals | 59 | 59 | 100.0% |
-| Tail Call Optimization (`--filter "tco"`) | 34 | 34 | 100.0% |
-
-- Note: runner may print `Failed to read module: .../syntax/foo.js` because that file is intentionally absent in the suite.
-
 ### Latest Status (2026-03-22)
 
 | Scope | Pass | Total | Rate |
