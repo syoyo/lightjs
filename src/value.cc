@@ -1821,6 +1821,20 @@ static std::vector<std::pair<std::string, Value>> getEnumerableOwnProperties(con
 
   if (!props) return result;
 
+  auto* interp = getGlobalInterpreter();
+  // Helper: get value via [[Get]] (handles accessor properties)
+  auto getValue = [&](const std::string& key) -> Value {
+    // Check for getter
+    auto getterIt = props->find("__get_" + key);
+    if (getterIt != props->end() && getterIt->second.isFunction() && interp) {
+      Value val = interp->callForHarness(getterIt->second, {}, source);
+      if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+      return val;
+    }
+    auto it = props->find(key);
+    return (it != props->end()) ? it->second : Value(Undefined{});
+  };
+
   // String keys first (in property order: integer indices, then strings)
   for (const auto& key : sortOwnPropertyKeys(props->orderedKeys())) {
     if (isInternalProperty(key)) continue;
@@ -1828,8 +1842,19 @@ static std::vector<std::pair<std::string, Value>> getEnumerableOwnProperties(con
     if (props->count("__non_enum_" + key)) continue;
     auto it = props->find(key);
     if (it != props->end()) {
-      result.push_back({key, it->second});
+      result.push_back({key, getValue(key)});
     }
+  }
+  // Also check for accessor-only properties (have __get_ but no data entry)
+  for (const auto& rawKey : props->orderedKeys()) {
+    if (rawKey.size() <= 6 || rawKey.substr(0, 6) != "__get_") continue;
+    std::string key = rawKey.substr(6);
+    if (isInternalProperty(key)) continue;
+    if (isSymbolPropertyKey(key)) continue;
+    if (props->count("__non_enum_" + key)) continue;
+    // Skip if already added as data property
+    if (props->find(key) != props->end()) continue;
+    result.push_back({key, getValue(key)});
   }
   // Symbol keys last (in insertion order)
   for (const auto& key : props->orderedKeys()) {
@@ -1838,8 +1863,18 @@ static std::vector<std::pair<std::string, Value>> getEnumerableOwnProperties(con
     if (props->count("__non_enum_" + key)) continue;
     auto it = props->find(key);
     if (it != props->end()) {
-      result.push_back({key, it->second});
+      result.push_back({key, getValue(key)});
     }
+  }
+  // Symbol accessor-only properties
+  for (const auto& rawKey : props->orderedKeys()) {
+    if (rawKey.size() <= 6 || rawKey.substr(0, 6) != "__get_") continue;
+    std::string key = rawKey.substr(6);
+    if (!isSymbolPropertyKey(key)) continue;
+    if (isInternalProperty(key)) continue;
+    if (props->count("__non_enum_" + key)) continue;
+    if (props->find(key) != props->end()) continue;
+    result.push_back({key, getValue(key)});
   }
   return result;
 }
