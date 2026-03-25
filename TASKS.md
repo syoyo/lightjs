@@ -588,6 +588,10 @@ When working on tasks:
 4. Update documentation as needed
 5. Run full test suite before committing
 
+## Test Status
+- `./build/test262_runner ./test262_suite --no-temp-skips` (2026-03-26) → 23,205 passed, 0 failed, 424 skipped (skips are known unsupported bundles such as `import-defer` and `regexp-modifiers`).
+- Targeted `with`/`Symbol.unscopables` probes (`language/statements/with/{unscopables-inc-dec,set-mutable-binding-idref-with-proxy-env,set-mutable-binding-idref-compound-assign-with-proxy-env}.js`) and the related `function/arrow` unscopables suites now pass on the updated runtime.
+
 ---
 
-**Last Updated:** 2026-03-20 (updated)
+**Last Updated:** 2026-03-26 (updated)
