@@ -14,6 +14,12 @@ namespace lightjs {
 class Environment;
 class Interpreter;
 
+enum class ModuleType {
+  JavaScript,
+  Json,
+  Bytes
+};
+
 // Represents a loaded ES6 module
 class Module : public std::enable_shared_from_this<Module> {
 public:
@@ -27,7 +33,8 @@ public:
     Evaluated
   };
 
-  Module(const std::string& path, const std::string& source);
+  Module(const std::string& path, const std::string& source,
+         ModuleType type = ModuleType::JavaScript);
 
   // Parse the module source code
   bool parse();
@@ -45,14 +52,17 @@ public:
   std::unordered_map<std::string, Value> getAllExports() const;
 
   // Get (and refresh) the module namespace object for this module.
-  GCPtr<Object> getNamespaceObject();
+  GCPtr<Object> getNamespaceObject(bool deferred = false);
 
   // Module metadata
   std::string getPath() const { return path_; }
   State getState() const { return state_; }
+  ModuleType getType() const { return type_; }
   std::optional<Value> getLastError() const { return lastError_; }
   GCPtr<Promise> getEvaluationPromise() const { return topLevelPromise_; }
   bool isAsyncModule() const { return isAsync_; }
+  bool hasStartedEvaluation() const { return evaluationInitialized_; }
+  bool readyForSyncExecution(std::unordered_set<const Module*>& seen) const;
 
 private:
   bool hasExport(const std::string& name) const;
@@ -68,6 +78,7 @@ private:
 
   std::string path_;
   std::string source_;
+  ModuleType type_ = ModuleType::JavaScript;
   State state_;
 
   // Parsed AST
@@ -85,9 +96,11 @@ private:
   // Dependencies (imported modules)
   std::vector<std::shared_ptr<Module>> dependencies_;
   std::unordered_map<std::string, std::shared_ptr<Module>> sourceDependencies_;
+  std::unordered_set<std::string> eagerDependencyKeys_;
   std::unordered_set<std::string> ambiguousReExports_;
   std::unordered_map<std::string, std::string> exportBindings_;
   GCPtr<Object> namespaceObject_;
+  GCPtr<Object> deferredNamespaceObject_;
 
   // Most recent module-level failure reason.
   std::optional<Value> lastError_;
@@ -112,7 +125,8 @@ public:
   ModuleLoader();
 
   // Load a module by path
-  std::shared_ptr<Module> loadModule(const std::string& path);
+  std::shared_ptr<Module> loadModule(const std::string& path,
+                                     ModuleType type = ModuleType::JavaScript);
 
   // Resolve module path (handles relative paths, node_modules, etc.)
   std::string resolvePath(const std::string& specifier, const std::string& parentPath = "");

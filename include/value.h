@@ -15,6 +15,7 @@
 
 #include "object_shape.h"
 #include "ordered_map.h"
+#include "regex_utils.h"
 #include "value_core.h"
 
 #if USE_SIMPLE_REGEX
@@ -112,6 +113,7 @@ struct Object : public GCObject {
   std::vector<Value> slots;  // Fast slot-based storage for known properties
   std::shared_ptr<ObjectShape> shape;  // Shape for inline caching optimization
   bool isModuleNamespace = false;  // Special handling for ES module namespace objects.
+  bool isDeferredModuleNamespace = false;  // Distinguish defer-phase namespace objects.
   std::vector<std::string> moduleExportNames;  // Sorted string export keys.
   bool frozen = false;  // Object.freeze() prevents adding/removing/modifying properties
   bool sealed = false;  // Object.seal() prevents adding/removing properties (can still modify)
@@ -205,23 +207,34 @@ struct Regex : public GCObject {
 #endif
   std::string pattern;
   std::string flags;
+  std::vector<std::string> captureGroupNames;
   OrderedMap<std::string, Value> properties;
 
   Regex(const std::string& p, const std::string& f = "")
-    : pattern(p), flags(f) {
+    : pattern(p),
+      flags(canonicalizeRegexFlags(f)) {
+    if (flags.find('u') != std::string::npos &&
+        flags.find('v') != std::string::npos) {
+      throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+    }
+    validateRegexModifierGroups(pattern);
+    validateRegexNamedGroups(pattern, flags);
+    captureGroupNames = extractRegexCaptureGroupNames(pattern);
+    std::string enginePattern = normalizeRegexPatternForEngine(pattern, flags);
+    std::string engineFlags = normalizeRegexFlagsForEngine(pattern, flags);
 #if USE_SIMPLE_REGEX
     bool caseInsensitive = false;
-    for (char flag : flags) {
+    for (char flag : engineFlags) {
       if (flag == 'i') caseInsensitive = true;
     }
-    regex = new simple_regex::Regex(pattern, caseInsensitive);
+    regex = new simple_regex::Regex(enginePattern, caseInsensitive);
 #else
     std::regex::flag_type options = std::regex::ECMAScript;
-    for (char flag : flags) {
+    for (char flag : engineFlags) {
       if (flag == 'i') options |= std::regex::icase;
       if (flag == 'm') options |= std::regex::multiline;
     }
-    regex = std::regex(pattern, options);
+    regex = std::regex(enginePattern, options);
 #endif
   }
 
@@ -231,13 +244,23 @@ struct Regex : public GCObject {
 #endif
   }
 
-  Regex(const Regex& other) : pattern(other.pattern), flags(other.flags) {
+  Regex(const Regex& other)
+    : pattern(other.pattern),
+      flags(other.flags),
+      captureGroupNames(other.captureGroupNames) {
+    if (flags.find('u') != std::string::npos &&
+        flags.find('v') != std::string::npos) {
+      throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+    }
+    validateRegexModifierGroups(pattern);
+    std::string enginePattern = normalizeRegexPatternForEngine(pattern, flags);
+    std::string engineFlags = normalizeRegexFlagsForEngine(pattern, flags);
 #if USE_SIMPLE_REGEX
     bool caseInsensitive = false;
-    for (char flag : flags) {
+    for (char flag : engineFlags) {
       if (flag == 'i') caseInsensitive = true;
     }
-    regex = new simple_regex::Regex(pattern, caseInsensitive);
+    regex = new simple_regex::Regex(enginePattern, caseInsensitive);
 #else
     regex = other.regex;
 #endif
@@ -250,12 +273,20 @@ struct Regex : public GCObject {
 #endif
       pattern = other.pattern;
       flags = other.flags;
+      captureGroupNames = other.captureGroupNames;
+      if (flags.find('u') != std::string::npos &&
+          flags.find('v') != std::string::npos) {
+        throw std::runtime_error("SyntaxError: Invalid regular expression flags");
+      }
+      validateRegexModifierGroups(pattern);
+      std::string enginePattern = normalizeRegexPatternForEngine(pattern, flags);
+      std::string engineFlags = normalizeRegexFlagsForEngine(pattern, flags);
 #if USE_SIMPLE_REGEX
       bool caseInsensitive = false;
-      for (char flag : flags) {
+      for (char flag : engineFlags) {
         if (flag == 'i') caseInsensitive = true;
       }
-      regex = new simple_regex::Regex(pattern, caseInsensitive);
+      regex = new simple_regex::Regex(enginePattern, caseInsensitive);
 #else
       regex = other.regex;
 #endif

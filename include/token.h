@@ -28,6 +28,7 @@ enum class TokenType {
   Function,
   Async,
   Await,
+  Using,
   Yield,
   Return,
   If,
@@ -129,6 +130,7 @@ enum class TokenType {
   Comma,
   Dot,
   DotDotDot,
+  At,
 
   Arrow,
 

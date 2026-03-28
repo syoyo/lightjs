@@ -188,21 +188,50 @@ include(GNUInstallDirs)
 
 set(LIGHTJS_CORE_SOURCES
   src/lexer.cc
+  src/lexer_literals.cc
+  src/lexer_regex.cc
+  src/lexer_tokenize.cc
   src/parser.cc
+  src/parser_statements.cc
+  src/parser_statement_loops.cc
+  src/parser_statement_blocks.cc
+  src/parser_declarations.cc
+  src/parser_modules.cc
+  src/parser_expression_core.cc
+  src/parser_expression_operators.cc
+  src/parser_expression_member.cc
+  src/parser_expression_literals.cc
+  src/parser_expression_objects.cc
+  src/parser_expression_functions.cc
+  src/parser_expression_class.cc
+  src/parser_patterns.cc
   src/value.cc
+  src/value_typed_array.cc
+  src/value_object.cc
+  src/value_object_names.cc
+  src/value_dataview.cc
   src/environment.cc
   src/interpreter.cc
   src/crypto.cc
   src/http.cc
   src/simple_regex.cc
   src/module.cc
+  src/module_exports.cc
+  src/module_async.cc
+  src/module_loader.cc
   src/gc.cc
   src/gc_value.cc
   src/json.cc
+  src/json_helpers.cc
+  src/json_parse.cc
+  src/json_stringify.cc
   src/array_methods.cc
   src/string_methods.cc
   src/math_object.cc
   src/date_object.cc
+  src/date_object_getters.cc
+  src/date_object_setters.cc
+  src/date_object_format.cc
   src/unicode.cc
   src/event_loop.cc
   src/symbols.cc

@@ -201,7 +201,7 @@ struct NewExpr {
 struct ThisExpr {};
 
 struct MethodDefinition {
-  enum class Kind { Constructor, Method, Get, Set, Field, StaticBlock };
+  enum class Kind { Constructor, Method, Get, Set, Field, AutoAccessor, StaticBlock };
   Kind kind;
   Identifier key;
   ExprPtr computedKey;  // For computed property names in class elements ([expr])
@@ -313,7 +313,7 @@ struct VarDeclarator {
 };
 
 struct VarDeclaration {
-  enum class Kind { Let, Const, Var };
+  enum class Kind { Let, Const, Var, Using, AwaitUsing };
   Kind kind;
   std::vector<VarDeclarator> declarations;
 };
@@ -439,11 +439,19 @@ struct ImportSpecifier {
   Identifier local;
 };
 
+struct ImportAttribute {
+  std::string key;
+  std::string value;
+};
+
 struct ImportDeclaration {
+  enum class Phase { Evaluation, Source, Defer };
   std::vector<ImportSpecifier> specifiers;
   std::optional<Identifier> defaultImport;
   std::optional<Identifier> namespaceImport;  // import * as name
   std::string source;
+  std::vector<ImportAttribute> attributes;
+  Phase phase = Phase::Evaluation;
 };
 
 struct ExportSpecifier {
@@ -454,6 +462,7 @@ struct ExportSpecifier {
 struct ExportNamedDeclaration {
   std::vector<ExportSpecifier> specifiers;
   std::optional<std::string> source;  // for re-exports
+  std::vector<ImportAttribute> attributes;
   StmtPtr declaration;  // for export const/let/var/function
 };
 
@@ -465,6 +474,7 @@ struct ExportDefaultDeclaration {
 struct ExportAllDeclaration {
   std::string source;
   std::optional<Identifier> exported;  // export * as name from
+  std::vector<ImportAttribute> attributes;
 };
 
 struct Statement {

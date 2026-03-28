@@ -32,6 +32,8 @@ private:
   static constexpr int kMaxParseDepth = 500;
   std::set<std::string> allowedPrivateNames_;
   bool inSingleStatementPosition_ = false;  // True when parsing body of for/while/if/etc.
+  int blockDepth_ = 0;
+  int switchCaseDepth_ = 0;
   int superCallDisallowDepth_ = 0;
   int loopDepth_ = 0;
   int switchDepth_ = 0;
@@ -60,10 +62,15 @@ private:
   bool expect(TokenType type);
   void consumeSemicolon();
   bool consumeSemicolonOrASI();
+  bool parseDecoratorList(size_t& count);
+  bool parseImportAttributes(std::vector<ImportAttribute>& attributes);
   bool canUseAwaitAsIdentifier() const;
   bool canParseAwaitExpression() const;
   bool canUseYieldAsIdentifier() const;
   bool isIdentifierLikeToken(TokenType type) const;
+  bool isUsingDeclarationStart(bool allowForHead = false) const;
+  bool isAwaitUsingDeclarationStart(bool allowForHead = false) const;
+  bool usingDeclarationAllowedInCurrentContext(bool inForHead = false) const;
 
   StmtPtr parseStatement(bool allowModuleItem = false);
   StmtPtr parseVarDeclaration();
