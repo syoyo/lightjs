@@ -489,6 +489,46 @@ private:
         testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Runic.js") !=
           std::string::npos ||
         testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Runic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Common.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Common.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Inherited.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Inherited.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Latin.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Latin.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Arabic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Arabic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Cyrillic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Cyrillic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Devanagari.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Devanagari.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Bengali.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Bengali.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Gujarati.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Gujarati.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Brahmi.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Brahmi.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Khmer.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Khmer.js") !=
           std::string::npos;
       const bool isRegExpUnicodeSetsTargeted =
         testPath.find("built-ins/RegExp/prototype/unicodeSets/") != std::string::npos;

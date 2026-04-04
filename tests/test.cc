@@ -2803,6 +2803,48 @@ int main() {
     ].join("|")
   )", "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|𠮷,𠮷|0,3");
 
+  runTest("RegExp property escapes additional script aliases", R"(
+    [
+      /\p{Script=Common}/u.test("!"),
+      /\p{Script=Qaai}/u.test("\u0301"),
+      /\p{sc=Latn}/u.test("A"),
+      /\p{sc=Arab}/u.test("ب"),
+      /\p{scx=Arab}/u.test("،"),
+      /\p{Script=Arabic}/u.test("،"),
+      /\p{scx=Cyrl}/u.test("\u0304"),
+      /\p{sc=Deva}/u.test("अ"),
+      /\p{scx=Beng}/u.test("।"),
+      /\p{sc=Gujr}/u.test("અ"),
+      /\p{sc=Brah}/u.test("𑀓"),
+      /\p{sc=Khmr}/u.test("ក")
+    ].join("|")
+  )", "true|true|true|true|true|false|true|true|true|true|true|true");
+
+  runTest("RegExp property escapes trailing script ranges", R"(
+    [
+      /^\p{Script=Common}+$/u.test(String.fromCodePoint(0xE0020)),
+      /^\p{scx=Common}+$/u.test(String.fromCodePoint(0xE0020)),
+      /^\p{Script=Inherited}+$/u.test(String.fromCodePoint(0xE0100)),
+      /^\p{scx=Inherited}+$/u.test(String.fromCodePoint(0xE0100)),
+      /^\p{Script=Latin}+$/u.test(String.fromCodePoint(0x1DF25)),
+      /^\p{scx=Latin}+$/u.test(String.fromCodePoint(0x1DF25)),
+      /^\p{Script=Arabic}+$/u.test(String.fromCodePoint(0x1EEF0)),
+      /^\p{scx=Arabic}+$/u.test(String.fromCodePoint(0x1EEF0)),
+      /^\p{Script=Cyrillic}+$/u.test(String.fromCodePoint(0x1E030)),
+      /^\p{scx=Cyrillic}+$/u.test(String.fromCodePoint(0x1E030)),
+      /^\p{Script=Devanagari}+$/u.test(String.fromCodePoint(0x11B00)),
+      /^\p{scx=Devanagari}+$/u.test(String.fromCodePoint(0x11B00)),
+      /^\p{Script=Bengali}+$/u.test(String.fromCodePoint(0x09E6)),
+      /^\p{scx=Bengali}+$/u.test(String.fromCodePoint(0x1CF5)),
+      /^\p{Script=Gujarati}+$/u.test(String.fromCodePoint(0x0AF9)),
+      /^\p{scx=Gujarati}+$/u.test(String.fromCodePoint(0xA830)),
+      /^\p{Script=Brahmi}+$/u.test(String.fromCodePoint(0x11052)),
+      /^\p{scx=Brahmi}+$/u.test(String.fromCodePoint(0x11052)),
+      /^\p{Script=Khmer}+$/u.test(String.fromCodePoint(0x19E0)),
+      /^\p{scx=Khmer}+$/u.test(String.fromCodePoint(0x19E0))
+    ].join("|")
+  )", "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true");
+
   runTest("RegExp symbol methods use UTF-16 indices for astral text", R"(
     [
       RegExp.prototype[Symbol.search].call(/a/, "𠮷a𠮷"),

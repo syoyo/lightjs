@@ -71,6 +71,26 @@ enum class SupportedRegexUnicodeProperty {
   ScriptExtensionsCham,
   ScriptRunic,
   ScriptExtensionsRunic,
+  ScriptCommon,
+  ScriptExtensionsCommon,
+  ScriptInherited,
+  ScriptExtensionsInherited,
+  ScriptLatin,
+  ScriptExtensionsLatin,
+  ScriptArabic,
+  ScriptExtensionsArabic,
+  ScriptCyrillic,
+  ScriptExtensionsCyrillic,
+  ScriptDevanagari,
+  ScriptExtensionsDevanagari,
+  ScriptBengali,
+  ScriptExtensionsBengali,
+  ScriptGujarati,
+  ScriptExtensionsGujarati,
+  ScriptBrahmi,
+  ScriptExtensionsBrahmi,
+  ScriptKhmer,
+  ScriptExtensionsKhmer,
 };
 
 struct SupportedRegexUnicodePropertyPattern {
@@ -524,6 +544,130 @@ classifySupportedRegexUnicodePropertyName(const std::string& propertyName) {
       propertyName == "scx=Runic" ||
       propertyName == "scx=Runr") {
     return SupportedRegexUnicodeProperty::ScriptExtensionsRunic;
+  }
+  if (propertyName == "Script=Common" ||
+      propertyName == "Script=Zyyy" ||
+      propertyName == "sc=Common" ||
+      propertyName == "sc=Zyyy") {
+    return SupportedRegexUnicodeProperty::ScriptCommon;
+  }
+  if (propertyName == "Script_Extensions=Common" ||
+      propertyName == "Script_Extensions=Zyyy" ||
+      propertyName == "scx=Common" ||
+      propertyName == "scx=Zyyy") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsCommon;
+  }
+  if (propertyName == "Script=Inherited" ||
+      propertyName == "Script=Zinh" ||
+      propertyName == "Script=Qaai" ||
+      propertyName == "sc=Inherited" ||
+      propertyName == "sc=Zinh" ||
+      propertyName == "sc=Qaai") {
+    return SupportedRegexUnicodeProperty::ScriptInherited;
+  }
+  if (propertyName == "Script_Extensions=Inherited" ||
+      propertyName == "Script_Extensions=Zinh" ||
+      propertyName == "Script_Extensions=Qaai" ||
+      propertyName == "scx=Inherited" ||
+      propertyName == "scx=Zinh" ||
+      propertyName == "scx=Qaai") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsInherited;
+  }
+  if (propertyName == "Script=Latin" ||
+      propertyName == "Script=Latn" ||
+      propertyName == "sc=Latin" ||
+      propertyName == "sc=Latn") {
+    return SupportedRegexUnicodeProperty::ScriptLatin;
+  }
+  if (propertyName == "Script_Extensions=Latin" ||
+      propertyName == "Script_Extensions=Latn" ||
+      propertyName == "scx=Latin" ||
+      propertyName == "scx=Latn") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsLatin;
+  }
+  if (propertyName == "Script=Arabic" ||
+      propertyName == "Script=Arab" ||
+      propertyName == "sc=Arabic" ||
+      propertyName == "sc=Arab") {
+    return SupportedRegexUnicodeProperty::ScriptArabic;
+  }
+  if (propertyName == "Script_Extensions=Arabic" ||
+      propertyName == "Script_Extensions=Arab" ||
+      propertyName == "scx=Arabic" ||
+      propertyName == "scx=Arab") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsArabic;
+  }
+  if (propertyName == "Script=Cyrillic" ||
+      propertyName == "Script=Cyrl" ||
+      propertyName == "sc=Cyrillic" ||
+      propertyName == "sc=Cyrl") {
+    return SupportedRegexUnicodeProperty::ScriptCyrillic;
+  }
+  if (propertyName == "Script_Extensions=Cyrillic" ||
+      propertyName == "Script_Extensions=Cyrl" ||
+      propertyName == "scx=Cyrillic" ||
+      propertyName == "scx=Cyrl") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsCyrillic;
+  }
+  if (propertyName == "Script=Devanagari" ||
+      propertyName == "Script=Deva" ||
+      propertyName == "sc=Devanagari" ||
+      propertyName == "sc=Deva") {
+    return SupportedRegexUnicodeProperty::ScriptDevanagari;
+  }
+  if (propertyName == "Script_Extensions=Devanagari" ||
+      propertyName == "Script_Extensions=Deva" ||
+      propertyName == "scx=Devanagari" ||
+      propertyName == "scx=Deva") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsDevanagari;
+  }
+  if (propertyName == "Script=Bengali" ||
+      propertyName == "Script=Beng" ||
+      propertyName == "sc=Bengali" ||
+      propertyName == "sc=Beng") {
+    return SupportedRegexUnicodeProperty::ScriptBengali;
+  }
+  if (propertyName == "Script_Extensions=Bengali" ||
+      propertyName == "Script_Extensions=Beng" ||
+      propertyName == "scx=Bengali" ||
+      propertyName == "scx=Beng") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsBengali;
+  }
+  if (propertyName == "Script=Gujarati" ||
+      propertyName == "Script=Gujr" ||
+      propertyName == "sc=Gujarati" ||
+      propertyName == "sc=Gujr") {
+    return SupportedRegexUnicodeProperty::ScriptGujarati;
+  }
+  if (propertyName == "Script_Extensions=Gujarati" ||
+      propertyName == "Script_Extensions=Gujr" ||
+      propertyName == "scx=Gujarati" ||
+      propertyName == "scx=Gujr") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsGujarati;
+  }
+  if (propertyName == "Script=Brahmi" ||
+      propertyName == "Script=Brah" ||
+      propertyName == "sc=Brahmi" ||
+      propertyName == "sc=Brah") {
+    return SupportedRegexUnicodeProperty::ScriptBrahmi;
+  }
+  if (propertyName == "Script_Extensions=Brahmi" ||
+      propertyName == "Script_Extensions=Brah" ||
+      propertyName == "scx=Brahmi" ||
+      propertyName == "scx=Brah") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsBrahmi;
+  }
+  if (propertyName == "Script=Khmer" ||
+      propertyName == "Script=Khmr" ||
+      propertyName == "sc=Khmer" ||
+      propertyName == "sc=Khmr") {
+    return SupportedRegexUnicodeProperty::ScriptKhmer;
+  }
+  if (propertyName == "Script_Extensions=Khmer" ||
+      propertyName == "Script_Extensions=Khmr" ||
+      propertyName == "scx=Khmer" ||
+      propertyName == "scx=Khmr") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsKhmer;
   }
   return std::nullopt;
 }
