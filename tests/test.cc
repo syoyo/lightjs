@@ -43,6 +43,7 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
     auto env = Environment::createGlobal();
     Interpreter interpreter(env);
+    setGlobalInterpreter(&interpreter);
 
     auto task = interpreter.evaluate(*program);
 
@@ -60,6 +61,8 @@ void runTest(const std::string& name, const std::string& code, const std::string
     std::cout << "  Error: " << e.what() << std::endl;
     gFailedTests++;
   }
+
+  setGlobalInterpreter(nullptr);
 
   std::cout << std::endl;
 }
@@ -211,6 +214,96 @@ int main() {
     let big = 42n;
     -big
   )", "-42n");
+
+  runTest("Function caller on sloppy function", R"(
+    function outer() {
+      return inner();
+    }
+    function inner() {
+      return inner.caller === outer;
+    }
+    outer()
+  )", "true");
+
+  runTest("Function caller rejects strict caller", R"(
+    function outer() {
+      "use strict";
+      return inner();
+    }
+    function inner() {
+      try {
+        inner.caller;
+        return false;
+      } catch (e) {
+        return e instanceof TypeError;
+      }
+    }
+    outer()
+  )", "true");
+
+  runTest("Bound function caller is poisoned", R"(
+    function target() {}
+    let bound = target.bind(null);
+    try {
+      bound.caller;
+      false
+    } catch (e) {
+      e instanceof TypeError
+    }
+  )", "true");
+
+  runTest("Arrow function caller is poisoned", R"(
+    let arrow = () => {};
+    try {
+      arrow.caller;
+      false
+    } catch (e) {
+      e instanceof TypeError
+    }
+  )", "true");
+
+  runTest("Decorator syntax on class expression", R"(
+    function dec() {}
+    let C = @dec class {};
+    typeof C
+  )", "function");
+
+  runTest("Decorator syntax on class elements", R"(
+    function dec() {}
+    class C {
+      @dec method() {}
+      @dec static field;
+    }
+    typeof C.prototype.method
+  )", "function");
+
+  runTest("Class field named accessor", R"(
+    class C {
+      accessor;
+    }
+    let c = new C();
+    c.accessor === undefined
+  )", "true");
+
+  runTest("Public auto accessor", R"(
+    class C {
+      accessor x = 1;
+    }
+    let c = new C();
+    c.x = 4;
+    c.x
+  )", "4");
+
+  runTest("Private auto accessor", R"(
+    class C {
+      accessor #x = 2;
+      getX() { return this.#x; }
+      setX(v) { this.#x = v; }
+    }
+    let c = new C();
+    c.setX(5);
+    c.getX()
+  )", "5");
 
   runTest("Uint8Array creation", R"(
     let arr = new Uint8Array(10);
@@ -601,6 +694,124 @@ int main() {
     let str = "5";
     str.padEnd(3, "0")
   )", "500");
+
+  runTest("String.normalize forms", R"(
+    let sample = '\u1E9B\u0323';
+    let composed = '\u00C5\u2ADC\u0958\u2126\u0344';
+    sample.normalize('NFC') === '\u1E9B\u0323' &&
+    sample.normalize('NFD') === '\u017F\u0323\u0307' &&
+    sample.normalize('NFKC') === '\u1E69' &&
+    sample.normalize('NFKD') === 's\u0323\u0307' &&
+    composed.normalize() === '\u00C5\u2ADD\u0338\u0915\u093C\u03A9\u0308\u0301'
+  )", "true");
+
+  runTest("String.normalize coercion and errors", R"(
+    let sample = '\u00C5\u2ADC\u0958\u2126\u0344';
+    let coerced = sample.normalize(['NFD']) === 'A\u030A\u2ADD\u0338\u0915\u093C\u03A9\u0308\u0301';
+    let typeErr = false;
+    let rangeErr = false;
+    try { 'foo'.normalize(Symbol('x')); } catch (e) { typeErr = e.name === 'TypeError'; }
+    try { 'foo'.normalize(null); } catch (e) { rangeErr = e.name === 'RangeError'; }
+    coerced && typeErr && rangeErr
+  )", "true");
+
+  runTest("String.replace function replacer", R"(
+    new String("undefined").replace(undefined, function(match, offset, whole) {
+      return "" + match.length + ":" + offset + ":" + (whole === "undefined");
+    })
+  )", "9:0:true");
+
+  runTest("String.replace regex replacement coercion", R"(
+    let err = false;
+    Number.prototype.replace = String.prototype.replace;
+    try {
+      (new Number(1100.00777001)).replace(/77/, {
+        toString: function() { return function() {}; }
+      });
+    } catch (e) {
+      err = e.name === "TypeError";
+    }
+    err
+  )", "true");
+
+  runTest("String.search default regexp create", R"(
+    "" .search() + "|" + "--undefined--".search()
+  )", "0|0");
+
+  runTest("String.search RegExpCreate fallback", R"(
+    let original = RegExp.prototype[Symbol.search];
+    let ok = false;
+    RegExp.prototype[Symbol.search] = function(s) {
+      ok = this instanceof RegExp && this.source === "string source" && this.flags === "" && s === "target";
+      return 123;
+    };
+    let result = new String("target").search("string source");
+    RegExp.prototype[Symbol.search] = original;
+    "" + ok + "|" + result
+  )", "true|123");
+
+  runTest("String.split custom splitter before receiver coercion", R"(
+    let receiver = {
+      toString() { throw new Error("receiver"); }
+    };
+    let separator = {
+      [Symbol.split](value, limit) {
+        return value === receiver && typeof limit === "symbol";
+      }
+    };
+    "" + String.prototype.split.call(receiver, separator, Symbol("limit"))
+  )", "true");
+
+  runTest("String.split coercion order", R"(
+    let log = [];
+    let receiver = {
+      toString() {
+        log.push("receiver");
+        return "abba";
+      }
+    };
+    let separator = {
+      toString() {
+        log.push("separator");
+        return "b";
+      }
+    };
+    let limit = {
+      valueOf() {
+        log.push("limit");
+        return 0;
+      }
+    };
+    String.prototype.split.call(receiver, separator, limit);
+    log.join(",")
+  )", "receiver,limit,separator");
+
+  runTest("String.split regexp empty matches", R"(
+    let a = "x".split(/^/);
+    let b = "x".split(/$/);
+    let c = "x".split(/(?:)/);
+    "" + a.length + ":" + a[0] + "|" + b.length + ":" + b[0] + "|" + c.length + ":" + c[0]
+  )", "1:x|1:x|1:x");
+
+  runTest("String constructor coercion", R"(
+    let original = Function.prototype.toString;
+    Function.prototype.toString = function() { return "SHIFTED"; };
+    let wrapped = new String(function() {});
+    Function.prototype.toString = original;
+    "" + (wrapped == "SHIFTED") + "|" + (wrapped.constructor === String)
+  )", "true|true");
+
+  runTest("String trim generic coercion", R"(
+    let regObj = new RegExp(/test/);
+    let argObj = (function() { return arguments; })(1, 2, true);
+    String.prototype.trim.call(regObj) + "|" + String.prototype.trim.call(argObj)
+  )", "/test/|[object Arguments]");
+
+  runTest("String fromCharCode bigint throws", R"(
+    let threw = false;
+    try { String.fromCharCode(0n); } catch (e) { threw = e.name === "TypeError"; }
+    "" + threw
+  )", "true");
 
   runTest("Array.isArray - array", R"(
     let arr = [1, 2, 3];
@@ -1961,6 +2172,16 @@ int main() {
     }
   )", "ok");
 
+  runTest("Generator computed property keys use string coercion", R"(
+    function * g() { return 1; }
+    class C {
+      [g()] = 1;
+      static [g()] = 2;
+    }
+    let c = new C();
+    String(g()) + "|" + c[String(g())] + "|" + C[String(g())]
+  )", "[object Generator]|1|2");
+
   // Array destructuring must use Array.prototype[Symbol.iterator] (including overrides).
   runTest("Array Destructure Uses Overridden Iterator", R"(
     Array.prototype[Symbol.iterator] = function* () {
@@ -2058,6 +2279,31 @@ int main() {
     "" + (b instanceof B) + "," + (b instanceof A)
   )", "true,true");
 
+  runTest("instanceof Function.prototype getter", R"(
+    let getterCalled = false;
+    Object.defineProperty(Function.prototype, "prototype", {
+      get() {
+        getterCalled = true;
+        return Array.prototype;
+      }
+    });
+    "" + ([] instanceof Function.prototype) + "," + getterCalled
+  )", "true,true");
+
+  runTest("with unscopables blocks assignment", R"(
+    var v = 1;
+    globalThis[Symbol.unscopables] = { v: true };
+    let result = ((x) => {
+      var v = x;
+      with (globalThis) {
+        v = 20;
+      }
+      return "" + v + "," + globalThis.v;
+    })(10);
+    globalThis[Symbol.unscopables] = undefined;
+    result
+  )", "20,1");
+
   runTest("Private static methods", R"(
     class C {
       static #x(value) { return value / 2; }
@@ -2111,6 +2357,451 @@ int main() {
   runTest("String.raw basic", R"(
     String.raw({raw: ["a", "b", "c"]}, 1, 2)
   )", "a1b2c");
+
+  runTest("String replaceAll RegExp sticky", R"(
+    "abc abc abc".replaceAll(/b/gy, "z")
+  )", "abc abc abc");
+
+  runTest("String replaceAll RegExp named capture", R"JS(
+    "abcba".replaceAll(new RegExp("(?<named>b)", "g"), "($<named>)")
+  )JS", "a(b)c(b)a");
+
+  gTotalTests++;
+  std::cout << "Test: Module parser disambiguates static source phase imports" << std::endl;
+  try {
+    Lexer lexer(R"(
+      import source binding from "one";
+      import source from "two";
+      import from from "three";
+    )");
+    auto tokens = lexer.tokenize();
+    Parser parser(tokens, true);
+    auto program = parser.parse();
+    bool ok =
+      program.has_value() &&
+      program->body.size() == 3 &&
+      std::holds_alternative<ImportDeclaration>(program->body[0]->node) &&
+      std::holds_alternative<ImportDeclaration>(program->body[1]->node) &&
+      std::holds_alternative<ImportDeclaration>(program->body[2]->node);
+
+    if (ok) {
+      const auto& firstImport = std::get<ImportDeclaration>(program->body[0]->node);
+      const auto& secondImport = std::get<ImportDeclaration>(program->body[1]->node);
+      const auto& thirdImport = std::get<ImportDeclaration>(program->body[2]->node);
+      ok =
+        firstImport.phase == ImportDeclaration::Phase::Source &&
+        firstImport.defaultImport.has_value() &&
+        firstImport.defaultImport->name == "binding" &&
+        secondImport.phase == ImportDeclaration::Phase::Evaluation &&
+        secondImport.defaultImport.has_value() &&
+        secondImport.defaultImport->name == "source" &&
+        thirdImport.phase == ImportDeclaration::Phase::Evaluation &&
+        thirdImport.defaultImport.has_value() &&
+        thirdImport.defaultImport->name == "from";
+    }
+
+    if (!ok) {
+      std::cout << "  FAILED! Parser did not preserve source-phase import ambiguity rules" << std::endl;
+      gFailedTests++;
+    } else {
+      std::cout << "  PASSED" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cout << "  Error: " << e.what() << std::endl;
+    gFailedTests++;
+  }
+  std::cout << std::endl;
+
+  gTotalTests++;
+  std::cout << "Test: Parser accepts await using declaration forms" << std::endl;
+  try {
+    Lexer lexer(R"(
+      await using z = null;
+      async function f() {
+        for (await using of of []) { }
+      }
+    )");
+    auto tokens = lexer.tokenize();
+    Parser parser(tokens, true);
+    parser.setSource(R"(
+      await using z = null;
+      async function f() {
+        for (await using of of []) { }
+      }
+    )");
+    auto program = parser.parse();
+    bool ok = program.has_value();
+    if (!ok) {
+      std::cout << "  FAILED! Parser rejected await using declaration syntax" << std::endl;
+      gFailedTests++;
+    } else {
+      std::cout << "  PASSED" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cout << "  Error: " << e.what() << std::endl;
+    gFailedTests++;
+  }
+  std::cout << std::endl;
+
+  runTest("RegExp scoped modifier lowering", R"(
+    function expect(cond, label) {
+      if (!cond) throw new Error(label);
+    }
+
+    expect(/(?i:a)b/.test("Ab"), "scoped ignoreCase should affect literals");
+    expect(!/(?-i:fo)o/i.test("FOO"), "scoped ignoreCase removal should preserve case");
+    expect(/(?i:[ab])c/.test("Bc"), "scoped ignoreCase should affect character classes");
+    expect(/(?i:\w)/u.test("\u017f"), "scoped ignoreCase should widen unicode word chars");
+    expect(!/(?-i:\W)/ui.test("\u017f"), "scoped ignoreCase removal should restore unicode non-word chars");
+    expect(/(?i:Z\B)/u.test("Z\u017f"), "scoped ignoreCase should widen unicode non-boundaries");
+    expect(!/(?-i:\b)/ui.test("\u017f"), "scoped ignoreCase removal should narrow unicode boundaries");
+    expect(/(a)(?i:\1)/.test("aA"), "scoped ignoreCase should affect backreferences");
+    expect(!/(a)(?-i:\1)/i.test("aA"), "scoped ignoreCase removal should affect backreferences");
+    expect(/(?m:es$)/.test("es\ns"), "scoped multiline should affect end anchor");
+    expect(!/^(?-m:es$)/m.test("es\ns"), "scoped multiline removal should isolate end anchor");
+    expect(/(?m-i:^a$)/i.test("a\n"), "scoped add/remove modifiers should isolate ignoreCase");
+    expect(/(?i:\p{Lu})/u.test("a"), "scoped ignoreCase should widen unicode Lu property");
+    expect(!/(?-i:\p{Lu})/ui.test("a"), "scoped ignoreCase removal should restore unicode Lu property");
+    expect(/(?i:\P{Lu})/u.test("A"), "scoped ignoreCase should widen unicode non-Lu property");
+    expect(!/(?-i:\P{Lu})/ui.test("A"), "scoped ignoreCase removal should restore unicode non-Lu property");
+    expect(/(?s:^.$)/.test("\n"), "scoped dotAll should affect dot");
+    expect(!/(?-s:^.$)/s.test("\n"), "scoped dotAll removal should not leak");
+    expect(/a.a|(?s:c.c)|d.d/.test("c\nc"), "scoped dotAll should stay inside alternative");
+    expect(!/a.a|(?s:c.c)|d.d/.test("a\na"), "scoped dotAll should not affect outside alternatives");
+  )");
+
+  gTotalTests++;
+  std::cout << "Test: Regex modifier group syntax validation" << std::endl;
+  try {
+    auto expectRegexParses = [](const std::string& code) -> bool {
+      try {
+        Lexer lexer(code);
+        auto tokens = lexer.tokenize();
+        Parser parser(tokens);
+        return parser.parse().has_value();
+      } catch (const std::exception&) {
+        return false;
+      }
+    };
+    bool ok =
+      expectRegexParses(R"(/(?i-s:)/)") &&
+      expectRegexParses(R"(/(?m:abc)/)") &&
+      !expectRegexParses(R"(/(?-:a)/)") &&
+      !expectRegexParses(R"(/(?g:a)/)") &&
+      !expectRegexParses(R"(/(?ms-i)/)");
+    if (!ok) {
+      std::cout << "  FAILED! Regex modifier group syntax handling regressed" << std::endl;
+      gFailedTests++;
+    } else {
+      std::cout << "  PASSED" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cout << "  Error: " << e.what() << std::endl;
+    gFailedTests++;
+  }
+  std::cout << std::endl;
+
+  runTest("RegExp prototype getter metadata and throws", R"(
+    let unicodeDesc = Object.getOwnPropertyDescriptor(RegExp.prototype, "unicode");
+    let unicodeSetsDesc = Object.getOwnPropertyDescriptor(RegExp.prototype, "unicodeSets");
+    let threwType = false;
+    let threwInvalid = false;
+    try { unicodeDesc.get.call(undefined); } catch (e) { threwType = e.name === "TypeError"; }
+    try { unicodeDesc.get.call({}); } catch (e) { threwInvalid = e.name === "TypeError"; }
+    [
+      unicodeDesc.get.name,
+      unicodeDesc.get.length,
+      unicodeSetsDesc.get.name,
+      unicodeSetsDesc.get.length,
+      /./v.unicodeSets,
+      (() => {
+        try {
+          new RegExp(".", "uv");
+          return false;
+        } catch (e) {
+          return e.name === "SyntaxError";
+        }
+      })(),
+      threwType,
+      threwInvalid
+    ].join("|")
+  )", "get unicode|0|get unicodeSets|0|true|true|true|true");
+
+  runTest("Symbol dispose and IteratorPrototype dispose", R"(
+    const IteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+    let called = false;
+    let iter = Object.create(IteratorPrototype);
+    iter.return = function() {
+      called = true;
+      return { done: true };
+    };
+    [
+      typeof Symbol.dispose,
+      typeof Symbol.asyncDispose,
+      IteratorPrototype[Symbol.dispose].name,
+      IteratorPrototype[Symbol.dispose].length,
+      IteratorPrototype[Symbol.dispose]() === undefined,
+      iter[Symbol.dispose]() === undefined,
+      called,
+      (Symbol.keyFor(Symbol.dispose) === undefined)
+    ].join("|")
+  )", "symbol|symbol|[Symbol.dispose]|0|true|true|true|true");
+
+  runTest("AsyncIteratorPrototype asyncDispose", R"(
+    async function* generator() {}
+    const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(generator.prototype));
+    [
+      typeof AsyncIteratorPrototype[Symbol.asyncDispose],
+      AsyncIteratorPrototype[Symbol.asyncDispose].name,
+      AsyncIteratorPrototype[Symbol.asyncDispose].length
+    ].join("|")
+  )", "function|[Symbol.asyncDispose]|0");
+
+  runTest("ERM constructor and stack surface", R"(
+    let d = new DisposableStack();
+    let ad = new AsyncDisposableStack();
+    let syncDesc = Object.getOwnPropertyDescriptor(DisposableStack.prototype, "disposed");
+    let asyncDesc = Object.getOwnPropertyDescriptor(AsyncDisposableStack.prototype, "disposed");
+    let suppressed = SuppressedError("err", "sup", 42);
+    let order = [];
+    let resource = { [Symbol.dispose]() { order.push("use"); } };
+    d.use(resource);
+    d.adopt("adopted", v => order.push(v));
+    d.defer(() => order.push("defer"));
+    let promise = ad.disposeAsync();
+    [
+      Object.getPrototypeOf(suppressed) === SuppressedError.prototype,
+      suppressed instanceof SuppressedError,
+      suppressed.message,
+      suppressed.error,
+      suppressed.suppressed,
+      d.disposed,
+      d.dispose() === undefined,
+      d.disposed,
+      DisposableStack.prototype[Symbol.dispose] === DisposableStack.prototype.dispose,
+      syncDesc.get.name,
+      syncDesc.get.length,
+      asyncDesc.get.name,
+      asyncDesc.get.length,
+      typeof promise.then === "function",
+      ad.disposed,
+      order.join(","),
+      Object.getOwnPropertyDescriptor(globalThis, "DisposableStack").enumerable === false,
+      Object.getOwnPropertyDescriptor(globalThis, "AsyncDisposableStack").enumerable === false,
+      Object.getOwnPropertyDescriptor(globalThis, "SuppressedError").enumerable === false
+    ].join("|")
+  )", "true|true|42|err|sup|false|true|true|true|get disposed|0|get disposed|0|true|true|defer,adopted,use|true|true|true");
+
+  runTest("ERM stack move and async surface", R"(
+    let d1 = new DisposableStack();
+    let syncOrder = [];
+    d1.defer(() => syncOrder.push("a"));
+    d1.defer(() => syncOrder.push("b"));
+    let d2 = d1.move();
+    d2.dispose();
+
+    let ad = new AsyncDisposableStack();
+    let asyncUseDesc = Object.getOwnPropertyDescriptor(AsyncDisposableStack.prototype, "use");
+    let asyncMoveDesc = Object.getOwnPropertyDescriptor(AsyncDisposableStack.prototype, "move");
+    let used = ad.use({ [Symbol.asyncDispose]() {} });
+    let adopted = ad.adopt(7, async () => {});
+    let deferred = ad.defer(async () => {});
+    let moved = ad.move();
+
+    [
+      d1.disposed,
+      d2.disposed,
+      syncOrder.join(","),
+      typeof AsyncDisposableStack.prototype.use,
+      asyncUseDesc.enumerable === false,
+      asyncMoveDesc.enumerable === false,
+      used !== null,
+      adopted,
+      deferred === undefined,
+      moved instanceof AsyncDisposableStack,
+      ad.disposed,
+      moved.disposed
+    ].join("|")
+  )", "true|true|b,a|function|true|true|true|7|true|true|true|false");
+
+  runTest("ERM async disposal surface", R"(
+    let stack = new AsyncDisposableStack();
+    stack.defer(async () => {});
+    let p = stack.disposeAsync();
+    [
+      typeof AsyncDisposableStack.prototype.disposeAsync,
+      typeof AsyncDisposableStack.prototype.dispose,
+      typeof p.then === "function",
+      stack.disposed
+    ].join("|")
+  )", "function|function|true|true");
+
+  runTest("Using disposes in class static block", R"(
+    let values = [];
+    class C {
+      static {
+        using x = {
+          [Symbol.dispose]() {
+            values.push(42);
+          }
+        };
+      }
+    }
+    new C();
+    values.join(",")
+  )", "42");
+
+  runTest("Using disposes before derived super call", R"(
+    let values = [];
+    class Base {
+      constructor() {
+        values.push(43);
+      }
+    }
+    class Sub extends Base {
+      constructor() {
+        try {
+          using x = {
+            [Symbol.dispose]() {
+              values.push(42);
+            }
+          };
+        } catch (e) {
+          return;
+        } finally {
+          super();
+        }
+      }
+    }
+    new Sub();
+    values.join(",")
+  )", "42,43");
+
+  runTest("Using disposes after async function completion", R"(
+    let disposed = false;
+    async function f() {
+      using x = {
+        [Symbol.dispose]() {
+          disposed = true;
+        }
+      };
+      await Promise.resolve(1);
+      return disposed;
+    }
+    let p = f();
+    let before = disposed;
+    await p;
+    "" + before + "," + disposed
+  )", "false,true", true);
+
+  runTest("Await using disposes mixed resources in reverse order", R"(
+    let order = [];
+    {
+      await using a = {
+        async [Symbol.asyncDispose]() {
+          order.push("a");
+        }
+      };
+      using b = {
+        [Symbol.dispose]() {
+          order.push("b");
+        }
+      };
+    }
+    order.join(",")
+  )", "b,a", true);
+
+  runTest("Await using falls back to Symbol.dispose and awaits promises", R"(
+    let order = [];
+    let done = false;
+    {
+      await using x = {
+        [Symbol.dispose]() {
+          order.push("dispose");
+          return Promise.resolve().then(() => {
+            done = true;
+            order.push("resolved");
+          });
+        }
+      };
+      order.push("body");
+    }
+    [order.join(","), done].join("|")
+  )", "body,dispose,resolved|true", true);
+
+  runTest("RegExp property escapes ASCII and selected scripts", R"(
+    [
+      /\p{ASCII}/u.test("A"),
+      /\p{ASCII_Hex_Digit}/u.test("AF09"),
+      /\p{AHex}/u.test("af"),
+      /\P{ASCII}/u.test("𠮷"),
+      /\p{Script=Han}/u.test("𠮷"),
+      /\p{Script_Extensions=Han}/u.test("・"),
+      /\P{Script_Extensions=Han}/u.test("A"),
+      /\p{Script=Hangul}/u.test("한"),
+      /\p{Script_Extensions=Hangul}/u.test("・"),
+      /\p{Script=Hanunoo}/u.test("ᜠ"),
+      /\p{Script_Extensions=Hanunoo}/u.test("᜶"),
+      /\P{Script_Extensions=Hanunoo}/u.test("A"),
+      /\p{Script=Buhid}/u.test("ᝀ"),
+      /\p{Script_Extensions=Buhid}/u.test("᜵"),
+      /\p{Script=Tagalog}/u.test("ᜀ"),
+      /\p{Script_Extensions=Tagalog}/u.test("᜵"),
+      /\p{Script=Tagbanwa}/u.test("ᝠ"),
+      /\p{Script_Extensions=Tagbanwa}/u.test("᜵"),
+      /\p{Script=Ogham}/u.test(" "),
+      /\p{Script_Extensions=Ogham}/u.test(" "),
+      /\p{Script=Buginese}/u.test("ᨀ"),
+      /\p{Script_Extensions=Buginese}/u.test("ꧏ"),
+      /\p{Script=Tai_Le}/u.test("ᥐ"),
+      /\p{Script_Extensions=Tai_Le}/u.test("̀"),
+      /\p{Script=Cham}/u.test("ꨀ"),
+      /\p{Script_Extensions=Cham}/u.test("ꨀ"),
+      /\p{Script=Runic}/u.test("\u16A0"),
+      /\p{Script_Extensions=Runic}/u.test("\u16EB"),
+      "𠮷a𠮷".match(/\p{Script=Han}/gu).join(","),
+      Array.from("𠮷a𠮷".matchAll(/\P{ASCII}/gu), m => m.index).join(",")
+    ].join("|")
+  )", "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|𠮷,𠮷|0,3");
+
+  runTest("RegExp symbol methods use UTF-16 indices for astral text", R"(
+    [
+      RegExp.prototype[Symbol.search].call(/a/, "𠮷a𠮷"),
+      RegExp.prototype[Symbol.replace].call(/./gu, "𠮷a𠮷", (m, i) => i).toString(),
+      Array.from(RegExp.prototype[Symbol.matchAll].call(/\p{Script=Han}/gu, "𠮷a𠮷"), m => m.index).join(",")
+    ].join("|")
+  )", "2|023|0,3");
+
+  runTest("RegExp exec reports UTF-16 index on astral text", R"(
+    [
+      /\p{ASCII}/u.exec("𠮷a𠮷").index,
+      /./u.exec("𠮷a𠮷")[0],
+      /(\p{Script=Han})(.)/u.exec("𠮷a𠮷")[2]
+    ].join("|")
+  )", "2|𠮷|a");
+
+  runTest("RegExp exec preserves last repeated optional captures", R"(
+    let r = /(z)((a+)?(b+)?(c))*/.exec("zaacbbbcac");
+    [
+      r[0],
+      r[1],
+      r[2],
+      r[3],
+      String(r[4]),
+      r[5]
+    ].join("|")
+  )", "zaacbbbcac|z|ac|a|undefined|c");
+
+  runTest("RegExp string properties of strings under v flag", R"(
+    [
+      /^\p{Emoji_Keycap_Sequence}+$/v.test("#\uFE0F\u20E31\uFE0F\u20E3"),
+      /^\p{RGI_Emoji_Flag_Sequence}+$/v.test("\u{1F1EF}\u{1F1F5}\u{1F1FA}\u{1F1F8}"),
+      /^\p{RGI_Emoji_Tag_Sequence}+$/v.test("\u{1F3F4}\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}"),
+      /^\p{RGI_Emoji_Modifier_Sequence}+$/v.test("\u{1F44D}\u{1F3FD}\u{1F44B}\u{1F3FB}"),
+      /^\p{RGI_Emoji_ZWJ_Sequence}+$/v.test("\u{1F468}\u200D\u2764\uFE0F\u200D\u{1F48B}\u200D\u{1F468}"),
+      /^\p{RGI_Emoji}+$/v.test("\u{1F44D}\u{1F3FD}\u{1F468}\u200D\u2764\uFE0F\u200D\u{1F48B}\u200D\u{1F468}\u{1F1EF}\u{1F1F5}")
+    ].join("|")
+  )", "true|true|true|true|true|true");
 
   std::cout << "=== All tests completed ===" << std::endl;
   std::cout << "Summary: " << (gTotalTests - gFailedTests) << "/" << gTotalTests

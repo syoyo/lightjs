@@ -37,6 +37,7 @@ void TaskAwaiter::await_suspend(std::coroutine_handle<> awaiting) noexcept {
 
 #include "module.h"
 #include "array_methods.h"
+#include "regex_match_utils.h"
 #include "string_methods.h"
 #include "unicode.h"
 #include "gc.h"
@@ -232,6 +233,46 @@ std::string privateMethodMarkerKey(const GCPtr<Class>& owner, const std::string&
     return "__private_method_marker_" + std::to_string(owner->privateBrandId) + "_" + privateName + "__";
   }
   return "__private_method_marker_" + privateName + "__";
+}
+
+std::string publicAutoAccessorStorageKey(const std::string& propertyName) {
+  return "__auto_accessor_" + propertyName + "__";
+}
+
+std::string privateAutoAccessorBackingName(const std::string& privateName) {
+  return privateName + "@@accessor_storage";
+}
+
+OrderedMap<std::string, Value>* getHiddenFieldStorage(Value& value) {
+  if (value.isObject()) return &value.getGC<Object>()->properties;
+  if (value.isArray()) return &value.getGC<Array>()->properties;
+  if (value.isFunction()) return &value.getGC<Function>()->properties;
+  if (value.isRegex()) return &value.getGC<Regex>()->properties;
+  if (value.isPromise()) return &value.getGC<Promise>()->properties;
+  if (value.isClass()) return &value.getGC<Class>()->properties;
+  if (value.isProxy()) {
+    auto proxy = value.getGC<Proxy>();
+    if (proxy->target) {
+      return getHiddenFieldStorage(*proxy->target);
+    }
+  }
+  return nullptr;
+}
+
+const OrderedMap<std::string, Value>* getHiddenFieldStorage(const Value& value) {
+  if (value.isObject()) return &value.getGC<Object>()->properties;
+  if (value.isArray()) return &value.getGC<Array>()->properties;
+  if (value.isFunction()) return &value.getGC<Function>()->properties;
+  if (value.isRegex()) return &value.getGC<Regex>()->properties;
+  if (value.isPromise()) return &value.getGC<Promise>()->properties;
+  if (value.isClass()) return &value.getGC<Class>()->properties;
+  if (value.isProxy()) {
+    auto proxy = value.getGC<Proxy>();
+    if (proxy->target) {
+      return getHiddenFieldStorage(*proxy->target);
+    }
+  }
+  return nullptr;
 }
 
 bool classDeclaresInstancePrivateName(const GCPtr<Class>& cls, const std::string& privateName) {
@@ -500,6 +541,39 @@ Value computeCompoundOp(AssignmentExpr::Op op, const Value& current, const Value
     default:
       return right;
   }
+}
+
+bool isDeferredNamespaceSymbolLikeKey(const std::string& key) {
+  return key == "then" ||
+         key == WellKnownSymbols::toStringTagKey() ||
+         isSymbolPropertyKey(key);
+}
+
+bool triggerDeferredNamespaceIfNeeded(const GCPtr<Object>& obj, const std::string& key) {
+  if (!obj || !obj->isModuleNamespace || isDeferredNamespaceSymbolLikeKey(key)) {
+    return true;
+  }
+
+  auto pendingIt = obj->properties.find("__deferred_pending__");
+  if (pendingIt == obj->properties.end() ||
+      !pendingIt->second.isBool() ||
+      !pendingIt->second.toBool()) {
+    return true;
+  }
+
+  auto evalIt = obj->properties.find("__deferred_eval__");
+  if (evalIt == obj->properties.end() || !evalIt->second.isFunction()) {
+    return true;
+  }
+
+  auto deferredEvalFn = evalIt->second.getGC<Function>();
+  if (!deferredEvalFn || !deferredEvalFn->isNative) {
+    return true;
+  }
+
+  deferredEvalFn->nativeFunc({});
+  obj->properties["__deferred_pending__"] = Value(false);
+  return true;
 }
 
 std::string numberToPropertyKey(double value) {
@@ -849,9 +923,11 @@ Value Interpreter::runScriptInGlobalScope(const std::string& source) {
     if (globalObj) {
       for (const auto& stmt : kept->body) {
         std::vector<std::string> lexNames;
-        if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
-          if (varDecl->kind == VarDeclaration::Kind::Let ||
-              varDecl->kind == VarDeclaration::Kind::Const) {
+      if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
+        if (varDecl->kind == VarDeclaration::Kind::Let ||
+            varDecl->kind == VarDeclaration::Kind::Const ||
+            varDecl->kind == VarDeclaration::Kind::Using ||
+            varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
             for (const auto& declarator : varDecl->declarations) {
               collectVarHoistNames(*declarator.pattern, lexNames);
             }
@@ -1004,7 +1080,9 @@ Value Interpreter::runScriptInGlobalScope(const std::string& source) {
   for (const auto& stmt : kept->body) {
     if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
       if (varDecl->kind == VarDeclaration::Kind::Let ||
-          varDecl->kind == VarDeclaration::Kind::Const) {
+          varDecl->kind == VarDeclaration::Kind::Const ||
+          varDecl->kind == VarDeclaration::Kind::Using ||
+          varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
         for (const auto& declarator : varDecl->declarations) {
           std::vector<std::string> names;
           collectVarHoistNames(*declarator.pattern, names);
@@ -1020,6 +1098,7 @@ Value Interpreter::runScriptInGlobalScope(const std::string& source) {
 
   // Evaluate statements
   Value result = Value(Undefined{});
+  size_t disposableScope = beginSyncDisposableScope();
   for (const auto& stmt : kept->body) {
     if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
       continue;  // Already hoisted
@@ -1034,6 +1113,7 @@ Value Interpreter::runScriptInGlobalScope(const std::string& source) {
       break;
     }
   }
+  disposeSyncDisposableScope(disposableScope);
 
   sourceKeepAlive_ = savedKeepAlive;
   env_ = savedEnv;
@@ -1095,6 +1175,16 @@ Value Interpreter::generatorNext(const Value& generatorVal, const Value& resumeV
   }
   auto gen = generatorVal.getGC<Generator>();
   return runGeneratorNext(gen, ControlFlow::ResumeMode::Next, resumeValue);
+}
+
+Value Interpreter::generatorResume(const GCPtr<Generator>& generator, int mode, const Value& resumeValue) {
+  ControlFlow::ResumeMode rm;
+  switch (mode) {
+    case 1: rm = ControlFlow::ResumeMode::Return; break;
+    case 2: rm = ControlFlow::ResumeMode::Throw; break;
+    default: rm = ControlFlow::ResumeMode::Next; break;
+  }
+  return runGeneratorNext(generator, rm, resumeValue);
 }
 
 bool Interpreter::isObjectLike(const Value& value) const {
@@ -1359,7 +1449,31 @@ std::pair<bool, Value> Interpreter::getPropertyForPrimitive(const Value& receive
   }
 
   if (receiver.isRegex()) {
-    return getFromPropertyBag(receiver.getGC<Regex>()->properties);
+    auto regex = receiver.getGC<Regex>();
+    auto result = getFromPropertyBag(regex->properties);
+    if (result.first) {
+      return result;
+    }
+
+    auto protoIt = regex->properties.find("__proto__");
+    if (protoIt != regex->properties.end() && protoIt->second.isObject()) {
+      auto proto = protoIt->second.getGC<Object>();
+      int depth = 0;
+      while (proto && depth < 50) {
+        auto protoResult = getFromPropertyBag(proto->properties);
+        if (protoResult.first) {
+          return protoResult;
+        }
+        auto nextProto = proto->properties.find("__proto__");
+        if (nextProto == proto->properties.end() || !nextProto->second.isObject()) {
+          break;
+        }
+        proto = nextProto->second.getGC<Object>();
+        depth++;
+      }
+    }
+
+    return {false, Value(Undefined{})};
   }
 
   if (receiver.isProxy()) {
@@ -1494,8 +1608,181 @@ bool Interpreter::checkMemoryLimit(size_t additionalBytes) {
   return true;
 }
 
+size_t Interpreter::beginSyncDisposableScope() {
+  return disposableResources_.size();
+}
+
+Value Interpreter::makeSuppressedErrorValue(const Value& errorValue, const Value& suppressedValue) {
+  auto ctor = env_->get("SuppressedError");
+  if (ctor && ctor->isFunction()) {
+    auto task = constructValue(*ctor,
+                               {errorValue, suppressedValue,
+                                Value(std::string("An error was suppressed during disposal"))});
+    Value constructed = Value(Undefined{});
+    LIGHTJS_RUN_TASK_SYNC(task, constructed);
+    if (flow_.type != ControlFlow::Type::Throw) {
+      return constructed;
+    }
+  }
+  return errorValue;
+}
+
+bool Interpreter::registerSyncDisposableResource(const Value& value) {
+  if (value.isNull() || value.isUndefined()) {
+    return true;
+  }
+  auto [foundMethod, method] = getPropertyForExternal(value, WellKnownSymbols::disposeKey());
+  if (flow_.type == ControlFlow::Type::Throw) {
+    return false;
+  }
+  auto isCallableLike = [](const Value& candidate) {
+    if (candidate.isFunction() || candidate.isClass() || candidate.isProxy()) {
+      return true;
+    }
+    if (candidate.isObject()) {
+      auto obj = candidate.getGC<Object>();
+      auto callableIt = obj->properties.find("__callable_object__");
+      return callableIt != obj->properties.end() &&
+             callableIt->second.isBool() &&
+             callableIt->second.toBool();
+    }
+    return false;
+  };
+  if (!foundMethod || method.isUndefined() || method.isNull() || !isCallableLike(method)) {
+    throwError(ErrorType::TypeError, "value does not have a callable @@dispose");
+    return false;
+  }
+  disposableResources_.push_back({value, method, false});
+  return true;
+}
+
+bool Interpreter::registerAsyncDisposableResource(const Value& value) {
+  if (value.isNull() || value.isUndefined()) {
+    return true;
+  }
+
+  auto isCallableLike = [](const Value& candidate) {
+    if (candidate.isFunction() || candidate.isClass() || candidate.isProxy()) {
+      return true;
+    }
+    if (candidate.isObject()) {
+      auto obj = candidate.getGC<Object>();
+      auto callableIt = obj->properties.find("__callable_object__");
+      return callableIt != obj->properties.end() &&
+             callableIt->second.isBool() &&
+             callableIt->second.toBool();
+    }
+    return false;
+  };
+
+  auto [foundAsyncMethod, asyncMethod] = getPropertyForExternal(value, WellKnownSymbols::asyncDisposeKey());
+  if (flow_.type == ControlFlow::Type::Throw) {
+    return false;
+  }
+  if (foundAsyncMethod && !asyncMethod.isUndefined() && !asyncMethod.isNull()) {
+    if (!isCallableLike(asyncMethod)) {
+      throwError(ErrorType::TypeError, "value does not have a callable @@asyncDispose");
+      return false;
+    }
+    disposableResources_.push_back({value, asyncMethod, true});
+    return true;
+  }
+
+  auto [foundSyncMethod, syncMethod] = getPropertyForExternal(value, WellKnownSymbols::disposeKey());
+  if (flow_.type == ControlFlow::Type::Throw) {
+    return false;
+  }
+  if (!foundSyncMethod || syncMethod.isUndefined() || syncMethod.isNull() || !isCallableLike(syncMethod)) {
+    throwError(ErrorType::TypeError, "value does not have a callable @@asyncDispose");
+    return false;
+  }
+  disposableResources_.push_back({value, syncMethod, true});
+  return true;
+}
+
+void Interpreter::disposeSyncDisposableScope(size_t startIndex) {
+  Value accumulatedError = Value(Undefined{});
+  bool hasAccumulatedError = false;
+  if (flow_.type == ControlFlow::Type::Throw) {
+    accumulatedError = flow_.value;
+    hasAccumulatedError = true;
+  }
+
+  while (disposableResources_.size() > startIndex) {
+    auto resource = disposableResources_.back();
+    disposableResources_.pop_back();
+
+    auto savedFlow = flow_;
+    flow_.reset();
+    Value callResult = callFunction(resource.method, {}, resource.value);
+    if (flow_.type == ControlFlow::Type::Throw) {
+      Value disposeError = flow_.value;
+      flow_.reset();
+      if (hasAccumulatedError) {
+        accumulatedError = makeSuppressedErrorValue(disposeError, accumulatedError);
+      } else {
+        accumulatedError = disposeError;
+        hasAccumulatedError = true;
+      }
+      continue;
+    }
+    if (resource.awaitDispose) {
+      awaitValue(callResult);
+      if (flow_.type == ControlFlow::Type::Throw) {
+        Value disposeError = flow_.value;
+        flow_.reset();
+        if (hasAccumulatedError) {
+          accumulatedError = makeSuppressedErrorValue(disposeError, accumulatedError);
+        } else {
+          accumulatedError = disposeError;
+          hasAccumulatedError = true;
+        }
+        continue;
+      }
+    }
+
+    flow_ = savedFlow;
+  }
+
+  if (hasAccumulatedError) {
+    flow_.type = ControlFlow::Type::Throw;
+    flow_.value = accumulatedError;
+  }
+}
+
+void Interpreter::initializeLexicalDeclarations(const std::vector<StmtPtr>& body) {
+  for (const auto& s : body) {
+    if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
+      if (varDecl->kind == VarDeclaration::Kind::Let ||
+          varDecl->kind == VarDeclaration::Kind::Const ||
+          varDecl->kind == VarDeclaration::Kind::Using ||
+          varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
+        for (const auto& declarator : varDecl->declarations) {
+          std::vector<std::string> names;
+          collectVarHoistNames(*declarator.pattern, names);
+          for (const auto& name : names) {
+            env_->defineTDZ(name);
+          }
+        }
+      }
+    } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
+      env_->defineTDZ(classDecl->id.name);
+    }
+  }
+}
+
+void Interpreter::hoistFunctionDeclarations(const std::vector<StmtPtr>& body) {
+  for (const auto& stmt : body) {
+    if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
+      auto task = evaluate(*stmt);
+      LIGHTJS_RUN_TASK_VOID_SYNC(task);
+    }
+  }
+}
+
 Task Interpreter::evaluateGeneratorBody(const std::vector<StmtPtr>& body) {
   Value result = Value(Undefined{});
+  size_t disposableScope = beginSyncDisposableScope();
   for (const auto& stmt : body) {
     { auto _t = evaluate(*stmt); LIGHTJS_RUN_TASK(_t, result); }
     if (flow_.type == ControlFlow::Type::Return ||
@@ -1503,6 +1790,7 @@ Task Interpreter::evaluateGeneratorBody(const std::vector<StmtPtr>& body) {
       break;
     }
   }
+  disposeSyncDisposableScope(disposableScope);
   LIGHTJS_RETURN(result);
 }
 
@@ -1536,7 +1824,9 @@ Task Interpreter::evaluate(const Program& program) {
         std::vector<std::string> lexNames;
         if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
           if (varDecl->kind == VarDeclaration::Kind::Let ||
-              varDecl->kind == VarDeclaration::Kind::Const) {
+              varDecl->kind == VarDeclaration::Kind::Const ||
+              varDecl->kind == VarDeclaration::Kind::Using ||
+              varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
             for (const auto& declarator : varDecl->declarations) {
               collectVarHoistNames(*declarator.pattern, lexNames);
             }
@@ -1563,7 +1853,9 @@ Task Interpreter::evaluate(const Program& program) {
   for (const auto& stmt : program.body) {
     if (auto* varDecl = std::get_if<VarDeclaration>(&stmt->node)) {
       if (varDecl->kind == VarDeclaration::Kind::Let ||
-          varDecl->kind == VarDeclaration::Kind::Const) {
+          varDecl->kind == VarDeclaration::Kind::Const ||
+          varDecl->kind == VarDeclaration::Kind::Using ||
+          varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
         for (const auto& declarator : varDecl->declarations) {
           std::vector<std::string> names;
           collectVarHoistNames(*declarator.pattern, names);
@@ -1590,6 +1882,7 @@ Task Interpreter::evaluate(const Program& program) {
 
   // Script/module bodies use UpdateEmpty to preserve the last non-empty completion.
   Value result = Value(Empty{});
+  size_t disposableScope = beginSyncDisposableScope();
   for (const auto& stmt : program.body) {
     if (program.isModule && std::holds_alternative<ImportDeclaration>(stmt->node)) {
       continue;
@@ -1608,6 +1901,7 @@ Task Interpreter::evaluate(const Program& program) {
       break;
     }
   }
+  disposeSyncDisposableScope(disposableScope);
   strictMode_ = previousStrictMode;
   if (result.isEmpty()) {
     result = Value(Undefined{});
@@ -1904,6 +2198,83 @@ Task Interpreter::evaluate(const Statement& stmt) {
         methodName = toPropertyKeyString(keyValue);
       }
 
+      // Handle field declarations and auto-accessors
+      if (method.kind == MethodDefinition::Kind::AutoAccessor) {
+        Class::FieldInit fi;
+        fi.name = method.isPrivate ? privateAutoAccessorBackingName(methodName)
+                                   : publicAutoAccessorStorageKey(methodName);
+        fi.isPrivate = method.isPrivate;
+        if (method.initializer) {
+          fi.initExpr = std::shared_ptr<void>(
+            const_cast<Expression*>(method.initializer.get()),
+            [](void*){}
+          );
+        }
+        if (method.isStatic) {
+          StaticInitStep step;
+          step.kind = StaticInitStep::Kind::Field;
+          step.field = std::move(fi);
+          staticInitSteps.push_back(std::move(step));
+        } else {
+          cls->fieldInitializers.push_back(std::move(fi));
+        }
+
+        std::string storageKey =
+            method.isPrivate
+                ? privateStorageKey(cls, privateAutoAccessorBackingName(methodName))
+                : publicAutoAccessorStorageKey(methodName);
+        auto makeAutoAccessor = [&](bool isSetter) {
+          auto fn = GarbageCollector::makeGC<Function>();
+          fn->isNative = true;
+          fn->isStrict = true;
+          fn->properties["__uses_this_arg__"] = Value(true);
+          fn->properties["length"] = Value(isSetter ? 1.0 : 0.0);
+          fn->properties["__non_writable_length"] = Value(true);
+          fn->properties["__non_enum_length"] = Value(true);
+          fn->properties["name"] = Value((isSetter ? "set " : "get ") + methodName);
+          fn->properties["__non_writable_name"] = Value(true);
+          fn->properties["__non_enum_name"] = Value(true);
+          fn->nativeFunc = [storageKey, isSetter](const std::vector<Value>& args) -> Value {
+            Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+            auto* storage = getHiddenFieldStorage(receiver);
+            if (!storage) {
+              throw std::runtime_error("TypeError: Cannot access auto-accessor on non-object receiver");
+            }
+            auto it = storage->find(storageKey);
+            if (it == storage->end()) {
+              throw std::runtime_error("TypeError: Cannot access auto-accessor on receiver without backing storage");
+            }
+            if (isSetter) {
+              (*storage)[storageKey] = args.size() > 1 ? args[1] : Value(Undefined{});
+              return Value(Undefined{});
+            }
+            return it->second;
+          };
+          return fn;
+        };
+        auto getter = makeAutoAccessor(false);
+        auto setter = makeAutoAccessor(true);
+        if (method.isStatic) {
+          if (method.isPrivate) {
+            std::string mangledName = privateStorageKey(cls, methodName);
+            cls->properties["__get_" + mangledName] = Value(getter);
+            cls->properties["__set_" + mangledName] = Value(setter);
+          } else {
+            cls->properties["__get_" + methodName] = Value(getter);
+            cls->properties["__set_" + methodName] = Value(setter);
+            cls->properties["__non_enum_" + methodName] = Value(true);
+          }
+        } else if (method.isPrivate) {
+          cls->getters[methodName] = getter;
+          cls->setters[methodName] = setter;
+        } else {
+          classPrototype->properties["__get_" + methodName] = Value(getter);
+          classPrototype->properties["__set_" + methodName] = Value(setter);
+          classPrototype->properties["__non_enum_" + methodName] = Value(true);
+        }
+        continue;
+      }
+
       // Handle field declarations
       if (method.kind == MethodDefinition::Kind::Field) {
         if (method.isStatic && !method.isPrivate && methodName == "prototype") {
@@ -2113,25 +2484,10 @@ Task Interpreter::evaluate(const Statement& stmt) {
 
       hoistVarDeclarations(body);
       env_ = env_->createChild();
-
-      for (const auto& s : body) {
-        if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-          if (varDecl->kind == VarDeclaration::Kind::Let ||
-              varDecl->kind == VarDeclaration::Kind::Const) {
-            for (const auto& declarator : varDecl->declarations) {
-              std::vector<std::string> names;
-              collectVarHoistNames(*declarator.pattern, names);
-              for (const auto& name : names) {
-                env_->defineTDZ(name);
-              }
-            }
-          }
-        } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-          env_->defineTDZ(classDecl->id.name);
-        }
-      }
+      initializeLexicalDeclarations(body);
 
       strictMode_ = true;
+      size_t disposableScope = beginSyncDisposableScope();
       for (const auto& s : body) {
         auto t = evaluate(*s);
         LIGHTJS_RUN_TASK_VOID(t);
@@ -2139,6 +2495,7 @@ Task Interpreter::evaluate(const Statement& stmt) {
           break;
         }
       }
+      disposeSyncDisposableScope(disposableScope);
 
       strictMode_ = prevStrict;
       env_ = prevEnvStatic;
@@ -2590,6 +2947,9 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         throwError(ErrorType::TypeError, "Right-hand side of 'in' should be an object");
         LIGHTJS_RETURN(Value(Undefined{}));
       }
+      if (rightValue.isObject() && rightValue.getGC<Object>()->isModuleNamespace) {
+        LIGHTJS_RETURN(Value(false));
+      }
 
       if (!activePrivateOwnerClass_) {
         LIGHTJS_RETURN(Value(false));
@@ -2825,7 +3185,7 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
         LIGHTJS_RETURN(Value(Undefined{}));
       }
       if (lhs.isString() || rhs.isString()) {
-        LIGHTJS_RETURN(Value(lhs.toString() + rhs.toString()));
+        LIGHTJS_RETURN(Value(unicode::normalizeUTF8(lhs.toString() + rhs.toString())));
       }
       if (lhs.isBigInt() && rhs.isBigInt()) {
         LIGHTJS_RETURN(Value(BigInt(lhs.toBigInt() + rhs.toBigInt())));
@@ -3517,7 +3877,19 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
           auto proto = protoIt->second.getGC<Object>();
           int depth = 0;
           while (proto && depth < 50) {
-            if (proto->properties.find(propName) != proto->properties.end()) return true;
+            if (proto->isModuleNamespace) {
+              triggerDeferredNamespaceIfNeeded(proto, propName);
+              if ((!isDeferredNamespaceSymbolLikeKey(propName) &&
+                   std::find(proto->moduleExportNames.begin(),
+                             proto->moduleExportNames.end(),
+                             propName) != proto->moduleExportNames.end()) ||
+                  proto->properties.find("__get_" + propName) != proto->properties.end() ||
+                  proto->properties.find(propName) != proto->properties.end()) {
+                return true;
+              }
+            } else if (proto->properties.find(propName) != proto->properties.end()) {
+              return true;
+            }
             auto nextProto = proto->properties.find("__proto__");
             if (nextProto == proto->properties.end() || !nextProto->second.isObject()) break;
             proto = nextProto->second.getGC<Object>();
@@ -3529,6 +3901,16 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       if (right.isObject()) {
         auto objPtr = right.getGC<Object>();
+        if (objPtr->isModuleNamespace) {
+          triggerDeferredNamespaceIfNeeded(objPtr, propName);
+          bool hasProp = ((!isDeferredNamespaceSymbolLikeKey(propName)) &&
+                          std::find(objPtr->moduleExportNames.begin(),
+                                    objPtr->moduleExportNames.end(),
+                                    propName) != objPtr->moduleExportNames.end()) ||
+                         objPtr->properties.find("__get_" + propName) != objPtr->properties.end() ||
+                         objPtr->properties.find(propName) != objPtr->properties.end();
+          LIGHTJS_RETURN(Value(hasProp));
+        }
         LIGHTJS_RETURN(Value(hasPropertyInChain(objPtr->properties)));
       }
 
@@ -3598,34 +3980,45 @@ Task Interpreter::evaluateBinary(const BinaryExpr& expr) {
 
       // 2. Let instOfHandler be GetMethod(C, @@hasInstance).
       // 3. If instOfHandler is not undefined, return ToBoolean(Call(instOfHandler, C, «O»)).
-      // Note: Only check OWN @@hasInstance to avoid triggering the default
-      // Function.prototype[@@hasInstance] (OrdinaryHasInstance), which is
-      // already implemented below with better type coverage.
+      // Skip the intrinsic %FunctionPrototype%[@@hasInstance] so the optimized
+      // OrdinaryHasInstance path below can preserve engine-specific built-in handling.
       {
         const std::string& hasInstanceKey = WellKnownSymbols::hasInstanceKey();
-        bool foundOwn = false;
-        Value handler;
-        if (right.isFunction()) {
-          auto fn = right.getGC<Function>();
-          auto it = fn->properties.find(hasInstanceKey);
-          if (it != fn->properties.end()) { foundOwn = true; handler = it->second; }
-        } else if (right.isClass()) {
-          auto cls = right.getGC<Class>();
-          auto it = cls->properties.find(hasInstanceKey);
-          if (it != cls->properties.end()) { foundOwn = true; handler = it->second; }
-        } else if (right.isObject()) {
-          auto obj = right.getGC<Object>();
-          auto it = obj->properties.find(hasInstanceKey);
-          if (it != obj->properties.end()) { foundOwn = true; handler = it->second; }
+        auto [foundHandler, handler] = getPropertyForExternal(right, hasInstanceKey);
+        if (hasError()) {
+          LIGHTJS_RETURN(Value(Undefined{}));
         }
-        if (foundOwn && !handler.isUndefined()) {
+        if (foundHandler && !handler.isUndefined()) {
           if (!handler.isFunction()) {
             throwError(ErrorType::TypeError, "Symbol.hasInstance is not callable");
             LIGHTJS_RETURN(Value(Undefined{}));
           }
-          Value result = callFunction(handler, {left}, right);
-          if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
-          LIGHTJS_RETURN(Value(result.toBool()));
+
+          bool isIntrinsicHasInstance = false;
+          if (auto functionCtor = env_->get("Function");
+              functionCtor && functionCtor->isFunction()) {
+            auto [foundPrototype, functionPrototype] =
+              getPropertyForPrimitive(*functionCtor, "prototype");
+            if (!hasError() && foundPrototype) {
+              auto [foundIntrinsic, intrinsicHandler] =
+                getPropertyForPrimitive(functionPrototype, hasInstanceKey);
+              if (!hasError() &&
+                  foundIntrinsic &&
+                  intrinsicHandler.isFunction() &&
+                  handler.getGC<Function>() == intrinsicHandler.getGC<Function>()) {
+                isIntrinsicHasInstance = true;
+              }
+            }
+            if (hasError()) {
+              LIGHTJS_RETURN(Value(Undefined{}));
+            }
+          }
+
+          if (!isIntrinsicHasInstance) {
+            Value result = callFunction(handler, {left}, right);
+            if (hasError()) LIGHTJS_RETURN(Value(Undefined{}));
+            LIGHTJS_RETURN(Value(result.toBool()));
+          }
         }
       }
 
@@ -4085,6 +4478,7 @@ Task Interpreter::evaluateUnary(const UnaryExpr& expr) {
       if (obj.isObject()) {
         auto objPtr = obj.getGC<Object>();
         if (objPtr->isModuleNamespace) {
+          triggerDeferredNamespaceIfNeeded(objPtr, propName);
           const std::string& toStringTagKey = WellKnownSymbols::toStringTagKey();
           bool isExport = std::find(
             objPtr->moduleExportNames.begin(),
@@ -5595,6 +5989,15 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       if (isSuperTarget && superReceiver.isObject()) {
         receiver = superReceiver;
       }
+      if (isSuperTarget &&
+          receiver.isObject() &&
+          receiver.getGC<Object>()->isModuleNamespace) {
+        if (strictMode_) {
+          throwError(ErrorType::TypeError, "Cannot assign to property '" + propName + "' of module namespace object");
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        LIGHTJS_RETURN(right);
+      }
 
       auto ordinarySet = [&](auto&& self,
                              const Value& base,
@@ -5630,6 +6033,9 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
         if (base.isObject()) {
           auto baseObj = base.getGC<Object>();
+          if (baseObj->isModuleNamespace) {
+            return false;
+          }
           std::string getterName = "__get_" + key;
           std::string setterName = "__set_" + key;
           auto setterIt = baseObj->properties.find(setterName);
@@ -5735,6 +6141,13 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
       auto writeObjPtr = objPtr;
       if (isSuperTarget && superReceiver.isObject()) {
         writeObjPtr = superReceiver.getGC<Object>();
+        if (writeObjPtr->isModuleNamespace) {
+          if (strictMode_) {
+            throwError(ErrorType::TypeError, "Cannot assign to property '" + propName + "' of module namespace object");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(right);
+        }
       }
 
       // Handle private field assignment (#name)
@@ -6162,15 +6575,155 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
 
     if (obj.isRegex()) {
       auto rxPtr = obj.getGC<Regex>();
+      std::string getterName = "__get_" + propName;
+      std::string setterName = "__set_" + propName;
+      auto getterIt = rxPtr->properties.find(getterName);
+      auto setterIt = rxPtr->properties.find(setterName);
+      bool hasGetter = getterIt != rxPtr->properties.end() && getterIt->second.isFunction();
+      bool hasSetter = setterIt != rxPtr->properties.end() && setterIt->second.isFunction();
+      bool baseHasDataProp = rxPtr->properties.count(propName) > 0;
+      bool inheritedHasGetter = false;
+      bool inheritedHasSetter = false;
+      bool inheritedDataNonWritable = false;
+      Value inheritedGetter(Undefined{});
+      Value inheritedSetter(Undefined{});
+      if (!hasGetter && !hasSetter && !baseHasDataProp) {
+        auto protoIt = rxPtr->properties.find("__proto__");
+        if (protoIt != rxPtr->properties.end()) {
+          Value protoVal = protoIt->second;
+          int depth = 0;
+          while (depth < 50) {
+            if (protoVal.isNull() || protoVal.isUndefined()) break;
+            if (protoVal.isObject()) {
+              auto proto = protoVal.getGC<Object>();
+              auto gIt = proto->properties.find(getterName);
+              auto sIt = proto->properties.find(setterName);
+              bool g = gIt != proto->properties.end() && gIt->second.isFunction();
+              bool s = sIt != proto->properties.end() && sIt->second.isFunction();
+              if (g || s) {
+                inheritedHasGetter = g;
+                inheritedHasSetter = s;
+                if (g) inheritedGetter = gIt->second;
+                if (s) inheritedSetter = sIt->second;
+                break;
+              }
+              if (proto->properties.count(propName) > 0) {
+                inheritedDataNonWritable =
+                  proto->properties.count("__non_writable_" + propName) > 0;
+                break;
+              }
+              auto nextProto = proto->properties.find("__proto__");
+              if (nextProto == proto->properties.end()) break;
+              protoVal = nextProto->second;
+            } else if (protoVal.isClass()) {
+              auto protoCls = protoVal.getGC<Class>();
+              auto gIt = protoCls->properties.find(getterName);
+              auto sIt = protoCls->properties.find(setterName);
+              bool g = gIt != protoCls->properties.end() && gIt->second.isFunction();
+              bool s = sIt != protoCls->properties.end() && sIt->second.isFunction();
+              if (g || s) {
+                inheritedHasGetter = g;
+                inheritedHasSetter = s;
+                if (g) inheritedGetter = gIt->second;
+                if (s) inheritedSetter = sIt->second;
+                break;
+              }
+              if (protoCls->properties.count(propName) > 0) {
+                inheritedDataNonWritable =
+                  protoCls->properties.count("__non_writable_" + propName) > 0;
+                break;
+              }
+              auto nextProto = protoCls->properties.find("__proto__");
+              if (nextProto == protoCls->properties.end()) break;
+              protoVal = nextProto->second;
+            } else {
+              break;
+            }
+            depth++;
+          }
+        }
+      }
+
       if (expr.op == AssignmentExpr::Op::Assign) {
+        if (hasSetter) {
+          invokeFunction(setterIt->second.getGC<Function>(), {right}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(right);
+        }
+        if (inheritedHasSetter) {
+          invokeFunction(inheritedSetter.getGC<Function>(), {right}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(right);
+        }
+        if ((hasGetter && !hasSetter) || (inheritedHasGetter && !inheritedHasSetter)) {
+          if (strictMode_) {
+            throwError(ErrorType::TypeError,
+                       "Cannot set property " + propName + " which has only a getter");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(right);
+        }
+        if (rxPtr->properties.count("__non_writable_" + propName) || inheritedDataNonWritable) {
+          if (strictMode_) {
+            throwError(ErrorType::TypeError,
+                       "Cannot assign to read only property '" + propName + "'");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(right);
+        }
         rxPtr->properties[propName] = right;
       } else {
         Value current = Value(Undefined{});
-        auto it = rxPtr->properties.find(propName);
-        if (it != rxPtr->properties.end()) current = it->second;
+        if (hasGetter) {
+          current = callFunction(getterIt->second, {}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        } else if (inheritedHasGetter) {
+          current = callFunction(inheritedGetter, {}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+        } else if (auto it = rxPtr->properties.find(propName); it != rxPtr->properties.end()) {
+          current = it->second;
+        }
         Value result;
         if (!computeCompoundValue(expr.op, current, right, result)) {
           LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        if (hasSetter) {
+          invokeFunction(setterIt->second.getGC<Function>(), {result}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(result);
+        }
+        if (inheritedHasSetter) {
+          invokeFunction(inheritedSetter.getGC<Function>(), {result}, obj);
+          if (hasError()) {
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(result);
+        }
+        if ((hasGetter && !hasSetter) || (inheritedHasGetter && !inheritedHasSetter)) {
+          if (strictMode_) {
+            throwError(ErrorType::TypeError,
+                       "Cannot set property " + propName + " which has only a getter");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(result);
+        }
+        if (rxPtr->properties.count("__non_writable_" + propName) || inheritedDataNonWritable) {
+          if (strictMode_) {
+            throwError(ErrorType::TypeError,
+                       "Cannot assign to read only property '" + propName + "'");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(result);
         }
         rxPtr->properties[propName] = result;
         LIGHTJS_RETURN(result);
@@ -8621,8 +9174,8 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       }
     }
 
-    // Deferred dynamic import namespace: trigger evaluation on first external property access.
-    if (propName.rfind("__", 0) != 0) {
+    // Deferred namespace objects evaluate on first non-symbol-like property access.
+    if (propName.rfind("__", 0) != 0 && !isDeferredNamespaceSymbolLikeKey(propName)) {
       auto pendingIt = objPtr->properties.find("__deferred_pending__");
       auto evalIt = objPtr->properties.find("__deferred_eval__");
       if (pendingIt != objPtr->properties.end() &&
@@ -8670,6 +9223,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         }
         proto = protoIt->second.getGC<Object>();
         depth++;
+        if (proto->isModuleNamespace) {
+          triggerDeferredNamespaceIfNeeded(proto, propName);
+        }
         // Check getter on prototype
         auto protoGetterIt = proto->properties.find("__get_" + propName);
         if (protoGetterIt != proto->properties.end() && protoGetterIt->second.isFunction()) {
@@ -8773,6 +9329,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           if (k.size() > 7 && k.substr(0, 7) == "__enum_") return true;
           return false;
         };
+        auto hasOwnPropertyInBag = [&](const auto& props, const std::string& k) -> bool {
+          return props.count(k) > 0 || props.count("__get_" + k) > 0 ||
+                 props.count("__set_" + k) > 0;
+        };
         if (isHiddenInternalKey(key)) return Value(false);
 
         if (receiver.isObject()) {
@@ -8780,73 +9340,74 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           if (key == "__proto__" && objPtr->properties.count("__own_prop___proto__") > 0) {
             return Value(true);
           }
-          return Value(objPtr->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(objPtr->properties, key));
         }
         if (receiver.isFunction()) {
           auto fnPtr = receiver.getGC<Function>();
-          return Value(fnPtr->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(fnPtr->properties, key));
         }
         if (receiver.isArray()) {
           auto arrPtr = receiver.getGC<Array>();
           if (key == "length") return Value(true);
+          if (hasOwnPropertyInBag(arrPtr->properties, key)) return Value(true);
           size_t idx = 0;
           if (parseArrayIndex(key, idx) && idx < arrPtr->elements.size()) return Value(true);
-          return Value(arrPtr->properties.count(key) > 0);
+          return Value(false);
         }
         if (receiver.isRegex()) {
           auto rxPtr = receiver.getGC<Regex>();
-          if (key == "source" || key == "flags") return Value(true);
-          return Value(rxPtr->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(rxPtr->properties, key));
         }
         if (receiver.isPromise()) {
           auto p = receiver.getGC<Promise>();
-          return Value(p->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(p->properties, key));
         }
         if (receiver.isClass()) {
           auto cls = receiver.getGC<Class>();
-          return Value(cls->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(cls->properties, key));
         }
         if (receiver.isGenerator()) {
           auto gen = receiver.getGC<Generator>();
-          return Value(gen->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(gen->properties, key));
         }
         if (receiver.isMap()) {
           auto m = receiver.getGC<Map>();
-          return Value(m->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(m->properties, key));
         }
         if (receiver.isSet()) {
           auto s = receiver.getGC<Set>();
-          return Value(s->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(s->properties, key));
         }
         if (receiver.isWeakMap()) {
           auto wm = receiver.getGC<WeakMap>();
-          return Value(wm->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(wm->properties, key));
         }
         if (receiver.isWeakSet()) {
           auto ws = receiver.getGC<WeakSet>();
-          return Value(ws->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(ws->properties, key));
         }
         if (receiver.isTypedArray()) {
           auto ta = receiver.getGC<TypedArray>();
           if (key == "length" || key == "byteLength" || key == "buffer" || key == "byteOffset") {
             return Value(true);
           }
+          if (hasOwnPropertyInBag(ta->properties, key)) return Value(true);
           size_t idx = 0;
           if (parseArrayIndex(key, idx) && idx < ta->currentLength()) return Value(true);
-          return Value(ta->properties.count(key) > 0);
+          return Value(false);
         }
         if (receiver.isArrayBuffer()) {
           auto b = receiver.getGC<ArrayBuffer>();
           if (key == "byteLength") return Value(true);
-          return Value(b->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(b->properties, key));
         }
         if (receiver.isDataView()) {
           auto v = receiver.getGC<DataView>();
-          return Value(v->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(v->properties, key));
         }
         if (receiver.isError()) {
           auto e = receiver.getGC<Error>();
-          return Value(e->properties.count(key) > 0);
+          return Value(hasOwnPropertyInBag(e->properties, key));
         }
         return Value(false);
       };
@@ -8865,36 +9426,39 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         auto isEnumerableForMarkers = [&](const auto& props) -> bool {
           return props.find("__non_enum_" + key) == props.end();
         };
+        auto hasOwnPropertyInBag = [&](const auto& props) -> bool {
+          return props.count(key) > 0 || props.count("__get_" + key) > 0 ||
+                 props.count("__set_" + key) > 0;
+        };
 
         if (receiver.isArray()) {
           auto arrPtr = receiver.getGC<Array>();
           if (key == "length") return Value(false);
           size_t idx = 0;
           if (parseArrayIndex(key, idx) && idx < arrPtr->elements.size()) return Value(true);
-          if (arrPtr->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(arrPtr->properties)) return Value(false);
           return Value(isEnumerableForMarkers(arrPtr->properties));
         }
         if (receiver.isObject()) {
           auto objPtr = receiver.getGC<Object>();
-          if (objPtr->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(objPtr->properties)) return Value(false);
           return Value(isEnumerableForMarkers(objPtr->properties));
         }
         if (receiver.isFunction()) {
           auto fnPtr = receiver.getGC<Function>();
-          if (fnPtr->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(fnPtr->properties)) return Value(false);
           // name/length are non-enumerable by spec
           if (key == "name" || key == "length") return Value(false);
           return Value(isEnumerableForMarkers(fnPtr->properties));
         }
         if (receiver.isRegex()) {
           auto rxPtr = receiver.getGC<Regex>();
-          if (key == "source" || key == "flags") return Value(true);
-          if (rxPtr->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(rxPtr->properties)) return Value(false);
           return Value(isEnumerableForMarkers(rxPtr->properties));
         }
         if (receiver.isError()) {
           auto e = receiver.getGC<Error>();
-          if (e->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(e->properties)) return Value(false);
           return Value(isEnumerableForMarkers(e->properties));
         }
         if (receiver.isTypedArray()) {
@@ -8904,7 +9468,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           }
           size_t idx = 0;
           if (parseArrayIndex(key, idx) && idx < ta->currentLength()) return Value(true);
-          if (ta->properties.count(key) == 0) return Value(false);
+          if (!hasOwnPropertyInBag(ta->properties)) return Value(false);
           return Value(isEnumerableForMarkers(ta->properties));
         }
         // Fallback: not enumerable.
@@ -8928,12 +9492,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
 
   if (obj.isFunction()) {
     auto funcPtr = obj.getGC<Function>();
-    if ((funcPtr->isStrict || funcPtr->isGenerator) &&
+    bool isArrowFunction =
+      funcPtr->properties.find("__is_arrow_function__") != funcPtr->properties.end();
+    bool isBoundFunction = funcPtr->properties.find("__bound_target__") != funcPtr->properties.end();
+    if ((funcPtr->isStrict || funcPtr->isGenerator || isArrowFunction || isBoundFunction) &&
         (propName == "caller" || propName == "arguments")) {
       throwError(ErrorType::TypeError, "'caller', 'callee', and 'arguments' properties may not be accessed");
       LIGHTJS_RETURN(Value(Undefined{}));
     }
-
     // Use %Function.prototype%.{call,apply,bind} so semantics match built-ins (esp. bound functions).
     auto resolveFunctionPrototypeMethod = [&](const std::string& name) -> std::optional<Value> {
       auto tryLookupOnProtoValue = [&](const Value& protoValue) -> std::optional<Value> {
@@ -9017,6 +9583,23 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     auto it = funcPtr->properties.find(propName);
     if (it != funcPtr->properties.end()) {
       LIGHTJS_RETURN(it->second);
+    }
+    if (propName == "caller") {
+      if (activeFunction_.get() == funcPtr.get() && !callerContextStack_.empty()) {
+        const auto& callerContext = callerContextStack_.back();
+        if (callerContext.function) {
+          bool restrictedCaller =
+              callerContext.function->isStrict ||
+              callerContext.function->isGenerator ||
+              callerContext.function->properties.find("__bound_target__") != callerContext.function->properties.end();
+          if (restrictedCaller) {
+            throwError(ErrorType::TypeError, "'caller', 'callee', and 'arguments' properties may not be accessed");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
+          LIGHTJS_RETURN(Value(callerContext.function));
+        }
+      }
+      LIGHTJS_RETURN(Value(Undefined{}));
     }
 
     // Walk prototype chain (__proto__) for functions
@@ -9334,6 +9917,15 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
         return step;
       };
       LIGHTJS_RETURN(Value(fn));
+    }
+
+    // Fallback: look up property via prototype chain (e.g. Iterator.prototype.map)
+    auto [genFound, genVal] = getPropertyForPrimitive(obj, propName);
+    if (hasError()) {
+      LIGHTJS_RETURN(Value(Undefined{}));
+    }
+    if (genFound) {
+      LIGHTJS_RETURN(genVal);
     }
   }
 
@@ -10333,6 +10925,28 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       }
     }
 
+    if (auto protoIt = regexPtr->properties.find("__proto__");
+        protoIt != regexPtr->properties.end() && protoIt->second.isObject()) {
+      auto proto = protoIt->second.getGC<Object>();
+      int depth = 0;
+      while (proto && depth < 50) {
+        auto getterIt = proto->properties.find("__get_" + propName);
+        if (getterIt != proto->properties.end() && getterIt->second.isFunction()) {
+          LIGHTJS_RETURN(invokeFunction(getterIt->second.getGC<Function>(), {}, obj));
+        }
+        auto propIt = proto->properties.find(propName);
+        if (propIt != proto->properties.end()) {
+          LIGHTJS_RETURN(propIt->second);
+        }
+        auto nextProto = proto->properties.find("__proto__");
+        if (nextProto == proto->properties.end() || !nextProto->second.isObject()) {
+          break;
+        }
+        proto = nextProto->second.getGC<Object>();
+        depth++;
+      }
+    }
+
     // RegExp flag getters (ES spec 21.2.5.*)
     if (propName == "global") {
       LIGHTJS_RETURN(Value(regexPtr->flags.find('g') != std::string::npos));
@@ -10349,6 +10963,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "unicode") {
       LIGHTJS_RETURN(Value(regexPtr->flags.find('u') != std::string::npos));
     }
+    if (propName == "unicodeSets") {
+      LIGHTJS_RETURN(Value(regexPtr->flags.find('v') != std::string::npos));
+    }
     if (propName == "sticky") {
       LIGHTJS_RETURN(Value(regexPtr->flags.find('y') != std::string::npos));
     }
@@ -10357,26 +10974,19 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "flags") {
-      // Sort flags in canonical order: dgimsuy
-      std::string sortedFlags;
-      const char* canonical = "dgimsuy";
-      for (const char* p = canonical; *p; ++p) {
-        if (regexPtr->flags.find(*p) != std::string::npos) {
-          sortedFlags += *p;
-        }
-      }
-      LIGHTJS_RETURN(Value(sortedFlags));
+      LIGHTJS_RETURN(Value(canonicalizeRegexFlags(regexPtr->flags)));
     }
     if (propName == "source") {
-      std::string src = regexPtr->pattern;
-      if (src.empty()) src = "(?:)";
-      LIGHTJS_RETURN(Value(src));
+      LIGHTJS_RETURN(Value(escapeRegexPatternSource(regexPtr->pattern,
+                                                    regexPtr->flags)));
     }
     if (propName == "toString") {
       auto toStringFn = GarbageCollector::makeGC<Function>();
       toStringFn->isNative = true;
       toStringFn->nativeFunc = [regexPtr](const std::vector<Value>& /*args*/) -> Value {
-        return Value(std::string("/") + regexPtr->pattern + "/" + regexPtr->flags);
+        std::string source = escapeRegexPatternSource(regexPtr->pattern,
+                                                      regexPtr->flags);
+        return Value(std::string("/") + source + "/" + canonicalizeRegexFlags(regexPtr->flags));
       };
       LIGHTJS_RETURN(Value(toStringFn));
     }
@@ -10400,6 +11010,17 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             regexPtr->properties["lastIndex"] = Value(0.0);
             return Value(false);
           }
+        }
+        if (isSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags)) {
+          auto special =
+            tryMatchSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags, str, lastIndex);
+          bool found = special.has_value() && (!sticky || special->index == lastIndex);
+          if (found && (global || sticky)) {
+            regexPtr->properties["lastIndex"] = Value(static_cast<double>(special->end));
+          } else if (!found && (global || sticky)) {
+            regexPtr->properties["lastIndex"] = Value(0.0);
+          }
+          return Value(found);
         }
         // For global/sticky, search from lastIndex but preserve anchors
         // by using match_prev_avail and iterating from the correct position
@@ -10458,22 +11079,228 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "exec") {
       auto execFn = GarbageCollector::makeGC<Function>();
       execFn->isNative = true;
-      execFn->nativeFunc = [regexPtr](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(Null{});
-        std::string str = args[0].toString();
+      execFn->nativeFunc = [regexPtr, this](const std::vector<Value>& args) -> Value {
+        std::string str = args.empty() ? Value(Undefined{}).toString() : args[0].toString();
         bool global = regexPtr->flags.find('g') != std::string::npos;
         bool sticky = regexPtr->flags.find('y') != std::string::npos;
-        size_t lastIndex = 0;
-        if (global || sticky) {
-          auto liIt = regexPtr->properties.find("lastIndex");
-          if (liIt != regexPtr->properties.end()) {
-            double li = liIt->second.toNumber();
-            lastIndex = (li >= 0) ? static_cast<size_t>(li) : 0;
+        bool unicode = regexPtr->flags.find('u') != std::string::npos ||
+                       regexPtr->flags.find('v') != std::string::npos;
+        auto utf16IndexFromByteOffset = [&str](size_t rawOffset) -> double {
+          auto accumulateUtf16ByCodePointCount = [&str](size_t codePointCountTarget) -> size_t {
+            size_t cursor = 0;
+            size_t codePointCount = 0;
+            size_t utf16Units = 0;
+            while (cursor < str.size() && codePointCount < codePointCountTarget) {
+              uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+              utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+              codePointCount++;
+            }
+            return utf16Units;
+          };
+
+          if (rawOffset < str.size() &&
+              unicode::isContinuationByte(static_cast<uint8_t>(str[rawOffset]))) {
+            return static_cast<double>(accumulateUtf16ByCodePointCount(rawOffset));
           }
-          if (lastIndex > str.size()) {
-            regexPtr->properties["lastIndex"] = Value(0.0);
-            return Value(Null{});
+
+          size_t cursor = 0;
+          size_t utf16Units = 0;
+          while (cursor < rawOffset && cursor < str.size()) {
+            uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+            utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
           }
+          return static_cast<double>(utf16Units);
+        };
+        auto byteOffsetFromUtf16Index = [&str](size_t targetIndex) -> size_t {
+          size_t cursor = 0;
+          size_t utf16Units = 0;
+          while (cursor < str.size() && utf16Units < targetIndex) {
+            size_t currentByteOffset = cursor;
+            uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+            size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+            if (utf16Units + codeUnitWidth > targetIndex) {
+              return currentByteOffset;
+            }
+            utf16Units += codeUnitWidth;
+          }
+          return cursor;
+        };
+        auto toPrimitiveNumber = [&](const Value& input) -> Value {
+          if (!isObjectLike(input)) {
+            return input;
+          }
+          auto [hasExotic, exotic] = getPropertyForExternal(input, WellKnownSymbols::toPrimitiveKey());
+          if (hasError()) {
+            Value err = getError();
+            clearError();
+            throw JsValueException(err);
+          }
+          if (hasExotic && !exotic.isUndefined() && !exotic.isNull()) {
+            if (!exotic.isFunction()) {
+              throw std::runtime_error("TypeError: @@toPrimitive is not callable");
+            }
+            Value result = callForHarness(exotic, {Value(std::string("number"))}, input);
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw JsValueException(err);
+            }
+            if (isObjectLike(result)) {
+              throw std::runtime_error("TypeError: @@toPrimitive must return a primitive value");
+            }
+            return result;
+          }
+          for (const std::string& methodName : {"valueOf", "toString"}) {
+            auto [foundMethod, method] = getPropertyForExternal(input, methodName);
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw JsValueException(err);
+            }
+            if (!foundMethod || !method.isFunction()) {
+              continue;
+            }
+            Value result = callForHarness(method, {}, input);
+            if (hasError()) {
+              Value err = getError();
+              clearError();
+              throw JsValueException(err);
+            }
+            if (!isObjectLike(result)) {
+              return result;
+            }
+          }
+          throw std::runtime_error("TypeError: Cannot convert object to primitive value");
+        };
+        auto toLengthValue = [&](const Value& input) -> size_t {
+          Value primitive = toPrimitiveNumber(input);
+          if (primitive.isBigInt() || primitive.isSymbol()) {
+            throw std::runtime_error("TypeError: Cannot convert value to length");
+          }
+          double number = primitive.toNumber();
+          if (std::isnan(number) || number <= 0.0) {
+            return 0;
+          }
+          if (std::isinf(number)) {
+            return 9007199254740991ull;
+          }
+          double integer = std::floor(number);
+          if (integer > 9007199254740991.0) {
+            return 9007199254740991ull;
+          }
+          return static_cast<size_t>(integer);
+        };
+        auto setLastIndexValue = [&](double nextLastIndex) {
+          if (regexPtr->properties.find("__non_writable_lastIndex") != regexPtr->properties.end()) {
+            throw std::runtime_error("TypeError: Cannot assign to read only property 'lastIndex'");
+          }
+          regexPtr->properties["lastIndex"] = Value(nextLastIndex);
+        };
+        auto makeNullProtoObject = []() {
+          auto obj = GarbageCollector::makeGC<Object>();
+          GarbageCollector::instance().reportAllocation(sizeof(Object));
+          obj->properties["__null_proto__"] = Value(true);
+          return obj;
+        };
+        auto buildSpecialResult = [regexPtr, &str, &utf16IndexFromByteOffset, makeNullProtoObject](
+                                      const SpecialRegexMatchResult& special) {
+          auto arr = makeArrayWithPrototype();
+          arr->elements.push_back(Value(special.value));
+          for (const auto& capture : special.captures) {
+            if (capture.matched) arr->elements.push_back(Value(capture.value));
+            else arr->elements.push_back(Value(Undefined{}));
+          }
+          arr->properties["index"] = Value(utf16IndexFromByteOffset(special.index));
+          arr->properties["input"] = Value(str);
+
+          bool hasNamedCaptures = false;
+          for (const auto& name : regexPtr->captureGroupNames) {
+            if (!name.empty()) {
+              hasNamedCaptures = true;
+              break;
+            }
+          }
+          if (hasNamedCaptures) {
+            auto groups = makeNullProtoObject();
+            std::unordered_set<std::string> seenNames;
+            for (const auto& name : regexPtr->captureGroupNames) {
+              if (!name.empty() && seenNames.insert(name).second) {
+                groups->properties[name] = Value(Undefined{});
+              }
+            }
+            for (size_t i = 0; i < special.captures.size() && i < regexPtr->captureGroupNames.size(); ++i) {
+              const std::string& name = regexPtr->captureGroupNames[i];
+              if (!name.empty() && special.captures[i].matched) {
+                groups->properties[name] = Value(special.captures[i].value);
+              }
+            }
+            arr->properties["groups"] = Value(groups);
+          } else {
+            arr->properties["groups"] = Value(Undefined{});
+          }
+          if (regexPtr->flags.find('d') != std::string::npos) {
+            auto indices = makeArrayWithPrototype();
+            auto pushIndexPair = [&](const GCPtr<Array>& target, size_t start, size_t end) {
+              auto pair = makeArrayWithPrototype();
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(start)));
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(end)));
+              target->elements.push_back(Value(pair));
+            };
+            pushIndexPair(indices, special.index, special.end);
+            for (const auto& capture : special.captures) {
+              if (capture.matched) pushIndexPair(indices, capture.start, capture.end);
+              else indices->elements.push_back(Value(Undefined{}));
+            }
+            if (hasNamedCaptures) {
+              auto groups = makeNullProtoObject();
+              std::unordered_set<std::string> seenNames;
+              for (const auto& name : regexPtr->captureGroupNames) {
+                if (!name.empty() && seenNames.insert(name).second) {
+                  groups->properties[name] = Value(Undefined{});
+                }
+              }
+              for (size_t i = 0; i < special.captures.size() && i < regexPtr->captureGroupNames.size(); ++i) {
+                const std::string& name = regexPtr->captureGroupNames[i];
+                if (!name.empty() && special.captures[i].matched) {
+                  auto pair = makeArrayWithPrototype();
+                  pair->elements.push_back(Value(utf16IndexFromByteOffset(special.captures[i].start)));
+                  pair->elements.push_back(Value(utf16IndexFromByteOffset(special.captures[i].end)));
+                  groups->properties[name] = Value(pair);
+                }
+              }
+              indices->properties["groups"] = Value(groups);
+            }
+            arr->properties["indices"] = Value(indices);
+          }
+          return Value(arr);
+        };
+        size_t stringLengthUtf16 = unicode::utf16Length(str);
+        size_t lastIndexUtf16 = 0;
+        auto liIt = regexPtr->properties.find("lastIndex");
+        if (liIt != regexPtr->properties.end()) {
+          lastIndexUtf16 = toLengthValue(liIt->second);
+        }
+        size_t lastIndex = (global || sticky) ? byteOffsetFromUtf16Index(lastIndexUtf16) : 0;
+        if ((global || sticky) && lastIndexUtf16 > stringLengthUtf16) {
+          setLastIndexValue(0.0);
+          return Value(Null{});
+        }
+        if (isSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags)) {
+          if (auto special =
+                tryMatchSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags, str, lastIndex)) {
+            if (sticky && special->index != lastIndex) {
+              setLastIndexValue(0.0);
+              return Value(Null{});
+            }
+            if (global || sticky) {
+              setLastIndexValue(utf16IndexFromByteOffset(special->end));
+            }
+            return buildSpecialResult(*special);
+          }
+          if (global || sticky) {
+            setLastIndexValue(0.0);
+          }
+          return Value(Null{});
         }
 #if USE_SIMPLE_REGEX
         std::vector<simple_regex::Regex::Match> matches;
@@ -10497,13 +11324,13 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             if (arr->elements.size() == 1) { matchPos = m.position; matchLen = m.length; }
           }
           if (!found || arr->elements.empty()) {
-            if (global || sticky) regexPtr->properties["lastIndex"] = Value(0.0);
+            if (global || sticky) setLastIndexValue(0.0);
             return Value(Null{});
           }
-          arr->properties["index"] = Value(static_cast<double>(matchPos));
+          arr->properties["index"] = Value(utf16IndexFromByteOffset(matchPos));
           arr->properties["input"] = Value(str);
           if (global || sticky) {
-            regexPtr->properties["lastIndex"] = Value(static_cast<double>(matchPos + matchLen));
+            setLastIndexValue(utf16IndexFromByteOffset(matchPos + matchLen));
           }
           return Value(arr);
         }
@@ -10524,20 +11351,89 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
           found = std::regex_search(str, match, regexPtr->regex);
         }
         if (found) {
-          auto arr = GarbageCollector::makeGC<Array>();
-          for (const auto& m : match) {
-            arr->elements.push_back(Value(m.str()));
+          auto arr = makeArrayWithPrototype();
+          arr->elements.push_back(Value(match.str(0)));
+          for (size_t i = 1; i < match.size(); ++i) {
+            if (match[i].matched) arr->elements.push_back(Value(match.str(i)));
+            else arr->elements.push_back(Value(Undefined{}));
           }
-          arr->properties["index"] = Value(static_cast<double>(lastIndex + match.position(0)));
+          size_t matchIndex = lastIndex + static_cast<size_t>(match.position(0));
+          arr->properties["index"] = Value(utf16IndexFromByteOffset(matchIndex));
           arr->properties["input"] = Value(str);
+          bool hasNamedCaptures = false;
+          for (const auto& name : regexPtr->captureGroupNames) {
+            if (!name.empty()) {
+              hasNamedCaptures = true;
+              break;
+            }
+          }
+          if (hasNamedCaptures) {
+            auto groups = makeNullProtoObject();
+            std::unordered_set<std::string> seenNames;
+            for (const auto& name : regexPtr->captureGroupNames) {
+              if (!name.empty() && seenNames.insert(name).second) {
+                groups->properties[name] = Value(Undefined{});
+              }
+            }
+            for (size_t i = 1; i < match.size() && i <= regexPtr->captureGroupNames.size(); ++i) {
+              const std::string& name = regexPtr->captureGroupNames[i - 1];
+              if (!name.empty() && match[i].matched) {
+                groups->properties[name] = Value(match.str(i));
+              }
+            }
+            arr->properties["groups"] = Value(groups);
+          } else {
+            arr->properties["groups"] = Value(Undefined{});
+          }
+          if (regexPtr->flags.find('d') != std::string::npos) {
+            auto indices = makeArrayWithPrototype();
+            auto pushIndexPair = [&](const GCPtr<Array>& target, size_t start, size_t end) {
+              auto pair = makeArrayWithPrototype();
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(start)));
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(end)));
+              target->elements.push_back(Value(pair));
+            };
+            pushIndexPair(indices, matchIndex, matchIndex + static_cast<size_t>(match.length(0)));
+            for (size_t i = 1; i < match.size(); ++i) {
+              if (match[i].matched) {
+                size_t start = lastIndex + static_cast<size_t>(match.position(i));
+                pushIndexPair(indices, start, start + static_cast<size_t>(match.length(i)));
+              } else {
+                indices->elements.push_back(Value(Undefined{}));
+              }
+            }
+            if (hasNamedCaptures) {
+              auto groups = makeNullProtoObject();
+              std::unordered_set<std::string> seenNames;
+              for (const auto& name : regexPtr->captureGroupNames) {
+                if (!name.empty() && seenNames.insert(name).second) {
+                  groups->properties[name] = Value(Undefined{});
+                }
+              }
+              for (size_t i = 1; i < match.size() && i <= regexPtr->captureGroupNames.size(); ++i) {
+                const std::string& name = regexPtr->captureGroupNames[i - 1];
+                if (!name.empty() && match[i].matched) {
+                  size_t start = lastIndex + static_cast<size_t>(match.position(i));
+                  auto pair = makeArrayWithPrototype();
+                  pair->elements.push_back(Value(utf16IndexFromByteOffset(start)));
+                  pair->elements.push_back(Value(
+                      utf16IndexFromByteOffset(start + static_cast<size_t>(match.length(i)))));
+                  groups->properties[name] = Value(pair);
+                }
+              }
+              indices->properties["groups"] = Value(groups);
+            }
+            arr->properties["indices"] = Value(indices);
+          }
           if (global || sticky) {
-            regexPtr->properties["lastIndex"] = Value(static_cast<double>(lastIndex + match.position(0) + match.length(0)));
+            setLastIndexValue(
+                utf16IndexFromByteOffset(matchIndex + static_cast<size_t>(match.length(0))));
           }
           return Value(arr);
         }
 #endif
         if (global || sticky) {
-          regexPtr->properties["lastIndex"] = Value(0.0);
+          setLastIndexValue(0.0);
         }
         return Value(Null{});
       };
@@ -10549,7 +11445,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "flags") {
-      LIGHTJS_RETURN(Value(regexPtr->flags));
+      LIGHTJS_RETURN(Value(canonicalizeRegexFlags(regexPtr->flags)));
     }
 
     // Walk prototype chain for methods not handled above
@@ -10834,18 +11730,21 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "includes") {
-      auto includesFn = GarbageCollector::makeGC<Function>();
-      includesFn->isNative = true;
-      includesFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // IsRegExp check via Symbol.match
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
         if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
           auto* interp = getGlobalInterpreter();
           if (interp && (args[0].isObject() || args[0].isRegex() || args[0].isArray() || args[0].isFunction())) {
             const std::string& matchKey = WellKnownSymbols::matchKey();
             auto [found, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (interp->hasError()) {
+              Value err = interp->getError();
+              interp->clearError();
+              throw JsValueException(err);
+            }
             if (found && !matchProp.isUndefined()) {
-              if (matchProp.isBool() ? std::get<bool>(matchProp.data) : true) {
+              if (matchProp.toBool()) {
                 throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
               }
             } else if (args[0].isRegex()) {
@@ -10855,17 +11754,27 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
           }
         }
+
+        std::string s = std::get<std::string>(obj.data);
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         double pos = 0;
         if (args.size() > 1 && !args[1].isUndefined()) {
           pos = toIntegerForStringBuiltinArg(args[1]);
           if (pos < 0) pos = 0;
         }
-        size_t position = static_cast<size_t>(std::min(pos, static_cast<double>(str.length())));
-        return Value(str.find(searchStr, position) != std::string::npos);
+        size_t len = unicode::utf16Length(s);
+        size_t start = static_cast<size_t>(std::min(pos, static_cast<double>(len)));
+        if (searchStr.empty()) {
+          return Value(true);
+        }
+        if (start >= len) {
+          return Value(false);
+        }
+        std::string haystack = unicode::utf16Slice(s, static_cast<int>(start), static_cast<int>(len));
+        return Value(haystack.find(searchStr) != std::string::npos);
       };
-      setNativeFnProps(includesFn, "includes", 1);
-      LIGHTJS_RETURN(Value(includesFn));
+      setNativeFnProps(fn, "includes", 1);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "repeat") {
@@ -10892,163 +11801,110 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     }
 
     if (propName == "padStart") {
-      auto padStartFn = GarbageCollector::makeGC<Function>();
-      padStartFn->isNative = true;
-      padStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(str);
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        // We'll need to implement String_padStart if we want to redirect
+        // For now, let's keep it here but fix it to use UTF-16
+        std::string s = std::get<std::string>(obj.data);
+        if (args.empty()) return Value(s);
         double maxLen = toIntegerForStringBuiltinArg(args[0]);
         if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
         size_t targetLength = static_cast<size_t>(maxLen);
-        if (targetLength <= str.length()) return Value(str);
+        size_t currentLen = unicode::utf16Length(s);
+        if (targetLength <= currentLen) return Value(s);
 
         std::string padString = (args.size() > 1 && !args[1].isUndefined()) ? toStringForStringBuiltinArg(args[1]) : " ";
-        if (padString.empty()) return Value(str);
+        if (padString.empty()) return Value(s);
 
-        size_t padLength = targetLength - str.length();
-        std::string result;
-        while (result.length() < padLength) {
-          result += padString;
+        size_t padLength = targetLength - currentLen;
+        std::string pad;
+        size_t padUnitLen = unicode::utf16Length(padString);
+        while (unicode::utf16Length(pad) < padLength) {
+          pad += padString;
         }
-        result = result.substr(0, padLength) + str;
-        return Value(result);
+        // Slice pad to exact UTF-16 length
+        pad = unicode::utf16Slice(pad, 0, static_cast<int>(padLength));
+        return Value(pad + s);
       };
-      setNativeFnProps(padStartFn, "padStart", 1);
-      LIGHTJS_RETURN(Value(padStartFn));
+      setNativeFnProps(fn, "padStart", 1);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "padEnd") {
-      auto padEndFn = GarbageCollector::makeGC<Function>();
-      padEndFn->isNative = true;
-      padEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        if (args.empty()) return Value(str);
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::string s = std::get<std::string>(obj.data);
+        if (args.empty()) return Value(s);
         double maxLen = toIntegerForStringBuiltinArg(args[0]);
         if (std::isnan(maxLen) || maxLen < 0) maxLen = 0;
         size_t targetLength = static_cast<size_t>(maxLen);
-        if (targetLength <= str.length()) return Value(str);
+        size_t currentLen = unicode::utf16Length(s);
+        if (targetLength <= currentLen) return Value(s);
 
         std::string padString = (args.size() > 1 && !args[1].isUndefined()) ? toStringForStringBuiltinArg(args[1]) : " ";
-        if (padString.empty()) return Value(str);
+        if (padString.empty()) return Value(s);
 
-        size_t padLength = targetLength - str.length();
-        std::string result = str;
-        while (result.length() < targetLength) {
-          result += padString;
+        size_t padLength = targetLength - currentLen;
+        std::string pad;
+        while (unicode::utf16Length(pad) < padLength) {
+          pad += padString;
         }
-        result = result.substr(0, targetLength);
-        return Value(result);
+        pad = unicode::utf16Slice(pad, 0, static_cast<int>(padLength));
+        return Value(s + pad);
       };
-      setNativeFnProps(padEndFn, "padEnd", 1);
-      LIGHTJS_RETURN(Value(padEndFn));
+      setNativeFnProps(fn, "padEnd", 1);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "trim") {
-      auto trimFn = GarbageCollector::makeGC<Function>();
-      trimFn->isNative = true;
-      trimFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        return Value(stripESWhitespace(str));
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        return String_trim(fullArgs);
       };
-      setNativeFnProps(trimFn, "trim", 0);
-      LIGHTJS_RETURN(Value(trimFn));
+      setNativeFnProps(fn, "trim", 0);
+      LIGHTJS_RETURN(Value(fn));
     }
 
-    if (propName == "trimStart") {
-      auto trimStartFn = GarbageCollector::makeGC<Function>();
-      trimStartFn->isNative = true;
-      trimStartFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+    if (propName == "trimStart" || propName == "trimLeft") {
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripLeadingESWhitespace(str));
       };
-      setNativeFnProps(trimStartFn, "trimStart", 0);
-      LIGHTJS_RETURN(Value(trimStartFn));
+      setNativeFnProps(fn, propName, 0);
+      LIGHTJS_RETURN(Value(fn));
     }
 
-    if (propName == "trimEnd") {
-      auto trimEndFn = GarbageCollector::makeGC<Function>();
-      trimEndFn->isNative = true;
-      trimEndFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+    if (propName == "trimEnd" || propName == "trimRight") {
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         return Value(stripTrailingESWhitespace(str));
       };
-      setNativeFnProps(trimEndFn, "trimEnd", 0);
-      LIGHTJS_RETURN(Value(trimEndFn));
+      setNativeFnProps(fn, propName, 0);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "split") {
-      auto splitFn = GarbageCollector::makeGC<Function>();
-      splitFn->isNative = true;
-      splitFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // ES2020 21.1.3.17: If separator is not null/undefined, check for @@split
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            const std::string& splitKey = WellKnownSymbols::splitKey();
-            auto [found, splitter] = interp->getPropertyForExternal(args[0], splitKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            if (found && !splitter.isUndefined() && !splitter.isNull()) {
-              if (!splitter.isFunction()) throw std::runtime_error("TypeError: @@split is not a function");
-              Value limitVal = args.size() > 1 ? args[1] : Value(Undefined{});
-              Value result = interp->callForHarness(splitter, {Value(str), limitVal}, args[0]);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              return result;
-            }
-          }
-        }
-        auto result = makeArrayWithPrototype();
-
-        // Handle limit parameter (ToUint32 per spec)
-        uint32_t limit = 0xFFFFFFFF;
-        if (args.size() > 1 && !args[1].isUndefined()) {
-          double lim = toNumberForStringBuiltinArg(args[1]);
-          if (std::isnan(lim) || lim == 0.0) {
-            limit = 0;
-          } else if (!std::isfinite(lim)) {
-            limit = (lim > 0) ? 0xFFFFFFFF : 0;
-          } else {
-            // ToUint32: truncate and modulo 2^32
-            double integer = std::trunc(lim);
-            double mod = std::fmod(integer, 4294967296.0);
-            if (mod < 0) mod += 4294967296.0;
-            limit = static_cast<uint32_t>(mod);
-          }
-        }
-
-        if (limit == 0) return Value(result);
-
-        if (args.empty() || args[0].isUndefined()) {
-          // No separator: return array with entire string
-          result->elements.push_back(Value(str));
-          return Value(result);
-        }
-
-        std::string separator = toStringForStringBuiltinArg(args[0]);
-
-        if (separator.empty()) {
-          // Split into individual characters
-          size_t len = unicode::utf8Length(str);
-          for (size_t i = 0; i < len && result->elements.size() < limit; ++i) {
-            result->elements.push_back(Value(unicode::charAt(str, i)));
-          }
-          return Value(result);
-        }
-
-        size_t start = 0;
-        size_t pos;
-        while ((pos = str.find(separator, start)) != std::string::npos) {
-          if (result->elements.size() >= limit) break;
-          result->elements.push_back(Value(str.substr(start, pos - start)));
-          start = pos + separator.length();
-        }
-        if (result->elements.size() < limit) {
-          result->elements.push_back(Value(str.substr(start)));
-        }
-        return Value(result);
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_split(fullArgs);
       };
-      setNativeFnProps(splitFn, "split", 2);
-      LIGHTJS_RETURN(Value(splitFn));
+      setNativeFnProps(fn, "split", 2);
+      LIGHTJS_RETURN(Value(fn));
     }
 
     if (propName == "startsWith") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
         // IsRegExp check: access Symbol.match, throw if getter throws or returns truthy
         if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
           auto* interp = getGlobalInterpreter();
@@ -11067,14 +11923,16 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             throw std::runtime_error("TypeError: First argument to String.prototype.startsWith must not be a regular expression");
           }
         }
+        std::string s = std::get<std::string>(obj.data);
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
         double pos = 0;
         if (args.size() > 1 && !args[1].isUndefined()) {
           pos = toIntegerForStringBuiltinArg(args[1]);
         }
-        size_t position = static_cast<size_t>(std::max(0.0, std::min(pos, static_cast<double>(str.length()))));
-        if (position + searchStr.length() > str.length()) return Value(false);
-        return Value(str.compare(position, searchStr.length(), searchStr) == 0);
+        size_t currentLen = unicode::utf16Length(s);
+        int position = static_cast<int>(std::max(0.0, std::min(pos, static_cast<double>(currentLen))));
+        std::string slice = unicode::utf16Slice(s, position, position + static_cast<int>(unicode::utf16Length(searchStr)));
+        return Value(slice == searchStr);
       };
       setNativeFnProps(fn, "startsWith", 1);
       LIGHTJS_RETURN(Value(fn));
@@ -11083,7 +11941,7 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "endsWith") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
         // IsRegExp check
         if (!args.empty() && !args[0].isUndefined() && !args[0].isNull()) {
           auto* interp = getGlobalInterpreter();
@@ -11102,14 +11960,18 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
             throw std::runtime_error("TypeError: First argument to String.prototype.endsWith must not be a regular expression");
           }
         }
+        std::string s = std::get<std::string>(obj.data);
         std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
-        double e = static_cast<double>(str.length());
+        size_t currentLen = unicode::utf16Length(s);
+        double e = static_cast<double>(currentLen);
         if (args.size() > 1 && !args[1].isUndefined()) {
           e = toIntegerForStringBuiltinArg(args[1]);
         }
-        size_t endPos = static_cast<size_t>(std::max(0.0, std::min(e, static_cast<double>(str.length()))));
-        if (searchStr.length() > endPos) return Value(false);
-        return Value(str.compare(endPos - searchStr.length(), searchStr.length(), searchStr) == 0);
+        int endPos = static_cast<int>(std::max(0.0, std::min(e, static_cast<double>(currentLen))));
+        int searchLen = static_cast<int>(unicode::utf16Length(searchStr));
+        if (searchLen > endPos) return Value(false);
+        std::string slice = unicode::utf16Slice(s, endPos - searchLen, endPos);
+        return Value(slice == searchStr);
       };
       setNativeFnProps(fn, "endsWith", 1);
       LIGHTJS_RETURN(Value(fn));
@@ -11119,9 +11981,14 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // Basic implementation - just returns the string as-is
-        // Full Unicode normalization (NFC, NFD, etc.) is complex
-        return Value(str);
+        std::string form = "NFC";
+        if (!args.empty() && !args[0].isUndefined()) {
+          form = toStringForStringBuiltinArg(args[0]);
+        }
+        if (form != "NFC" && form != "NFD" && form != "NFKC" && form != "NFKD") {
+          throw std::runtime_error("RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+        }
+        return Value(unicode::normalize(str, form));
       };
       setNativeFnProps(fn, "normalize", 0);
       LIGHTJS_RETURN(Value(fn));
@@ -11228,7 +12095,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
       fn->isNative = true;
       fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
         std::string other = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
-        int result = str.compare(other);
+        std::string lhs = unicode::normalize(str, "NFD");
+        std::string rhs = unicode::normalize(other, "NFD");
+        int result = lhs.compare(rhs);
         return Value(static_cast<double>(result < 0 ? -1 : (result > 0 ? 1 : 0)));
       };
       setNativeFnProps(fn, "localeCompare", 1);
@@ -11306,64 +12175,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "search") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // ES2020 21.1.3.15: If regexp is not null/undefined, check for @@search
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            const std::string& searchKey = WellKnownSymbols::searchKey();
-            auto [found, searcher] = interp->getPropertyForExternal(args[0], searchKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            if (found && !searcher.isUndefined() && !searcher.isNull()) {
-              if (!searcher.isFunction()) throw std::runtime_error("TypeError: @@search is not a function");
-              Value result = interp->callForHarness(searcher, {Value(str)}, args[0]);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              return result;
-            }
-          }
-        }
-        if (!args.empty() && args[0].isRegex()) {
-          auto regexPtr = args[0].getGC<Regex>();
-#if USE_SIMPLE_REGEX
-          std::vector<simple_regex::Regex::Match> matches;
-          if (regexPtr->regex->search(str, matches) && !matches.empty()) {
-            return Value(static_cast<double>(matches[0].start));
-          }
-#else
-          std::smatch match;
-          if (std::regex_search(str, match, regexPtr->regex)) {
-            return Value(static_cast<double>(match.position(0)));
-          }
-#endif
-          return Value(-1.0);
-        }
-        // RegExpCreate fallback: construct RegExp via constructor, invoke @@search
-        std::string searchStr = args.empty() ? "undefined" : toStringForStringBuiltinArg(args[0]);
-        auto* interp2 = getGlobalInterpreter();
-        if (interp2) {
-          try {
-            auto regexpCtor = interp2->resolveVariable("RegExp");
-            if (regexpCtor.has_value() && regexpCtor->isFunction()) {
-              Value rx = interp2->constructFromNative(*regexpCtor, {Value(searchStr)});
-              if (!interp2->hasError() && rx.isRegex()) {
-                const std::string& searchKey2 = WellKnownSymbols::searchKey();
-                auto [found2, searcher2] = interp2->getPropertyForExternal(rx, searchKey2);
-                if (found2 && searcher2.isFunction()) {
-                  Value result = interp2->callForHarness(searcher2, {Value(str)}, rx);
-                  if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
-                  return result;
-                }
-              }
-              if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
-            }
-          } catch (const JsValueException&) {
-            throw;
-          } catch (...) {}
-        }
-        // Fallback string search
-        size_t pos = str.find(searchStr);
-        if (pos == std::string::npos) return Value(-1.0);
-        return Value(static_cast<double>(pos));
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_search(fullArgs);
       };
       setNativeFnProps(fn, "search", 1);
       LIGHTJS_RETURN(Value(fn));
@@ -11372,69 +12187,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "match") {
       auto matchFn = GarbageCollector::makeGC<Function>();
       matchFn->isNative = true;
-      matchFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // ES2020 21.1.3.11: If regexp is not null/undefined, check for @@match
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            const std::string& matchKey = WellKnownSymbols::matchKey();
-            auto [found, matcher] = interp->getPropertyForExternal(args[0], matchKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            if (found && !matcher.isUndefined() && !matcher.isNull()) {
-              if (!matcher.isFunction()) throw std::runtime_error("TypeError: @@match is not a function");
-              Value result = interp->callForHarness(matcher, {Value(str)}, args[0]);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              return result;
-            }
-          }
-        }
-        if (args.empty() || !args[0].isRegex()) {
-          // RegExpCreate fallback: construct RegExp via constructor, invoke @@match
-          std::string pattern = args.empty() ? "" : (args[0].isUndefined() ? "" : toStringForStringBuiltinArg(args[0]));
-          auto* interp2 = getGlobalInterpreter();
-          if (interp2) {
-            try {
-              auto regexpCtor = interp2->resolveVariable("RegExp");
-              if (regexpCtor.has_value() && regexpCtor->isFunction()) {
-                Value rx = interp2->constructFromNative(*regexpCtor, {Value(pattern)});
-                if (!interp2->hasError() && rx.isRegex()) {
-                  const std::string& matchKey2 = WellKnownSymbols::matchKey();
-                  auto [found2, matcher2] = interp2->getPropertyForExternal(rx, matchKey2);
-                  if (found2 && matcher2.isFunction()) {
-                    Value result = interp2->callForHarness(matcher2, {Value(str)}, rx);
-                    if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
-                    return result;
-                  }
-                }
-                if (interp2->hasError()) { Value err = interp2->getError(); interp2->clearError(); throw JsValueException(err); }
-              }
-            } catch (const JsValueException&) {
-              throw;
-            } catch (...) {}
-          }
-          return Value(Null{});
-        }
-        auto regexPtr = args[0].getGC<Regex>();
-#if USE_SIMPLE_REGEX
-        std::vector<simple_regex::Regex::Match> matches;
-        if (regexPtr->regex->search(str, matches)) {
-          auto arr = GarbageCollector::makeGC<Array>();
-          for (const auto& m : matches) {
-            arr->elements.push_back(Value(m.str));
-          }
-          return Value(arr);
-        }
-#else
-        std::smatch match;
-        if (std::regex_search(str, match, regexPtr->regex)) {
-          auto arr = GarbageCollector::makeGC<Array>();
-          for (const auto& m : match) {
-            arr->elements.push_back(Value(m.str()));
-          }
-          return Value(arr);
-        }
-#endif
-        return Value(Null{});
+      matchFn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_match(fullArgs);
       };
       setNativeFnProps(matchFn, "match", 1);
       LIGHTJS_RETURN(Value(matchFn));
@@ -11459,112 +12215,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "replace") {
       auto replaceFn = GarbageCollector::makeGC<Function>();
       replaceFn->isNative = true;
-      auto interp = this;
-      replaceFn->nativeFunc = [str, interp](const std::vector<Value>& args) -> Value {
-        // ES2020 21.1.3.14: If searchValue is not null/undefined, check @@replace
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
-          const std::string& replaceKey = WellKnownSymbols::replaceKey();
-          auto [found, replacer] = interp->getPropertyForExternal(args[0], replaceKey);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          if (found && !replacer.isUndefined() && !replacer.isNull()) {
-            if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
-            Value replaceValue = args.size() > 1 ? args[1] : Value(Undefined{});
-            Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[0]);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            return result;
-          }
-        }
-        if (args.size() < 2) return Value(str);
-        if (args[0].isRegex()) {
-          auto regexPtr = args[0].getGC<Regex>();
-          if (args[1].isFunction()) {
-            // Function callback for regex replace
-            auto callbackFn = args[1];
-#if USE_SIMPLE_REGEX
-            // For simple regex, do manual match+replace
-            std::string result = str;
-            // Simple single-match replacement
-            auto matches = regexPtr->regex->match(str);
-            if (!matches.empty()) {
-              std::vector<Value> cbArgs;
-              cbArgs.push_back(Value(matches[0]));  // match
-              // TODO: add capture groups
-              cbArgs.push_back(Value(static_cast<double>(str.find(matches[0]))));  // offset
-              cbArgs.push_back(Value(str));  // string
-              Value replacement = interp->callForHarness(callbackFn, cbArgs, Value(Undefined{}));
-              std::string repStr = replacement.toString();
-              size_t pos = result.find(matches[0]);
-              if (pos != std::string::npos) {
-                result.replace(pos, matches[0].length(), repStr);
-              }
-            }
-            return Value(result);
-#else
-            // std::regex path
-            std::smatch m;
-            std::string result = str;
-            if (std::regex_search(result, m, regexPtr->regex)) {
-              std::vector<Value> cbArgs;
-              cbArgs.push_back(Value(m[0].str()));  // match
-              for (size_t i = 1; i < m.size(); ++i) {
-                cbArgs.push_back(Value(m[i].str()));  // capture groups
-              }
-              cbArgs.push_back(Value(static_cast<double>(m.position())));  // offset
-              cbArgs.push_back(Value(str));  // string
-              Value replacement = interp->callForHarness(callbackFn, cbArgs, Value(Undefined{}));
-              result = m.prefix().str() + replacement.toString() + m.suffix().str();
-            }
-            return Value(result);
-#endif
-          }
-          std::string replacement = args[1].toString();
-#if USE_SIMPLE_REGEX
-          return Value(regexPtr->regex->replace(str, replacement));
-#else
-          return Value(std::regex_replace(str, regexPtr->regex, replacement));
-#endif
-        } else {
-          std::string search = toStringForStringBuiltinArg(args[0]);
-          bool isFnReplace = args[1].isFunction();
-          // Step 6: If not callable, ToString(replaceValue) BEFORE searching
-          std::string replaceTemplate;
-          if (!isFnReplace) {
-            replaceTemplate = toStringForStringBuiltinArg(args[1]);
-          }
-          if (isFnReplace) {
-            std::string result = str;
-            size_t pos = result.find(search);
-            if (pos != std::string::npos) {
-              std::vector<Value> cbArgs;
-              cbArgs.push_back(Value(search));
-              cbArgs.push_back(Value(static_cast<double>(pos)));
-              cbArgs.push_back(Value(str));
-              Value replacement = interp->callForHarness(args[1], cbArgs, Value(Undefined{}));
-              result.replace(pos, search.length(), replacement.toString());
-            }
-            return Value(result);
-          }
-          std::string result = str;
-          size_t pos = result.find(search);
-          if (pos != std::string::npos) {
-            // GetSubstitution: process $-patterns
-            std::string replacement;
-            for (size_t i = 0; i < replaceTemplate.size(); i++) {
-              if (replaceTemplate[i] == '$' && i + 1 < replaceTemplate.size()) {
-                char next = replaceTemplate[i + 1];
-                if (next == '$') { replacement += '$'; i++; }
-                else if (next == '&') { replacement += search; i++; }
-                else if (next == '`') { replacement += str.substr(0, pos); i++; }
-                else if (next == '\'') { replacement += str.substr(pos + search.size()); i++; }
-                else { replacement += '$'; } // Unrecognized: keep $
-              } else {
-                replacement += replaceTemplate[i];
-              }
-            }
-            result.replace(pos, search.length(), replacement);
-          }
-          return Value(result);
-        }
+      replaceFn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_replace(fullArgs);
       };
       setNativeFnProps(replaceFn, "replace", 2);
       LIGHTJS_RETURN(Value(replaceFn));
@@ -11573,111 +12227,9 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "replaceAll") {
       auto replaceAllFn = GarbageCollector::makeGC<Function>();
       replaceAllFn->isNative = true;
-      replaceAllFn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        // ES2021 21.1.3.18: If searchValue is not null/undefined, check @@replace
-        if (!args.empty() && !args[0].isUndefined() && !args[0].isNull() && !args[0].isString() && !args[0].isBool() && !args[0].isNumber() && !args[0].isBigInt() && !args[0].isSymbol()) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            // Check if searchValue is a RegExp (via @@match)
-            const std::string& matchKey = WellKnownSymbols::matchKey();
-            auto [hasMatch, matchProp] = interp->getPropertyForExternal(args[0], matchKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            bool isRegExp = false;
-            if (hasMatch && !matchProp.isUndefined() && !matchProp.isNull()) {
-              isRegExp = true;
-            } else if (args[0].isRegex()) {
-              isRegExp = true;
-            }
-            // If it's a RegExp, must have 'g' flag
-            if (isRegExp) {
-              if (args[0].isRegex()) {
-                auto regexPtr = args[0].getGC<Regex>();
-                if (regexPtr->flags.find('g') == std::string::npos) {
-                  throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-                }
-              } else {
-                // Check flags property for 'g'
-                auto [hasFlags, flagsVal] = interp->getPropertyForExternal(args[0], "flags");
-                if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-                std::string flags = hasFlags ? flagsVal.toString() : "";
-                if (flags.find('g') == std::string::npos) {
-                  throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-                }
-              }
-            }
-            // Check for @@replace
-            const std::string& replaceKey = WellKnownSymbols::replaceKey();
-            auto [found, replacer] = interp->getPropertyForExternal(args[0], replaceKey);
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            if (found && !replacer.isUndefined() && !replacer.isNull()) {
-              if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
-              Value replaceValue = args.size() > 1 ? args[1] : Value(Undefined{});
-              Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[0]);
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              return result;
-            }
-          }
-        }
-        if (args.size() < 2) return Value(str);
-        std::string search = toStringForStringBuiltinArg(args[0]);
-        bool isFnReplacer = args[1].isFunction();
-        std::string replacement = isFnReplacer ? "" : toStringForStringBuiltinArg(args[1]);
-
-        // Helper: get replacement for a match
-        auto getReplacement = [&](const std::string& matched, size_t matchPos) -> std::string {
-          if (isFnReplacer) {
-            auto* interp = getGlobalInterpreter();
-            if (interp) {
-              std::vector<Value> cbArgs;
-              cbArgs.push_back(Value(matched));
-              cbArgs.push_back(Value(static_cast<double>(matchPos)));
-              cbArgs.push_back(Value(str));
-              Value result = interp->callForHarness(args[1], cbArgs, Value(Undefined{}));
-              if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-              return result.toString();
-            }
-            return "";
-          }
-          // GetSubstitution
-          std::string sub;
-          for (size_t i = 0; i < replacement.size(); i++) {
-            if (replacement[i] == '$' && i + 1 < replacement.size()) {
-              char next = replacement[i + 1];
-              if (next == '$') { sub += '$'; i++; }
-              else if (next == '&') { sub += matched; i++; }
-              else if (next == '`') { sub += str.substr(0, matchPos); i++; }
-              else if (next == '\'') { sub += str.substr(matchPos + matched.size()); i++; }
-              else { sub += '$'; }
-            } else {
-              sub += replacement[i];
-            }
-          }
-          return sub;
-        };
-
-        if (search.empty()) {
-          // Insert replacement between every character and at start/end
-          std::string result;
-          result += getReplacement("", 0);
-          for (size_t i = 0; i < str.size(); ++i) {
-            result += str[i];
-            result += getReplacement("", i + 1);
-          }
-          return Value(result);
-        }
-        std::string result;
-        size_t pos = 0;
-        while (true) {
-          size_t found = str.find(search, pos);
-          if (found == std::string::npos) {
-            result += str.substr(pos);
-            break;
-          }
-          result += str.substr(pos, found - pos);
-          result += getReplacement(search, found);
-          pos = found + search.size();
-        }
-        return Value(result);
+      replaceAllFn->properties["__uses_this_arg__"] = Value(true);
+      replaceAllFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        return String_replaceAll(args);
       };
       setNativeFnProps(replaceAllFn, "replaceAll", 2);
       LIGHTJS_RETURN(Value(replaceAllFn));
@@ -11794,20 +12346,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "substring") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        int len = static_cast<int>(str.length());
-        double intStart = 0;
-        if (!args.empty() && !args[0].isUndefined()) {
-          intStart = toIntegerForStringBuiltinArg(args[0]);
-        }
-        double intEnd = len;
-        if (args.size() > 1 && !args[1].isUndefined()) {
-          intEnd = toIntegerForStringBuiltinArg(args[1]);
-        }
-        int start = static_cast<int>(std::max(0.0, std::min(intStart, static_cast<double>(len))));
-        int end = static_cast<int>(std::max(0.0, std::min(intEnd, static_cast<double>(len))));
-        if (start > end) std::swap(start, end);
-        return Value(str.substr(start, end - start));
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_substring(fullArgs);
       };
       setNativeFnProps(fn, "substring", 2);
       LIGHTJS_RETURN(Value(fn));
@@ -11816,23 +12358,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "slice") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        int len = static_cast<int>(str.length());
-        double intStart = 0;
-        if (!args.empty() && !args[0].isUndefined()) {
-          intStart = toIntegerForStringBuiltinArg(args[0]);
-        }
-        double intEnd = len;
-        if (args.size() > 1 && !args[1].isUndefined()) {
-          intEnd = toIntegerForStringBuiltinArg(args[1]);
-        }
-        int start, end;
-        if (intStart < 0) start = std::max(0, len + static_cast<int>(std::max(intStart, static_cast<double>(-len))));
-        else start = std::min(static_cast<int>(std::min(intStart, static_cast<double>(len))), len);
-        if (intEnd < 0) end = std::max(0, len + static_cast<int>(std::max(intEnd, static_cast<double>(-len))));
-        else end = std::min(static_cast<int>(std::min(intEnd, static_cast<double>(len))), len);
-        if (start >= end) return Value(std::string(""));
-        return Value(str.substr(start, end - start));
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_slice(fullArgs);
       };
       setNativeFnProps(fn, "slice", 2);
       LIGHTJS_RETURN(Value(fn));
@@ -11841,20 +12370,10 @@ Task Interpreter::evaluateMember(const MemberExpr& expr) {
     if (propName == "substr") {
       auto fn = GarbageCollector::makeGC<Function>();
       fn->isNative = true;
-      fn->nativeFunc = [str](const std::vector<Value>& args) -> Value {
-        int len = static_cast<int>(str.length());
-        int start = 0;
-        if (!args.empty()) {
-          start = static_cast<int>(args[0].toNumber());
-          if (start < 0) start = std::max(0, len + start);
-        }
-        int length = len - start;
-        if (args.size() > 1 && !args[1].isUndefined()) {
-          length = static_cast<int>(args[1].toNumber());
-          if (length < 0) length = 0;
-        }
-        if (start >= len || length <= 0) return Value(std::string(""));
-        return Value(str.substr(start, length));
+      fn->nativeFunc = [obj](const std::vector<Value>& args) -> Value {
+        std::vector<Value> fullArgs = {obj};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        return String_substr(fullArgs);
       };
       setNativeFnProps(fn, "substr", 2);
       LIGHTJS_RETURN(Value(fn));
@@ -11904,6 +12423,17 @@ Value Interpreter::makeIteratorResult(const Value& value, bool done) {
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   resultObj->properties["value"] = value;
   resultObj->properties["done"] = Value(done);
+  // Set __proto__ to Object.prototype
+  auto* interp = getGlobalInterpreter();
+  if (interp) {
+    auto env = interp->getEnvironment();
+    if (env) {
+      auto objProtoVal = env->getRoot()->get("__object_prototype__");
+      if (objProtoVal && objProtoVal->isObject()) {
+        resultObj->properties["__proto__"] = *objProtoVal;
+      }
+    }
+  }
   return Value(resultObj);
 }
 
@@ -12250,6 +12780,14 @@ std::optional<Interpreter::IteratorRecord> Interpreter::getIterator(const Value&
         record.kind = IteratorRecord::Kind::IteratorObject;
         record.iteratorValue = value;
         record.nextMethod = nextIt->second;  // Cache next() per GetIterator spec (7.4.1)
+        return record;
+      }
+      // Walk prototype chain to find "next"
+      auto [foundNext, nextVal] = getPropertyForPrimitive(value, "next");
+      if (foundNext && (nextVal.isFunction() || nextVal.isObject())) {
+        record.kind = IteratorRecord::Kind::IteratorObject;
+        record.iteratorValue = value;
+        record.nextMethod = nextVal;
         return record;
       }
     }
@@ -12610,6 +13148,16 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     }
   } privateOwnerClassGuard{this, previousPrivateOwnerClass};
 
+  callerContextStack_.push_back({activeFunction_, strictMode_});
+  struct CallerContextGuard {
+    Interpreter* interpreter;
+    ~CallerContextGuard() {
+      if (!interpreter->callerContextStack_.empty()) {
+        interpreter->callerContextStack_.pop_back();
+      }
+    }
+  } callerContextGuard{this};
+
   auto bindParameters = [&](GCPtr<Environment>& targetEnv) {
     bool isArrowFunction = false;
     auto arrowIt = func->properties.find("__is_arrow_function__");
@@ -12739,7 +13287,18 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
           argumentsArray->properties["__proto__"] = protoIt->second;
         }
       }
-      if (func->isStrict) {
+      // Determine if parameters are simple (no defaults, no rest, no destructuring)
+      bool hasSimpleParamsForCallee = !func->restParam.has_value();
+      if (hasSimpleParamsForCallee) {
+        for (const auto& p : func->params) {
+          if (p.defaultValue || p.name.empty() ||
+              (p.name.size() > 8 && p.name.substr(0, 8) == "__param_")) {
+            hasSimpleParamsForCallee = false; break;
+          }
+        }
+      }
+      // Strict mode or non-simple params: ThrowTypeError accessor for callee
+      if (func->isStrict || !hasSimpleParamsForCallee) {
         auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
         if (!throwTypeErrorAccessor) {
           throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
@@ -13054,7 +13613,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     for (const auto& s : *bodyPtr) {
       if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
         if (varDecl->kind == VarDeclaration::Kind::Let ||
-            varDecl->kind == VarDeclaration::Kind::Const) {
+            varDecl->kind == VarDeclaration::Kind::Const ||
+            varDecl->kind == VarDeclaration::Kind::Using ||
+            varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
           for (const auto& declarator : varDecl->declarations) {
             std::vector<std::string> names;
             collectVarHoistNames(*declarator.pattern, names);
@@ -13085,7 +13646,9 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     if (protoIt != func->properties.end() && (protoIt->second.isObject() || protoIt->second.isArray() || protoIt->second.isFunction() || protoIt->second.isGenerator() || protoIt->second.isProxy())) {
       generator->properties["__proto__"] = protoIt->second;
     } else {
-      if (auto genProto = env_->getRoot()->get("__generator_prototype__"); genProto && genProto->isObject()) {
+      const char* prototypeName =
+        (func->isAsync && func->isGenerator) ? "__async_generator_prototype__" : "__generator_prototype__";
+      if (auto genProto = env_->getRoot()->get(prototypeName); genProto && genProto->isObject()) {
         generator->properties["__proto__"] = *genProto;
       }
     }
@@ -13167,37 +13730,16 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     bool previousStrictMode = strictMode_;
     strictMode_ = func->isStrict;
 
-    // Initialize TDZ for lexical declarations in async function body
-    for (const auto& s : *bodyPtr) {
-      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-        if (varDecl->kind == VarDeclaration::Kind::Let ||
-            varDecl->kind == VarDeclaration::Kind::Const) {
-          for (const auto& declarator : varDecl->declarations) {
-            std::vector<std::string> names;
-            collectVarHoistNames(*declarator.pattern, names);
-            for (const auto& name : names) {
-              env_->defineTDZ(name);
-            }
-          }
-        }
-      } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-        env_->defineTDZ(classDecl->id.name);
-      }
-    }
+    initializeLexicalDeclarations(*bodyPtr);
 
     // Hoist var and function declarations in async function body
     hoistVarDeclarations(*bodyPtr);
-    for (const auto& stmt : *bodyPtr) {
-      if (std::holds_alternative<FunctionDeclaration>(stmt->node)) {
-        auto task = evaluate(*stmt);
-        LIGHTJS_RUN_TASK_VOID_SYNC(task);
-        if (flow_.type == ControlFlow::Type::Yield) return Value(Undefined{});
-      }
-    }
+    hoistFunctionDeclarations(*bodyPtr);
 
     auto asyncEnv = env_;
+    size_t asyncDisposableScope = beginSyncDisposableScope();
     auto executeAsyncBody = std::make_shared<std::function<void(size_t)>>();
-    *executeAsyncBody = [this, executeAsyncBody, promise, asyncEnv, bodyPtr, isStrict = func->isStrict, initializePromiseIntrinsics](size_t startIndex) {
+    *executeAsyncBody = [this, executeAsyncBody, promise, asyncEnv, bodyPtr, isStrict = func->isStrict, initializePromiseIntrinsics, asyncDisposableScope](size_t startIndex) {
       if (!promise || promise->state != PromiseState::Pending) {
         return;
       }
@@ -13327,9 +13869,16 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
           Value stmtResult = Value(Undefined{});
           LIGHTJS_RUN_TASK_SYNC(stmtTask, stmtResult);
           if (flow_.type == ControlFlow::Type::Return) {
-            Value returnValue = flow_.value;
-            if (returnValue.isPromise()) {
-              auto returnedPromise = returnValue.getGC<Promise>();
+            disposeSyncDisposableScope(asyncDisposableScope);
+            if (flow_.type == ControlFlow::Type::Throw) {
+              promise->reject(flow_.value);
+              restoreState();
+              return;
+            }
+
+            Value completionValue = flow_.value;
+            if (completionValue.isPromise()) {
+              auto returnedPromise = completionValue.getGC<Promise>();
               returnedPromise->then(
                 [promise](Value value) -> Value {
                   if (promise && promise->state == PromiseState::Pending) {
@@ -13345,18 +13894,25 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
                 }
               );
             } else {
-              promise->resolve(returnValue);
+              promise->resolve(completionValue);
             }
             restoreState();
             return;
           }
           if (flow_.type == ControlFlow::Type::Throw) {
+            disposeSyncDisposableScope(asyncDisposableScope);
             promise->reject(flow_.value);
             restoreState();
             return;
           }
         }
 
+        disposeSyncDisposableScope(asyncDisposableScope);
+        if (flow_.type == ControlFlow::Type::Throw) {
+          promise->reject(flow_.value);
+          restoreState();
+          return;
+        }
         promise->resolve(Value(Undefined{}));
       } catch (const std::exception& e) {
         promise->reject(Value(std::string(e.what())));
@@ -13418,32 +13974,11 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
       env_ = env_->createChild();
     }
 
-    // Initialize TDZ for lexical declarations in function body
-    for (const auto& s : *bodyPtr) {
-      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-        if (varDecl->kind == VarDeclaration::Kind::Let ||
-            varDecl->kind == VarDeclaration::Kind::Const) {
-          for (const auto& declarator : varDecl->declarations) {
-            std::vector<std::string> names;
-            collectVarHoistNames(*declarator.pattern, names);
-            for (const auto& name : names) {
-              env_->defineTDZ(name);
-            }
-          }
-        }
-      } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-        env_->defineTDZ(classDecl->id.name);
-      }
-    }
+    initializeLexicalDeclarations(*bodyPtr);
 
     // Hoist var and function declarations in function body
     hoistVarDeclarations(*bodyPtr);
-    for (const auto& hoistStmt : *bodyPtr) {
-      if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
-        auto hoistTask = evaluate(*hoistStmt);
-        LIGHTJS_RUN_TASK_VOID_SYNC(hoistTask);
-      }
-    }
+    hoistFunctionDeclarations(*bodyPtr);
 
     bool returned = false;
     bool tailCallSelf = false;
@@ -13451,6 +13986,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
     pendingSelfTailCall_ = false;
     pendingSelfTailArgs_.clear();
     pendingSelfTailThis_ = Value(Undefined{});
+    size_t disposableScope = beginSyncDisposableScope();
 
     for (const auto& stmt : *bodyPtr) {
       // Skip function declarations - already hoisted
@@ -13481,6 +14017,7 @@ Value Interpreter::callFunction(const Value& callee, const std::vector<Value>& a
         break;
       }
     }
+    disposeSyncDisposableScope(disposableScope);
 
     if (tailCallSelf) {
       continue;
@@ -14067,7 +14604,9 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
     auto proto = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     if (func->isGenerator) {
-      if (auto genProto = env_->get("__generator_prototype__"); genProto && genProto->isObject()) {
+      const char* prototypeName =
+        (func->isAsync && func->isGenerator) ? "__async_generator_prototype__" : "__generator_prototype__";
+      if (auto genProto = env_->get(prototypeName); genProto && genProto->isObject()) {
         proto->properties["__proto__"] = *genProto;
       }
       func->properties["__non_enum_prototype"] = Value(true);
@@ -14106,11 +14645,23 @@ Task Interpreter::evaluateFunction(const FunctionExpr& expr) {
     func->isConstructor = false;
   }
 
-  // Set __proto__ to Function.prototype or GeneratorFunction.prototype for proper prototype chain
-  std::string protoName = func->isGenerator ? "__generator_function_prototype__" : "Function";
+  // Set __proto__ to correct function prototype
+  // Note: async generators use generatorFunctionPrototype temporarily until
+  // proper async generator prototype methods (next/return/throw) are added.
+  std::string protoName;
+  bool directProto = false;
+  if (func->isGenerator) {
+    protoName = "__generator_function_prototype__";
+    directProto = true;
+  } else if (func->isAsync) {
+    protoName = "__async_function_prototype__";
+    directProto = true;
+  } else {
+    protoName = "Function";
+  }
   auto protoVal = env_->getRoot()->get(protoName);
   if (protoVal.has_value()) {
-    if (func->isGenerator && protoVal->isObject()) {
+    if (directProto && protoVal->isObject()) {
       func->properties["__proto__"] = *protoVal;
     } else {
       Value functionProto(Undefined{});
@@ -14415,6 +14966,13 @@ bool Interpreter::defineClassElementOnValue(Value& targetVal,
 
   if (targetVal.isObject()) {
     auto obj = targetVal.getGC<Object>();
+    if (obj->isModuleNamespace) {
+      if (isPrivateKey || key.rfind("__", 0) == 0) {
+        return false;
+      }
+      triggerDeferredNamespaceIfNeeded(obj, key);
+      return false;
+    }
     bool isNew = obj->properties.find(key) == obj->properties.end();
     if (isPrivateKey && !isNew) return false;
     if (obj->frozen) return false;
@@ -14523,7 +15081,31 @@ Value Interpreter::getPrototypeFromConstructorValue(const Value& ctorValue) {
   if (!isObjectLike(ctorValue)) {
     return Value(Undefined{});
   }
-  auto [found, proto] = getPropertyForPrimitive(ctorValue, "prototype");
+  auto getPrototypeProperty = [&]() -> std::pair<bool, Value> {
+    if (ctorValue.isProxy()) {
+      auto proxy = ctorValue.getGC<Proxy>();
+      if (proxy && proxy->handler && proxy->handler->isObject()) {
+        auto handlerObj = proxy->handler->getGC<Object>();
+        auto trapIt = handlerObj->properties.find("get");
+        if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+          Value result = callFunction(
+            trapIt->second,
+            {*proxy->target, toPropertyKeyValue("prototype"), ctorValue},
+            Value(handlerObj));
+          if (hasError()) {
+            return {false, Value(Undefined{})};
+          }
+          return {true, result};
+        }
+      }
+      if (proxy && proxy->target) {
+        return getPropertyForPrimitive(*proxy->target, "prototype");
+      }
+    }
+    return getPropertyForPrimitive(ctorValue, "prototype");
+  };
+
+  auto [found, proto] = getPrototypeProperty();
   if (hasError()) {
     return Value(Undefined{});
   }
@@ -14592,9 +15174,9 @@ Value Interpreter::getOrdinaryCreatePrototypeFromNewTarget(const Value& newTarge
   // If newTarget.prototype is not an Object, use the realm's
   // intrinsic %Object.prototype%.
   if (isObjectLike(newTargetValue)) {
-    auto [found, proto] = getPropertyForPrimitive(newTargetValue, "prototype");
+    Value proto = getPrototypeFromConstructorValue(newTargetValue);
     if (hasError()) return Value(Undefined{});
-    if (found && isObjectLike(proto)) return proto;
+    if (isObjectLike(proto)) return proto;
   }
   return getIntrinsicObjectPrototypeForCtor(newTargetValue);
 }
@@ -15031,18 +15613,15 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     if (primitive.isString()) {
       // String exotic object: numeric indexed properties + length
       const std::string& s = std::get<std::string>(primitive.data);
-      size_t cpLen = 0, bytePos = 0;
-      while (bytePos < s.size()) {
-        unsigned char c = s[bytePos];
-        size_t charLen = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-        std::string idx = std::to_string(cpLen);
-        wrapper->properties[idx] = Value(s.substr(bytePos, charLen));
+      size_t strLen = String_utf16Length(s);
+      for (size_t i = 0; i < strLen; i++) {
+        std::string idx = std::to_string(i);
+        std::string codeUnitStr = String_utf16CodeUnitStringAt(s, i);
+        wrapper->properties[idx] = Value(codeUnitStr);
         wrapper->properties["__non_writable_" + idx] = Value(true);
         wrapper->properties["__non_configurable_" + idx] = Value(true);
-        bytePos += charLen;
-        cpLen++;
       }
-      wrapper->properties["length"] = Value(static_cast<double>(cpLen));
+      wrapper->properties["length"] = Value(static_cast<double>(strLen));
       wrapper->properties["__non_writable_length"] = Value(true);
       wrapper->properties["__non_enum_length"] = Value(true);
       wrapper->properties["__non_configurable_length"] = Value(true);
@@ -15225,32 +15804,11 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       // Execute constructor body
       auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
 
-      // Initialize TDZ for lexical declarations in constructor body
-      for (const auto& s : *bodyPtr) {
-        if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-          if (varDecl->kind == VarDeclaration::Kind::Let ||
-              varDecl->kind == VarDeclaration::Kind::Const) {
-            for (const auto& declarator : varDecl->declarations) {
-              std::vector<std::string> names;
-              collectVarHoistNames(*declarator.pattern, names);
-              for (const auto& name : names) {
-                env_->defineTDZ(name);
-              }
-            }
-          }
-        } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-          env_->defineTDZ(classDecl->id.name);
-        }
-      }
+      initializeLexicalDeclarations(*bodyPtr);
 
       // Hoist var and function declarations in the constructor body (same as callFunction()).
       hoistVarDeclarations(*bodyPtr);
-      for (const auto& hoistStmt : *bodyPtr) {
-        if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
-          auto hoistTask = evaluate(*hoistStmt);
-          LIGHTJS_RUN_TASK_VOID(hoistTask);
-        }
-      }
+      hoistFunctionDeclarations(*bodyPtr);
       if (flow_.type == ControlFlow::Type::Throw) {
         env_ = prevEnv;
         LIGHTJS_RETURN(Value(Undefined{}));
@@ -15258,6 +15816,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
       auto prevFlow = flow_;
       flow_ = ControlFlow{};
+      size_t disposableScope = beginSyncDisposableScope();
 
       for (const auto& stmt : *bodyPtr) {
         auto stmtTask = evaluate(*stmt);
@@ -15271,6 +15830,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
           break;
         }
       }
+      disposeSyncDisposableScope(disposableScope);
 
       bool superCalled = true;
       if (derivedConstructor) {
@@ -15482,12 +16042,40 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       }
       // Native constructors (e.g., Array, Object, Map, etc.)
       Value constructed(Undefined{});
-      auto nativeConstructIt = func->properties.find("__native_construct__");
-      if (nativeConstructIt != func->properties.end() && nativeConstructIt->second.isFunction()) {
-        auto ctorFn = nativeConstructIt->second.getGC<Function>();
-        constructed = ctorFn->nativeFunc(args);
-      } else {
-        constructed = func->nativeFunc(args);
+      try {
+        auto nativeConstructIt = func->properties.find("__native_construct__");
+        if (nativeConstructIt != func->properties.end() && nativeConstructIt->second.isFunction()) {
+          auto ctorFn = nativeConstructIt->second.getGC<Function>();
+          constructed = ctorFn->nativeFunc(args);
+        } else {
+          constructed = func->nativeFunc(args);
+        }
+      } catch (const JsValueException& e) {
+        flow_.type = ControlFlow::Type::Throw;
+        flow_.value = e.value();
+        LIGHTJS_RETURN(Value(Undefined{}));
+      } catch (const std::exception& e) {
+        std::string message = e.what();
+        ErrorType errorType = ErrorType::Error;
+        auto consumePrefix = [&](const std::string& prefix, ErrorType type) {
+          if (message.rfind(prefix, 0) == 0) {
+            errorType = type;
+            message = message.substr(prefix.size());
+            return true;
+          }
+          return false;
+        };
+        if (!consumePrefix("TypeError: ", ErrorType::TypeError) &&
+            !consumePrefix("ReferenceError: ", ErrorType::ReferenceError) &&
+            !consumePrefix("RangeError: ", ErrorType::RangeError) &&
+            !consumePrefix("SyntaxError: ", ErrorType::SyntaxError) &&
+            !consumePrefix("URIError: ", ErrorType::URIError) &&
+            !consumePrefix("EvalError: ", ErrorType::EvalError) &&
+            !consumePrefix("Error: ", ErrorType::Error)) {
+          errorType = ErrorType::Error;
+        }
+        throwError(errorType, message);
+        LIGHTJS_RETURN(Value(Undefined{}));
       }
       if (constructed.isNumber() || constructed.isString() || constructed.isBool()) {
         constructed = wrapPrimitiveValue(constructed);
@@ -15504,18 +16092,18 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       if (newTargetOverride.isUndefined()) {
         auto protoIt = func->properties.find("prototype");
         if (protoIt != func->properties.end() &&
-            (protoIt->second.isObject() || protoIt->second.isNull())) {
+            (isObjectLike(protoIt->second) || protoIt->second.isNull())) {
           protoFromNewTarget = protoIt->second;
         }
       } else {
         protoFromNewTarget = this->getPrototypeFromConstructorValue(effectiveNewTarget);
-        if (!ctorName.empty() && !protoFromNewTarget.isObject()) {
+        if (!ctorName.empty() && !isObjectLike(protoFromNewTarget)) {
           protoFromNewTarget = getIntrinsicPrototypeForCtorNamed(effectiveNewTarget, ctorName);
         }
       }
       if (newTargetOverride.isUndefined() &&
           !ctorName.empty() &&
-          !protoFromNewTarget.isObject()) {
+          !isObjectLike(protoFromNewTarget)) {
         protoFromNewTarget = getIntrinsicPrototypeForCtorNamed(callee, ctorName);
       }
       if (ctorName == "DataView" && constructed.isDataView()) {
@@ -15572,9 +16160,27 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
 
     // Set up execution environment
     auto prevEnv = env_;
+    auto prevActiveFunction = activeFunction_;
     env_ = func->closure;
     env_ = env_->createChild();
     env_->define("__var_scope__", Value(true), true);
+    activeFunction_ = func;
+    struct ConstructorActiveFunctionGuard {
+      Interpreter* interpreter;
+      GCPtr<Function> previous;
+      ~ConstructorActiveFunctionGuard() {
+        interpreter->activeFunction_ = previous;
+      }
+    } constructorActiveFunctionGuard{this, prevActiveFunction};
+    callerContextStack_.push_back({prevActiveFunction, strictMode_});
+    struct ConstructorCallerContextGuard {
+      Interpreter* interpreter;
+      ~ConstructorCallerContextGuard() {
+        if (!interpreter->callerContextStack_.empty()) {
+          interpreter->callerContextStack_.pop_back();
+        }
+      }
+    } constructorCallerContextGuard{this};
 
     // Bind 'this' to the new instance
     env_->define("this", Value(instance));
@@ -15584,7 +16190,17 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     auto argumentsArray = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
     argumentsArray->elements = args;
-    if (func->isStrict) {
+    // Determine if parameters are simple
+    bool hasSimpleParamsForCtor = !func->restParam.has_value();
+    if (hasSimpleParamsForCtor) {
+      for (const auto& p : func->params) {
+        if (p.defaultValue || p.name.empty() ||
+            (p.name.size() > 8 && p.name.substr(0, 8) == "__param_")) {
+          hasSimpleParamsForCtor = false; break;
+        }
+      }
+    }
+    if (func->isStrict || !hasSimpleParamsForCtor) {
       auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
       if (!throwTypeErrorAccessor) {
         throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
@@ -15595,6 +16211,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
       }
       argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__non_configurable_callee"] = Value(true);
     } else {
       argumentsArray->properties["callee"] = callee;
     }
@@ -15668,36 +16285,16 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
     // Execute function body
     auto bodyPtr = std::static_pointer_cast<std::vector<StmtPtr>>(func->body);
 
-    // Initialize TDZ for lexical declarations in constructor body
-    for (const auto& s : *bodyPtr) {
-      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-        if (varDecl->kind == VarDeclaration::Kind::Let ||
-            varDecl->kind == VarDeclaration::Kind::Const) {
-          for (const auto& declarator : varDecl->declarations) {
-            std::vector<std::string> names;
-            collectVarHoistNames(*declarator.pattern, names);
-            for (const auto& name : names) {
-              env_->defineTDZ(name);
-            }
-          }
-        }
-      } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-        env_->defineTDZ(classDecl->id.name);
-      }
-    }
+    initializeLexicalDeclarations(*bodyPtr);
 
     // Hoist var and function declarations in constructor body
     hoistVarDeclarations(*bodyPtr);
-    for (const auto& hoistStmt : *bodyPtr) {
-      if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
-        auto hoistTask = evaluate(*hoistStmt);
-        LIGHTJS_RUN_TASK_VOID_SYNC(hoistTask);
-      }
-    }
+    hoistFunctionDeclarations(*bodyPtr);
 
     Value result = Value(Undefined{});
     auto prevFlow = flow_;
     flow_ = ControlFlow{};
+    size_t disposableScope = beginSyncDisposableScope();
 
     for (const auto& stmt : *bodyPtr) {
       // Skip function declarations - already hoisted
@@ -15727,6 +16324,7 @@ Task Interpreter::constructValue(Value callee, std::vector<Value> args, Value ne
         break;
       }
     }
+    disposeSyncDisposableScope(disposableScope);
 
     // Don't restore flow if an error was thrown - preserve the error
     if (flow_.type != ControlFlow::Type::Throw) {
@@ -16106,6 +16704,83 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
       methodName = toPropertyKeyString(keyValue);
     }
 
+    // Handle field declarations and auto-accessors
+    if (method.kind == MethodDefinition::Kind::AutoAccessor) {
+      Class::FieldInit fi;
+      fi.name = method.isPrivate ? privateAutoAccessorBackingName(methodName)
+                                 : publicAutoAccessorStorageKey(methodName);
+      fi.isPrivate = method.isPrivate;
+      if (method.initializer) {
+        fi.initExpr = std::shared_ptr<void>(
+          const_cast<Expression*>(method.initializer.get()),
+          [](void*){}
+        );
+      }
+      if (method.isStatic) {
+        StaticInitStep step;
+        step.kind = StaticInitStep::Kind::Field;
+        step.field = std::move(fi);
+        staticInitSteps.push_back(std::move(step));
+      } else {
+        cls->fieldInitializers.push_back(std::move(fi));
+      }
+
+      std::string storageKey =
+          method.isPrivate
+              ? privateStorageKey(cls, privateAutoAccessorBackingName(methodName))
+              : publicAutoAccessorStorageKey(methodName);
+      auto makeAutoAccessor = [&](bool isSetter) {
+        auto fn = GarbageCollector::makeGC<Function>();
+        fn->isNative = true;
+        fn->isStrict = true;
+        fn->properties["__uses_this_arg__"] = Value(true);
+        fn->properties["length"] = Value(isSetter ? 1.0 : 0.0);
+        fn->properties["__non_writable_length"] = Value(true);
+        fn->properties["__non_enum_length"] = Value(true);
+        fn->properties["name"] = Value((isSetter ? "set " : "get ") + methodName);
+        fn->properties["__non_writable_name"] = Value(true);
+        fn->properties["__non_enum_name"] = Value(true);
+        fn->nativeFunc = [storageKey, isSetter](const std::vector<Value>& args) -> Value {
+          Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+          auto* storage = getHiddenFieldStorage(receiver);
+          if (!storage) {
+            throw std::runtime_error("TypeError: Cannot access auto-accessor on non-object receiver");
+          }
+          auto it = storage->find(storageKey);
+          if (it == storage->end()) {
+            throw std::runtime_error("TypeError: Cannot access auto-accessor on receiver without backing storage");
+          }
+          if (isSetter) {
+            (*storage)[storageKey] = args.size() > 1 ? args[1] : Value(Undefined{});
+            return Value(Undefined{});
+          }
+          return it->second;
+        };
+        return fn;
+      };
+      auto getter = makeAutoAccessor(false);
+      auto setter = makeAutoAccessor(true);
+      if (method.isStatic) {
+        if (method.isPrivate) {
+          std::string mangledName = privateStorageKey(cls, methodName);
+          cls->properties["__get_" + mangledName] = Value(getter);
+          cls->properties["__set_" + mangledName] = Value(setter);
+        } else {
+          cls->properties["__get_" + methodName] = Value(getter);
+          cls->properties["__set_" + methodName] = Value(setter);
+          cls->properties["__non_enum_" + methodName] = Value(true);
+        }
+      } else if (method.isPrivate) {
+        cls->getters[methodName] = getter;
+        cls->setters[methodName] = setter;
+      } else {
+        classPrototype->properties["__get_" + methodName] = Value(getter);
+        classPrototype->properties["__set_" + methodName] = Value(setter);
+        classPrototype->properties["__non_enum_" + methodName] = Value(true);
+      }
+      continue;
+    }
+
     // Handle field declarations
     if (method.kind == MethodDefinition::Kind::Field) {
       if (method.isStatic && !method.isPrivate && methodName == "prototype") {
@@ -16325,25 +17000,10 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
     // Lexical environment for the block.
     env_ = env_->createChild();
 
-    // Initialize TDZ for lexical declarations in this block (non-recursive)
-    for (const auto& s : body) {
-      if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-        if (varDecl->kind == VarDeclaration::Kind::Let ||
-            varDecl->kind == VarDeclaration::Kind::Const) {
-          for (const auto& declarator : varDecl->declarations) {
-            std::vector<std::string> names;
-            collectVarHoistNames(*declarator.pattern, names);
-            for (const auto& name : names) {
-              env_->defineTDZ(name);
-            }
-          }
-        }
-      } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-        env_->defineTDZ(classDecl->id.name);
-      }
-    }
+    initializeLexicalDeclarations(body);
 
     strictMode_ = true;  // Class bodies are always strict.
+    size_t disposableScope = beginSyncDisposableScope();
     for (const auto& s : body) {
       auto t = evaluate(*s);
       LIGHTJS_RUN_TASK_VOID(t);
@@ -16351,6 +17011,7 @@ Task Interpreter::evaluateClass(const ClassExpr& expr) {
         break;
       }
     }
+    disposeSyncDisposableScope(disposableScope);
 
     strictMode_ = prevStrict;
     env_ = prevEnvStatic;
@@ -16439,7 +17100,13 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
     }
     // Simple identifier
     if (useSet) {
-      if (!env_->set(id->name, value)) {
+      bool stored = false;
+      if (varDeclBypassWith_) {
+        stored = env_->setVar(id->name, value);
+      } else {
+        stored = env_->set(id->name, value);
+      }
+      if (!stored) {
         // Check if this is a const binding being reassigned
         if (env_->isConst(id->name)) {
           throwError(ErrorType::TypeError, "Assignment to constant variable '" + id->name + "'");
@@ -16758,7 +17425,13 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
               if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
             } else {
               auto nextIt = iterObj->properties.find("next");
-              if (nextIt != iterObj->properties.end()) nextMethod = nextIt->second;
+              if (nextIt != iterObj->properties.end()) {
+                nextMethod = nextIt->second;
+              } else {
+                // Walk prototype chain
+                auto [found, val] = getPropertyForPrimitive(iterResult, "next");
+                if (found) nextMethod = val;
+              }
             }
             if (!nextMethod.isFunction()) {
               throwError(ErrorType::TypeError, "Iterator next is not a function");
@@ -17249,6 +17922,14 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
         }
       }
 
+      if (!hasMemberTarget && targetExpr) {
+        if (auto* targetId = std::get_if<Identifier>(&targetExpr->node)) {
+          env_->resolveWithScopeValue(targetId->name);
+          if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
+          env_->resolveBindingEnvironment(targetId->name);
+        }
+      }
+
       Value propValue;
       auto [foundProp, fetchedPropValue] = getPropertyForPrimitive(value, keyName);
       if (flow_.type == ControlFlow::Type::Throw) LIGHTJS_RETURN(Value(Undefined{}));
@@ -17721,7 +18402,17 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
         argumentsArray->properties["__proto__"] = protoIt->second;
       }
     }
-    if (func->isStrict) {
+    // Determine if parameters are simple
+    bool hasSimpleParamsForArgs = !func->restParam.has_value();
+    if (hasSimpleParamsForArgs) {
+      for (const auto& p : func->params) {
+        if (p.defaultValue || p.name.empty() ||
+            (p.name.size() > 8 && p.name.substr(0, 8) == "__param_")) {
+          hasSimpleParamsForArgs = false; break;
+        }
+      }
+    }
+    if (func->isStrict || !hasSimpleParamsForArgs) {
       auto throwTypeErrorAccessor = getRealmThrowTypeErrorAccessor(env_.get());
       if (!throwTypeErrorAccessor) {
         throwTypeErrorAccessor = GarbageCollector::makeGC<Function>();
@@ -17733,6 +18424,7 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
       }
       argumentsArray->properties["__get_callee"] = Value(throwTypeErrorAccessor);
       argumentsArray->properties["__set_callee"] = Value(throwTypeErrorAccessor);
+      argumentsArray->properties["__non_configurable_callee"] = Value(true);
     } else {
       argumentsArray->properties["callee"] = Value(func);
     }
@@ -17806,38 +18498,18 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
   bool previousStrictMode = strictMode_;
   strictMode_ = func->isStrict;
 
-  // Initialize TDZ for lexical declarations in function body
-  for (const auto& s : *bodyPtr) {
-    if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-      if (varDecl->kind == VarDeclaration::Kind::Let ||
-          varDecl->kind == VarDeclaration::Kind::Const) {
-        for (const auto& declarator : varDecl->declarations) {
-          std::vector<std::string> names;
-          collectVarHoistNames(*declarator.pattern, names);
-          for (const auto& name : names) {
-            env_->defineTDZ(name);
-          }
-        }
-      }
-    } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-      env_->defineTDZ(classDecl->id.name);
-    }
-  }
+  initializeLexicalDeclarations(*bodyPtr);
 
   // Hoist var and function declarations in function body.
   hoistVarDeclarations(*bodyPtr);
-  for (const auto& hoistStmt : *bodyPtr) {
-    if (std::holds_alternative<FunctionDeclaration>(hoistStmt->node)) {
-      auto hoistTask = evaluate(*hoistStmt);
-      LIGHTJS_RUN_TASK_VOID_SYNC(hoistTask);
-    }
-  }
+  hoistFunctionDeclarations(*bodyPtr);
 
   Value result = Value(Undefined{});
   bool returned = false;
 
   auto prevFlow = flow_;
   flow_ = ControlFlow{};
+  size_t disposableScope = beginSyncDisposableScope();
 
   for (const auto& stmt : *bodyPtr) {
     auto stmtTask = evaluate(*stmt);
@@ -17852,6 +18524,7 @@ Value Interpreter::invokeFunction(GCPtr<Function> func, const std::vector<Value>
       break;
     }
   }
+  disposeSyncDisposableScope(disposableScope);
 
   if (!returned && flow_.type != ControlFlow::Type::Throw) {
     result = Value(Undefined{});
@@ -17947,11 +18620,31 @@ Task Interpreter::evaluateVarDecl(const VarDeclaration& decl) {
     }
 
     // Use the unified destructuring helper
-    bool isConst = (decl.kind == VarDeclaration::Kind::Const);
+    bool isConst = (decl.kind == VarDeclaration::Kind::Const ||
+                    decl.kind == VarDeclaration::Kind::Using ||
+                    decl.kind == VarDeclaration::Kind::AwaitUsing);
     // For var declarations, use set() to update the hoisted binding in function scope
     // rather than define() which would create a new binding in the current block scope
     bool useSet = (decl.kind == VarDeclaration::Kind::Var);
+    bool prevVarDeclBypassWith = varDeclBypassWith_;
+    varDeclBypassWith_ = useSet;
+    struct VarDeclBypassWithGuard {
+      Interpreter* interpreter;
+      bool previous;
+      ~VarDeclBypassWithGuard() {
+        interpreter->varDeclBypassWith_ = previous;
+      }
+    } varDeclBypassWithGuard{this, prevVarDeclBypassWith};
     { auto t = bindDestructuringPattern(*declarator.pattern, value, isConst, useSet); LIGHTJS_RUN_TASK_VOID(t); }
+    if (decl.kind == VarDeclaration::Kind::Using) {
+      if (!registerSyncDisposableResource(value)) {
+        LIGHTJS_RETURN(Value(Empty{}));
+      }
+    } else if (decl.kind == VarDeclaration::Kind::AwaitUsing) {
+      if (!registerAsyncDisposableResource(value)) {
+        LIGHTJS_RETURN(Value(Empty{}));
+      }
+    }
   }
   LIGHTJS_RETURN(Value(Empty{}));
 }
@@ -18109,7 +18802,9 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
     auto proto = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
     if (func->isGenerator) {
-      if (auto genProto = env_->get("__generator_prototype__"); genProto && genProto->isObject()) {
+      const char* prototypeName =
+        (func->isAsync && func->isGenerator) ? "__async_generator_prototype__" : "__generator_prototype__";
+      if (auto genProto = env_->get(prototypeName); genProto && genProto->isObject()) {
         proto->properties["__proto__"] = *genProto;
       }
       func->properties["__non_enum_prototype"] = Value(true);
@@ -18131,11 +18826,21 @@ Task Interpreter::evaluateFuncDecl(const FunctionDeclaration& decl) {
     func->properties["__non_configurable_prototype"] = Value(true);
   }
 
-  // Set __proto__ to Function.prototype or GeneratorFunction.prototype
-  std::string funcProtoName = func->isGenerator ? "__generator_function_prototype__" : "Function";
+  // Set __proto__ to correct function prototype
+  std::string funcProtoName;
+  bool directFuncProto = false;
+  if (func->isGenerator) {
+    funcProtoName = "__generator_function_prototype__";
+    directFuncProto = true;
+  } else if (func->isAsync) {
+    funcProtoName = "__async_function_prototype__";
+    directFuncProto = true;
+  } else {
+    funcProtoName = "Function";
+  }
   auto funcVal = env_->getRoot()->get(funcProtoName);
   if (funcVal.has_value()) {
-    if (func->isGenerator && funcVal->isObject()) {
+    if (directFuncProto && funcVal->isObject()) {
       func->properties["__proto__"] = *funcVal;
     } else if (funcVal->isFunction()) {
       auto funcCtor = std::get<GCPtr<Function>>(funcVal->data);
@@ -18203,26 +18908,10 @@ Task Interpreter::evaluateExprStmt(const ExpressionStmt& stmt) {
 Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
   auto prevEnv = env_;
   env_ = env_->createChild();
-
-  // Initialize TDZ for lexical declarations in this block (non-recursive)
-  for (const auto& s : stmt.body) {
-    if (auto* varDecl = std::get_if<VarDeclaration>(&s->node)) {
-      if (varDecl->kind == VarDeclaration::Kind::Let ||
-          varDecl->kind == VarDeclaration::Kind::Const) {
-        for (const auto& declarator : varDecl->declarations) {
-          std::vector<std::string> names;
-          collectVarHoistNames(*declarator.pattern, names);
-          for (const auto& name : names) {
-            env_->defineTDZ(name);
-          }
-        }
-      }
-    } else if (auto* classDecl = std::get_if<ClassDeclaration>(&s->node)) {
-      env_->defineTDZ(classDecl->id.name);
-    }
-  }
+  initializeLexicalDeclarations(stmt.body);
 
   Value result = Value(Empty{});
+  size_t disposableScope = beginSyncDisposableScope();
   for (const auto& s : stmt.body) {
     auto task = evaluate(*s);
     LIGHTJS_RUN_TASK_VOID(task);
@@ -18233,6 +18922,7 @@ Task Interpreter::evaluateBlock(const BlockStmt& stmt) {
       break;
     }
   }
+  disposeSyncDisposableScope(disposableScope);
 
   env_ = prevEnv;
   LIGHTJS_RETURN(result);
@@ -18457,6 +19147,7 @@ Task Interpreter::evaluateWith(const WithStmt& stmt) {
 Task Interpreter::evaluateFor(const ForStmt& stmt) {
   auto prevEnv = env_;
   env_ = env_->createChild();
+  size_t disposableScope = beginSyncDisposableScope();
   std::string myLabel = pendingIterationLabel_;
   pendingIterationLabel_.clear();
 
@@ -18465,6 +19156,7 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
     LIGHTJS_RUN_TASK_VOID(initTask);
     // If init threw (e.g. destructuring null/undefined), propagate the error
     if (flow_.type == ControlFlow::Type::Throw) {
+      disposeSyncDisposableScope(disposableScope);
       env_ = prevEnv;
       LIGHTJS_RETURN(Value(Undefined{}));
     }
@@ -18566,6 +19258,7 @@ Task Interpreter::evaluateFor(const ForStmt& stmt) {
     }
   }
 
+  disposeSyncDisposableScope(disposableScope);
   env_ = prevEnv;
   LIGHTJS_RETURN(result);
 }
@@ -18669,8 +19362,13 @@ Task Interpreter::evaluateForIn(const ForInStmt& stmt) {
 
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isVarDecl = true;
-    isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let || varDecl->kind == VarDeclaration::Kind::Const);
-    isConst = (varDecl->kind == VarDeclaration::Kind::Const);
+    isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let ||
+                    varDecl->kind == VarDeclaration::Kind::Const ||
+                    varDecl->kind == VarDeclaration::Kind::Using ||
+                    varDecl->kind == VarDeclaration::Kind::AwaitUsing);
+    isConst = (varDecl->kind == VarDeclaration::Kind::Const ||
+               varDecl->kind == VarDeclaration::Kind::Using ||
+               varDecl->kind == VarDeclaration::Kind::AwaitUsing);
     if (!varDecl->declarations.empty()) {
       if (auto* id = std::get_if<Identifier>(&varDecl->declarations[0].pattern->node)) {
         varName = id->name;
@@ -19073,6 +19771,8 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
   ForOfLHS lhsType = ForOfLHS::SimpleVar;
   std::string varName;
   bool isConst = false;
+  bool isUsing = false;
+  bool isAwaitUsing = false;
   bool isLetOrConst = false;
   bool isDeclaration = false;  // true for var/let/const declarations, false for expression targets
   const Expression* lhsPattern = nullptr;
@@ -19100,9 +19800,15 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
 
   if (auto* varDecl = std::get_if<VarDeclaration>(&stmt.left->node)) {
     isDeclaration = true;
-    isConst = (varDecl->kind == VarDeclaration::Kind::Const);
+    isConst = (varDecl->kind == VarDeclaration::Kind::Const ||
+               varDecl->kind == VarDeclaration::Kind::Using ||
+               varDecl->kind == VarDeclaration::Kind::AwaitUsing);
+    isUsing = (varDecl->kind == VarDeclaration::Kind::Using);
+    isAwaitUsing = (varDecl->kind == VarDeclaration::Kind::AwaitUsing);
     isLetOrConst = (varDecl->kind == VarDeclaration::Kind::Let ||
-                    varDecl->kind == VarDeclaration::Kind::Const);
+                    varDecl->kind == VarDeclaration::Kind::Const ||
+                    varDecl->kind == VarDeclaration::Kind::Using ||
+                    varDecl->kind == VarDeclaration::Kind::AwaitUsing);
     if (!varDecl->declarations.empty()) {
       const auto& pattern = varDecl->declarations[0].pattern;
       if (auto* id = std::get_if<Identifier>(&pattern->node)) {
@@ -19314,6 +20020,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     auto iterEnv = env_->createChild();
     auto outerEnv = env_;
     env_ = iterEnv;
+    size_t iterationDisposableScope = beginSyncDisposableScope();
 
     auto handleAbruptBindingCompletion = [&]() -> bool {
       if (flow_.type == ControlFlow::Type::None ||
@@ -19338,6 +20045,16 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
       if (isConst) {
         // let/const declaration: define in per-iteration scope
         env_->define(varName, currentValue, true);
+        if (isUsing && !registerSyncDisposableResource(currentValue)) {
+          iteratorClose(iterator);
+          env_ = prevEnv;
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
+        if (isAwaitUsing && !registerAsyncDisposableResource(currentValue)) {
+          iteratorClose(iterator);
+          env_ = prevEnv;
+          LIGHTJS_RETURN(Value(Undefined{}));
+        }
       } else if (!varName.empty() && env_->isConst(varName)) {
         // Expression target assigning to const variable
         throwError(ErrorType::TypeError, "Assignment to constant variable '" + varName + "'");
@@ -19385,6 +20102,7 @@ Task Interpreter::evaluateForOf(const ForOfStmt& stmt) {
     }
 
     // Restore to outer loop env
+    disposeSyncDisposableScope(iterationDisposableScope);
     env_ = outerEnv;
 
     if (flow_.type == ControlFlow::Type::Break) {
@@ -19551,6 +20269,8 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
   // Create block scope for try block (let/const should be scoped here)
   auto tryBlockEnv = env_->createChild();
   env_ = tryBlockEnv;
+  initializeLexicalDeclarations(stmt.block);
+  size_t tryDisposableScope = beginSyncDisposableScope();
 
   for (const auto& s : stmt.block) {
     Value stmtResult;
@@ -19561,6 +20281,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
     }
 
     if (flow_.type == ControlFlow::Type::Throw && stmt.hasHandler) {
+      disposeSyncDisposableScope(tryDisposableScope);
       // Restore environment to before the try block
       env_ = envBeforeTry;
 
@@ -19584,6 +20305,8 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
       // so closures in param initializers vs block body capture different scopes
       auto catchBlockEnv = env_->createChild();
       env_ = catchBlockEnv;
+      initializeLexicalDeclarations(stmt.handler.body);
+      size_t catchDisposableScope = beginSyncDisposableScope();
 
       for (const auto& catchStmt : stmt.handler.body) {
         Value catchResult;
@@ -19596,6 +20319,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
           break;
         }
       }
+      disposeSyncDisposableScope(catchDisposableScope);
 
       env_ = prevEnv;
       break;
@@ -19608,6 +20332,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
 
   // Restore environment after try block (unwind try block scope)
   if (env_ == tryBlockEnv) {
+    disposeSyncDisposableScope(tryDisposableScope);
     env_ = envBeforeTry;
   }
 
@@ -19627,6 +20352,8 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
     auto finallyEnv = env_->createChild();
     auto envBeforeFinally = env_;
     env_ = finallyEnv;
+    initializeLexicalDeclarations(stmt.finalizer);
+    size_t finallyDisposableScope = beginSyncDisposableScope();
     for (const auto& finalStmt : stmt.finalizer) {
       auto finalTask = evaluate(*finalStmt);
       Value finalResult;
@@ -19639,6 +20366,7 @@ Task Interpreter::evaluateTry(const TryStmt& stmt) {
         break;
       }
     }
+    disposeSyncDisposableScope(finallyDisposableScope);
     env_ = envBeforeFinally;
 
     // If finally block produced its own control flow, it overrides try/catch's

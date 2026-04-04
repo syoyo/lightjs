@@ -1,11 +1,564 @@
 #pragma once
 
+#include "unicode.h"
+
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace lightjs {
+
+enum class SupportedRegexUnicodeProperty {
+  ASCII,
+  ASCIIHexDigit,
+  UppercaseLetter,
+  LowercaseLetter,
+  DecimalNumber,
+  TitlecaseLetter,
+  LetterNumber,
+  OtherNumber,
+  Number,
+  CasedLetter,
+  ModifierLetter,
+  OtherLetter,
+  Letter,
+  LineSeparator,
+  ParagraphSeparator,
+  SpaceSeparator,
+  Separator,
+  NonspacingMark,
+  EnclosingMark,
+  SpacingMark,
+  Mark,
+  ConnectorPunctuation,
+  FinalPunctuation,
+  InitialPunctuation,
+  DashPunctuation,
+  OpenPunctuation,
+  ClosePunctuation,
+  OtherPunctuation,
+  Punctuation,
+  Control,
+  PrivateUse,
+  CurrencySymbol,
+  Format,
+  ModifierSymbol,
+  MathSymbol,
+  OtherSymbol,
+  Symbol,
+  Surrogate,
+  ScriptHan,
+  ScriptExtensionsHan,
+  ScriptHangul,
+  ScriptExtensionsHangul,
+  ScriptHanunoo,
+  ScriptExtensionsHanunoo,
+  ScriptBuhid,
+  ScriptExtensionsBuhid,
+  ScriptTagalog,
+  ScriptExtensionsTagalog,
+  ScriptTagbanwa,
+  ScriptExtensionsTagbanwa,
+  ScriptOgham,
+  ScriptExtensionsOgham,
+  ScriptBuginese,
+  ScriptExtensionsBuginese,
+  ScriptTaiLe,
+  ScriptExtensionsTaiLe,
+  ScriptCham,
+  ScriptExtensionsCham,
+  ScriptRunic,
+  ScriptExtensionsRunic,
+};
+
+struct SupportedRegexUnicodePropertyPattern {
+  SupportedRegexUnicodeProperty property;
+  bool negated = false;
+  bool anchoredOneOrMore = false;
+};
+
+inline bool isSupportedRegexStringPropertyName(const std::string& propertyName) {
+  return propertyName == "Basic_Emoji" ||
+         propertyName == "Emoji_Keycap_Sequence" ||
+         propertyName == "RGI_Emoji" ||
+         propertyName == "RGI_Emoji_Flag_Sequence" ||
+         propertyName == "RGI_Emoji_Modifier_Sequence" ||
+         propertyName == "RGI_Emoji_Tag_Sequence" ||
+         propertyName == "RGI_Emoji_ZWJ_Sequence";
+}
+
+inline std::optional<SupportedRegexUnicodeProperty>
+classifySupportedRegexUnicodePropertyName(const std::string& propertyName) {
+  if (propertyName == "ASCII") {
+    return SupportedRegexUnicodeProperty::ASCII;
+  }
+  if (propertyName == "ASCII_Hex_Digit" || propertyName == "AHex") {
+    return SupportedRegexUnicodeProperty::ASCIIHexDigit;
+  }
+  if (propertyName == "Lu" ||
+      propertyName == "Uppercase_Letter" ||
+      propertyName == "General_Category=Lu" ||
+      propertyName == "General_Category=Uppercase_Letter" ||
+      propertyName == "gc=Lu" ||
+      propertyName == "gc=Uppercase_Letter") {
+    return SupportedRegexUnicodeProperty::UppercaseLetter;
+  }
+  if (propertyName == "Ll" ||
+      propertyName == "Lowercase_Letter" ||
+      propertyName == "General_Category=Ll" ||
+      propertyName == "General_Category=Lowercase_Letter" ||
+      propertyName == "gc=Ll" ||
+      propertyName == "gc=Lowercase_Letter") {
+    return SupportedRegexUnicodeProperty::LowercaseLetter;
+  }
+  if (propertyName == "Nd" ||
+      propertyName == "digit" ||
+      propertyName == "Decimal_Number" ||
+      propertyName == "General_Category=Nd" ||
+      propertyName == "General_Category=digit" ||
+      propertyName == "General_Category=Decimal_Number" ||
+      propertyName == "gc=Nd" ||
+      propertyName == "gc=digit" ||
+      propertyName == "gc=Decimal_Number") {
+    return SupportedRegexUnicodeProperty::DecimalNumber;
+  }
+  if (propertyName == "Lt" ||
+      propertyName == "Titlecase_Letter" ||
+      propertyName == "General_Category=Lt" ||
+      propertyName == "General_Category=Titlecase_Letter" ||
+      propertyName == "gc=Lt" ||
+      propertyName == "gc=Titlecase_Letter") {
+    return SupportedRegexUnicodeProperty::TitlecaseLetter;
+  }
+  if (propertyName == "Nl" ||
+      propertyName == "Letter_Number" ||
+      propertyName == "General_Category=Nl" ||
+      propertyName == "General_Category=Letter_Number" ||
+      propertyName == "gc=Nl" ||
+      propertyName == "gc=Letter_Number") {
+    return SupportedRegexUnicodeProperty::LetterNumber;
+  }
+  if (propertyName == "No" ||
+      propertyName == "Other_Number" ||
+      propertyName == "General_Category=No" ||
+      propertyName == "General_Category=Other_Number" ||
+      propertyName == "gc=No" ||
+      propertyName == "gc=Other_Number") {
+    return SupportedRegexUnicodeProperty::OtherNumber;
+  }
+  if (propertyName == "N" ||
+      propertyName == "Number" ||
+      propertyName == "General_Category=N" ||
+      propertyName == "General_Category=Number" ||
+      propertyName == "gc=N" ||
+      propertyName == "gc=Number") {
+    return SupportedRegexUnicodeProperty::Number;
+  }
+  if (propertyName == "LC" ||
+      propertyName == "Cased_Letter" ||
+      propertyName == "General_Category=LC" ||
+      propertyName == "General_Category=Cased_Letter" ||
+      propertyName == "gc=LC" ||
+      propertyName == "gc=Cased_Letter") {
+    return SupportedRegexUnicodeProperty::CasedLetter;
+  }
+  if (propertyName == "Lm" ||
+      propertyName == "Modifier_Letter" ||
+      propertyName == "General_Category=Lm" ||
+      propertyName == "General_Category=Modifier_Letter" ||
+      propertyName == "gc=Lm" ||
+      propertyName == "gc=Modifier_Letter") {
+    return SupportedRegexUnicodeProperty::ModifierLetter;
+  }
+  if (propertyName == "Lo" ||
+      propertyName == "Other_Letter" ||
+      propertyName == "General_Category=Lo" ||
+      propertyName == "General_Category=Other_Letter" ||
+      propertyName == "gc=Lo" ||
+      propertyName == "gc=Other_Letter") {
+    return SupportedRegexUnicodeProperty::OtherLetter;
+  }
+  if (propertyName == "L" ||
+      propertyName == "Letter" ||
+      propertyName == "General_Category=L" ||
+      propertyName == "General_Category=Letter" ||
+      propertyName == "gc=L" ||
+      propertyName == "gc=Letter") {
+    return SupportedRegexUnicodeProperty::Letter;
+  }
+  if (propertyName == "Zl" ||
+      propertyName == "Line_Separator" ||
+      propertyName == "General_Category=Zl" ||
+      propertyName == "General_Category=Line_Separator" ||
+      propertyName == "gc=Zl" ||
+      propertyName == "gc=Line_Separator") {
+    return SupportedRegexUnicodeProperty::LineSeparator;
+  }
+  if (propertyName == "Zp" ||
+      propertyName == "Paragraph_Separator" ||
+      propertyName == "General_Category=Zp" ||
+      propertyName == "General_Category=Paragraph_Separator" ||
+      propertyName == "gc=Zp" ||
+      propertyName == "gc=Paragraph_Separator") {
+    return SupportedRegexUnicodeProperty::ParagraphSeparator;
+  }
+  if (propertyName == "Zs" ||
+      propertyName == "Space_Separator" ||
+      propertyName == "General_Category=Zs" ||
+      propertyName == "General_Category=Space_Separator" ||
+      propertyName == "gc=Zs" ||
+      propertyName == "gc=Space_Separator") {
+    return SupportedRegexUnicodeProperty::SpaceSeparator;
+  }
+  if (propertyName == "Z" ||
+      propertyName == "Separator" ||
+      propertyName == "General_Category=Z" ||
+      propertyName == "General_Category=Separator" ||
+      propertyName == "gc=Z" ||
+      propertyName == "gc=Separator") {
+    return SupportedRegexUnicodeProperty::Separator;
+  }
+  if (propertyName == "Mn" ||
+      propertyName == "Nonspacing_Mark" ||
+      propertyName == "General_Category=Mn" ||
+      propertyName == "General_Category=Nonspacing_Mark" ||
+      propertyName == "gc=Mn" ||
+      propertyName == "gc=Nonspacing_Mark") {
+    return SupportedRegexUnicodeProperty::NonspacingMark;
+  }
+  if (propertyName == "Me" ||
+      propertyName == "Enclosing_Mark" ||
+      propertyName == "General_Category=Me" ||
+      propertyName == "General_Category=Enclosing_Mark" ||
+      propertyName == "gc=Me" ||
+      propertyName == "gc=Enclosing_Mark") {
+    return SupportedRegexUnicodeProperty::EnclosingMark;
+  }
+  if (propertyName == "Mc" ||
+      propertyName == "Spacing_Mark" ||
+      propertyName == "General_Category=Mc" ||
+      propertyName == "General_Category=Spacing_Mark" ||
+      propertyName == "gc=Mc" ||
+      propertyName == "gc=Spacing_Mark") {
+    return SupportedRegexUnicodeProperty::SpacingMark;
+  }
+  if (propertyName == "M" ||
+      propertyName == "Mark" ||
+      propertyName == "Combining_Mark" ||
+      propertyName == "General_Category=M" ||
+      propertyName == "General_Category=Mark" ||
+      propertyName == "General_Category=Combining_Mark" ||
+      propertyName == "gc=M" ||
+      propertyName == "gc=Mark" ||
+      propertyName == "gc=Combining_Mark") {
+    return SupportedRegexUnicodeProperty::Mark;
+  }
+  if (propertyName == "Pc" ||
+      propertyName == "Connector_Punctuation" ||
+      propertyName == "General_Category=Pc" ||
+      propertyName == "General_Category=Connector_Punctuation" ||
+      propertyName == "gc=Pc" ||
+      propertyName == "gc=Connector_Punctuation") {
+    return SupportedRegexUnicodeProperty::ConnectorPunctuation;
+  }
+  if (propertyName == "Pf" ||
+      propertyName == "Final_Punctuation" ||
+      propertyName == "General_Category=Pf" ||
+      propertyName == "General_Category=Final_Punctuation" ||
+      propertyName == "gc=Pf" ||
+      propertyName == "gc=Final_Punctuation") {
+    return SupportedRegexUnicodeProperty::FinalPunctuation;
+  }
+  if (propertyName == "Pi" ||
+      propertyName == "Initial_Punctuation" ||
+      propertyName == "General_Category=Pi" ||
+      propertyName == "General_Category=Initial_Punctuation" ||
+      propertyName == "gc=Pi" ||
+      propertyName == "gc=Initial_Punctuation") {
+    return SupportedRegexUnicodeProperty::InitialPunctuation;
+  }
+  if (propertyName == "Pd" ||
+      propertyName == "Dash_Punctuation" ||
+      propertyName == "General_Category=Pd" ||
+      propertyName == "General_Category=Dash_Punctuation" ||
+      propertyName == "gc=Pd" ||
+      propertyName == "gc=Dash_Punctuation") {
+    return SupportedRegexUnicodeProperty::DashPunctuation;
+  }
+  if (propertyName == "Ps" ||
+      propertyName == "Open_Punctuation" ||
+      propertyName == "General_Category=Ps" ||
+      propertyName == "General_Category=Open_Punctuation" ||
+      propertyName == "gc=Ps" ||
+      propertyName == "gc=Open_Punctuation") {
+    return SupportedRegexUnicodeProperty::OpenPunctuation;
+  }
+  if (propertyName == "Pe" ||
+      propertyName == "Close_Punctuation" ||
+      propertyName == "General_Category=Pe" ||
+      propertyName == "General_Category=Close_Punctuation" ||
+      propertyName == "gc=Pe" ||
+      propertyName == "gc=Close_Punctuation") {
+    return SupportedRegexUnicodeProperty::ClosePunctuation;
+  }
+  if (propertyName == "Po" ||
+      propertyName == "Other_Punctuation" ||
+      propertyName == "General_Category=Po" ||
+      propertyName == "General_Category=Other_Punctuation" ||
+      propertyName == "gc=Po" ||
+      propertyName == "gc=Other_Punctuation") {
+    return SupportedRegexUnicodeProperty::OtherPunctuation;
+  }
+  if (propertyName == "P" ||
+      propertyName == "punct" ||
+      propertyName == "Punctuation" ||
+      propertyName == "General_Category=P" ||
+      propertyName == "General_Category=punct" ||
+      propertyName == "General_Category=Punctuation" ||
+      propertyName == "gc=P" ||
+      propertyName == "gc=punct" ||
+      propertyName == "gc=Punctuation") {
+    return SupportedRegexUnicodeProperty::Punctuation;
+  }
+  if (propertyName == "Cc" ||
+      propertyName == "cntrl" ||
+      propertyName == "Control" ||
+      propertyName == "General_Category=Cc" ||
+      propertyName == "General_Category=cntrl" ||
+      propertyName == "General_Category=Control" ||
+      propertyName == "gc=Cc" ||
+      propertyName == "gc=cntrl" ||
+      propertyName == "gc=Control") {
+    return SupportedRegexUnicodeProperty::Control;
+  }
+  if (propertyName == "Co" ||
+      propertyName == "Private_Use" ||
+      propertyName == "General_Category=Co" ||
+      propertyName == "General_Category=Private_Use" ||
+      propertyName == "gc=Co" ||
+      propertyName == "gc=Private_Use") {
+    return SupportedRegexUnicodeProperty::PrivateUse;
+  }
+  if (propertyName == "Sc" ||
+      propertyName == "Currency_Symbol" ||
+      propertyName == "General_Category=Sc" ||
+      propertyName == "General_Category=Currency_Symbol" ||
+      propertyName == "gc=Sc" ||
+      propertyName == "gc=Currency_Symbol") {
+    return SupportedRegexUnicodeProperty::CurrencySymbol;
+  }
+  if (propertyName == "Cf" ||
+      propertyName == "Format" ||
+      propertyName == "General_Category=Cf" ||
+      propertyName == "General_Category=Format" ||
+      propertyName == "gc=Cf" ||
+      propertyName == "gc=Format") {
+    return SupportedRegexUnicodeProperty::Format;
+  }
+  if (propertyName == "Sk" ||
+      propertyName == "Modifier_Symbol" ||
+      propertyName == "General_Category=Sk" ||
+      propertyName == "General_Category=Modifier_Symbol" ||
+      propertyName == "gc=Sk" ||
+      propertyName == "gc=Modifier_Symbol") {
+    return SupportedRegexUnicodeProperty::ModifierSymbol;
+  }
+  if (propertyName == "Sm" ||
+      propertyName == "Math_Symbol" ||
+      propertyName == "General_Category=Sm" ||
+      propertyName == "General_Category=Math_Symbol" ||
+      propertyName == "gc=Sm" ||
+      propertyName == "gc=Math_Symbol") {
+    return SupportedRegexUnicodeProperty::MathSymbol;
+  }
+  if (propertyName == "So" ||
+      propertyName == "Other_Symbol" ||
+      propertyName == "General_Category=So" ||
+      propertyName == "General_Category=Other_Symbol" ||
+      propertyName == "gc=So" ||
+      propertyName == "gc=Other_Symbol") {
+    return SupportedRegexUnicodeProperty::OtherSymbol;
+  }
+  if (propertyName == "S" ||
+      propertyName == "Symbol" ||
+      propertyName == "General_Category=S" ||
+      propertyName == "General_Category=Symbol" ||
+      propertyName == "gc=S" ||
+      propertyName == "gc=Symbol") {
+    return SupportedRegexUnicodeProperty::Symbol;
+  }
+  if (propertyName == "Cs" ||
+      propertyName == "Surrogate" ||
+      propertyName == "General_Category=Cs" ||
+      propertyName == "General_Category=Surrogate" ||
+      propertyName == "gc=Cs" ||
+      propertyName == "gc=Surrogate") {
+    return SupportedRegexUnicodeProperty::Surrogate;
+  }
+  if (propertyName == "Script=Han" ||
+      propertyName == "Script=Hani" ||
+      propertyName == "sc=Han" ||
+      propertyName == "sc=Hani") {
+    return SupportedRegexUnicodeProperty::ScriptHan;
+  }
+  if (propertyName == "Script_Extensions=Han" ||
+      propertyName == "Script_Extensions=Hani" ||
+      propertyName == "scx=Han" ||
+      propertyName == "scx=Hani") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsHan;
+  }
+  if (propertyName == "Script=Hangul" ||
+      propertyName == "Script=Hang" ||
+      propertyName == "sc=Hangul" ||
+      propertyName == "sc=Hang") {
+    return SupportedRegexUnicodeProperty::ScriptHangul;
+  }
+  if (propertyName == "Script_Extensions=Hangul" ||
+      propertyName == "Script_Extensions=Hang" ||
+      propertyName == "scx=Hangul" ||
+      propertyName == "scx=Hang") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsHangul;
+  }
+  if (propertyName == "Script=Hanunoo" ||
+      propertyName == "Script=Hano" ||
+      propertyName == "sc=Hanunoo" ||
+      propertyName == "sc=Hano") {
+    return SupportedRegexUnicodeProperty::ScriptHanunoo;
+  }
+  if (propertyName == "Script_Extensions=Hanunoo" ||
+      propertyName == "Script_Extensions=Hano" ||
+      propertyName == "scx=Hanunoo" ||
+      propertyName == "scx=Hano") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsHanunoo;
+  }
+  if (propertyName == "Script=Buhid" ||
+      propertyName == "Script=Buhd" ||
+      propertyName == "sc=Buhid" ||
+      propertyName == "sc=Buhd") {
+    return SupportedRegexUnicodeProperty::ScriptBuhid;
+  }
+  if (propertyName == "Script_Extensions=Buhid" ||
+      propertyName == "Script_Extensions=Buhd" ||
+      propertyName == "scx=Buhid" ||
+      propertyName == "scx=Buhd") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsBuhid;
+  }
+  if (propertyName == "Script=Tagalog" ||
+      propertyName == "Script=Tglg" ||
+      propertyName == "sc=Tagalog" ||
+      propertyName == "sc=Tglg") {
+    return SupportedRegexUnicodeProperty::ScriptTagalog;
+  }
+  if (propertyName == "Script_Extensions=Tagalog" ||
+      propertyName == "Script_Extensions=Tglg" ||
+      propertyName == "scx=Tagalog" ||
+      propertyName == "scx=Tglg") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsTagalog;
+  }
+  if (propertyName == "Script=Tagbanwa" ||
+      propertyName == "Script=Tagb" ||
+      propertyName == "sc=Tagbanwa" ||
+      propertyName == "sc=Tagb") {
+    return SupportedRegexUnicodeProperty::ScriptTagbanwa;
+  }
+  if (propertyName == "Script_Extensions=Tagbanwa" ||
+      propertyName == "Script_Extensions=Tagb" ||
+      propertyName == "scx=Tagbanwa" ||
+      propertyName == "scx=Tagb") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsTagbanwa;
+  }
+  if (propertyName == "Script=Ogham" ||
+      propertyName == "Script=Ogam" ||
+      propertyName == "sc=Ogham" ||
+      propertyName == "sc=Ogam") {
+    return SupportedRegexUnicodeProperty::ScriptOgham;
+  }
+  if (propertyName == "Script_Extensions=Ogham" ||
+      propertyName == "Script_Extensions=Ogam" ||
+      propertyName == "scx=Ogham" ||
+      propertyName == "scx=Ogam") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsOgham;
+  }
+  if (propertyName == "Script=Buginese" ||
+      propertyName == "Script=Bugi" ||
+      propertyName == "sc=Buginese" ||
+      propertyName == "sc=Bugi") {
+    return SupportedRegexUnicodeProperty::ScriptBuginese;
+  }
+  if (propertyName == "Script_Extensions=Buginese" ||
+      propertyName == "Script_Extensions=Bugi" ||
+      propertyName == "scx=Buginese" ||
+      propertyName == "scx=Bugi") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsBuginese;
+  }
+  if (propertyName == "Script=Tai_Le" ||
+      propertyName == "Script=Tale" ||
+      propertyName == "sc=Tai_Le" ||
+      propertyName == "sc=Tale") {
+    return SupportedRegexUnicodeProperty::ScriptTaiLe;
+  }
+  if (propertyName == "Script_Extensions=Tai_Le" ||
+      propertyName == "Script_Extensions=Tale" ||
+      propertyName == "scx=Tai_Le" ||
+      propertyName == "scx=Tale") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsTaiLe;
+  }
+  if (propertyName == "Script=Cham" ||
+      propertyName == "sc=Cham") {
+    return SupportedRegexUnicodeProperty::ScriptCham;
+  }
+  if (propertyName == "Script_Extensions=Cham" ||
+      propertyName == "scx=Cham") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsCham;
+  }
+  if (propertyName == "Script=Runic" ||
+      propertyName == "Script=Runr" ||
+      propertyName == "sc=Runic" ||
+      propertyName == "sc=Runr") {
+    return SupportedRegexUnicodeProperty::ScriptRunic;
+  }
+  if (propertyName == "Script_Extensions=Runic" ||
+      propertyName == "Script_Extensions=Runr" ||
+      propertyName == "scx=Runic" ||
+      propertyName == "scx=Runr") {
+    return SupportedRegexUnicodeProperty::ScriptExtensionsRunic;
+  }
+  return std::nullopt;
+}
+
+inline std::optional<SupportedRegexUnicodePropertyPattern>
+parseSupportedRegexUnicodePropertyPattern(const std::string& pattern) {
+  const auto parseCore = [](const std::string& core, bool anchoredOneOrMore)
+      -> std::optional<SupportedRegexUnicodePropertyPattern> {
+    if (core.size() < 5 || core[0] != '\\' ||
+        (core[1] != 'p' && core[1] != 'P') || core[2] != '{' || core.back() != '}') {
+      return std::nullopt;
+    }
+    std::string propertyName = core.substr(3, core.size() - 4);
+    auto property = classifySupportedRegexUnicodePropertyName(propertyName);
+    if (!property.has_value()) {
+      return std::nullopt;
+    }
+    return SupportedRegexUnicodePropertyPattern{
+      *property,
+      core[1] == 'P',
+      anchoredOneOrMore,
+    };
+  };
+
+  if (auto direct = parseCore(pattern, false)) {
+    return direct;
+  }
+  if (pattern.size() >= 6 &&
+      pattern[0] == '^' &&
+      pattern[pattern.size() - 1] == '$' &&
+      pattern[pattern.size() - 2] == '+') {
+    return parseCore(pattern.substr(1, pattern.size() - 3), true);
+  }
+  return std::nullopt;
+}
 
 inline bool isRegexHexDigit(char ch) {
   return (ch >= '0' && ch <= '9') ||
@@ -108,6 +661,118 @@ inline std::string canonicalizeRegexFlags(const std::string& flags) {
     }
   }
   return canonicalFlags;
+}
+
+inline uint32_t parseRegexHexWord(const std::string& pattern, size_t offset) {
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    char ch = pattern[offset + i];
+    value <<= 4;
+    if (ch >= '0' && ch <= '9') {
+      value |= static_cast<uint32_t>(ch - '0');
+    } else if (ch >= 'a' && ch <= 'f') {
+      value |= static_cast<uint32_t>(10 + (ch - 'a'));
+    } else {
+      value |= static_cast<uint32_t>(10 + (ch - 'A'));
+    }
+  }
+  return value;
+}
+
+inline void appendRegexCodePointEscape(std::string& out, uint32_t codePoint) {
+  static const char* kHexDigits = "0123456789abcdef";
+  out += "\\u{";
+  char buffer[8];
+  size_t length = 0;
+  do {
+    buffer[length++] = kHexDigits[codePoint & 0xF];
+    codePoint >>= 4;
+  } while (codePoint != 0);
+  while (length > 0) {
+    out.push_back(buffer[--length]);
+  }
+  out.push_back('}');
+}
+
+inline std::string escapeRegexPatternSource(const std::string& pattern,
+                                            const std::string& flags) {
+  if (pattern.empty()) {
+    return "(?:)";
+  }
+
+  std::string escaped;
+  escaped.reserve(pattern.size() + 8);
+  bool unicodeMode = flags.find('u') != std::string::npos ||
+                     flags.find('v') != std::string::npos;
+
+  for (size_t i = 0; i < pattern.size();) {
+    if (unicodeMode &&
+        i + 12 <= pattern.size() &&
+        pattern[i] == '\\' &&
+        pattern[i + 1] == 'u' &&
+        isRegexHexDigit(pattern[i + 2]) &&
+        isRegexHexDigit(pattern[i + 3]) &&
+        isRegexHexDigit(pattern[i + 4]) &&
+        isRegexHexDigit(pattern[i + 5]) &&
+        pattern[i + 6] == '\\' &&
+        pattern[i + 7] == 'u' &&
+        isRegexHexDigit(pattern[i + 8]) &&
+        isRegexHexDigit(pattern[i + 9]) &&
+        isRegexHexDigit(pattern[i + 10]) &&
+        isRegexHexDigit(pattern[i + 11])) {
+      uint32_t lead = parseRegexHexWord(pattern, i + 2);
+      uint32_t trail = parseRegexHexWord(pattern, i + 8);
+      if (lead >= 0xD800 && lead <= 0xDBFF &&
+          trail >= 0xDC00 && trail <= 0xDFFF) {
+        uint32_t codePoint = 0x10000u + ((lead - 0xD800u) << 10) +
+                             (trail - 0xDC00u);
+        appendRegexCodePointEscape(escaped, codePoint);
+        i += 12;
+        continue;
+      }
+    }
+
+    if (pattern[i] == '\\' && i + 1 < pattern.size()) {
+      escaped.push_back(pattern[i]);
+      escaped.push_back(pattern[i + 1]);
+      i += 2;
+      continue;
+    }
+
+    unsigned char ch = static_cast<unsigned char>(pattern[i]);
+    if (ch == '/') {
+      escaped += "\\/";
+      ++i;
+      continue;
+    }
+    if (ch == '\n') {
+      escaped += "\\n";
+      ++i;
+      continue;
+    }
+    if (ch == '\r') {
+      escaped += "\\r";
+      ++i;
+      continue;
+    }
+
+    if (ch < 0x80) {
+      escaped.push_back(static_cast<char>(ch));
+      ++i;
+      continue;
+    }
+
+    size_t cursor = i;
+    uint32_t codePoint = unicode::decodeUTF8(pattern, cursor);
+    if (codePoint == 0x2028 || codePoint == 0x2029) {
+      appendRegexCodePointEscape(escaped, codePoint);
+    } else {
+      escaped.append(pattern.substr(i, cursor - i));
+    }
+    i = cursor;
+  }
+
+  return escaped;
 }
 
 inline void appendRegexUtf8(std::string& out, uint32_t codepoint) {
@@ -519,8 +1184,7 @@ inline bool isBraceUnicodeEscapeOnlyPattern(const std::string& pattern) {
 
 inline bool shouldBypassRegexEngineValidation(const std::string& pattern) {
   return isBraceUnicodeEscapeOnlyPattern(pattern) ||
-         pattern == R"(\p{ASCII})" ||
-         pattern == R"(\P{ASCII})" ||
+         parseSupportedRegexUnicodePropertyPattern(pattern).has_value() ||
          pattern == R"(^\p{Basic_Emoji}+$)" ||
          pattern == R"(^\p{Emoji_Keycap_Sequence}+$)" ||
          pattern == R"(^\p{RGI_Emoji}+$)" ||
@@ -528,9 +1192,7 @@ inline bool shouldBypassRegexEngineValidation(const std::string& pattern) {
          pattern == R"(^\p{RGI_Emoji_Modifier_Sequence}+$)" ||
          pattern == R"(^\p{RGI_Emoji_Tag_Sequence}+$)" ||
          pattern == R"(^\p{RGI_Emoji_ZWJ_Sequence}+$)" ||
-         pattern == R"(\p{Script=Han})" ||
          pattern == R"((\p{Script=Han})(.))" ||
-         pattern == R"(\p{Script_Extensions=Han})" ||
          pattern == R"((?i:\p{Lu}))" ||
          pattern == R"((?i-:\p{Lu}))" ||
          pattern == R"((?-i:\p{Lu}))" ||
@@ -590,9 +1252,24 @@ inline std::string makeRegexIgnoreCaseAtom(char ch) {
   return out;
 }
 
-inline std::string makeRegexDotAtom(bool dotAll) {
+inline std::string makeRegexDotAtom(bool dotAll, bool unicodeMode = false) {
   if (dotAll) {
+    if (unicodeMode) {
+      return "(?:[\\x00-\\x7F]|[\\xC2-\\xDF][\\x80-\\xBF]|"
+             "[\\xE0-\\xEF][\\x80-\\xBF][\\x80-\\xBF]|"
+             "[\\xF0][\\x90-\\xBF][\\x80-\\xBF][\\x80-\\xBF]|"
+             "[\\xF1-\\xF3][\\x80-\\xBF][\\x80-\\xBF][\\x80-\\xBF]|"
+             "[\\xF4][\\x80-\\x8F][\\x80-\\xBF][\\x80-\\xBF])";
+    }
     return "(?:[\\x00-\\x7F]|[\\xC2-\\xDF][\\x80-\\xBF]|[\\xE0-\\xEF][\\x80-\\xBF][\\x80-\\xBF])";
+  }
+  if (unicodeMode) {
+    return "(?:[\\x00-\\x09\\x0B\\x0C\\x0E-\\x7F]|[\\xC2-\\xDF][\\x80-\\xBF]|"
+           "(?:\\xE2\\x80[\\x80-\\xA7\\xAA-\\xBF])|"
+           "(?:[\\xE0-\\xE1\\xE3-\\xEF][\\x80-\\xBF][\\x80-\\xBF])|"
+           "[\\xF0][\\x90-\\xBF][\\x80-\\xBF][\\x80-\\xBF]|"
+           "[\\xF1-\\xF3][\\x80-\\xBF][\\x80-\\xBF][\\x80-\\xBF]|"
+           "[\\xF4][\\x80-\\x8F][\\x80-\\xBF][\\x80-\\xBF])";
   }
   return "(?:[\\x00-\\x09\\x0B\\x0C\\x0E-\\x7F]|[\\xC2-\\xDF][\\x80-\\xBF]|(?:\\xE2\\x80[\\x80-\\xA7\\xAA-\\xBF])|(?:[\\xE0-\\xE1\\xE3-\\xEF][\\x80-\\xBF][\\x80-\\xBF]))";
 }
@@ -607,7 +1284,7 @@ inline std::string makeRegexWordCharAtom(bool unicodeMode, bool ignoreCase) {
 
 inline std::string makeRegexNonWordCharAtom(bool unicodeMode, bool ignoreCase) {
   return "(?:(?!" + makeRegexWordCharAtom(unicodeMode, ignoreCase) + ")" +
-         makeRegexDotAtom(true) + ")";
+         makeRegexDotAtom(true, unicodeMode) + ")";
 }
 
 inline bool regexFlagsContain(const std::string& flags, char flag) {
@@ -954,6 +1631,8 @@ inline std::string normalizeRegexPatternForEngine(const std::string& pattern,
   RegexEngineConfig loweredConfig;
   const bool loweredPattern = tryLowerRegexPatternForEngine(pattern, flags, loweredConfig);
   const std::string& sourcePattern = loweredPattern ? loweredConfig.pattern : pattern;
+  const bool unicodeMode = regexFlagsContain(flags, 'u') || regexFlagsContain(flags, 'v');
+  const bool dotAllMode = regexFlagsContain(flags, 's');
 
   if (shouldBypassRegexEngineValidation(sourcePattern)) {
     return "(?:)";
@@ -993,11 +1672,30 @@ inline std::string normalizeRegexPatternForEngine(const std::string& pattern,
         normalized.push_back(ch);
         continue;
       }
+#if !USE_SIMPLE_REGEX
+      if (ch == '.') {
+        normalized += makeRegexDotAtom(dotAllMode, unicodeMode);
+        continue;
+      }
+#endif
       size_t modifierHeaderEnd = 0;
       if (tryParseRegexModifierGroupHeader(sourcePattern, i, modifierHeaderEnd)) {
         openCaptureGroups.push_back(0);
         normalized.append("(?:");
         i = modifierHeaderEnd;
+        continue;
+      }
+      if (static_cast<unsigned char>(ch) >= 0x80) {
+        size_t cursor = i;
+        uint32_t codepoint = unicode::decodeUTF8(sourcePattern, cursor);
+        if (!unicodeMode && codepoint > 0xFFFF) {
+          uint32_t value = codepoint - 0x10000u;
+          appendRegexUtf8(normalized, 0xD800u + (value >> 10));
+          appendRegexUtf8(normalized, 0xDC00u + (value & 0x3FFu));
+        } else {
+          normalized.append(sourcePattern, i, cursor - i);
+        }
+        i = cursor - 1;
         continue;
       }
       if (ch == '(' && i + 3 < sourcePattern.size() &&
@@ -1117,7 +1815,25 @@ inline std::string normalizeRegexPatternForEngine(const std::string& pattern,
           isRegexHexDigit(sourcePattern[i + 3]) &&
           isRegexHexDigit(sourcePattern[i + 4]) &&
           isRegexHexDigit(sourcePattern[i + 5])) {
-        normalized.append(sourcePattern, i, 6);
+        uint32_t codepoint = parseRegexHexWord(sourcePattern, i + 2);
+        if (unicodeMode &&
+            codepoint >= 0xD800 && codepoint <= 0xDBFF &&
+            i + 11 < sourcePattern.size() &&
+            sourcePattern[i + 6] == '\\' &&
+            sourcePattern[i + 7] == 'u' &&
+            isRegexHexDigit(sourcePattern[i + 8]) &&
+            isRegexHexDigit(sourcePattern[i + 9]) &&
+            isRegexHexDigit(sourcePattern[i + 10]) &&
+            isRegexHexDigit(sourcePattern[i + 11])) {
+          uint32_t trailing = parseRegexHexWord(sourcePattern, i + 8);
+          if (trailing >= 0xDC00 && trailing <= 0xDFFF) {
+            appendRegexUtf8(normalized,
+                            0x10000u + ((codepoint - 0xD800u) << 10) + (trailing - 0xDC00u));
+            i += 11;
+            continue;
+          }
+        }
+        appendRegexUtf8(normalized, codepoint);
         i += 5;
       } else {
         normalized.push_back('u');

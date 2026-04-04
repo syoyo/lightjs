@@ -272,6 +272,9 @@ class Interpreter {
 public:
   explicit Interpreter(GCPtr<Environment> env);
 
+  static Value makeIteratorResult(const Value& value, bool done);
+  static Value createIteratorFactory(const GCPtr<Array>& arrPtr);
+
   Task evaluate(const Expression& expr);
   Task evaluate(const Statement& stmt);
   Task evaluate(const Program& program);
@@ -329,6 +332,9 @@ public:
 
   // Run generator.next() - public wrapper for native code that needs to iterate generators
   Value generatorNext(const Value& generatorVal, const Value& resumeValue = Value(Undefined{}));
+
+  // Public generator resume with explicit mode (Next/Return/Throw)
+  Value generatorResume(const GCPtr<Generator>& generator, int mode, const Value& resumeValue = Value(Undefined{}));
 
   // Public ToPrimitive for native code (ES spec ToPrimitive)
   Value toPrimitive(const Value& input, bool preferString) {
@@ -456,6 +462,18 @@ private:
   std::shared_ptr<void> sourceKeepAlive_;  // Keeps eval AST alive for function bodies
   std::vector<GCPtr<Function>> activeNamedExpressionStack_;
   std::string pendingIterationLabel_;  // Label for next iteration statement (consumed once)
+  struct CallerContext {
+    GCPtr<Function> function = {};
+    bool strict = false;
+  };
+  std::vector<CallerContext> callerContextStack_;
+
+  struct DisposableResource {
+    Value value;
+    Value method;
+    bool awaitDispose = false;
+  };
+  std::vector<DisposableResource> disposableResources_;
 
   struct IteratorRecord {
     enum class Kind { Generator, Array, String, IteratorObject, TypedArray };
@@ -470,8 +488,6 @@ private:
     Value nextMethod;  // Cached next() method per GetIterator spec (7.4.1)
   };
 
-  static Value makeIteratorResult(const Value& value, bool done);
-  static Value createIteratorFactory(const GCPtr<Array>& arrPtr);
   Value runGeneratorNext(const GCPtr<Generator>& generator,
                          ControlFlow::ResumeMode mode = ControlFlow::ResumeMode::None,
                          const Value& resumeValue = Value(Undefined{}));
@@ -479,6 +495,13 @@ private:
   std::optional<IteratorRecord> getIterator(const Value& iterable);
   Value iteratorNext(IteratorRecord& record);
   void iteratorClose(IteratorRecord& record);
+  size_t beginSyncDisposableScope();
+  void disposeSyncDisposableScope(size_t startIndex);
+  bool registerSyncDisposableResource(const Value& value);
+  bool registerAsyncDisposableResource(const Value& value);
+  void initializeLexicalDeclarations(const std::vector<StmtPtr>& body);
+  void hoistFunctionDeclarations(const std::vector<StmtPtr>& body);
+  Value makeSuppressedErrorValue(const Value& errorValue, const Value& suppressedValue);
   Value callFunction(const Value& callee, const std::vector<Value>& args, const Value& thisValue = Value(Undefined{}));
   bool isObjectLike(const Value& value) const;
   std::pair<bool, Value> getPropertyForPrimitive(const Value& receiver, const std::string& key);

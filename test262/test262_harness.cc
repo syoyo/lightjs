@@ -4,6 +4,7 @@
 #include "parser.h"
 #include "value.h"
 #include "interpreter.h"
+#include "symbols.h"
 #include <cmath>
 #include <stdexcept>
 #include <memory>
@@ -266,6 +267,57 @@ void installTest262Harness(GCPtr<Environment> env) {
 
   // $262.global
   $262->properties["global"] = Value(env->getGlobal());
+
+  // $262.AbstractModuleSource
+  auto abstractModuleSourcePrototype = GarbageCollector::makeGC<Object>();
+  if (auto objectCtor = env->get("Object");
+      objectCtor && objectCtor->isFunction()) {
+    auto objectFn = objectCtor->getGC<Function>();
+    auto objectProtoIt = objectFn->properties.find("prototype");
+    if (objectProtoIt != objectFn->properties.end()) {
+      abstractModuleSourcePrototype->properties["__proto__"] = objectProtoIt->second;
+    }
+  }
+
+  auto abstractModuleSource = GarbageCollector::makeGC<Function>();
+  abstractModuleSource->isNative = true;
+  abstractModuleSource->isConstructor = true;
+  abstractModuleSource->nativeFunc = [](const std::vector<Value>&) -> Value {
+    throw std::runtime_error("TypeError: AbstractModuleSource cannot be constructed");
+  };
+  abstractModuleSource->properties["name"] = Value(std::string("AbstractModuleSource"));
+  abstractModuleSource->properties["__non_writable_name"] = Value(true);
+  abstractModuleSource->properties["__non_enum_name"] = Value(true);
+  abstractModuleSource->properties["length"] = Value(0.0);
+  abstractModuleSource->properties["__non_writable_length"] = Value(true);
+  abstractModuleSource->properties["__non_enum_length"] = Value(true);
+  abstractModuleSource->properties["prototype"] = Value(abstractModuleSourcePrototype);
+  abstractModuleSource->properties["__non_writable_prototype"] = Value(true);
+  abstractModuleSource->properties["__non_configurable_prototype"] = Value(true);
+  abstractModuleSource->properties["__non_enum_prototype"] = Value(true);
+
+  auto toStringTagGetter = GarbageCollector::makeGC<Function>();
+  toStringTagGetter->isNative = true;
+  toStringTagGetter->properties["__throw_on_new__"] = Value(true);
+  toStringTagGetter->properties["name"] = Value(std::string("get [Symbol.toStringTag]"));
+  toStringTagGetter->properties["__non_writable_name"] = Value(true);
+  toStringTagGetter->properties["__non_enum_name"] = Value(true);
+  toStringTagGetter->properties["length"] = Value(0.0);
+  toStringTagGetter->properties["__non_writable_length"] = Value(true);
+  toStringTagGetter->properties["__non_enum_length"] = Value(true);
+  toStringTagGetter->nativeFunc = [](const std::vector<Value>&) -> Value {
+    return Value(Undefined{});
+  };
+
+  abstractModuleSourcePrototype->properties["constructor"] = Value(abstractModuleSource);
+  abstractModuleSourcePrototype->properties["__non_enum_constructor"] = Value(true);
+  abstractModuleSourcePrototype->properties["__get_" + WellKnownSymbols::toStringTagKey()] =
+    Value(toStringTagGetter);
+  abstractModuleSourcePrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] =
+    Value(true);
+
+  $262->properties["AbstractModuleSource"] = Value(abstractModuleSource);
+  $262->properties["__non_enum_AbstractModuleSource"] = Value(true);
 
   // $262.agent object
   auto agent = GarbageCollector::makeGC<Object>();

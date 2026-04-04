@@ -22,6 +22,26 @@ const std::string& WellKnownSymbols::asyncIteratorKey() {
   return key;
 }
 
+const Value& WellKnownSymbols::dispose() {
+  static Value symbolDispose(Symbol("Symbol.dispose"));
+  return symbolDispose;
+}
+
+const std::string& WellKnownSymbols::disposeKey() {
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::dispose());
+  return key;
+}
+
+const Value& WellKnownSymbols::asyncDispose() {
+  static Value symbolAsyncDispose(Symbol("Symbol.asyncDispose"));
+  return symbolAsyncDispose;
+}
+
+const std::string& WellKnownSymbols::asyncDisposeKey() {
+  static const std::string key = valueToPropertyKey(WellKnownSymbols::asyncDispose());
+  return key;
+}
+
 const Value& WellKnownSymbols::toStringTag() {
   static Value symbolToStringTag(Symbol("Symbol.toStringTag"));
   return symbolToStringTag;

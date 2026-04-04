@@ -414,14 +414,176 @@ Value Math_f16round(const std::vector<Value>& args) {
     return Value(static_cast<double>(float16_to_float32(halfBits)));
 }
 
-// Two-sum: exact computation of a + b = hi + lo where hi = fl(a+b)
-static inline void twoSum(long double a, long double b, long double& hi, long double& lo) {
-    hi = a + b;
-    long double v = hi - a;
-    lo = (a - (hi - v)) + (b - v);
-}
+struct ExactAccumulator {
+    uint64_t buckets[45]; // ~2880 bits, enough for double range + carries
 
-// Maximally precise summation using Shewchuk algorithm with overflow prevention.
+    ExactAccumulator() {
+        memset(buckets, 0, sizeof(buckets));
+    }
+
+    void add(double d) {
+        if (d == 0.0) return;
+        uint64_t u;
+        memcpy(&u, &d, 8);
+        int e = (u >> 52) & 0x7FF;
+        uint64_t m = u & 0xFFFFFFFFFFFFFULL;
+        int exp;
+        if (e == 0) {
+            // Subnormal
+            exp = -1022 - 52;
+        } else {
+            m |= (1ULL << 52);
+            exp = e - 1023 - 52;
+        }
+        
+        // Bit 0 is 2^-1074
+        int bitPos = exp + 1074;
+        int bucketIdx = bitPos / 64;
+        int offset = bitPos % 64;
+        
+        __uint128_t val = (__uint128_t)m << offset;
+        int i = bucketIdx;
+        while (val > 0 && i < 45) {
+            __uint128_t sum = (__uint128_t)buckets[i] + (uint64_t)val;
+            buckets[i] = (uint64_t)sum;
+            val = (val >> 64) + (sum >> 64);
+            i++;
+        }
+    }
+
+    bool isZero() const {
+        for (int i = 0; i < 45; i++) if (buckets[i] != 0) return false;
+        return true;
+    }
+
+    // Returns true if this >= other, and performs this -= other.
+    // Otherwise returns false and leaves this unchanged.
+    bool subtract(const ExactAccumulator& other) {
+        // Compare first
+        bool ge = true;
+        for (int i = 44; i >= 0; i--) {
+            if (buckets[i] > other.buckets[i]) { ge = true; break; }
+            if (buckets[i] < other.buckets[i]) { ge = false; break; }
+        }
+        if (!ge) return false;
+
+        uint64_t borrow = 0;
+        for (int i = 0; i < 45; i++) {
+            uint64_t a = buckets[i];
+            uint64_t b = other.buckets[i];
+            uint64_t next_borrow = 0;
+            if (a < b || (a == b && borrow)) {
+                if (a < b + borrow || (b == 0xFFFFFFFFFFFFFFFFULL && borrow)) {
+                    next_borrow = 1;
+                }
+            }
+            buckets[i] = a - b - borrow;
+            borrow = next_borrow;
+        }
+        return true;
+    }
+
+    double roundToDouble(bool negative) const {
+        int highestBucket = -1;
+        for (int i = 44; i >= 0; i--) {
+            if (buckets[i] != 0) { highestBucket = i; break; }
+        }
+        if (highestBucket == -1) return negative ? -0.0 : 0.0;
+
+        int highestBitInBucket = 63;
+        while (!(buckets[highestBucket] & (1ULL << highestBitInBucket))) highestBitInBucket--;
+        
+        int H = highestBucket * 64 + highestBitInBucket;
+        // Mathematical sum is in [2^(H-1074), 2^(H-1074+1))
+        int exp = H - 1074;
+
+        if (exp >= 1024) return negative ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
+
+        // We need bits [H-52, H] for the mantissa (53 bits total)
+        // Bit H is the implicit 1 (for normal numbers)
+        // If exp < -1022, it's a subnormal.
+        
+        if (exp < -1022) {
+            // Subnormal rounding
+            // Bits are relative to 2^-1074.
+            // Result will be M * 2^-1074 where M is in [1, 2^52)
+            // We want to round the exact value to nearest M.
+            // Our buckets already have bits starting from 2^-1074.
+            // So we just need to round the buckets[0..1] to nearest.
+            uint64_t m = 0;
+            bool half = false;
+            bool sticky = false;
+
+            // Bit i corresponds to 2^(i-1074).
+            // We want to round to bits [0, 51].
+            // Wait, subnormal mantissa is 52 bits, but the implicit bit is 0.
+            // So it's bits [0, 51] that are stored in the double.
+            // Rounding bit is -1? No, we can't have bits below 2^-1074.
+            // So it's exactly represented if it's subnormal!
+            // Wait, if exp < -1022, H < -1022 + 1074 = 52.
+            // So highest bit is below 52. All bits are exactly representable!
+            for (int i = 0; i < 45; i++) {
+                if (i == 0) m = buckets[0];
+                else if (buckets[i] != 0) {
+                    // This should not happen if H < 52
+                }
+            }
+            double res = std::scalbn((double)m, -1074);
+            return negative ? -res : res;
+        }
+
+        // Normal number rounding
+        // Mantissa bits [H-52, H].
+        // Get these bits.
+        uint64_t m = 0;
+        for (int i = 0; i < 53; i++) {
+            int bit = H - i;
+            if (bit >= 0 && (buckets[bit / 64] & (1ULL << (bit % 64)))) {
+                m |= (1ULL << (52 - i));
+            }
+        }
+
+        // Rounding bit: H-53
+        bool roundBit = false;
+        if (H - 53 >= 0 && (buckets[(H - 53) / 64] & (1ULL << ((H - 53) % 64)))) roundBit = true;
+
+        // Sticky bit: any bit below H-53
+        bool sticky = false;
+        for (int bit = H - 54; bit >= 0; bit--) {
+            if (buckets[bit / 64] & (1ULL << (bit % 64))) {
+                sticky = true;
+                break;
+            }
+        }
+
+        if (roundBit) {
+            if (sticky || (m & 1)) {
+                m++;
+                if (m == (1ULL << 53)) {
+                    m = (1ULL << 52);
+                    exp++;
+                }
+            }
+        }
+
+        if (exp >= 1024) return negative ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
+
+        double res;
+        if (exp < -1022) {
+            // Became subnormal after rounding? (Should not happen if it was normal before)
+            res = std::scalbn((double)m, exp - 52);
+        } else {
+            // m has the implicit 1 at bit 52.
+            // Double format: exp biased by 1023, mantissa 52 bits.
+            uint64_t u = (uint64_t)(exp + 1023) << 52;
+            u |= (m & 0xFFFFFFFFFFFFFULL);
+            memcpy(&res, &u, 8);
+        }
+        return negative ? -res : res;
+    }
+};
+
+// Maximally precise summation using exact accumulator.
 static Value shewchukSum(const std::vector<double>& numbers) {
     bool hasInf = false, hasNegInf = false, hasNaN = false;
     bool allNegZeroOrZero = true;
@@ -439,69 +601,27 @@ static Value shewchukSum(const std::vector<double>& numbers) {
     if (hasInf) return Value(std::numeric_limits<double>::infinity());
     if (hasNegInf) return Value(-std::numeric_limits<double>::infinity());
 
-    // Sort values by magnitude descending, then interleave pos/neg
-    // to minimize intermediate overflow in Shewchuk algorithm
-    std::vector<long double> pos, neg;
+    ExactAccumulator pos, neg;
     for (double val : numbers) {
-        if (!std::isfinite(val) || val == 0.0) continue;
-        if (val > 0) pos.push_back(static_cast<long double>(val));
-        else neg.push_back(-static_cast<long double>(val));
-    }
-    std::sort(pos.begin(), pos.end(), std::greater<long double>());
-    std::sort(neg.begin(), neg.end(), std::greater<long double>());
-
-    // Interleave: alternate pos/neg, picking the larger magnitude first
-    // This ensures consecutive values tend to cancel rather than overflow
-    std::vector<long double> ordered;
-    ordered.reserve(pos.size() + neg.size());
-    size_t pi = 0, ni = 0;
-    while (pi < pos.size() || ni < neg.size()) {
-        // Always alternate: add one pos, then one neg
-        if (pi < pos.size()) ordered.push_back(pos[pi++]);
-        if (ni < neg.size()) ordered.push_back(-neg[ni++]);
+        if (val > 0) pos.add(val);
+        else if (val < 0) neg.add(-val);
     }
 
-    std::vector<long double> partials;
-    for (long double x : ordered) {
-        size_t i = 0;
-        for (size_t j = 0; j < partials.size(); j++) {
-            long double y = partials[j];
-            long double hi, lo;
-            if (std::abs(x) < std::abs(y)) std::swap(x, y);
-            twoSum(x, y, hi, lo);
-            if (lo != 0.0) partials[i++] = lo;
-            x = hi;
-        }
-        partials.resize(i);
-        if (std::isfinite(x)) {
-            partials.push_back(x);
-        } else {
-            // Overflow in intermediate sum
-            return Value(static_cast<double>(x));
-        }
-    }
-    if (partials.empty()) {
+    if (pos.isZero() && neg.isZero()) {
         if (numbers.empty() || (allNegZeroOrZero && !hasPositiveZero)) {
             return Value(-0.0);
         }
         return Value(0.0);
     }
 
-    long double sum = 0.0L;
-    for (long double partial : partials) {
-        sum += partial;
+    if (pos.subtract(neg)) {
+        return Value(pos.roundToDouble(false));
+    } else {
+        neg.subtract(pos);
+        return Value(neg.roundToDouble(true));
     }
-
-    if (sum == 0.0) {
-        if (numbers.empty() || (allNegZeroOrZero && !hasPositiveZero)) {
-            return Value(-0.0);
-        }
-        return Value(0.0);
-    }
-
-    if (!std::isfinite(sum)) return Value(static_cast<double>(sum));
-    return Value(static_cast<double>(sum));
 }
+
 
 // Helper: get iterator from a value, returns {iteratorObj, nextFn}
 // Throws TypeError if not iterable

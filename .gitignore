@@ -12,9 +12,12 @@ cmake_install.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
-compile_commands.jsona.out
+compile_commands.json
+a.out
 build-asan/
 build-asan-fresh/
 build-baseline/
+build-*/
 count_tokens.py
 test262-suite/
+test262_suite/

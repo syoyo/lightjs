@@ -158,24 +158,13 @@ std::optional<Token> Lexer::readRegex() {
         throw std::runtime_error("SyntaxError: Invalid regular expression: unterminated property escape");
       }
       std::string propertyName = pattern.substr(nameStart, nameEnd - nameStart);
-      const bool isStringPropertyName =
-          propertyName == "Basic_Emoji" ||
-          propertyName == "Emoji_Keycap_Sequence" ||
-          propertyName == "RGI_Emoji" ||
-          propertyName == "RGI_Emoji_Flag_Sequence" ||
-          propertyName == "RGI_Emoji_Modifier_Sequence" ||
-          propertyName == "RGI_Emoji_Tag_Sequence" ||
-          propertyName == "RGI_Emoji_ZWJ_Sequence";
-      if (isStringPropertyName) {
+      if (isSupportedRegexStringPropertyName(propertyName)) {
         if (!hasVFlag || pattern[escapeIndex + 1] != 'p' || inCharacterClass) {
           throw std::runtime_error("SyntaxError: Invalid regular expression: unsupported property escape");
         }
         return nameEnd + 1;
       }
-      if (propertyName != "Lu" &&
-          propertyName != "ASCII" &&
-          propertyName != "Script=Han" &&
-          propertyName != "Script_Extensions=Han") {
+      if (!classifySupportedRegexUnicodePropertyName(propertyName).has_value()) {
         throw std::runtime_error("SyntaxError: Invalid regular expression: unsupported property escape");
       }
       return nameEnd + 1;
@@ -539,67 +528,65 @@ std::optional<Token> Lexer::readRegex() {
   // Validate pattern+flags early using std::regex/simple_regex for basic syntax.
   // For patterns with features std::regex doesn't support (named groups, unicode escapes),
   // transform the pattern before validation.
-  if (!unicodeMode) {
-    std::string validationPattern = pattern;
-    if (shouldBypassRegexEngineValidation(pattern)) {
-      validationPattern = "(?:)";
-    }
-    // Strip named group syntax (?<name>...) -> (...) for std::regex validation
-    if (validationPattern != "(?:)" && hasNamedGroups) {
-      std::string transformed;
-      size_t j = 0;
-      while (j < validationPattern.size()) {
-        if (validationPattern[j] == '\\' && j + 1 < validationPattern.size()) {
-          if (validationPattern[j + 1] == 'k') {
-            // Replace \k<name> with a non-capturing group (avoids forward reference issues)
-            transformed += "(?:)";
-            j += 2;
-            if (j < validationPattern.size() && validationPattern[j] == '<') {
-              while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
-              if (j < validationPattern.size()) ++j;
-            }
-          } else {
-            transformed += validationPattern[j];
-            transformed += validationPattern[j + 1];
-            j += 2;
+  std::string validationPattern = pattern;
+  if (shouldBypassRegexEngineValidation(pattern)) {
+    validationPattern = "(?:)";
+  }
+  // Strip named group syntax (?<name>...) -> (...) for std::regex validation
+  if (validationPattern != "(?:)" && hasNamedGroups) {
+    std::string transformed;
+    size_t j = 0;
+    while (j < validationPattern.size()) {
+      if (validationPattern[j] == '\\' && j + 1 < validationPattern.size()) {
+        if (validationPattern[j + 1] == 'k') {
+          // Replace \k<name> with a non-capturing group (avoids forward reference issues)
+          transformed += "(?:)";
+          j += 2;
+          if (j < validationPattern.size() && validationPattern[j] == '<') {
+            while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
+            if (j < validationPattern.size()) ++j;
           }
-          continue;
-        }
-        if (validationPattern[j] == '(' && j + 1 < validationPattern.size() &&
-            validationPattern[j + 1] == '?' && j + 2 < validationPattern.size() &&
-            validationPattern[j + 2] == '<' && j + 3 < validationPattern.size() &&
-            validationPattern[j + 3] != '=' && validationPattern[j + 3] != '!') {
-          // Replace (?<name> with (
-          transformed += '(';
-          j += 3;
-          while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
-          if (j < validationPattern.size()) ++j;
         } else {
           transformed += validationPattern[j];
-          ++j;
+          transformed += validationPattern[j + 1];
+          j += 2;
         }
+        continue;
       }
-      validationPattern = transformed;
+      if (validationPattern[j] == '(' && j + 1 < validationPattern.size() &&
+          validationPattern[j + 1] == '?' && j + 2 < validationPattern.size() &&
+          validationPattern[j + 2] == '<' && j + 3 < validationPattern.size() &&
+          validationPattern[j + 3] != '=' && validationPattern[j + 3] != '!') {
+        // Replace (?<name> with (
+        transformed += '(';
+        j += 3;
+        while (j < validationPattern.size() && validationPattern[j] != '>') ++j;
+        if (j < validationPattern.size()) ++j;
+      } else {
+        transformed += validationPattern[j];
+        ++j;
+      }
     }
-    if (validationPattern != "(?:)") {
-      validationPattern = normalizeRegexPatternForEngine(validationPattern, flags);
-    }
-    try {
+    validationPattern = transformed;
+  }
+  if (validationPattern != "(?:)") {
+    validationPattern = normalizeRegexPatternForEngine(validationPattern, flags);
+  }
+  try {
 #if USE_SIMPLE_REGEX
-      bool caseInsensitive = flags.find('i') != std::string::npos;
-      simple_regex::Regex tmp(validationPattern, caseInsensitive);
-      (void)tmp;
+    bool caseInsensitive = flags.find('i') != std::string::npos;
+    simple_regex::Regex tmp(validationPattern, caseInsensitive);
+    (void)tmp;
 #else
-      std::regex::flag_type options = std::regex::ECMAScript;
-      if (flags.find('i') != std::string::npos) {
-        options |= std::regex::icase;
-      }
-      std::regex tmp(validationPattern, options);
-      (void)tmp;
-#endif
-    } catch (...) {
-      throw std::runtime_error("SyntaxError: Invalid regular expression");
+    std::regex::flag_type options = std::regex::ECMAScript;
+    if (flags.find('i') != std::string::npos) {
+      options |= std::regex::icase;
     }
+    std::regex tmp(validationPattern, options);
+    (void)tmp;
+#endif
+  } catch (...) {
+    throw std::runtime_error("SyntaxError: Invalid regular expression");
   }
 
   // Encode pattern length as prefix so parser can split unambiguously.

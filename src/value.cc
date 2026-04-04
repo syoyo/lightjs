@@ -462,7 +462,8 @@ std::string Value::toString() const {
     } else if constexpr (std::is_same_v<T, GCPtr<Promise>>) {
       return "[Promise]";
     } else if constexpr (std::is_same_v<T, GCPtr<Regex>>) {
-      return "/" + arg->pattern + "/" + canonicalizeRegexFlags(arg->flags);
+      return "/" + escapeRegexPatternSource(arg->pattern, arg->flags) + "/" +
+             canonicalizeRegexFlags(arg->flags);
     } else if constexpr (std::is_same_v<T, GCPtr<Error>>) {
       return arg->toString();
     } else if constexpr (std::is_same_v<T, GCPtr<Generator>>) {

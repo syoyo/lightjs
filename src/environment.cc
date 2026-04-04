@@ -6,6 +6,7 @@
 #include "object_methods.h"
 #include "array_methods.h"
 #include "string_methods.h"
+#include "regex_match_utils.h"
 #include "math_object.h"
 #include "date_object.h"
 #include "event_loop.h"
@@ -59,8 +60,53 @@ int digitValue(char c) {
 
 
 bool isModuleNamespaceExportKey(const GCPtr<Object>& obj, const std::string& key) {
-  return std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
-         obj->moduleExportNames.end();
+  if (std::find(obj->moduleExportNames.begin(), obj->moduleExportNames.end(), key) !=
+      obj->moduleExportNames.end()) {
+    return true;
+  }
+  if (obj->properties.find("__get_" + key) != obj->properties.end()) {
+    return true;
+  }
+  auto it = obj->properties.find(key);
+  return it != obj->properties.end() &&
+         key != WellKnownSymbols::toStringTagKey() &&
+         key.rfind("__", 0) != 0;
+}
+
+bool maybeTriggerDeferredNamespaceEvaluation(const GCPtr<Object>& obj,
+                                            const std::optional<std::string>& key = std::nullopt) {
+  if (!obj || !obj->isModuleNamespace) {
+    return true;
+  }
+
+  auto pendingIt = obj->properties.find("__deferred_pending__");
+  if (pendingIt == obj->properties.end() ||
+      !pendingIt->second.isBool() ||
+      !pendingIt->second.toBool()) {
+    return true;
+  }
+
+  if (key.has_value()) {
+    if (*key == "then" ||
+        *key == WellKnownSymbols::toStringTagKey() ||
+        isSymbolPropertyKey(*key)) {
+      return true;
+    }
+  }
+
+  auto evalIt = obj->properties.find("__deferred_eval__");
+  if (evalIt == obj->properties.end() || !evalIt->second.isFunction()) {
+    return true;
+  }
+
+  auto deferredEvalFn = evalIt->second.getGC<Function>();
+  if (!deferredEvalFn || !deferredEvalFn->isNative) {
+    return true;
+  }
+
+  deferredEvalFn->nativeFunc({});
+  obj->properties["__deferred_pending__"] = Value(false);
+  return true;
 }
 
 constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_source__";
@@ -146,6 +192,7 @@ bool isInternalPropertyKeyForReflection(const std::string& key) {
   if (key.rfind("__json_source_", 0) == 0) return true;
 
   static const std::unordered_set<std::string> internalKeys = {
+    "__null_proto__",
     "__callable_object__",
     "__constructor_wrapper__",
     "__constructor__",
@@ -163,6 +210,13 @@ bool isInternalPropertyKeyForReflection(const std::string& key) {
     "__builtin_array_iterator__",
     "__in_class_field_initializer__",
     "__super_called__",
+    "__disposable_state__",
+    "__async_disposable_state__",
+    "__disposable_resources__",
+    "__async_disposable_resources__",
+    "__dispose_method__",
+    "__dispose_value__",
+    "__dispose_kind__",
   };
   return internalKeys.count(key) > 0;
 }
@@ -178,6 +232,13 @@ bool isVisibleWithIdentifier(const std::string& name) {
     return false;
   }
   return true;
+}
+
+GCPtr<Object> makeNullPrototypeObject() {
+  auto obj = GarbageCollector::makeGC<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
+  obj->properties["__null_proto__"] = Value(true);
+  return obj;
 }
 
 bool isObjectLikeValue(const Value& value) {
@@ -220,6 +281,10 @@ bool parseArrayIndexKey(const std::string& key, size_t& index) {
 std::optional<Value> getPrototypeValue(const Value& receiver) {
   if (receiver.isObject()) {
     auto obj = receiver.getGC<Object>();
+    auto nullProtoIt = obj->properties.find("__null_proto__");
+    if (nullProtoIt != obj->properties.end() && nullProtoIt->second.toBool()) {
+      return Value(Null{});
+    }
     auto it = obj->properties.find("__proto__");
     if (it != obj->properties.end()) return it->second;
   } else if (receiver.isArray()) {
@@ -287,6 +352,17 @@ Value makeIteratorResultObject(const Value& value, bool done) {
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   result->properties["value"] = value;
   result->properties["done"] = Value(done);
+  // Set __proto__ to Object.prototype
+  auto* interp = getGlobalInterpreter();
+  if (interp) {
+    auto env = interp->getEnvironment();
+    if (env) {
+      auto objProtoVal = env->getRoot()->get("__object_prototype__");
+      if (objProtoVal && objProtoVal->isObject()) {
+        result->properties["__proto__"] = *objProtoVal;
+      }
+    }
+  }
   return Value(result);
 }
 
@@ -605,7 +681,7 @@ bool setPropertyLike(const Value& receiver, const std::string& name, const Value
     }
     return false;
   }
-  auto setOnBag = [&](auto& bag) -> bool {
+  auto setOwnOnBag = [&](auto& bag) -> bool {
     auto setterIt = bag.find("__set_" + name);
     if (setterIt != bag.end() && setterIt->second.isFunction()) {
       if (!interpreter) {
@@ -614,11 +690,59 @@ bool setPropertyLike(const Value& receiver, const std::string& name, const Value
       interpreter->callForHarness(setterIt->second, {value}, receiver);
       return !interpreter->hasError();
     }
+    if (bag.count("__get_" + name)) {
+      return false;
+    }
     if (bag.count("__non_writable_" + name)) {
       return false;
     }
     bag[name] = value;
     return true;
+  };
+  auto hasOwnWritableEntry = [&](const auto& bag) -> bool {
+    return bag.count(name) > 0 || bag.count("__get_" + name) > 0 ||
+           bag.count("__set_" + name) > 0 || bag.count("__non_writable_" + name) > 0;
+  };
+  auto trySetViaPrototype = [&]() -> std::optional<bool> {
+    auto checkBag = [&](const auto& bag) -> std::optional<bool> {
+      auto setterIt = bag.find("__set_" + name);
+      if (setterIt != bag.end()) {
+        if (!setterIt->second.isFunction() || !interpreter) {
+          return false;
+        }
+        interpreter->callForHarness(setterIt->second, {value}, receiver);
+        return !interpreter->hasError();
+      }
+      if (bag.find("__get_" + name) != bag.end()) {
+        return false;
+      }
+      if (bag.find(name) != bag.end() && bag.find("__non_writable_" + name) != bag.end()) {
+        return false;
+      }
+      return std::nullopt;
+    };
+
+    auto proto = getPrototypeValue(receiver);
+    while (proto.has_value() && !proto->isNull() && !proto->isUndefined() &&
+           isObjectLikeValue(*proto)) {
+      std::optional<bool> result;
+      if (proto->isObject()) {
+        result = checkBag(proto->getGC<Object>()->properties);
+      } else if (proto->isArray()) {
+        result = checkBag(proto->getGC<Array>()->properties);
+      } else if (proto->isFunction()) {
+        result = checkBag(proto->getGC<Function>()->properties);
+      } else if (proto->isRegex()) {
+        result = checkBag(proto->getGC<Regex>()->properties);
+      } else if (proto->isClass()) {
+        result = checkBag(proto->getGC<Class>()->properties);
+      }
+      if (result.has_value()) {
+        return result;
+      }
+      proto = getPrototypeValue(*proto);
+    }
+    return std::nullopt;
   };
 
   if (receiver.isObject()) {
@@ -629,7 +753,14 @@ bool setPropertyLike(const Value& receiver, const std::string& name, const Value
         return false;
       }
     }
-    return setOnBag(obj->properties);
+    if (hasOwnWritableEntry(obj->properties)) {
+      return setOwnOnBag(obj->properties);
+    }
+    if (auto protoResult = trySetViaPrototype(); protoResult.has_value()) {
+      return *protoResult;
+    }
+    obj->properties[name] = value;
+    return true;
   }
 
   if (receiver.isArray()) {
@@ -653,12 +784,38 @@ bool setPropertyLike(const Value& receiver, const std::string& name, const Value
       arr->elements[index] = value;
       return true;
     }
-    return setOnBag(arr->properties);
+    if (hasOwnWritableEntry(arr->properties)) {
+      return setOwnOnBag(arr->properties);
+    }
+    if (auto protoResult = trySetViaPrototype(); protoResult.has_value()) {
+      return *protoResult;
+    }
+    arr->properties[name] = value;
+    return true;
   }
 
   if (receiver.isFunction()) {
     auto fn = receiver.getGC<Function>();
-    return setOnBag(fn->properties);
+    if (hasOwnWritableEntry(fn->properties)) {
+      return setOwnOnBag(fn->properties);
+    }
+    if (auto protoResult = trySetViaPrototype(); protoResult.has_value()) {
+      return *protoResult;
+    }
+    fn->properties[name] = value;
+    return true;
+  }
+
+  if (receiver.isRegex()) {
+    auto regex = receiver.getGC<Regex>();
+    if (hasOwnWritableEntry(regex->properties)) {
+      return setOwnOnBag(regex->properties);
+    }
+    if (auto protoResult = trySetViaPrototype(); protoResult.has_value()) {
+      return *protoResult;
+    }
+    regex->properties[name] = value;
+    return true;
   }
 
   if (receiver.isTypedArray()) {
@@ -678,12 +835,19 @@ bool setPropertyLike(const Value& receiver, const std::string& name, const Value
       }
       return true;
     }
-    return setOnBag(ta->properties);
+    return setOwnOnBag(ta->properties);
   }
 
   if (receiver.isClass()) {
     auto cls = receiver.getGC<Class>();
-    return setOnBag(cls->properties);
+    if (hasOwnWritableEntry(cls->properties)) {
+      return setOwnOnBag(cls->properties);
+    }
+    if (auto protoResult = trySetViaPrototype(); protoResult.has_value()) {
+      return *protoResult;
+    }
+    cls->properties[name] = value;
+    return true;
   }
 
   return false;
@@ -2285,6 +2449,13 @@ bool Environment::setVar(const std::string& name, const Value& value) {
   auto it = bindings_.find(name);
   if (it != bindings_.end()) {
     it->second = value;
+    if (!parent_) {
+      auto globalIt = bindings_.find("globalThis");
+      if (globalIt != bindings_.end() && globalIt->second.isObject()) {
+        auto globalObj = globalIt->second.getGC<Object>();
+        globalObj->properties[name] = value;
+      }
+    }
     return true;
   }
   if (parent_) {
@@ -2503,6 +2674,7 @@ GCPtr<Environment> Environment::createGlobal() {
   consoleObj->properties["assert"] = Value(consoleAssertFn);
 
   env->define("console", Value(consoleObj));
+  env->define("print", Value(consoleFn));
 
   auto evalFn = GarbageCollector::makeGC<Function>();
   evalFn->isNative = true;
@@ -3144,6 +3316,8 @@ GCPtr<Environment> Environment::createGlobal() {
   }
   symbolFn->properties["iterator"] = WellKnownSymbols::iterator();
   symbolFn->properties["asyncIterator"] = WellKnownSymbols::asyncIterator();
+  symbolFn->properties["dispose"] = WellKnownSymbols::dispose();
+  symbolFn->properties["asyncDispose"] = WellKnownSymbols::asyncDispose();
   symbolFn->properties["toStringTag"] = WellKnownSymbols::toStringTag();
   symbolFn->properties["toPrimitive"] = WellKnownSymbols::toPrimitive();
   symbolFn->properties["matchAll"] = WellKnownSymbols::matchAll();
@@ -3157,7 +3331,8 @@ GCPtr<Environment> Environment::createGlobal() {
   symbolFn->properties["split"] = WellKnownSymbols::split();
   // Well-known symbol properties on Symbol are non-writable and non-configurable.
   const char* wellKnownNames[] = {
-    "iterator", "asyncIterator", "toStringTag", "toPrimitive",
+    "iterator", "asyncIterator", "dispose", "asyncDispose",
+    "toStringTag", "toPrimitive",
     "matchAll", "unscopables", "hasInstance", "species",
     "isConcatSpreadable", "match", "replace", "search", "split"
   };
@@ -8312,6 +8487,7 @@ GCPtr<Environment> Environment::createGlobal() {
         return Value(promise);
       }
 
+      std::unordered_map<std::string, std::string> importAttributes;
       if (hasImportOptions && !importOptions.isUndefined()) {
         if (!isObjectLikeImport(importOptions)) {
           auto err = GarbageCollector::makeGC<Error>(ErrorType::TypeError, "import() options must be an object");
@@ -8352,17 +8528,28 @@ GCPtr<Environment> Environment::createGlobal() {
               promise->reject(Value(err));
               return Value(promise);
             }
+            importAttributes[key] = std::get<std::string>(attrValue.data);
           }
         }
       }
 
+      ModuleType moduleType = ModuleType::JavaScript;
       // Use global module loader if available
       if (g_moduleLoader && g_interpreter) {
+        auto typeIt = importAttributes.find("type");
+        if (typeIt != importAttributes.end()) {
+          if (typeIt->second == "json") {
+            moduleType = ModuleType::Json;
+          } else if (typeIt->second == "bytes") {
+            moduleType = ModuleType::Bytes;
+          }
+        }
+
         // Resolve the module path
         std::string resolvedPath = g_moduleLoader->resolvePath(specifier);
 
         // Load the module
-        auto module = g_moduleLoader->loadModule(resolvedPath);
+        auto module = g_moduleLoader->loadModule(resolvedPath, moduleType);
         if (!module) {
           rejectWith(ErrorType::Error, "Failed to load module: " + specifier, g_moduleLoader->getLastError());
           return Value(promise);
@@ -8421,8 +8608,8 @@ GCPtr<Environment> Environment::createGlobal() {
           auto evalPromise = module->getEvaluationPromise();
           if (evalPromise) {
             evalPromise->then(
-              [promise, module](Value) -> Value {
-                promise->resolve(Value(module->getNamespaceObject()));
+              [promise, module, importPhase](Value) -> Value {
+                promise->resolve(Value(module->getNamespaceObject(importPhase == ImportPhase::Defer)));
                 return Value(Undefined{});
               },
               [promise](Value reason) -> Value {
@@ -8434,7 +8621,7 @@ GCPtr<Environment> Environment::createGlobal() {
           }
         }
 
-        auto moduleNamespace = module->getNamespaceObject();
+        auto moduleNamespace = module->getNamespaceObject(importPhase == ImportPhase::Defer);
         if (deferEvaluationUntilNamespaceAccess) {
           auto deferredEvalFn = GarbageCollector::makeGC<Function>();
           deferredEvalFn->isNative = true;
@@ -8444,13 +8631,24 @@ GCPtr<Environment> Environment::createGlobal() {
             if (deferredModule->getState() == Module::State::Evaluated) {
               return Value(Undefined{});
             }
+            if (deferredModule->hasStartedEvaluation()) {
+              if (auto error = deferredModule->getLastError()) {
+                throw JsValueException(*error);
+              }
+            }
+            std::unordered_set<const Module*> seen;
+            if (!deferredModule->readyForSyncExecution(seen)) {
+              throw JsValueException(
+                Value(GarbageCollector::makeGC<Error>(
+                  ErrorType::TypeError, "Deferred module is not ready for synchronous evaluation")));
+            }
             Interpreter* interpreter = getGlobalInterpreter();
             if (!interpreter) {
               throw std::runtime_error("Error: Interpreter unavailable for deferred module evaluation");
             }
             if (!deferredModule->evaluate(interpreter)) {
               if (auto error = deferredModule->getLastError()) {
-                throw std::runtime_error(error->toString());
+                throw JsValueException(*error);
               }
               throw std::runtime_error("Error: Failed to evaluate deferred module");
             }
@@ -8505,141 +8703,257 @@ GCPtr<Environment> Environment::createGlobal() {
   auto regExpPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
 
+  // %RegExpStringIteratorPrototype%
+  auto regExpStringIteratorPrototype = GarbageCollector::makeGC<Object>();
+  regExpStringIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("RegExp String Iterator"));
+  regExpStringIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  regExpStringIteratorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  if (auto iterProto = env->get("__iterator_prototype__"); iterProto && iterProto->isObject()) {
+    regExpStringIteratorPrototype->properties["__proto__"] = *iterProto;
+  }
+  {
+    auto reIterNext = GarbageCollector::makeGC<Function>();
+    reIterNext->isNative = true;
+    reIterNext->properties["name"] = Value(std::string("next"));
+    reIterNext->properties["length"] = Value(0.0);
+    reIterNext->properties["__non_writable_name"] = Value(true);
+    reIterNext->properties["__non_enum_name"] = Value(true);
+    reIterNext->properties["__non_writable_length"] = Value(true);
+    reIterNext->properties["__non_enum_length"] = Value(true);
+    reIterNext->properties["__uses_this_arg__"] = Value(true);
+    reIterNext->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isObject()) {
+        throw std::runtime_error("TypeError: %RegExpStringIteratorPrototype%.next requires that 'this' be an Object");
+      }
+      auto thisObj = args[0].getGC<Object>();
+      auto matchesIt = thisObj->properties.find("__regexp_string_iterator_matches__");
+      if (matchesIt == thisObj->properties.end()) {
+        throw std::runtime_error("TypeError: %RegExpStringIteratorPrototype%.next requires that 'this' be a RegExp String Iterator");
+      }
+      auto doneIt = thisObj->properties.find("__regexp_string_iterator_done__");
+      if (doneIt != thisObj->properties.end() && doneIt->second.isBool() && doneIt->second.toBool()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      if (!matchesIt->second.isArray()) {
+        thisObj->properties["__regexp_string_iterator_done__"] = Value(true);
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto matches = matchesIt->second.getGC<Array>();
+      auto idxIt = thisObj->properties.find("__regexp_string_iterator_index__");
+      size_t idx = idxIt != thisObj->properties.end() ? static_cast<size_t>(idxIt->second.toNumber()) : 0;
+      if (idx >= matches->elements.size()) {
+        thisObj->properties["__regexp_string_iterator_done__"] = Value(true);
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      thisObj->properties["__regexp_string_iterator_index__"] = Value(static_cast<double>(idx + 1));
+      return makeIteratorResultObject(matches->elements[idx], false);
+    };
+    regExpStringIteratorPrototype->properties["next"] = Value(reIterNext);
+    regExpStringIteratorPrototype->properties["__non_enum_next"] = Value(true);
+  }
+
   auto regExpMatchAll = GarbageCollector::makeGC<Function>();
   regExpMatchAll->isNative = true;
   regExpMatchAll->isConstructor = false;
+  regExpMatchAll->properties["name"] = Value(std::string("[Symbol.matchAll]"));
+  regExpMatchAll->properties["__non_writable_name"] = Value(true);
+  regExpMatchAll->properties["__non_enum_name"] = Value(true);
+  regExpMatchAll->properties["length"] = Value(1.0);
+  regExpMatchAll->properties["__non_writable_length"] = Value(true);
+  regExpMatchAll->properties["__non_enum_length"] = Value(true);
   regExpMatchAll->properties["__uses_this_arg__"] = Value(true);
   regExpMatchAll->properties["__throw_on_new__"] = Value(true);
-  regExpMatchAll->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (args.empty() || !args[0].isRegex()) {
-      throw std::runtime_error("TypeError: RegExp.prototype[@@matchAll] called on non-RegExp");
+  regExpMatchAll->nativeFunc = [regExpStringIteratorPrototype, regExpPrototype, toPrimitive](const std::vector<Value>& args) -> Value {
+    Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+    if (!isObjectLikeValue(receiver)) {
+      throw std::runtime_error("TypeError: RegExp.prototype[@@matchAll] called on non-object");
     }
 
-    auto regexPtr = args[0].getGC<Regex>();
-    std::string input = args.size() > 1 ? args[1].toString() : "";
-    bool global = regexPtr->flags.find('g') != std::string::npos;
-    bool unicodeMode = regexPtr->flags.find('u') != std::string::npos ||
-                       regexPtr->flags.find('v') != std::string::npos;
-    auto utf16IndexFromEngineOffset = [&input](size_t rawOffset) -> double {
-      auto accumulateUtf16ByCodePointCount = [&input](size_t codePointCountTarget) -> size_t {
-        size_t cursor = 0;
-        size_t codePointCount = 0;
-        size_t utf16Units = 0;
-        while (cursor < input.size() && codePointCount < codePointCountTarget) {
-          uint32_t codePoint = unicode::decodeUTF8(input, cursor);
-          utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
-          codePointCount++;
-        }
-        return utf16Units;
-      };
+    auto* interp = getGlobalInterpreter();
+    if (!interp) {
+      throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype[@@matchAll]");
+    }
 
-      // Some regex backends report byte offsets, others effectively report code point offsets.
-      // If the offset lands inside a UTF-8 sequence, treat it as a code point count.
-      if (rawOffset < input.size() &&
-          unicode::isContinuationByte(static_cast<uint8_t>(input[rawOffset]))) {
-        return static_cast<double>(accumulateUtf16ByCodePointCount(rawOffset));
+    std::string input = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
+    auto throwPendingError = [&]() {
+      if (!interp->hasError()) {
+        return;
       }
+      Value err = interp->getError();
+      interp->clearError();
+      throw JsValueException(err);
+    };
+    auto isConstructorValue = [](const Value& value) -> bool {
+      if (!value.isFunction()) {
+        return false;
+      }
+      auto fn = value.getGC<Function>();
+      return fn && fn->isConstructor;
+    };
+    auto toLengthValue = [&](const Value& inputValue) -> size_t {
+      Value primitive = isObjectLikeValue(inputValue) ? toPrimitive(inputValue, false) : inputValue;
+      if (primitive.isBigInt() || primitive.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert value to length");
+      }
+      double number = primitive.toNumber();
+      if (std::isnan(number) || number <= 0.0) {
+        return 0;
+      }
+      if (std::isinf(number)) {
+        return 9007199254740991ull;
+      }
+      double integer = std::floor(number);
+      if (integer > 9007199254740991.0) {
+        return 9007199254740991ull;
+      }
+      return static_cast<size_t>(integer);
+    };
 
+    auto [hasFlags, flagsValue] = getPropertyLike(receiver, "flags", receiver);
+    throwPendingError();
+    std::string flags = toStringForStringBuiltinArg(hasFlags ? flagsValue : Value(Undefined{}));
+
+    auto [hasMatch, matchValue] = getPropertyLike(receiver, WellKnownSymbols::matchKey(), receiver);
+    throwPendingError();
+    (void)hasMatch;
+    (void)matchValue;
+
+    Value ctorValue(Undefined{});
+    if (auto env = interp->getEnvironment()) {
+      if (auto defaultCtor = env->getRoot()->get("RegExp"); defaultCtor.has_value()) {
+        ctorValue = *defaultCtor;
+      }
+    }
+
+    auto [hasCtor, ctorProp] = getPropertyLike(receiver, "constructor", receiver);
+    throwPendingError();
+    if (hasCtor && !ctorProp.isUndefined()) {
+      if (!isObjectLikeValue(ctorProp)) {
+        throw std::runtime_error("TypeError: RegExp constructor property is not an object");
+      }
+      auto [hasSpecies, speciesProp] =
+          getPropertyLike(ctorProp, WellKnownSymbols::speciesKey(), ctorProp);
+      throwPendingError();
+      if (hasSpecies && !speciesProp.isUndefined() && !speciesProp.isNull()) {
+        if (!isConstructorValue(speciesProp)) {
+          throw std::runtime_error("TypeError: RegExp species is not a constructor");
+        }
+        ctorValue = speciesProp;
+      }
+    }
+
+    Value matcher = interp->constructFromNative(ctorValue, {receiver, Value(flags)});
+    throwPendingError();
+    if (!isObjectLikeValue(matcher)) {
+      throw std::runtime_error("TypeError: RegExp species constructor must return an object");
+    }
+
+    auto [hasLastIndex, lastIndexValue] = getPropertyLike(receiver, "lastIndex", receiver);
+    throwPendingError();
+    size_t lastIndex = toLengthValue(hasLastIndex ? lastIndexValue : Value(Undefined{}));
+    if (!setPropertyLike(matcher, "lastIndex", Value(static_cast<double>(lastIndex)))) {
+      throwPendingError();
+      throw std::runtime_error("TypeError: Cannot assign to matchAll lastIndex");
+    }
+    throwPendingError();
+
+    bool global = flags.find('g') != std::string::npos;
+    bool unicodeMatching = flags.find('u') != std::string::npos ||
+                           flags.find('v') != std::string::npos;
+    size_t stringLengthUtf16 = unicode::utf16Length(input);
+    auto byteOffsetFromUtf16Index = [&input](size_t targetIndex) -> size_t {
       size_t cursor = 0;
       size_t utf16Units = 0;
-      while (cursor < rawOffset && cursor < input.size()) {
+      while (cursor < input.size() && utf16Units < targetIndex) {
+        size_t currentByteOffset = cursor;
         uint32_t codePoint = unicode::decodeUTF8(input, cursor);
-        utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+        size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+        if (utf16Units + codeUnitWidth > targetIndex) {
+          return currentByteOffset;
+        }
+        utf16Units += codeUnitWidth;
       }
-      return static_cast<double>(utf16Units);
+      return cursor;
+    };
+    auto advanceStringIndex = [&](size_t index) -> size_t {
+      if (!unicodeMatching || index >= stringLengthUtf16) {
+        return index + 1;
+      }
+      size_t byteOffset = byteOffsetFromUtf16Index(index);
+      if (byteOffset >= input.size()) {
+        return index + 1;
+      }
+      size_t cursor = byteOffset;
+      uint32_t codePoint = unicode::decodeUTF8(input, cursor);
+      return std::min<size_t>(index + ((codePoint > 0xFFFF) ? 2 : 1), stringLengthUtf16);
+    };
+    auto getMatcherLastIndex = [&]() -> size_t {
+      auto [found, value] = getPropertyLike(matcher, "lastIndex", matcher);
+      throwPendingError();
+      return found ? toLengthValue(value) : 0;
+    };
+    auto setMatcherLastIndex = [&](size_t index) {
+      if (!setPropertyLike(matcher, "lastIndex", Value(static_cast<double>(index)))) {
+        throwPendingError();
+        throw std::runtime_error("TypeError: Cannot assign to matchAll lastIndex");
+      }
+      throwPendingError();
+    };
+    auto callExec = [&]() -> Value {
+      auto [hasExec, execValue] = getPropertyLike(matcher, "exec", matcher);
+      throwPendingError();
+      if (hasExec && !execValue.isUndefined()) {
+        if (!execValue.isFunction()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        Value result = interp->callForHarness(execValue, {Value(input)}, matcher);
+        throwPendingError();
+        if (!result.isNull() && !isObjectLikeValue(result)) {
+          throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+        }
+        return result;
+      }
+      if (!matcher.isRegex()) {
+        throw std::runtime_error("TypeError: RegExp exec is not callable");
+      }
+      auto execIt = regExpPrototype->properties.find("exec");
+      if (execIt == regExpPrototype->properties.end() || !execIt->second.isFunction()) {
+        throw std::runtime_error("TypeError: RegExp exec is not callable");
+      }
+      Value result = interp->callForHarness(execIt->second, {Value(input)}, matcher);
+      throwPendingError();
+      if (!result.isNull() && !isObjectLikeValue(result)) {
+        throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+      }
+      return result;
     };
 
     auto allMatches = GarbageCollector::makeGC<Array>();
     GarbageCollector::instance().reportAllocation(sizeof(Array));
-
-#if USE_SIMPLE_REGEX
-    std::string remaining = input;
-    size_t offsetBytes = 0;
-    std::vector<simple_regex::Regex::Match> matches;
-    while (regexPtr->regex->search(remaining, matches)) {
-      if (matches.empty()) break;
-      auto matchArr = GarbageCollector::makeGC<Array>();
-      GarbageCollector::instance().reportAllocation(sizeof(Array));
-      for (size_t i = 0; i < matches.size(); ++i) {
-        matchArr->elements.push_back(Value(matches[i].str));
+    while (true) {
+      Value execResult = callExec();
+      if (execResult.isNull()) {
+        break;
       }
-      size_t matchStartBytes = offsetBytes + matches[0].start;
-      double matchIndex = utf16IndexFromEngineOffset(matchStartBytes);
-      matchArr->properties["index"] = Value(matchIndex);
-      matchArr->properties["input"] = Value(input);
-      allMatches->elements.push_back(Value(matchArr));
-
-      if (!global) break;
-
-      size_t matchAdvance = matches[0].start + matches[0].str.length();
-      if (matchAdvance == 0) {
-        if (!remaining.empty()) {
-          if (unicodeMode) {
-            matchAdvance = unicode::utf8SequenceLength(static_cast<uint8_t>(remaining[0]));
-          } else {
-            matchAdvance = 1;
-          }
-        } else {
-          break;
-        }
+      allMatches->elements.push_back(execResult);
+      if (!global) {
+        break;
       }
-      offsetBytes += matchAdvance;
-      remaining = remaining.substr(matchAdvance);
-      matches.clear();
-    }
-#else
-    std::string::const_iterator searchStart = input.cbegin();
-    std::smatch match;
-    while (std::regex_search(searchStart, input.cend(), match, regexPtr->regex)) {
-      auto matchArr = GarbageCollector::makeGC<Array>();
-      GarbageCollector::instance().reportAllocation(sizeof(Array));
-      for (size_t i = 0; i < match.size(); ++i) {
-        matchArr->elements.push_back(Value(match[i].str()));
-      }
-      size_t matchStartBytes = static_cast<size_t>(match.position() + (searchStart - input.cbegin()));
-      double matchIndex = utf16IndexFromEngineOffset(matchStartBytes);
-      matchArr->properties["index"] = Value(matchIndex);
-      matchArr->properties["input"] = Value(input);
-      allMatches->elements.push_back(Value(matchArr));
-
-      if (!global) break;
-      searchStart = match.suffix().first;
-      if (match[0].length() == 0) {
-        if (searchStart != input.cend()) {
-          if (unicodeMode) {
-            size_t byteOffset = static_cast<size_t>(searchStart - input.cbegin());
-            size_t advance = unicode::utf8SequenceLength(static_cast<uint8_t>(input[byteOffset]));
-            std::advance(searchStart, static_cast<std::ptrdiff_t>(advance));
-          } else {
-            ++searchStart;
-          }
-        } else {
-          break;  // empty match at end of string, stop
-        }
+      auto [hasZero, zeroValue] = getPropertyLike(execResult, "0", execResult);
+      throwPendingError();
+      std::string matchStr = toStringForStringBuiltinArg(hasZero ? zeroValue : Value(Undefined{}));
+      if (matchStr.empty()) {
+        size_t thisIndex = getMatcherLastIndex();
+        setMatcherLastIndex(advanceStringIndex(thisIndex));
       }
     }
-#endif
 
-    // Return a RegExpStringIterator (object with .next() method)
+    // Return a RegExpStringIterator using shared prototype
     auto iterObj = GarbageCollector::makeGC<Object>();
     GarbageCollector::instance().reportAllocation(sizeof(Object));
-    auto idx = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [allMatches, idx](const std::vector<Value>& /*args*/) -> Value {
-      auto result = GarbageCollector::makeGC<Object>();
-      GarbageCollector::instance().reportAllocation(sizeof(Object));
-      if (*idx < allMatches->elements.size()) {
-        result->properties["value"] = allMatches->elements[*idx];
-        result->properties["done"] = Value(false);
-        (*idx)++;
-      } else {
-        result->properties["value"] = Value(Undefined{});
-        result->properties["done"] = Value(true);
-      }
-      return Value(result);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__proto__"] = Value(regExpStringIteratorPrototype);
+    iterObj->properties["__regexp_string_iterator_matches__"] = Value(allMatches);
+    iterObj->properties["__regexp_string_iterator_index__"] = Value(0.0);
     return Value(iterObj);
   };
   regExpPrototype->properties[WellKnownSymbols::matchAllKey()] = Value(regExpMatchAll);
@@ -8656,8 +8970,377 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpExec->properties["__non_writable_length"] = Value(true);
   regExpExec->properties["__non_enum_length"] = Value(true);
   regExpExec->properties["__uses_this_arg__"] = Value(true);
-  regExpExec->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    // Stub - actual exec is handled in evaluateMember/interpreter
+  regExpExec->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+    if (args.empty() || !args[0].isRegex()) {
+      throw std::runtime_error("TypeError: RegExp.prototype.exec called on non-RegExp");
+    }
+
+    auto regexPtr = args[0].getGC<Regex>();
+    std::string str = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
+    bool global = regexPtr->flags.find('g') != std::string::npos;
+    bool sticky = regexPtr->flags.find('y') != std::string::npos;
+    bool unicode = regexPtr->flags.find('u') != std::string::npos ||
+                   regexPtr->flags.find('v') != std::string::npos;
+    auto utf16IndexFromByteOffset = [&str](size_t rawOffset) -> double {
+      auto accumulateUtf16ByCodePointCount = [&str](size_t codePointCountTarget) -> size_t {
+        size_t cursor = 0;
+        size_t codePointCount = 0;
+        size_t utf16Units = 0;
+        while (cursor < str.size() && codePointCount < codePointCountTarget) {
+          uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+          utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+          codePointCount++;
+        }
+        return utf16Units;
+      };
+
+      if (rawOffset < str.size() &&
+          unicode::isContinuationByte(static_cast<uint8_t>(str[rawOffset]))) {
+        return static_cast<double>(accumulateUtf16ByCodePointCount(rawOffset));
+      }
+
+      size_t cursor = 0;
+      size_t utf16Units = 0;
+      while (cursor < rawOffset && cursor < str.size()) {
+        uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+        utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+      }
+      return static_cast<double>(utf16Units);
+    };
+    auto byteOffsetFromUtf16Index = [&str](size_t targetIndex) -> size_t {
+      size_t cursor = 0;
+      size_t utf16Units = 0;
+      while (cursor < str.size() && utf16Units < targetIndex) {
+        size_t currentByteOffset = cursor;
+        uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+        size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+        if (utf16Units + codeUnitWidth > targetIndex) {
+          return currentByteOffset;
+        }
+        utf16Units += codeUnitWidth;
+      }
+      return cursor;
+    };
+    auto toLengthValue = [&](const Value& input) -> size_t {
+      Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+      if (primitive.isBigInt() || primitive.isSymbol()) {
+        throw std::runtime_error("TypeError: Cannot convert value to length");
+      }
+      double number = primitive.toNumber();
+      if (std::isnan(number) || number <= 0.0) {
+        return 0;
+      }
+      if (std::isinf(number)) {
+        return 9007199254740991ull;
+      }
+      double integer = std::floor(number);
+      if (integer > 9007199254740991.0) {
+        return 9007199254740991ull;
+      }
+      return static_cast<size_t>(integer);
+    };
+    auto setLastIndexValue = [&](double nextLastIndex) {
+      if (regexPtr->properties.find("__non_writable_lastIndex") != regexPtr->properties.end()) {
+        throw std::runtime_error("TypeError: Cannot assign to read only property 'lastIndex'");
+      }
+      regexPtr->properties["lastIndex"] = Value(nextLastIndex);
+    };
+
+    auto buildSpecialResult = [regexPtr, &str, &utf16IndexFromByteOffset](
+                                  const SpecialRegexMatchResult& special) {
+      auto arr = makeArrayWithPrototype();
+      arr->elements.push_back(Value(special.value));
+      for (const auto& capture : special.captures) {
+        if (capture.matched) arr->elements.push_back(Value(capture.value));
+        else arr->elements.push_back(Value(Undefined{}));
+      }
+      arr->properties["index"] = Value(utf16IndexFromByteOffset(special.index));
+      arr->properties["input"] = Value(str);
+
+      bool hasNamedCaptures = false;
+      for (const auto& name : regexPtr->captureGroupNames) {
+        if (!name.empty()) {
+          hasNamedCaptures = true;
+          break;
+        }
+      }
+      if (hasNamedCaptures) {
+        auto groups = makeNullPrototypeObject();
+        std::unordered_set<std::string> seenNames;
+        for (const auto& name : regexPtr->captureGroupNames) {
+          if (!name.empty() && seenNames.insert(name).second) {
+            groups->properties[name] = Value(Undefined{});
+          }
+        }
+        for (size_t i = 0; i < special.captures.size() && i < regexPtr->captureGroupNames.size(); ++i) {
+          const std::string& name = regexPtr->captureGroupNames[i];
+          if (!name.empty() && special.captures[i].matched) {
+            groups->properties[name] = Value(special.captures[i].value);
+          }
+        }
+        arr->properties["groups"] = Value(groups);
+      } else {
+        arr->properties["groups"] = Value(Undefined{});
+      }
+      if (regexPtr->flags.find('d') != std::string::npos) {
+        auto indices = makeArrayWithPrototype();
+        auto pushIndexPair = [&](const GCPtr<Array>& target, size_t start, size_t end) {
+          auto pair = makeArrayWithPrototype();
+          pair->elements.push_back(Value(utf16IndexFromByteOffset(start)));
+          pair->elements.push_back(Value(utf16IndexFromByteOffset(end)));
+          target->elements.push_back(Value(pair));
+        };
+        pushIndexPair(indices, special.index, special.end);
+        for (const auto& capture : special.captures) {
+          if (capture.matched) pushIndexPair(indices, capture.start, capture.end);
+          else indices->elements.push_back(Value(Undefined{}));
+        }
+        if (hasNamedCaptures) {
+          auto groups = makeNullPrototypeObject();
+          std::unordered_set<std::string> seenNames;
+          for (const auto& name : regexPtr->captureGroupNames) {
+            if (!name.empty() && seenNames.insert(name).second) {
+              groups->properties[name] = Value(Undefined{});
+            }
+          }
+          for (size_t i = 0; i < special.captures.size() && i < regexPtr->captureGroupNames.size(); ++i) {
+            const std::string& name = regexPtr->captureGroupNames[i];
+            if (!name.empty() && special.captures[i].matched) {
+              auto pair = makeArrayWithPrototype();
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(special.captures[i].start)));
+              pair->elements.push_back(Value(utf16IndexFromByteOffset(special.captures[i].end)));
+              groups->properties[name] = Value(pair);
+            }
+          }
+          indices->properties["groups"] = Value(groups);
+        }
+        arr->properties["indices"] = Value(indices);
+      }
+      return Value(arr);
+    };
+
+    size_t stringLengthUtf16 = unicode::utf16Length(str);
+    size_t lastIndexUtf16 = 0;
+    auto liIt = regexPtr->properties.find("lastIndex");
+    if (liIt != regexPtr->properties.end()) {
+      lastIndexUtf16 = toLengthValue(liIt->second);
+    }
+    size_t lastIndex = (global || sticky) ? byteOffsetFromUtf16Index(lastIndexUtf16) : 0;
+    if ((global || sticky) && lastIndexUtf16 > stringLengthUtf16) {
+      setLastIndexValue(0.0);
+      return Value(Null{});
+    }
+
+    if (isSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags)) {
+      if (auto special =
+            tryMatchSpecialDuplicateNamedPattern(regexPtr->pattern, regexPtr->flags, str, lastIndex)) {
+        if (sticky && special->index != lastIndex) {
+          setLastIndexValue(0.0);
+          return Value(Null{});
+        }
+        if (global || sticky) {
+          setLastIndexValue(utf16IndexFromByteOffset(special->end));
+        }
+        return buildSpecialResult(*special);
+      }
+      if (global || sticky) {
+        setLastIndexValue(0.0);
+      }
+      return Value(Null{});
+    }
+
+#if USE_SIMPLE_REGEX
+    std::vector<simple_regex::Regex::Match> matches;
+    bool found = regexPtr->regex->search(str, matches);
+    if (found && (global || sticky)) {
+      bool matchOk = false;
+      for (const auto& m : matches) {
+        if (global && m.position >= lastIndex) { matchOk = true; break; }
+        if (sticky && m.position == lastIndex) { matchOk = true; break; }
+      }
+      found = matchOk;
+    }
+    if (found && !matches.empty()) {
+      auto arr = makeArrayWithPrototype();
+      size_t matchPos = 0;
+      size_t matchLen = 0;
+      for (const auto& m : matches) {
+        if ((global || sticky) && m.position < lastIndex) continue;
+        if (sticky && m.position != lastIndex) { found = false; break; }
+        arr->elements.push_back(Value(m.str));
+        if (arr->elements.size() == 1) {
+          matchPos = m.position;
+          matchLen = m.length;
+        }
+      }
+      if (!found || arr->elements.empty()) {
+        if (global || sticky) setLastIndexValue(0.0);
+        return Value(Null{});
+      }
+      arr->properties["index"] = Value(utf16IndexFromByteOffset(matchPos));
+      arr->properties["input"] = Value(str);
+      if (global || sticky) {
+        setLastIndexValue(utf16IndexFromByteOffset(matchPos + matchLen));
+      }
+      return Value(arr);
+    }
+#else
+    std::string engineStr = str;
+    if (!unicode) {
+      engineStr.clear();
+      size_t utf16Units = unicode::utf16Length(str);
+      for (size_t i = 0; i < utf16Units; ++i) {
+        uint16_t codeUnit = 0;
+        if (unicode::utf16CodeUnitAt(str, i, codeUnit)) {
+          engineStr += unicode::encodeUTF8(codeUnit);
+        }
+      }
+    }
+
+    auto codeUnitIndexFromEngineByteOffset = [&](size_t targetOffset) -> size_t {
+      size_t cursor = 0;
+      size_t codeUnits = 0;
+      while (cursor < targetOffset && cursor < engineStr.size()) {
+        unicode::decodeUTF8(engineStr, cursor);
+        ++codeUnits;
+      }
+      return codeUnits;
+    };
+    auto engineByteOffsetFromCodeUnitIndex = [&](size_t targetIndex) -> size_t {
+      size_t cursor = 0;
+      size_t codeUnits = 0;
+      while (cursor < engineStr.size() && codeUnits < targetIndex) {
+        unicode::decodeUTF8(engineStr, cursor);
+        ++codeUnits;
+      }
+      return cursor;
+    };
+    auto substringFromEngineSpan = [&](size_t startOffset, size_t length) -> std::string {
+      if (unicode) {
+        return engineStr.substr(startOffset, length);
+      }
+      size_t startIndex = codeUnitIndexFromEngineByteOffset(startOffset);
+      size_t endIndex = codeUnitIndexFromEngineByteOffset(startOffset + length);
+      return unicode::utf16Slice(str, static_cast<int>(startIndex), static_cast<int>(endIndex));
+    };
+    auto utf16IndexFromEngineByteOffset = [&](size_t rawOffset) -> double {
+      if (unicode) {
+        return utf16IndexFromByteOffset(rawOffset);
+      }
+      return static_cast<double>(codeUnitIndexFromEngineByteOffset(rawOffset));
+    };
+
+    std::smatch match;
+    bool found = false;
+    size_t searchByteOffset = 0;
+    if (global || sticky) {
+      searchByteOffset = unicode ? lastIndex : engineByteOffsetFromCodeUnitIndex(lastIndexUtf16);
+      auto searchStart = engineStr.cbegin() + static_cast<std::ptrdiff_t>(searchByteOffset);
+      auto flags = std::regex_constants::match_default;
+      if (searchByteOffset > 0) {
+        flags |= std::regex_constants::match_prev_avail;
+      }
+      found = std::regex_search(searchStart, engineStr.cend(), match, regexPtr->regex, flags);
+      if (found && sticky && match.position(0) != 0) {
+        found = false;
+      }
+    } else {
+      found = std::regex_search(engineStr, match, regexPtr->regex);
+    }
+    if (found) {
+      auto arr = makeArrayWithPrototype();
+      size_t matchStart = searchByteOffset + static_cast<size_t>(match.position(0));
+      size_t matchEnd = matchStart + static_cast<size_t>(match.length(0));
+      arr->elements.push_back(Value(
+          substringFromEngineSpan(matchStart, static_cast<size_t>(match.length(0)))));
+      for (size_t i = 1; i < match.size(); ++i) {
+        if (match[i].matched) {
+          size_t captureStart = searchByteOffset + static_cast<size_t>(match.position(i));
+          arr->elements.push_back(Value(
+              substringFromEngineSpan(captureStart, static_cast<size_t>(match.length(i)))));
+        } else {
+          arr->elements.push_back(Value(Undefined{}));
+        }
+      }
+      arr->properties["index"] = Value(utf16IndexFromEngineByteOffset(matchStart));
+      arr->properties["input"] = Value(str);
+      bool hasNamedCaptures = false;
+      for (const auto& name : regexPtr->captureGroupNames) {
+        if (!name.empty()) {
+          hasNamedCaptures = true;
+          break;
+        }
+      }
+      if (hasNamedCaptures) {
+        auto groups = makeNullPrototypeObject();
+        std::unordered_set<std::string> seenNames;
+        for (const auto& name : regexPtr->captureGroupNames) {
+          if (!name.empty() && seenNames.insert(name).second) {
+            groups->properties[name] = Value(Undefined{});
+          }
+        }
+        for (size_t i = 1; i < match.size() && i <= regexPtr->captureGroupNames.size(); ++i) {
+          const std::string& name = regexPtr->captureGroupNames[i - 1];
+          if (!name.empty() && match[i].matched) {
+            size_t captureStart = searchByteOffset + static_cast<size_t>(match.position(i));
+            groups->properties[name] = Value(
+                substringFromEngineSpan(captureStart, static_cast<size_t>(match.length(i))));
+          }
+        }
+        arr->properties["groups"] = Value(groups);
+      } else {
+        arr->properties["groups"] = Value(Undefined{});
+      }
+      if (regexPtr->flags.find('d') != std::string::npos) {
+        auto indices = makeArrayWithPrototype();
+        auto pushIndexPair = [&](const GCPtr<Array>& target, size_t start, size_t end) {
+          auto pair = makeArrayWithPrototype();
+          pair->elements.push_back(Value(utf16IndexFromEngineByteOffset(start)));
+          pair->elements.push_back(Value(utf16IndexFromEngineByteOffset(end)));
+          target->elements.push_back(Value(pair));
+        };
+        pushIndexPair(indices, matchStart, matchEnd);
+        for (size_t i = 1; i < match.size(); ++i) {
+          if (match[i].matched) {
+            size_t start = searchByteOffset + static_cast<size_t>(match.position(i));
+            pushIndexPair(indices, start, start + static_cast<size_t>(match.length(i)));
+          } else {
+            indices->elements.push_back(Value(Undefined{}));
+          }
+        }
+        if (hasNamedCaptures) {
+          auto groups = makeNullPrototypeObject();
+          std::unordered_set<std::string> seenNames;
+          for (const auto& name : regexPtr->captureGroupNames) {
+            if (!name.empty() && seenNames.insert(name).second) {
+              groups->properties[name] = Value(Undefined{});
+            }
+          }
+          for (size_t i = 1; i < match.size() && i <= regexPtr->captureGroupNames.size(); ++i) {
+            const std::string& name = regexPtr->captureGroupNames[i - 1];
+            if (!name.empty() && match[i].matched) {
+              size_t start = searchByteOffset + static_cast<size_t>(match.position(i));
+              auto pair = makeArrayWithPrototype();
+              pair->elements.push_back(Value(utf16IndexFromEngineByteOffset(start)));
+              pair->elements.push_back(Value(utf16IndexFromEngineByteOffset(
+                  start + static_cast<size_t>(match.length(i)))));
+              groups->properties[name] = Value(pair);
+            }
+          }
+          indices->properties["groups"] = Value(groups);
+        }
+        arr->properties["indices"] = Value(indices);
+      }
+      if (global || sticky) {
+        setLastIndexValue(utf16IndexFromEngineByteOffset(matchEnd));
+      }
+      return Value(arr);
+    }
+#endif
+
+    if (global || sticky) {
+      setLastIndexValue(0.0);
+    }
     return Value(Null{});
   };
   regExpPrototype->properties["exec"] = Value(regExpExec);
@@ -8675,8 +9358,30 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpTest->properties["__non_enum_length"] = Value(true);
   regExpTest->properties["__uses_this_arg__"] = Value(true);
   regExpTest->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    // Stub - actual test is handled in evaluateMember/interpreter
-    return Value(false);
+    if (args.empty() || !args[0].isRegex()) {
+      throw std::runtime_error("TypeError: RegExp.prototype.test called on non-RegExp");
+    }
+    auto* interp = getGlobalInterpreter();
+    if (!interp) {
+      throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype.test");
+    }
+    auto [hasExec, execValue] = interp->getPropertyForExternal(args[0], "exec");
+    if (interp->hasError()) {
+      Value err = interp->getError();
+      interp->clearError();
+      throw JsValueException(err);
+    }
+    if (!hasExec || !execValue.isFunction()) {
+      throw std::runtime_error("TypeError: RegExp exec is not callable");
+    }
+    Value input = args.size() > 1 ? args[1] : Value(Undefined{});
+    Value execResult = interp->callForHarness(execValue, {input}, args[0]);
+    if (interp->hasError()) {
+      Value err = interp->getError();
+      interp->clearError();
+      throw JsValueException(err);
+    }
+    return Value(!execResult.isNull());
   };
   regExpPrototype->properties["test"] = Value(regExpTest);
   regExpPrototype->properties["__non_enum_test"] = Value(true);
@@ -8693,57 +9398,147 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpToString->properties["__non_enum_length"] = Value(true);
   regExpToString->properties["__uses_this_arg__"] = Value(true);
   regExpToString->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    if (!args.empty() && args[0].isRegex()) {
-      auto rx = args[0].getGC<Regex>();
-      std::string source = rx->pattern.empty() ? "(?:)" : rx->pattern;
-      return Value("/" + source + "/" + rx->flags);
+    Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+    if (!isObjectLikeValue(receiver)) {
+      throw std::runtime_error("TypeError: RegExp.prototype.toString called on non-object");
     }
-    return Value(std::string("/undefined/"));
+
+    auto throwPendingError = []() {
+      if (auto* interp = getGlobalInterpreter(); interp && interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+    };
+
+    auto getProp = [&](const std::string& name) -> Value {
+      auto [found, value] = getPropertyLike(receiver, name, receiver);
+      throwPendingError();
+      return found ? value : Value(Undefined{});
+    };
+
+    std::string source = toStringForStringBuiltinArg(getProp("source"));
+    std::string flags = toStringForStringBuiltinArg(getProp("flags"));
+    return Value("/" + source + "/" + flags);
   };
   regExpPrototype->properties["toString"] = Value(regExpToString);
   regExpPrototype->properties["__non_enum_toString"] = Value(true);
 
-  // RegExp.prototype accessor properties: source, flags, global, ignoreCase, multiline, unicode, sticky, dotAll
-  auto makeRegExpGetter = [&](const std::string& name, auto extractFn) {
+  // RegExp.prototype accessor properties. The flag-specific accessors are
+  // narrow like RegExpHasFlag, while `flags` itself is generic and observes
+  // ordinary property access order.
+  auto makeRegExpFlagGetter = [&](const std::string& name, char flag) {
     auto getter = GarbageCollector::makeGC<Function>();
     getter->isNative = true;
     getter->isConstructor = false;
+    getter->properties["name"] = Value(std::string("get ") + name);
+    getter->properties["__non_writable_name"] = Value(true);
+    getter->properties["__non_enum_name"] = Value(true);
+    getter->properties["length"] = Value(0.0);
+    getter->properties["__non_writable_length"] = Value(true);
+    getter->properties["__non_enum_length"] = Value(true);
     getter->properties["__uses_this_arg__"] = Value(true);
-    getter->nativeFunc = [extractFn](const std::vector<Value>& args) -> Value {
-      if (!args.empty() && args[0].isRegex()) {
-        return extractFn(args[0].getGC<Regex>());
+    getter->nativeFunc = [flag, regExpPrototype](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !isObjectLikeValue(args[0])) {
+        throw std::runtime_error("TypeError: RegExp.prototype accessor called on non-object");
       }
-      // RegExp.prototype itself: return undefined (except source returns "(?:)")
-      return Value(Undefined{});
+
+      if (args[0].isRegex()) {
+        auto rx = args[0].getGC<Regex>();
+        return Value(rx->flags.find(flag) != std::string::npos);
+      }
+
+      if (args[0].isObject() && args[0].getGC<Object>() == regExpPrototype) {
+        return Value(Undefined{});
+      }
+      throw std::runtime_error("TypeError: RegExp.prototype accessor called on incompatible object");
     };
     regExpPrototype->properties["__get_" + name] = Value(getter);
     regExpPrototype->properties["__non_enum_" + name] = Value(true);
   };
 
-  makeRegExpGetter("source", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->pattern.empty() ? std::string("(?:)") : rx->pattern);
-  });
-  makeRegExpGetter("flags", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags);
-  });
-  makeRegExpGetter("global", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('g') != std::string::npos);
-  });
-  makeRegExpGetter("ignoreCase", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('i') != std::string::npos);
-  });
-  makeRegExpGetter("multiline", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('m') != std::string::npos);
-  });
-  makeRegExpGetter("unicode", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('u') != std::string::npos);
-  });
-  makeRegExpGetter("sticky", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('y') != std::string::npos);
-  });
-  makeRegExpGetter("dotAll", [](GCPtr<Regex> rx) -> Value {
-    return Value(rx->flags.find('s') != std::string::npos);
-  });
+  {
+    auto sourceGetter = GarbageCollector::makeGC<Function>();
+    sourceGetter->isNative = true;
+    sourceGetter->isConstructor = false;
+    sourceGetter->properties["name"] = Value(std::string("get source"));
+    sourceGetter->properties["__non_writable_name"] = Value(true);
+    sourceGetter->properties["__non_enum_name"] = Value(true);
+    sourceGetter->properties["length"] = Value(0.0);
+    sourceGetter->properties["__non_writable_length"] = Value(true);
+    sourceGetter->properties["__non_enum_length"] = Value(true);
+    sourceGetter->properties["__uses_this_arg__"] = Value(true);
+    sourceGetter->nativeFunc = [regExpPrototype](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !isObjectLikeValue(args[0])) {
+        throw std::runtime_error("TypeError: RegExp.prototype accessor called on non-object");
+      }
+      if (args[0].isRegex()) {
+        auto rx = args[0].getGC<Regex>();
+        return Value(escapeRegexPatternSource(rx->pattern, rx->flags));
+      }
+      if (args[0].isObject() && args[0].getGC<Object>() == regExpPrototype) {
+        return Value(std::string("(?:)"));
+      }
+      throw std::runtime_error("TypeError: RegExp.prototype accessor called on incompatible object");
+    };
+    regExpPrototype->properties["__get_source"] = Value(sourceGetter);
+    regExpPrototype->properties["__non_enum_source"] = Value(true);
+  }
+
+  {
+    auto flagsGetter = GarbageCollector::makeGC<Function>();
+    flagsGetter->isNative = true;
+    flagsGetter->isConstructor = false;
+    flagsGetter->properties["name"] = Value(std::string("get flags"));
+    flagsGetter->properties["__non_writable_name"] = Value(true);
+    flagsGetter->properties["__non_enum_name"] = Value(true);
+    flagsGetter->properties["length"] = Value(0.0);
+    flagsGetter->properties["__non_writable_length"] = Value(true);
+    flagsGetter->properties["__non_enum_length"] = Value(true);
+    flagsGetter->properties["__uses_this_arg__"] = Value(true);
+    flagsGetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      if (!isObjectLikeValue(receiver)) {
+        throw std::runtime_error("TypeError: RegExp.prototype.flags called on non-object");
+      }
+
+      auto throwPendingError = []() {
+        if (auto* interp = getGlobalInterpreter(); interp && interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw JsValueException(err);
+        }
+      };
+
+      auto hasTruthyFlag = [&](const std::string& name) -> bool {
+        auto [found, value] = getPropertyLike(receiver, name, receiver);
+        throwPendingError();
+        return found && value.toBool();
+      };
+
+      std::string flags;
+      if (hasTruthyFlag("hasIndices")) flags.push_back('d');
+      if (hasTruthyFlag("global")) flags.push_back('g');
+      if (hasTruthyFlag("ignoreCase")) flags.push_back('i');
+      if (hasTruthyFlag("multiline")) flags.push_back('m');
+      if (hasTruthyFlag("dotAll")) flags.push_back('s');
+      if (hasTruthyFlag("unicode")) flags.push_back('u');
+      if (hasTruthyFlag("unicodeSets")) flags.push_back('v');
+      if (hasTruthyFlag("sticky")) flags.push_back('y');
+      return Value(flags);
+    };
+    regExpPrototype->properties["__get_flags"] = Value(flagsGetter);
+    regExpPrototype->properties["__non_enum_flags"] = Value(true);
+  }
+
+  makeRegExpFlagGetter("hasIndices", 'd');
+  makeRegExpFlagGetter("global", 'g');
+  makeRegExpFlagGetter("ignoreCase", 'i');
+  makeRegExpFlagGetter("multiline", 'm');
+  makeRegExpFlagGetter("unicode", 'u');
+  makeRegExpFlagGetter("unicodeSets", 'v');
+  makeRegExpFlagGetter("sticky", 'y');
+  makeRegExpFlagGetter("dotAll", 's');
 
   // Install Symbol methods on RegExp.prototype
   // @@match - RegExp.prototype[Symbol.match](string)
@@ -8758,64 +9553,148 @@ GCPtr<Environment> Environment::createGlobal() {
     matchFn->properties["__non_writable_length"] = Value(true);
     matchFn->properties["__non_enum_length"] = Value(true);
     matchFn->properties["__uses_this_arg__"] = Value(true);
-    matchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      // this = regex (args[0]), string = args[1]
-      if (args.empty() || !args[0].isRegex()) {
-        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.match] called on non-RegExp");
+    matchFn->nativeFunc = [regExpPrototype, toPrimitive](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      if (!isObjectLikeValue(receiver)) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.match] called on non-object");
       }
-      auto rx = args[0].getGC<Regex>();
-      std::string str = args.size() > 1 ? args[1].toString() : "";
-      bool global = rx->flags.find('g') != std::string::npos;
-#if USE_SIMPLE_REGEX
-      std::vector<simple_regex::Regex::Match> matches;
+
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype[Symbol.match]");
+      }
+
+      std::string str = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "";
+      auto throwPendingError = [&]() {
+        if (!interp->hasError()) {
+          return;
+        }
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      };
+      auto toLengthValue = [&](const Value& input) -> size_t {
+        Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+        if (primitive.isBigInt() || primitive.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert value to length");
+        }
+        double number = primitive.toNumber();
+        if (std::isnan(number) || number <= 0.0) {
+          return 0;
+        }
+        if (std::isinf(number)) {
+          return 9007199254740991ull;
+        }
+        double integer = std::floor(number);
+        if (integer > 9007199254740991.0) {
+          return 9007199254740991ull;
+        }
+        return static_cast<size_t>(integer);
+      };
+
+      auto [hasFlags, flagsValue] = getPropertyLike(receiver, "flags", receiver);
+      throwPendingError();
+      std::string flags = toStringForStringBuiltinArg(hasFlags ? flagsValue : Value(Undefined{}));
+      bool global = flags.find('g') != std::string::npos;
+      bool fullUnicode = flags.find('u') != std::string::npos ||
+                         flags.find('v') != std::string::npos;
+
+      auto byteOffsetFromUtf16Index = [&str](size_t targetIndex) -> size_t {
+        size_t cursor = 0;
+        size_t utf16Units = 0;
+        while (cursor < str.size() && utf16Units < targetIndex) {
+          size_t currentByteOffset = cursor;
+          uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+          size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+          if (utf16Units + codeUnitWidth > targetIndex) {
+            return currentByteOffset;
+          }
+          utf16Units += codeUnitWidth;
+        }
+        return cursor;
+      };
+      size_t stringLengthUtf16 = unicode::utf16Length(str);
+      auto advanceStringIndex = [&](size_t index) -> size_t {
+        if (!fullUnicode || index >= stringLengthUtf16) {
+          return index + 1;
+        }
+        size_t byteOffset = byteOffsetFromUtf16Index(index);
+        if (byteOffset >= str.size()) {
+          return index + 1;
+        }
+        size_t cursor = byteOffset;
+        uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+        return std::min<size_t>(index + ((codePoint > 0xFFFF) ? 2 : 1), stringLengthUtf16);
+      };
+      auto setLastIndex = [&](size_t index) {
+        if (!setPropertyLike(receiver, "lastIndex", Value(static_cast<double>(index)))) {
+          throwPendingError();
+          throw std::runtime_error("TypeError: Cannot assign to match lastIndex");
+        }
+        throwPendingError();
+      };
+      auto getLastIndex = [&]() -> size_t {
+        auto [found, value] = getPropertyLike(receiver, "lastIndex", receiver);
+        throwPendingError();
+        if (!found) {
+          return 0;
+        }
+        return toLengthValue(value);
+      };
+      auto callExec = [&]() -> Value {
+        auto [hasExec, execValue] = getPropertyLike(receiver, "exec", receiver);
+        throwPendingError();
+        if (hasExec && !execValue.isUndefined()) {
+          if (!execValue.isFunction()) {
+            throw std::runtime_error("TypeError: RegExp exec is not callable");
+          }
+          Value result = interp->callForHarness(execValue, {Value(str)}, receiver);
+          throwPendingError();
+          if (!result.isNull() && !isObjectLikeValue(result)) {
+            throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+          }
+          return result;
+        }
+        if (!receiver.isRegex()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        auto execIt = regExpPrototype->properties.find("exec");
+        if (execIt == regExpPrototype->properties.end() || !execIt->second.isFunction()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        Value result = interp->callForHarness(execIt->second, {Value(str)}, receiver);
+        throwPendingError();
+        if (!result.isNull() && !isObjectLikeValue(result)) {
+          throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+        }
+        return result;
+      };
+
       if (!global) {
-        if (rx->regex->search(str, matches)) {
-          auto result = makeArrayWithPrototype();
-          for (const auto& m : matches) result->elements.push_back(Value(m.str));
-          if (!matches.empty()) {
-            result->properties["index"] = Value(static_cast<double>(matches[0].start));
-            result->properties["input"] = Value(str);
+        return callExec();
+      }
+
+      setLastIndex(0);
+      auto result = makeArrayWithPrototype();
+      while (true) {
+        Value execResult = callExec();
+        if (execResult.isNull()) {
+          if (result->elements.empty()) {
+            return Value(Null{});
           }
           return Value(result);
         }
-        return Value(Null{});
-      }
-      // Global: all matches
-      auto result = makeArrayWithPrototype();
-      size_t searchStart = 0;
-      while (searchStart <= str.size()) {
-        matches.clear();
-        std::string sub = str.substr(searchStart);
-        if (!rx->regex->search(sub, matches) || matches.empty()) break;
-        result->elements.push_back(Value(matches[0].str));
-        size_t matchEnd = searchStart + matches[0].start + matches[0].str.size();
-        searchStart = matchEnd == searchStart ? matchEnd + 1 : matchEnd;
-      }
-      if (result->elements.empty()) return Value(Null{});
-      return Value(result);
-#else
-      if (!global) {
-        std::smatch m;
-        if (!std::regex_search(str, m, rx->regex)) return Value(Null{});
-        auto result = makeArrayWithPrototype();
-        result->elements.push_back(Value(m.str(0)));
-        for (size_t i = 1; i < m.size(); ++i) {
-          if (m[i].matched) result->elements.push_back(Value(m.str(i)));
-          else result->elements.push_back(Value(Undefined{}));
+
+        auto [hasZero, zeroValue] = getPropertyLike(execResult, "0", execResult);
+        throwPendingError();
+        std::string matchStr = toStringForStringBuiltinArg(hasZero ? zeroValue : Value(Undefined{}));
+        result->elements.push_back(Value(matchStr));
+
+        if (matchStr.empty()) {
+          size_t thisIndex = getLastIndex();
+          setLastIndex(advanceStringIndex(thisIndex));
         }
-        result->properties["index"] = Value(static_cast<double>(m.position(0)));
-        result->properties["input"] = Value(str);
-        return Value(result);
       }
-      auto result = makeArrayWithPrototype();
-      auto begin = std::sregex_iterator(str.begin(), str.end(), rx->regex);
-      auto end = std::sregex_iterator();
-      for (auto it = begin; it != end; ++it) {
-        result->elements.push_back(Value(it->str()));
-      }
-      if (result->elements.empty()) return Value(Null{});
-      return Value(result);
-#endif
     };
     const auto& matchKey = WellKnownSymbols::matchKey();
     regExpPrototype->properties[matchKey] = Value(matchFn);
@@ -8835,23 +9714,115 @@ GCPtr<Environment> Environment::createGlobal() {
     searchFn->properties["__non_enum_length"] = Value(true);
     searchFn->properties["__uses_this_arg__"] = Value(true);
     searchFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.empty() || !args[0].isRegex()) {
-        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.search] called on non-RegExp");
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      if (!isObjectLikeValue(receiver)) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.search] called on non-object");
       }
-      auto rx = args[0].getGC<Regex>();
-      std::string str = args.size() > 1 ? args[1].toString() : "";
-#if USE_SIMPLE_REGEX
-      std::vector<simple_regex::Regex::Match> matches;
-      if (rx->regex->search(str, matches) && !matches.empty()) {
-        return Value(static_cast<double>(matches[0].start));
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype[Symbol.search]");
       }
-#else
-      std::smatch m;
-      if (std::regex_search(str, m, rx->regex)) {
-        return Value(static_cast<double>(m.position(0)));
+
+      std::string str = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "";
+      auto throwPendingError = [&]() {
+        if (!interp->hasError()) {
+          return;
+        }
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      };
+      auto sameValue = [](const Value& left, const Value& right) -> bool {
+        if (left.isNumber() && right.isNumber()) {
+          double a = left.toNumber();
+          double b = right.toNumber();
+          if (std::isnan(a) && std::isnan(b)) return true;
+          if (a == 0.0 && b == 0.0) return std::signbit(a) == std::signbit(b);
+          return a == b;
+        }
+        if (left.isString() && right.isString()) return left.toString() == right.toString();
+        if (left.isBool() && right.isBool()) return left.toBool() == right.toBool();
+        if (left.isNull() && right.isNull()) return true;
+        if (left.isUndefined() && right.isUndefined()) return true;
+        if (left.isSymbol() && right.isSymbol()) return std::get<Symbol>(left.data) == std::get<Symbol>(right.data);
+        if (left.isBigInt() && right.isBigInt()) return left.toBigInt() == right.toBigInt();
+        if (left.isObject() && right.isObject()) return left.getGC<Object>().get() == right.getGC<Object>().get();
+        if (left.isArray() && right.isArray()) return left.getGC<Array>().get() == right.getGC<Array>().get();
+        if (left.isFunction() && right.isFunction()) return left.getGC<Function>().get() == right.getGC<Function>().get();
+        if (left.isRegex() && right.isRegex()) return left.getGC<Regex>().get() == right.getGC<Regex>().get();
+        return false;
+      };
+      auto setLastIndex = [&](const Value& value) {
+        if (!setPropertyLike(receiver, "lastIndex", value)) {
+          throwPendingError();
+          throw std::runtime_error("TypeError: Cannot assign to search lastIndex");
+        }
+        throwPendingError();
+      };
+      auto getLastIndex = [&]() -> Value {
+        auto [found, value] = getPropertyLike(receiver, "lastIndex", receiver);
+        throwPendingError();
+        return found ? value : Value(Undefined{});
+      };
+      auto utf16IndexFromEngineOffset = [&str](size_t rawOffset) -> double {
+        auto accumulateUtf16ByCodePointCount = [&str](size_t codePointCountTarget) -> size_t {
+          size_t cursor = 0;
+          size_t codePointCount = 0;
+          size_t utf16Units = 0;
+          while (cursor < str.size() && codePointCount < codePointCountTarget) {
+            uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+            utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+            codePointCount++;
+          }
+          return utf16Units;
+        };
+
+        if (rawOffset < str.size() &&
+            unicode::isContinuationByte(static_cast<uint8_t>(str[rawOffset]))) {
+          return static_cast<double>(accumulateUtf16ByCodePointCount(rawOffset));
+        }
+
+        size_t cursor = 0;
+        size_t utf16Units = 0;
+        while (cursor < rawOffset && cursor < str.size()) {
+          uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+          utf16Units += (codePoint > 0xFFFF) ? 2 : 1;
+        }
+        return static_cast<double>(utf16Units);
+      };
+
+      Value previousLastIndex = getLastIndex();
+      if (!sameValue(previousLastIndex, Value(0.0))) {
+        setLastIndex(Value(0.0));
       }
-#endif
-      return Value(-1.0);
+
+      auto [hasExec, execValue] = getPropertyLike(receiver, "exec", receiver);
+      throwPendingError();
+      if (!hasExec || execValue.isUndefined()) {
+        throw std::runtime_error("TypeError: RegExp exec is not callable");
+      }
+      if (!execValue.isFunction()) {
+        throw std::runtime_error("TypeError: RegExp exec is not callable");
+      }
+
+      Value result = interp->callForHarness(execValue, {Value(str)}, receiver);
+      throwPendingError();
+      if (!result.isNull() && !isObjectLikeValue(result)) {
+        throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+      }
+
+      Value currentLastIndex = getLastIndex();
+      if (!sameValue(currentLastIndex, previousLastIndex)) {
+        setLastIndex(previousLastIndex);
+      }
+
+      if (result.isNull()) {
+        return Value(-1.0);
+      }
+
+      auto [hasIndex, indexValue] = getPropertyLike(result, "index", result);
+      throwPendingError();
+      return hasIndex ? indexValue : Value(Undefined{});
     };
     const auto& searchKey = WellKnownSymbols::searchKey();
     regExpPrototype->properties[searchKey] = Value(searchFn);
@@ -8870,100 +9841,353 @@ GCPtr<Environment> Environment::createGlobal() {
     replaceFn->properties["__non_writable_length"] = Value(true);
     replaceFn->properties["__non_enum_length"] = Value(true);
     replaceFn->properties["__uses_this_arg__"] = Value(true);
-    replaceFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.empty() || !args[0].isRegex()) {
-        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.replace] called on non-RegExp");
+    replaceFn->nativeFunc = [regExpPrototype, toPrimitive](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      if (!isObjectLikeValue(receiver)) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.replace] called on non-object");
       }
-      auto rx = args[0].getGC<Regex>();
-      std::string str = args.size() > 1 ? args[1].toString() : "";
-      bool isFnReplacer = args.size() > 2 && args[2].isFunction();
-      std::string replTmpl = (!isFnReplacer && args.size() > 2) ? args[2].toString() : "";
-      bool global = rx->flags.find('g') != std::string::npos;
 
-      // ES GetSubstitution helper
-      auto getSubstitution = [&](const std::string& matched, size_t pos,
-                                  const std::vector<std::string>& captures) -> std::string {
-        if (isFnReplacer) {
-          auto* interp = getGlobalInterpreter();
-          if (interp) {
-            std::vector<Value> cbArgs;
-            cbArgs.push_back(Value(matched));
-            for (const auto& cap : captures) cbArgs.push_back(Value(cap));
-            cbArgs.push_back(Value(static_cast<double>(pos)));
-            cbArgs.push_back(Value(str));
-            Value result = interp->callForHarness(args[2], cbArgs, Value(Undefined{}));
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            return result.toString();
-          }
-          return "";
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype[Symbol.replace]");
+      }
+
+      std::string str = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
+      bool isFnReplacer = args.size() > 2 && args[2].isFunction();
+      std::string replTmpl = isFnReplacer
+          ? ""
+          : toStringForStringBuiltinArg(args.size() > 2 ? args[2] : Value(Undefined{}));
+
+      auto throwPendingError = [&]() {
+        if (!interp->hasError()) {
+          return;
         }
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      };
+      auto toLengthValue = [&](const Value& input) -> size_t {
+        Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+        if (primitive.isBigInt() || primitive.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert value to length");
+        }
+        double number = primitive.toNumber();
+        if (std::isnan(number) || number <= 0.0) {
+          return 0;
+        }
+        if (std::isinf(number)) {
+          return 9007199254740991ull;
+        }
+        double integer = std::floor(number);
+        if (integer > 9007199254740991.0) {
+          return 9007199254740991ull;
+        }
+        return static_cast<size_t>(integer);
+      };
+      auto toIntegerOrInfinity = [&](const Value& input) -> double {
+        Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+        if (primitive.isBigInt() || primitive.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert value to integer");
+        }
+        double number = primitive.toNumber();
+        if (std::isnan(number) || number == 0.0) {
+          return 0.0;
+        }
+        if (std::isinf(number)) {
+          return number;
+        }
+        return number < 0.0 ? std::ceil(number) : std::floor(number);
+      };
+      auto [hasFlags, flagsValue] = getPropertyLike(receiver, "flags", receiver);
+      throwPendingError();
+      std::string flags = toStringForStringBuiltinArg(hasFlags ? flagsValue : Value(Undefined{}));
+      bool global = flags.find('g') != std::string::npos;
+      bool fullUnicode = flags.find('u') != std::string::npos ||
+                         flags.find('v') != std::string::npos;
+      size_t stringLengthUtf16 = unicode::utf16Length(str);
+      auto byteOffsetFromUtf16Index = [&str](size_t targetIndex) -> size_t {
+        size_t cursor = 0;
+        size_t utf16Units = 0;
+        while (cursor < str.size() && utf16Units < targetIndex) {
+          size_t currentByteOffset = cursor;
+          uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+          size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+          if (utf16Units + codeUnitWidth > targetIndex) {
+            return currentByteOffset;
+          }
+          utf16Units += codeUnitWidth;
+        }
+        return cursor;
+      };
+      auto advanceStringIndex = [&](size_t index) -> size_t {
+        if (!fullUnicode || index >= stringLengthUtf16) {
+          return index + 1;
+        }
+        size_t byteOffset = byteOffsetFromUtf16Index(index);
+        if (byteOffset >= str.size()) {
+          return index + 1;
+        }
+        size_t cursor = byteOffset;
+        uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+        return std::min<size_t>(index + ((codePoint > 0xFFFF) ? 2 : 1), stringLengthUtf16);
+      };
+      auto setLastIndex = [&](size_t index) {
+        if (!setPropertyLike(receiver, "lastIndex", Value(static_cast<double>(index)))) {
+          throwPendingError();
+          throw std::runtime_error("TypeError: Cannot assign to replace lastIndex");
+        }
+        throwPendingError();
+      };
+      auto getLastIndex = [&]() -> size_t {
+        auto [found, value] = getPropertyLike(receiver, "lastIndex", receiver);
+        throwPendingError();
+        return found ? toLengthValue(value) : 0;
+      };
+      auto boxToObject = [&](const Value& value) -> Value {
+        if (value.isNull() || value.isUndefined()) {
+          throw std::runtime_error("TypeError: Cannot convert undefined or null to object");
+        }
+        if (isObjectLikeValue(value)) {
+          return value;
+        }
+        auto wrapper = GarbageCollector::makeGC<Object>();
+        GarbageCollector::instance().reportAllocation(sizeof(Object));
+        wrapper->properties["__primitive_value__"] = value;
+        std::string ctorName;
+        if (value.isBool()) ctorName = "Boolean";
+        else if (value.isNumber()) ctorName = "Number";
+        else if (value.isString()) ctorName = "String";
+        else if (value.isSymbol()) ctorName = "Symbol";
+        else ctorName = "BigInt";
+        if (auto ctor = interp->resolveVariable(ctorName)) {
+          auto [hasProto, proto] = interp->getPropertyForExternal(*ctor, "prototype");
+          if (hasProto && (proto.isObject() || proto.isNull())) {
+            wrapper->properties["__proto__"] = proto;
+          }
+        }
+        if (value.isString()) {
+          const std::string& wrapped = std::get<std::string>(value.data);
+          size_t wrappedLength = String_utf16Length(wrapped);
+          for (size_t i = 0; i < wrappedLength; ++i) {
+            std::string idx = std::to_string(i);
+            wrapper->properties[idx] = Value(String_utf16CodeUnitStringAt(wrapped, i));
+            wrapper->properties["__non_writable_" + idx] = Value(true);
+            wrapper->properties["__non_enum_" + idx] = Value(true);
+            wrapper->properties["__non_configurable_" + idx] = Value(true);
+          }
+          wrapper->properties["length"] = Value(static_cast<double>(wrappedLength));
+          wrapper->properties["__non_writable_length"] = Value(true);
+          wrapper->properties["__non_enum_length"] = Value(true);
+          wrapper->properties["__non_configurable_length"] = Value(true);
+        }
+        return Value(wrapper);
+      };
+      auto callExec = [&]() -> Value {
+        auto [hasExec, execValue] = getPropertyLike(receiver, "exec", receiver);
+        throwPendingError();
+        if (hasExec && !execValue.isUndefined()) {
+          if (!execValue.isFunction()) {
+            throw std::runtime_error("TypeError: RegExp exec is not callable");
+          }
+          Value result = interp->callForHarness(execValue, {Value(str)}, receiver);
+          throwPendingError();
+          if (!result.isNull() && !isObjectLikeValue(result)) {
+            throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+          }
+          return result;
+        }
+        if (!receiver.isRegex()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        auto execIt = regExpPrototype->properties.find("exec");
+        if (execIt == regExpPrototype->properties.end() || !execIt->second.isFunction()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        Value result = interp->callForHarness(execIt->second, {Value(str)}, receiver);
+        throwPendingError();
+        if (!result.isNull() && !isObjectLikeValue(result)) {
+          throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+        }
+        return result;
+      };
+      auto getSubstitution = [&](const std::string& matched,
+                                 size_t position,
+                                 const std::vector<std::optional<std::string>>& captures,
+                                 const Value& namedCaptures) -> std::string {
         std::string sub;
-        for (size_t i = 0; i < replTmpl.size(); i++) {
-          if (replTmpl[i] == '$' && i + 1 < replTmpl.size()) {
-            char c = replTmpl[i + 1];
-            if (c == '$') { sub += '$'; i++; }
-            else if (c == '&') { sub += matched; i++; }
-            else if (c == '`') { sub += str.substr(0, pos); i++; }
-            else if (c == '\'') { sub += str.substr(pos + matched.size()); i++; }
-            else if (c >= '0' && c <= '9') {
-              // Try two-digit capture index first
-              size_t idx = c - '0';
-              if (i + 2 < replTmpl.size() && replTmpl[i + 2] >= '0' && replTmpl[i + 2] <= '9') {
-                size_t idx2 = idx * 10 + (replTmpl[i + 2] - '0');
-                if (idx2 >= 1 && idx2 <= captures.size()) {
-                  sub += captures[idx2 - 1]; i += 2; continue;
+        size_t matchLength = unicode::utf16Length(matched);
+        for (size_t i = 0; i < replTmpl.size(); ++i) {
+          if (replTmpl[i] != '$' || i + 1 >= replTmpl.size()) {
+            sub.push_back(replTmpl[i]);
+            continue;
+          }
+          char c = replTmpl[i + 1];
+          if (c == '$') {
+            sub.push_back('$');
+            ++i;
+          } else if (c == '&') {
+            sub += matched;
+            ++i;
+          } else if (c == '`') {
+            sub += unicode::utf16Slice(str, 0, static_cast<int>(position));
+            ++i;
+          } else if (c == '\'') {
+            sub += unicode::utf16Slice(str,
+                                       static_cast<int>(position + matchLength),
+                                       static_cast<int>(stringLengthUtf16));
+            ++i;
+          } else if (c == '<') {
+            size_t nameStart = i + 2;
+            size_t nameEnd = nameStart;
+            while (nameEnd < replTmpl.size() && replTmpl[nameEnd] != '>') {
+              ++nameEnd;
+            }
+            if (nameEnd >= replTmpl.size() || namedCaptures.isUndefined()) {
+              sub += "$<";
+              ++i;
+              continue;
+            }
+            std::string name = replTmpl.substr(nameStart, nameEnd - nameStart);
+            auto [found, value] = getPropertyLike(namedCaptures, name, namedCaptures);
+            throwPendingError();
+            if (found && !value.isUndefined()) {
+              sub += toStringForStringBuiltinArg(value);
+            }
+            i = nameEnd;
+          } else if (c >= '0' && c <= '9') {
+            size_t idx = static_cast<size_t>(c - '0');
+            if (i + 2 < replTmpl.size() &&
+                replTmpl[i + 2] >= '0' && replTmpl[i + 2] <= '9') {
+              size_t idx2 = idx * 10 + static_cast<size_t>(replTmpl[i + 2] - '0');
+              if (idx2 >= 1 && idx2 <= captures.size()) {
+                if (captures[idx2 - 1].has_value()) {
+                  sub += *captures[idx2 - 1];
                 }
+                i += 2;
+                continue;
               }
-              // One-digit
-              if (idx >= 1 && idx <= captures.size()) {
-                sub += captures[idx - 1]; i++;
-              } else {
-                sub += '$'; // No matching capture, keep literal
+            }
+            if (idx >= 1 && idx <= captures.size()) {
+              if (captures[idx - 1].has_value()) {
+                sub += *captures[idx - 1];
               }
-            } else { sub += '$'; }
-          } else { sub += replTmpl[i]; }
+              ++i;
+            } else {
+              sub.push_back('$');
+            }
+          } else {
+            sub.push_back('$');
+          }
         }
         return sub;
       };
 
-#if USE_SIMPLE_REGEX
-      std::vector<simple_regex::Regex::Match> matches;
-      if (rx->regex->search(str, matches) && !matches.empty()) {
-        std::vector<std::string> captures;
-        for (size_t i = 1; i < matches.size(); i++) captures.push_back(matches[i].str);
-        std::string result = str.substr(0, matches[0].start);
-        result += getSubstitution(matches[0].str, matches[0].start, captures);
-        result += str.substr(matches[0].start + matches[0].str.size());
-        return Value(result);
+      if (global) {
+        setLastIndex(0);
       }
-      return Value(str);
-#else
-      std::string result;
-      size_t lastEnd = 0;
-      auto it = std::sregex_iterator(str.begin(), str.end(), rx->regex);
-      auto endIt = std::sregex_iterator();
-      for (; it != endIt; ++it) {
-        size_t matchStart = static_cast<size_t>(it->position(0));
-        std::string matched = it->str(0);
-        std::vector<std::string> captures;
-        for (size_t g = 1; g < it->size(); g++) {
-          captures.push_back((*it)[g].matched ? (*it)[g].str() : "");
+
+      std::vector<Value> results;
+      while (true) {
+        Value execResult = callExec();
+        if (execResult.isNull()) {
+          break;
         }
-        result += str.substr(lastEnd, matchStart - lastEnd);
-        result += getSubstitution(matched, matchStart, captures);
-        lastEnd = matchStart + matched.size();
-        if (!global) break;
-        if (matched.empty()) {
-          // Advance past one character to avoid infinite loop
-          if (lastEnd < str.size()) {
-            result += str[lastEnd];
+        results.push_back(execResult);
+        if (!global) {
+          break;
+        }
+        auto [hasZero, zeroValue] = getPropertyLike(execResult, "0", execResult);
+        throwPendingError();
+        std::string matchStr = toStringForStringBuiltinArg(hasZero ? zeroValue : Value(Undefined{}));
+        if (matchStr.empty()) {
+          size_t thisIndex = getLastIndex();
+          setLastIndex(advanceStringIndex(thisIndex));
+        }
+      }
+
+      if (results.empty()) {
+        return Value(str);
+      }
+
+      std::string accumulated;
+      size_t nextSourcePosition = 0;
+      for (const auto& result : results) {
+        auto [hasLength, lengthValue] = getPropertyLike(result, "length", result);
+        throwPendingError();
+        size_t nCaptures = toLengthValue(hasLength ? lengthValue : Value(Undefined{}));
+
+        auto [hasMatched, matchedValue] = getPropertyLike(result, "0", result);
+        throwPendingError();
+        std::string matched = toStringForStringBuiltinArg(hasMatched ? matchedValue : Value(Undefined{}));
+        size_t matchLength = unicode::utf16Length(matched);
+
+        auto [hasIndex, indexValue] = getPropertyLike(result, "index", result);
+        throwPendingError();
+        double rawPosition = toIntegerOrInfinity(hasIndex ? indexValue : Value(Undefined{}));
+        size_t position = 0;
+        if (std::isinf(rawPosition)) {
+          position = rawPosition > 0 ? stringLengthUtf16 : 0;
+        } else {
+          long long integerPosition = static_cast<long long>(rawPosition);
+          if (integerPosition <= 0) {
+            position = 0;
+          } else if (static_cast<size_t>(integerPosition) > stringLengthUtf16) {
+            position = stringLengthUtf16;
+          } else {
+            position = static_cast<size_t>(integerPosition);
           }
-          lastEnd++;
+        }
+
+        std::vector<std::optional<std::string>> captures;
+        for (size_t i = 1; i < nCaptures; ++i) {
+          auto [foundCapture, captureValue] = getPropertyLike(result, std::to_string(i), result);
+          throwPendingError();
+          if (!foundCapture || captureValue.isUndefined()) {
+            captures.push_back(std::nullopt);
+          } else {
+            captures.push_back(toStringForStringBuiltinArg(captureValue));
+          }
+        }
+
+        auto [hasGroups, groupsValue] = getPropertyLike(result, "groups", result);
+        throwPendingError();
+        Value namedCaptures = hasGroups ? groupsValue : Value(Undefined{});
+
+        std::string replacement;
+        if (isFnReplacer) {
+          std::vector<Value> replacerArgs;
+          replacerArgs.push_back(Value(matched));
+          for (const auto& capture : captures) {
+            replacerArgs.push_back(capture.has_value() ? Value(*capture) : Value(Undefined{}));
+          }
+          replacerArgs.push_back(Value(static_cast<double>(position)));
+          replacerArgs.push_back(Value(str));
+          if (!namedCaptures.isUndefined()) {
+            replacerArgs.push_back(namedCaptures);
+          }
+          Value replValue = interp->callForHarness(args[2], replacerArgs, Value(Undefined{}));
+          throwPendingError();
+          replacement = toStringForStringBuiltinArg(replValue);
+        } else {
+          Value substitutionCaptures = namedCaptures.isUndefined()
+              ? Value(Undefined{})
+              : boxToObject(namedCaptures);
+          replacement = getSubstitution(matched, position, captures, substitutionCaptures);
+        }
+
+        if (position >= nextSourcePosition) {
+          accumulated += unicode::utf16Slice(str,
+                                             static_cast<int>(nextSourcePosition),
+                                             static_cast<int>(position));
+          accumulated += replacement;
+          nextSourcePosition = position + matchLength;
         }
       }
-      if (lastEnd <= str.size()) result += str.substr(lastEnd);
-      return Value(result);
-#endif
+
+      accumulated += unicode::utf16Slice(str,
+                                         static_cast<int>(nextSourcePosition),
+                                         static_cast<int>(stringLengthUtf16));
+      return Value(accumulated);
     };
     const auto& replaceKey = WellKnownSymbols::replaceKey();
     regExpPrototype->properties[replaceKey] = Value(replaceFn);
@@ -8982,68 +10206,247 @@ GCPtr<Environment> Environment::createGlobal() {
     splitFn->properties["__non_writable_length"] = Value(true);
     splitFn->properties["__non_enum_length"] = Value(true);
     splitFn->properties["__uses_this_arg__"] = Value(true);
-    splitFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      if (args.empty() || !args[0].isRegex()) {
-        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.split] called on non-RegExp");
+    splitFn->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !isObjectLikeValue(args[0])) {
+        throw std::runtime_error("TypeError: RegExp.prototype[Symbol.split] called on non-object");
       }
-      auto rx = args[0].getGC<Regex>();
-      std::string str = args.size() > 1 ? args[1].toString() : "";
-      uint32_t limit = 0xFFFFFFFF;
+
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable for RegExp.prototype[Symbol.split]");
+      }
+
+      Value rx = args[0];
+      std::string str = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
+
+      auto toLengthValue = [&](const Value& input) -> size_t {
+        Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+        if (primitive.isBigInt() || primitive.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert value to length");
+        }
+        double number = primitive.toNumber();
+        if (std::isnan(number) || number <= 0.0) {
+          return 0;
+        }
+        if (std::isinf(number)) {
+          return 9007199254740991ull;
+        }
+        double integer = std::floor(number);
+        if (integer > 9007199254740991.0) {
+          return 9007199254740991ull;
+        }
+        return static_cast<size_t>(integer);
+      };
+
+      auto toUint32Value = [&](const Value& input) -> uint32_t {
+        Value primitive = isObjectLikeValue(input) ? toPrimitive(input, false) : input;
+        if (primitive.isBigInt() || primitive.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert value to uint32");
+        }
+        double number = primitive.toNumber();
+        if (std::isnan(number) || !std::isfinite(number) || number == 0.0) {
+          return 0;
+        }
+        double integer = std::trunc(number);
+        double modulo = std::fmod(integer, 4294967296.0);
+        if (modulo < 0) {
+          modulo += 4294967296.0;
+        }
+        return static_cast<uint32_t>(modulo);
+      };
+
+      auto throwPendingError = [&]() {
+        if (!interp->hasError()) {
+          return;
+        }
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      };
+
+      uint32_t limit = 0xFFFFFFFFu;
       if (args.size() > 2 && !args[2].isUndefined()) {
-        double lim = args[2].toNumber();
-        if (!std::isnan(lim) && std::isfinite(lim) && lim >= 0) {
-          limit = static_cast<uint32_t>(std::min(lim, static_cast<double>(0xFFFFFFFF)));
-        } else {
-          limit = 0;
+        limit = toUint32Value(args[2]);
+      }
+
+      auto result = makeArrayWithPrototype();
+      if (limit == 0) {
+        return Value(result);
+      }
+
+      auto isConstructorValue = [](const Value& value) -> bool {
+        if (!value.isFunction()) {
+          return false;
+        }
+        auto fn = value.getGC<Function>();
+        return fn && fn->isConstructor;
+      };
+
+      auto [hasFlags, flagsValue] = interp->getPropertyForExternal(rx, "flags");
+      throwPendingError();
+      std::string flags = toStringForStringBuiltinArg(hasFlags ? flagsValue : Value(Undefined{}));
+      bool unicodeMatching = flags.find('u') != std::string::npos ||
+                             flags.find('v') != std::string::npos;
+      std::string newFlags = flags.find('y') != std::string::npos ? flags : flags + "y";
+
+      Value ctorValue(Undefined{});
+      if (auto env = interp->getEnvironment()) {
+        if (auto defaultCtor = env->getRoot()->get("RegExp"); defaultCtor.has_value()) {
+          ctorValue = *defaultCtor;
         }
       }
-      auto result = makeArrayWithPrototype();
-      if (limit == 0) return Value(result);
-#if USE_SIMPLE_REGEX
-      // Simple split using string find
-      std::string pattern = rx->pattern;
-      size_t pos = 0;
-      while (pos <= str.size()) {
-        size_t found = str.find(pattern, pos);
-        if (found == std::string::npos) break;
-        result->elements.push_back(Value(str.substr(pos, found - pos)));
-        if (result->elements.size() >= limit) return Value(result);
-        pos = found + (pattern.empty() ? 1 : pattern.size());
-      }
-      result->elements.push_back(Value(str.substr(pos)));
-#else
-      std::sregex_iterator it(str.begin(), str.end(), rx->regex);
-      std::sregex_iterator endIt;
-      size_t lastEnd = 0;
-      for (; it != endIt; ++it) {
-        size_t matchStart = static_cast<size_t>(it->position(0));
-        size_t matchLen = static_cast<size_t>(it->length(0));
-        // For empty match at lastEnd, split produces the char before advancing
-        if (matchLen == 0 && matchStart == lastEnd) {
-          if (lastEnd < str.size()) {
-            result->elements.push_back(Value(str.substr(lastEnd, 1)));
-            if (result->elements.size() >= limit) return Value(result);
+
+      auto [hasCtor, ctorProp] = getPropertyLike(rx, "constructor", rx);
+      throwPendingError();
+      if (hasCtor && !ctorProp.isUndefined()) {
+        if (!isObjectLikeValue(ctorProp)) {
+          throw std::runtime_error("TypeError: RegExp constructor property is not an object");
+        }
+        auto [hasSpecies, speciesProp] =
+            getPropertyLike(ctorProp, WellKnownSymbols::speciesKey(), ctorProp);
+        throwPendingError();
+        if (hasSpecies && !speciesProp.isUndefined() && !speciesProp.isNull()) {
+          if (!isConstructorValue(speciesProp)) {
+            throw std::runtime_error("TypeError: RegExp species is not a constructor");
           }
-          lastEnd = matchStart + 1;
+          ctorValue = speciesProp;
+        }
+      }
+
+      Value splitter = interp->constructFromNative(ctorValue, {rx, Value(newFlags)});
+      throwPendingError();
+
+      auto byteOffsetFromUtf16Index = [&str](size_t targetIndex) -> size_t {
+        size_t cursor = 0;
+        size_t utf16Units = 0;
+        while (cursor < str.size() && utf16Units < targetIndex) {
+          size_t currentByteOffset = cursor;
+          uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+          size_t codeUnitWidth = (codePoint > 0xFFFF) ? 2 : 1;
+          if (utf16Units + codeUnitWidth > targetIndex) {
+            return currentByteOffset;
+          }
+          utf16Units += codeUnitWidth;
+        }
+        return cursor;
+      };
+
+      size_t size = unicode::utf16Length(str);
+      auto advanceStringIndex = [&](size_t index) -> size_t {
+        if (!unicodeMatching || index >= size) {
+          return index + 1;
+        }
+        size_t byteOffset = byteOffsetFromUtf16Index(index);
+        if (byteOffset >= str.size()) {
+          return index + 1;
+        }
+        size_t cursor = byteOffset;
+        uint32_t codePoint = unicode::decodeUTF8(str, cursor);
+        return std::min<size_t>(index + ((codePoint > 0xFFFF) ? 2 : 1), size);
+      };
+
+      auto setLastIndex = [&](size_t index) {
+        if (!setPropertyLike(splitter, "lastIndex", Value(static_cast<double>(index)))) {
+          throwPendingError();
+          throw std::runtime_error("TypeError: Cannot assign to splitter lastIndex");
+        }
+        throwPendingError();
+      };
+
+      auto getLastIndex = [&]() -> size_t {
+        auto [hasLastIndex, lastIndexValue] = getPropertyLike(splitter, "lastIndex", splitter);
+        throwPendingError();
+        if (!hasLastIndex) {
+          return 0;
+        }
+        return toLengthValue(lastIndexValue);
+      };
+
+      auto callExec = [&]() -> Value {
+        auto [hasExec, execValue] = interp->getPropertyForExternal(splitter, "exec");
+        throwPendingError();
+        if (!hasExec || !execValue.isFunction()) {
+          throw std::runtime_error("TypeError: RegExp exec is not callable");
+        }
+        Value execResult = interp->callForHarness(execValue, {Value(str)}, splitter);
+        throwPendingError();
+        if (!execResult.isNull() && !isObjectLikeValue(execResult)) {
+          throw std::runtime_error("TypeError: RegExp exec result must be an object or null");
+        }
+        return execResult;
+      };
+
+      auto appendCaptures = [&](const Value& execResult) -> bool {
+        size_t length = 0;
+        if (execResult.isArray()) {
+          auto arr = execResult.getGC<Array>();
+          length = arr ? arr->elements.size() : 0;
+          for (size_t i = 1; i < length; ++i) {
+            result->elements.push_back(arr->elements[i]);
+            if (result->elements.size() >= limit) {
+              return true;
+            }
+          }
+          return false;
+        }
+
+        auto [hasLength, lengthValue] = interp->getPropertyForExternal(execResult, "length");
+        throwPendingError();
+        if (hasLength) {
+          length = toLengthValue(lengthValue);
+        }
+        for (size_t i = 1; i < length; ++i) {
+          auto [hasCapture, captureValue] =
+              interp->getPropertyForExternal(execResult, std::to_string(i));
+          throwPendingError();
+          result->elements.push_back(hasCapture ? captureValue : Value(Undefined{}));
+          if (result->elements.size() >= limit) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      if (size == 0) {
+        Value match = callExec();
+        if (match.isNull()) {
+          result->elements.push_back(Value(str));
+        }
+        return Value(result);
+      }
+
+      size_t p = 0;
+      size_t q = 0;
+      while (q < size) {
+        setLastIndex(q);
+        Value match = callExec();
+        if (match.isNull()) {
+          q = advanceStringIndex(q);
           continue;
         }
-        result->elements.push_back(Value(str.substr(lastEnd, matchStart - lastEnd)));
-        if (result->elements.size() >= limit) return Value(result);
-        // Add capture groups
-        for (size_t g = 1; g < it->size(); g++) {
-          if ((*it)[g].matched) result->elements.push_back(Value((*it)[g].str()));
-          else result->elements.push_back(Value(Undefined{}));
-          if (result->elements.size() >= limit) return Value(result);
+
+        size_t e = getLastIndex();
+        if (e == p) {
+          q = advanceStringIndex(q);
+          continue;
         }
-        lastEnd = matchStart + matchLen;
+
+        size_t pByte = byteOffsetFromUtf16Index(p);
+        size_t qByte = byteOffsetFromUtf16Index(q);
+        result->elements.push_back(Value(str.substr(pByte, qByte - pByte)));
+        if (result->elements.size() >= limit) {
+          return Value(result);
+        }
+
+        p = e;
+        if (appendCaptures(match)) {
+          return Value(result);
+        }
+        q = p;
       }
-      if (lastEnd <= str.size()) {
-        result->elements.push_back(Value(str.substr(lastEnd)));
-      }
-#endif
-      if (result->elements.size() > limit) {
-        result->elements.resize(limit);
-      }
+
+      size_t pByte = byteOffsetFromUtf16Index(p);
+      result->elements.push_back(Value(str.substr(pByte)));
       return Value(result);
     };
     const auto& splitKey = WellKnownSymbols::splitKey();
@@ -9056,14 +10459,29 @@ GCPtr<Environment> Environment::createGlobal() {
   regExpConstructor->isConstructor = true;
   regExpConstructor->properties["name"] = Value(std::string("RegExp"));
   regExpConstructor->properties["length"] = Value(2.0);
-  regExpConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-    std::string pattern = (args.empty() || args[0].isUndefined()) ? std::string("") : args[0].toString();
-    std::string flags = (args.size() > 1 && !args[1].isUndefined()) ? args[1].toString() : "";
+  regExpConstructor->nativeFunc = [regExpPrototype](const std::vector<Value>& args) -> Value {
+    std::string pattern;
+    std::string flags;
+    if (args.empty() || args[0].isUndefined()) {
+      pattern = "";
+    } else if (args[0].isRegex()) {
+      auto existing = args[0].getGC<Regex>();
+      pattern = existing ? existing->pattern : "";
+      if (args.size() <= 1 || args[1].isUndefined()) {
+        flags = existing ? existing->flags : "";
+      }
+    } else {
+      pattern = toStringForStringBuiltinArg(args[0]);
+    }
+    if (args.size() > 1 && !args[1].isUndefined()) {
+      flags = toStringForStringBuiltinArg(args[1]);
+    }
     auto rx = GarbageCollector::makeGC<Regex>(pattern, flags);
     // lastIndex: writable, non-enumerable, non-configurable
     rx->properties["lastIndex"] = Value(0.0);
     rx->properties["__non_enum_lastIndex"] = Value(true);
     rx->properties["__non_configurable_lastIndex"] = Value(true);
+    rx->properties["__proto__"] = Value(regExpPrototype);
     return Value(rx);
   };
   regExpConstructor->properties["prototype"] = Value(regExpPrototype);
@@ -9294,30 +10712,867 @@ GCPtr<Environment> Environment::createGlobal() {
   env->define("URIError", Value(uriErrorCtor));
   env->define("EvalError", Value(evalErrorCtor));
 
-  // AggregateError (ES2021) - minimal constructor/prototype for subclassing tests.
+  // AggregateError (ES2021) - full constructor/prototype.
   {
+    auto aggregateErrorProto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto errorProtoIt = errorCtor->properties.find("prototype");
+    if (errorProtoIt != errorCtor->properties.end() && errorProtoIt->second.isObject()) {
+      aggregateErrorProto->properties["__proto__"] = errorProtoIt->second;
+    }
+    aggregateErrorProto->properties["name"] = Value(std::string("AggregateError"));
+    aggregateErrorProto->properties["__non_enum_name"] = Value(true);
+    aggregateErrorProto->properties["message"] = Value(std::string(""));
+    aggregateErrorProto->properties["__non_enum_message"] = Value(true);
+
     auto aggregateErrorCtor = GarbageCollector::makeGC<Function>();
     aggregateErrorCtor->isNative = true;
     aggregateErrorCtor->isConstructor = true;
     aggregateErrorCtor->properties["name"] = Value(std::string("AggregateError"));
     aggregateErrorCtor->properties["length"] = Value(2.0);
-    aggregateErrorCtor->nativeFunc = [](const std::vector<Value>& args) -> Value {
-      std::string message;
+    aggregateErrorCtor->properties["__non_writable_name"] = Value(true);
+    aggregateErrorCtor->properties["__non_enum_name"] = Value(true);
+    aggregateErrorCtor->properties["__non_writable_length"] = Value(true);
+    aggregateErrorCtor->properties["__non_enum_length"] = Value(true);
+    aggregateErrorCtor->properties["__proto__"] = Value(errorCtor);
+    aggregateErrorCtor->nativeFunc = [aggregateErrorProto](const std::vector<Value>& args) -> Value {
+      // AggregateError(errors, message [, options])
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, "");
+      err->properties["__proto__"] = Value(aggregateErrorProto);
+      err->properties["name"] = Value(std::string("AggregateError"));
+      err->properties["__non_enum_name"] = Value(true);
+
+      // Step: message
       if (args.size() >= 2 && !args[1].isUndefined()) {
-        message = args[1].toString();
+        std::string message = args[1].toString();
+        err->message = message;
+        err->properties["message"] = Value(message);
+        err->properties["__non_enum_message"] = Value(true);
       }
-      return Value(GarbageCollector::makeGC<Error>(ErrorType::Error, message));
+
+      // Step: cause from options
+      if (args.size() >= 3 && args[2].isObject()) {
+        auto opts = args[2].getGC<Object>();
+        auto causeIt = opts->properties.find("cause");
+        if (causeIt != opts->properties.end()) {
+          err->properties["cause"] = causeIt->second;
+          err->properties["__non_enum_cause"] = Value(true);
+        }
+      }
+
+      // Step: errors - IterableToList via Array.from
+      auto errorsArray = GarbageCollector::makeGC<Array>();
+      if (!args.empty()) {
+        auto* interp = getGlobalInterpreter();
+        if (interp && !args[0].isUndefined() && !args[0].isNull()) {
+          // Use Array.from to convert iterable to array
+          auto env = interp->getEnvironment();
+          auto arrayCtor = env->getRoot()->get("Array");
+          if (arrayCtor && arrayCtor->isFunction()) {
+            auto arrayFn = arrayCtor->getGC<Function>();
+            auto fromIt = arrayFn->properties.find("from");
+            if (fromIt != arrayFn->properties.end() && fromIt->second.isFunction()) {
+              Value result = interp->callForHarness(fromIt->second, {args[0]});
+              if (interp->hasError()) {
+                Value ierr = interp->getError();
+                interp->clearError();
+                throw JsValueException(ierr);
+              }
+              if (result.isArray()) {
+                errorsArray = result.getGC<Array>();
+              }
+            }
+          }
+        }
+      }
+      err->properties["errors"] = Value(errorsArray);
+
+      return Value(err);
     };
-    auto aggregateErrorProto = GarbageCollector::makeGC<Object>();
-    GarbageCollector::instance().reportAllocation(sizeof(Object));
     aggregateErrorCtor->properties["prototype"] = Value(aggregateErrorProto);
+    aggregateErrorCtor->properties["__non_configurable_prototype"] = Value(true);
     aggregateErrorProto->properties["constructor"] = Value(aggregateErrorCtor);
-    aggregateErrorProto->properties["name"] = Value(std::string("AggregateError"));
-    auto errorProtoIt = errorCtor->properties.find("prototype");
-    if (errorProtoIt != errorCtor->properties.end() && errorProtoIt->second.isObject()) {
-      aggregateErrorProto->properties["__proto__"] = errorProtoIt->second;
-    }
+    aggregateErrorProto->properties["__non_enum_constructor"] = Value(true);
     env->define("AggregateError", Value(aggregateErrorCtor));
+  }
+
+  // SuppressedError (Explicit Resource Management)
+  {
+    auto suppressedErrorProto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+
+    auto suppressedErrorCtor = GarbageCollector::makeGC<Function>();
+    suppressedErrorCtor->isNative = true;
+    suppressedErrorCtor->isConstructor = true;
+    suppressedErrorCtor->nativeFunc = [suppressedErrorProto](const std::vector<Value>& args) -> Value {
+      bool hasMessage = args.size() >= 3 && !args[2].isUndefined();
+      std::string message;
+      if (hasMessage) {
+        Value messageValue = args[2];
+        if (messageValue.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+        }
+        if (messageValue.isObject() || messageValue.isArray() || messageValue.isFunction()) {
+          messageValue = toPrimitiveFromNative(messageValue, true);
+        }
+        if (messageValue.isSymbol()) {
+          throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+        }
+        message = messageValue.toString();
+      }
+
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, message);
+      if (hasMessage) {
+        err->properties["message"] = Value(message);
+        err->properties["__non_enum_message"] = Value(true);
+      }
+      err->properties["error"] = args.size() > 0 ? args[0] : Value(Undefined{});
+      err->properties["__non_enum_error"] = Value(true);
+      err->properties["suppressed"] = args.size() > 1 ? args[1] : Value(Undefined{});
+      err->properties["__non_enum_suppressed"] = Value(true);
+      err->properties["__proto__"] = Value(suppressedErrorProto);
+      return Value(err);
+    };
+    suppressedErrorCtor->properties["name"] = Value(std::string("SuppressedError"));
+    suppressedErrorCtor->properties["__non_writable_name"] = Value(true);
+    suppressedErrorCtor->properties["__non_enum_name"] = Value(true);
+    suppressedErrorCtor->properties["length"] = Value(3.0);
+    suppressedErrorCtor->properties["__non_writable_length"] = Value(true);
+    suppressedErrorCtor->properties["__non_enum_length"] = Value(true);
+    suppressedErrorCtor->properties["prototype"] = Value(suppressedErrorProto);
+    suppressedErrorCtor->properties["__non_writable_prototype"] = Value(true);
+    suppressedErrorCtor->properties["__non_enum_prototype"] = Value(true);
+    suppressedErrorCtor->properties["__non_configurable_prototype"] = Value(true);
+
+    suppressedErrorProto->properties["constructor"] = Value(suppressedErrorCtor);
+    suppressedErrorProto->properties["__non_enum_constructor"] = Value(true);
+    suppressedErrorProto->properties["name"] = Value(std::string("SuppressedError"));
+    suppressedErrorProto->properties["__non_enum_name"] = Value(true);
+    suppressedErrorProto->properties["message"] = Value(std::string(""));
+    suppressedErrorProto->properties["__non_enum_message"] = Value(true);
+
+    suppressedErrorCtor->properties["__proto__"] = Value(errorCtor);
+    if (auto errorProtoIt = errorCtor->properties.find("prototype");
+        errorProtoIt != errorCtor->properties.end() && errorProtoIt->second.isObject()) {
+      suppressedErrorProto->properties["__proto__"] = errorProtoIt->second;
+    }
+    env->define("SuppressedError", Value(suppressedErrorCtor));
+    if (auto globalThis = env->get("globalThis"); globalThis && globalThis->isObject()) {
+      globalThis->getGC<Object>()->properties["__non_enum_SuppressedError"] = Value(true);
+    }
+  }
+
+  // DisposableStack / AsyncDisposableStack constructor surface and stateful dispose APIs.
+  {
+    auto makeSuppressedErrorValue = [env](const Value& errorValue, const Value& suppressedValue) -> Value {
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::Error, "");
+      if (auto ctor = env->get("SuppressedError"); ctor && ctor->isFunction()) {
+        auto protoIt = ctor->getGC<Function>()->properties.find("prototype");
+        if (protoIt != ctor->getGC<Function>()->properties.end() && protoIt->second.isObject()) {
+          err->properties["__proto__"] = protoIt->second;
+        }
+      }
+      err->properties["error"] = errorValue;
+      err->properties["__non_enum_error"] = Value(true);
+      err->properties["suppressed"] = suppressedValue;
+      err->properties["__non_enum_suppressed"] = Value(true);
+      return Value(err);
+    };
+    auto makeReferenceErrorValue = [env](const std::string& message) -> Value {
+      auto err = GarbageCollector::makeGC<Error>(ErrorType::ReferenceError, message);
+      if (auto refCtor = env->get("ReferenceError"); refCtor && refCtor->isFunction()) {
+        auto protoIt = refCtor->getGC<Function>()->properties.find("prototype");
+        if (protoIt != refCtor->getGC<Function>()->properties.end() && protoIt->second.isObject()) {
+          err->properties["__proto__"] = protoIt->second;
+        }
+      }
+      return Value(err);
+    };
+    auto makeStackStateObject = [](const std::string& slotName,
+                                   const std::string& resourcesName) -> Value {
+      auto obj = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      obj->properties[slotName] = Value(std::string("pending"));
+      auto resources = GarbageCollector::makeGC<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      obj->properties[resourcesName] = Value(resources);
+      return Value(obj);
+    };
+    auto requireStackInstance = [](const Value& receiver,
+                                   const std::string& slotName,
+                                   const std::string& displayName) -> GCPtr<Object> {
+      if (!receiver.isObject()) {
+        throw std::runtime_error("TypeError: " + displayName + " called on incompatible receiver");
+      }
+      auto obj = receiver.getGC<Object>();
+      if (obj->properties.find(slotName) == obj->properties.end()) {
+        throw std::runtime_error("TypeError: " + displayName + " called on incompatible receiver");
+      }
+      return obj;
+    };
+
+    auto disposableStackProto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto disposableStackCtor = GarbageCollector::makeGC<Function>();
+    disposableStackCtor->isNative = true;
+    disposableStackCtor->isConstructor = true;
+    disposableStackCtor->properties["__require_new__"] = Value(true);
+    disposableStackCtor->properties["name"] = Value(std::string("DisposableStack"));
+    disposableStackCtor->properties["__non_writable_name"] = Value(true);
+    disposableStackCtor->properties["__non_enum_name"] = Value(true);
+    disposableStackCtor->properties["length"] = Value(0.0);
+    disposableStackCtor->properties["__non_writable_length"] = Value(true);
+    disposableStackCtor->properties["__non_enum_length"] = Value(true);
+    disposableStackCtor->properties["prototype"] = Value(disposableStackProto);
+    disposableStackCtor->properties["__non_writable_prototype"] = Value(true);
+    disposableStackCtor->properties["__non_enum_prototype"] = Value(true);
+    disposableStackCtor->properties["__non_configurable_prototype"] = Value(true);
+    disposableStackCtor->nativeFunc = [makeStackStateObject](const std::vector<Value>&) -> Value {
+      return makeStackStateObject("__disposable_state__", "__disposable_resources__");
+    };
+    disposableStackProto->properties["constructor"] = Value(disposableStackCtor);
+    disposableStackProto->properties["__non_enum_constructor"] = Value(true);
+    disposableStackProto->properties[WellKnownSymbols::toStringTagKey()] =
+      Value(std::string("DisposableStack"));
+    disposableStackProto->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] =
+      Value(true);
+    disposableStackProto->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] =
+      Value(true);
+
+    auto disposableDisposedGetter = GarbageCollector::makeGC<Function>();
+    disposableDisposedGetter->isNative = true;
+    disposableDisposedGetter->properties["__uses_this_arg__"] = Value(true);
+    disposableDisposedGetter->properties["name"] = Value(std::string("get disposed"));
+    disposableDisposedGetter->properties["__non_writable_name"] = Value(true);
+    disposableDisposedGetter->properties["__non_enum_name"] = Value(true);
+    disposableDisposedGetter->properties["length"] = Value(0.0);
+    disposableDisposedGetter->properties["__non_writable_length"] = Value(true);
+    disposableDisposedGetter->properties["__non_enum_length"] = Value(true);
+    disposableDisposedGetter->nativeFunc = [requireStackInstance](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__disposable_state__", "get DisposableStack.prototype.disposed");
+      auto stateIt = obj->properties.find("__disposable_state__");
+      return Value(stateIt != obj->properties.end() &&
+                   stateIt->second.isString() &&
+                   stateIt->second.toString() == "disposed");
+    };
+    disposableStackProto->properties["__get_disposed"] = Value(disposableDisposedGetter);
+    disposableStackProto->properties["__non_enum_disposed"] = Value(true);
+
+    auto disposableDispose = GarbageCollector::makeGC<Function>();
+    disposableDispose->isNative = true;
+    disposableDispose->properties["__uses_this_arg__"] = Value(true);
+    disposableDispose->properties["name"] = Value(std::string("dispose"));
+    disposableDispose->properties["__non_writable_name"] = Value(true);
+    disposableDispose->properties["__non_enum_name"] = Value(true);
+    disposableDispose->properties["length"] = Value(0.0);
+    disposableDispose->properties["__non_writable_length"] = Value(true);
+    disposableDispose->properties["__non_enum_length"] = Value(true);
+    disposableDispose->nativeFunc = [env, requireStackInstance, makeSuppressedErrorValue](
+                                      const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__disposable_state__", "DisposableStack.prototype.dispose");
+      auto stateIt = obj->properties.find("__disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        return Value(Undefined{});
+      }
+      obj->properties["__disposable_state__"] = Value(std::string("disposed"));
+      auto resourcesIt = obj->properties.find("__disposable_resources__");
+      if (resourcesIt == obj->properties.end() || !resourcesIt->second.isArray()) {
+        return Value(Undefined{});
+      }
+      auto resources = resourcesIt->second.getGC<Array>();
+      auto* interp = getGlobalInterpreter();
+      Value accumulatedError(Undefined{});
+      for (size_t i = resources->elements.size(); i > 0; --i) {
+        Value recordValue = resources->elements[i - 1];
+        if (!recordValue.isObject()) continue;
+        auto record = recordValue.getGC<Object>();
+        auto kindIt = record->properties.find("__dispose_kind__");
+        auto methodIt = record->properties.find("__dispose_method__");
+        if (kindIt == record->properties.end() || !kindIt->second.isString() ||
+            methodIt == record->properties.end() || !methodIt->second.isFunction()) {
+          continue;
+        }
+        Value valueArg = Value(Undefined{});
+        auto valueIt = record->properties.find("__dispose_value__");
+        if (valueIt != record->properties.end()) valueArg = valueIt->second;
+        try {
+          if (!interp) {
+            throw std::runtime_error("TypeError: Interpreter unavailable");
+          }
+          const std::string kind = kindIt->second.toString();
+          if (kind == "use") {
+            interp->callForHarness(methodIt->second, {}, valueArg);
+          } else if (kind == "adopt") {
+            interp->callForHarness(methodIt->second, {valueArg}, Value(Undefined{}));
+          } else {
+            interp->callForHarness(methodIt->second, {}, Value(Undefined{}));
+          }
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (const JsValueException& e) {
+          if (accumulatedError.isUndefined()) {
+            accumulatedError = e.value();
+          } else {
+            accumulatedError = makeSuppressedErrorValue(e.value(), accumulatedError);
+          }
+        }
+      }
+      resources->elements.clear();
+      if (!accumulatedError.isUndefined()) {
+        throw JsValueException(accumulatedError);
+      }
+      return Value(Undefined{});
+    };
+    disposableStackProto->properties["dispose"] = Value(disposableDispose);
+    disposableStackProto->properties["__non_enum_dispose"] = Value(true);
+    disposableStackProto->properties[WellKnownSymbols::disposeKey()] = Value(disposableDispose);
+    disposableStackProto->properties["__non_enum_" + WellKnownSymbols::disposeKey()] = Value(true);
+
+    auto disposableDefer = GarbageCollector::makeGC<Function>();
+    disposableDefer->isNative = true;
+    disposableDefer->properties["__uses_this_arg__"] = Value(true);
+    disposableDefer->properties["name"] = Value(std::string("defer"));
+    disposableDefer->properties["__non_writable_name"] = Value(true);
+    disposableDefer->properties["__non_enum_name"] = Value(true);
+    disposableDefer->properties["length"] = Value(1.0);
+    disposableDefer->properties["__non_writable_length"] = Value(true);
+    disposableDefer->properties["__non_enum_length"] = Value(true);
+    disposableDefer->nativeFunc = [requireStackInstance](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(receiver, "__disposable_state__", "DisposableStack.prototype.defer");
+      if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("TypeError: onDispose is not callable");
+      }
+      auto stateIt = obj->properties.find("__disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw std::runtime_error("TypeError: DisposableStack is already disposed");
+      }
+      auto resources = obj->properties["__disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("defer"));
+      record->properties["__dispose_method__"] = args[1];
+      resources->elements.push_back(Value(record));
+      return Value(Undefined{});
+    };
+    disposableStackProto->properties["defer"] = Value(disposableDefer);
+    disposableStackProto->properties["__non_enum_defer"] = Value(true);
+
+    auto disposableAdopt = GarbageCollector::makeGC<Function>();
+    disposableAdopt->isNative = true;
+    disposableAdopt->properties["__uses_this_arg__"] = Value(true);
+    disposableAdopt->properties["name"] = Value(std::string("adopt"));
+    disposableAdopt->properties["__non_writable_name"] = Value(true);
+    disposableAdopt->properties["__non_enum_name"] = Value(true);
+    disposableAdopt->properties["length"] = Value(2.0);
+    disposableAdopt->properties["__non_writable_length"] = Value(true);
+    disposableAdopt->properties["__non_enum_length"] = Value(true);
+    disposableAdopt->nativeFunc = [requireStackInstance](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(receiver, "__disposable_state__", "DisposableStack.prototype.adopt");
+      if (args.size() < 3 || !args[2].isFunction()) {
+        throw std::runtime_error("TypeError: onDispose is not callable");
+      }
+      auto stateIt = obj->properties.find("__disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw std::runtime_error("TypeError: DisposableStack is already disposed");
+      }
+      auto resources = obj->properties["__disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("adopt"));
+      record->properties["__dispose_method__"] = args[2];
+      record->properties["__dispose_value__"] = args.size() > 1 ? args[1] : Value(Undefined{});
+      resources->elements.push_back(Value(record));
+      return args.size() > 1 ? args[1] : Value(Undefined{});
+    };
+    disposableStackProto->properties["adopt"] = Value(disposableAdopt);
+    disposableStackProto->properties["__non_enum_adopt"] = Value(true);
+
+    auto disposableUse = GarbageCollector::makeGC<Function>();
+    disposableUse->isNative = true;
+    disposableUse->properties["__uses_this_arg__"] = Value(true);
+    disposableUse->properties["name"] = Value(std::string("use"));
+    disposableUse->properties["__non_writable_name"] = Value(true);
+    disposableUse->properties["__non_enum_name"] = Value(true);
+    disposableUse->properties["length"] = Value(1.0);
+    disposableUse->properties["__non_writable_length"] = Value(true);
+    disposableUse->properties["__non_enum_length"] = Value(true);
+    disposableUse->nativeFunc = [env, requireStackInstance](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(receiver, "__disposable_state__", "DisposableStack.prototype.use");
+      auto stateIt = obj->properties.find("__disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        auto err = GarbageCollector::makeGC<Error>(ErrorType::ReferenceError,
+                                                   "DisposableStack is already disposed");
+        if (auto refCtor = env->get("ReferenceError"); refCtor && refCtor->isFunction()) {
+          auto protoIt = refCtor->getGC<Function>()->properties.find("prototype");
+          if (protoIt != refCtor->getGC<Function>()->properties.end() && protoIt->second.isObject()) {
+            err->properties["__proto__"] = protoIt->second;
+          }
+        }
+        throw JsValueException(Value(err));
+      }
+      Value valueArg = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (valueArg.isUndefined() || valueArg.isNull()) {
+        return valueArg;
+      }
+      if (!isObjectLikeValue(valueArg)) {
+        throw std::runtime_error("TypeError: value is not an object");
+      }
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable");
+      }
+      auto [foundMethod, method] = interp->getPropertyForExternal(valueArg, WellKnownSymbols::disposeKey());
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (!foundMethod || method.isUndefined() || method.isNull()) {
+        throw std::runtime_error("TypeError: value does not have a callable @@dispose");
+      }
+      if (!method.isFunction()) {
+        throw std::runtime_error("TypeError: value @@dispose is not callable");
+      }
+      auto resources = obj->properties["__disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("use"));
+      record->properties["__dispose_method__"] = method;
+      record->properties["__dispose_value__"] = valueArg;
+      resources->elements.push_back(Value(record));
+      return valueArg;
+    };
+    disposableStackProto->properties["use"] = Value(disposableUse);
+    disposableStackProto->properties["__non_enum_use"] = Value(true);
+
+    auto disposableMove = GarbageCollector::makeGC<Function>();
+    disposableMove->isNative = true;
+    disposableMove->properties["__uses_this_arg__"] = Value(true);
+    disposableMove->properties["name"] = Value(std::string("move"));
+    disposableMove->properties["__non_writable_name"] = Value(true);
+    disposableMove->properties["__non_enum_name"] = Value(true);
+    disposableMove->properties["length"] = Value(0.0);
+    disposableMove->properties["__non_writable_length"] = Value(true);
+    disposableMove->properties["__non_enum_length"] = Value(true);
+    disposableMove->nativeFunc =
+      [requireStackInstance, makeStackStateObject, makeReferenceErrorValue, disposableStackProto](
+        const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(receiver, "__disposable_state__", "DisposableStack.prototype.move");
+      auto stateIt = obj->properties.find("__disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw JsValueException(makeReferenceErrorValue("DisposableStack is already disposed"));
+      }
+      Value moved = makeStackStateObject("__disposable_state__", "__disposable_resources__");
+      auto movedObj = moved.getGC<Object>();
+      movedObj->properties["__proto__"] = Value(disposableStackProto);
+      movedObj->properties["__disposable_resources__"] = obj->properties["__disposable_resources__"];
+      auto replacementResources = GarbageCollector::makeGC<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      obj->properties["__disposable_resources__"] = Value(replacementResources);
+      obj->properties["__disposable_state__"] = Value(std::string("disposed"));
+      return moved;
+    };
+    disposableStackProto->properties["move"] = Value(disposableMove);
+    disposableStackProto->properties["__non_enum_move"] = Value(true);
+
+    env->define("DisposableStack", Value(disposableStackCtor));
+    if (auto globalThis = env->get("globalThis"); globalThis && globalThis->isObject()) {
+      globalThis->getGC<Object>()->properties["__non_enum_DisposableStack"] = Value(true);
+    }
+
+    auto asyncDisposableStackProto = GarbageCollector::makeGC<Object>();
+    GarbageCollector::instance().reportAllocation(sizeof(Object));
+    auto asyncDisposableStackCtor = GarbageCollector::makeGC<Function>();
+    asyncDisposableStackCtor->isNative = true;
+    asyncDisposableStackCtor->isConstructor = true;
+    asyncDisposableStackCtor->properties["__require_new__"] = Value(true);
+    asyncDisposableStackCtor->properties["name"] = Value(std::string("AsyncDisposableStack"));
+    asyncDisposableStackCtor->properties["__non_writable_name"] = Value(true);
+    asyncDisposableStackCtor->properties["__non_enum_name"] = Value(true);
+    asyncDisposableStackCtor->properties["length"] = Value(0.0);
+    asyncDisposableStackCtor->properties["__non_writable_length"] = Value(true);
+    asyncDisposableStackCtor->properties["__non_enum_length"] = Value(true);
+    asyncDisposableStackCtor->properties["prototype"] = Value(asyncDisposableStackProto);
+    asyncDisposableStackCtor->properties["__non_writable_prototype"] = Value(true);
+    asyncDisposableStackCtor->properties["__non_enum_prototype"] = Value(true);
+    asyncDisposableStackCtor->properties["__non_configurable_prototype"] = Value(true);
+    asyncDisposableStackCtor->nativeFunc = [makeStackStateObject](const std::vector<Value>&) -> Value {
+      return makeStackStateObject("__async_disposable_state__", "__async_disposable_resources__");
+    };
+    asyncDisposableStackProto->properties["constructor"] = Value(asyncDisposableStackCtor);
+    asyncDisposableStackProto->properties["__non_enum_constructor"] = Value(true);
+
+    auto asyncDisposedGetter = GarbageCollector::makeGC<Function>();
+    asyncDisposedGetter->isNative = true;
+    asyncDisposedGetter->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposedGetter->properties["name"] = Value(std::string("get disposed"));
+    asyncDisposedGetter->properties["__non_writable_name"] = Value(true);
+    asyncDisposedGetter->properties["__non_enum_name"] = Value(true);
+    asyncDisposedGetter->properties["length"] = Value(0.0);
+    asyncDisposedGetter->properties["__non_writable_length"] = Value(true);
+    asyncDisposedGetter->properties["__non_enum_length"] = Value(true);
+    asyncDisposedGetter->nativeFunc = [requireStackInstance](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__async_disposable_state__", "get AsyncDisposableStack.prototype.disposed");
+      auto stateIt = obj->properties.find("__async_disposable_state__");
+      return Value(stateIt != obj->properties.end() &&
+                   stateIt->second.isString() &&
+                   stateIt->second.toString() == "disposed");
+    };
+    asyncDisposableStackProto->properties["__get_disposed"] = Value(asyncDisposedGetter);
+    asyncDisposableStackProto->properties["__non_enum_disposed"] = Value(true);
+
+    auto asyncDisposeAsync = GarbageCollector::makeGC<Function>();
+    asyncDisposeAsync->isNative = true;
+    asyncDisposeAsync->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposeAsync->properties["name"] = Value(std::string("disposeAsync"));
+    asyncDisposeAsync->properties["__non_writable_name"] = Value(true);
+    asyncDisposeAsync->properties["__non_enum_name"] = Value(true);
+    asyncDisposeAsync->properties["length"] = Value(0.0);
+    asyncDisposeAsync->properties["__non_writable_length"] = Value(true);
+    asyncDisposeAsync->properties["__non_enum_length"] = Value(true);
+    asyncDisposeAsync->nativeFunc =
+      [env, requireStackInstance, makeSuppressedErrorValue](const std::vector<Value>& args) -> Value {
+      auto promise = GarbageCollector::makeGC<Promise>();
+      if (auto intrinsicPromise = env->get("__intrinsic_Promise__");
+          intrinsicPromise && intrinsicPromise->isFunction()) {
+        auto promiseCtor = intrinsicPromise->getGC<Function>();
+        promise->properties["constructor"] = *intrinsicPromise;
+        auto protoIt = promiseCtor->properties.find("prototype");
+        if (protoIt != promiseCtor->properties.end()) {
+          promise->properties["__proto__"] = protoIt->second;
+        }
+      }
+      try {
+        Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+        auto obj = requireStackInstance(
+          receiver, "__async_disposable_state__", "AsyncDisposableStack.prototype.disposeAsync");
+        auto stateIt = obj->properties.find("__async_disposable_state__");
+        if (stateIt != obj->properties.end() &&
+            stateIt->second.isString() &&
+            stateIt->second.toString() == "disposed") {
+          promise->resolve(Value(Undefined{}));
+          return Value(promise);
+        }
+        obj->properties["__async_disposable_state__"] = Value(std::string("disposed"));
+        auto resourcesIt = obj->properties.find("__async_disposable_resources__");
+        if (resourcesIt == obj->properties.end() || !resourcesIt->second.isArray()) {
+          promise->resolve(Value(Undefined{}));
+          return Value(promise);
+        }
+        auto resources = resourcesIt->second.getGC<Array>();
+        auto* interp = getGlobalInterpreter();
+        if (!interp) {
+          promise->reject(Value(GarbageCollector::makeGC<Error>(
+            ErrorType::TypeError, "Interpreter unavailable")));
+          return Value(promise);
+        }
+
+        auto accumulatedError = std::make_shared<Value>(Undefined{});
+        auto index = std::make_shared<size_t>(resources->elements.size());
+        auto settlePromise = std::make_shared<std::function<void()>>();
+        auto processNext = std::make_shared<std::function<void()>>();
+
+        *settlePromise = [promise, resources, accumulatedError]() {
+          resources->elements.clear();
+          if (accumulatedError->isUndefined()) {
+            promise->resolve(Value(Undefined{}));
+          } else {
+            promise->reject(*accumulatedError);
+          }
+        };
+
+        *processNext =
+          [interp, resources, index, accumulatedError, processNext, settlePromise,
+           makeSuppressedErrorValue]() {
+          auto appendError = [accumulatedError, makeSuppressedErrorValue](const Value& err) {
+            if (accumulatedError->isUndefined()) {
+              *accumulatedError = err;
+            } else {
+              *accumulatedError = makeSuppressedErrorValue(err, *accumulatedError);
+            }
+          };
+
+          while (*index > 0) {
+            Value recordValue = resources->elements[*index - 1];
+            --(*index);
+            if (!recordValue.isObject()) {
+              continue;
+            }
+            auto record = recordValue.getGC<Object>();
+            auto kindIt = record->properties.find("__dispose_kind__");
+            auto methodIt = record->properties.find("__dispose_method__");
+            if (kindIt == record->properties.end() || !kindIt->second.isString() ||
+                methodIt == record->properties.end() || !methodIt->second.isFunction()) {
+              continue;
+            }
+
+            Value valueArg = Value(Undefined{});
+            auto valueIt = record->properties.find("__dispose_value__");
+            if (valueIt != record->properties.end()) {
+              valueArg = valueIt->second;
+            }
+
+            try {
+              Value result(Undefined{});
+              const std::string kind = kindIt->second.toString();
+              if (kind == "use") {
+                result = interp->callForHarness(methodIt->second, {}, valueArg);
+              } else if (kind == "adopt") {
+                result = interp->callForHarness(methodIt->second, {valueArg}, Value(Undefined{}));
+              } else {
+                result = interp->callForHarness(methodIt->second, {}, Value(Undefined{}));
+              }
+              if (interp->hasError()) {
+                Value err = interp->getError();
+                interp->clearError();
+                appendError(err);
+                continue;
+              }
+              if (result.isPromise()) {
+                result.getGC<Promise>()->then(
+                  [processNext](Value) -> Value {
+                    (*processNext)();
+                    return Value(Undefined{});
+                  },
+                  [appendError, processNext](Value reason) -> Value {
+                    appendError(reason);
+                    (*processNext)();
+                    return Value(Undefined{});
+                  });
+                return;
+              }
+            } catch (const JsValueException& e) {
+              appendError(e.value());
+              continue;
+            } catch (const std::exception& e) {
+              appendError(Value(GarbageCollector::makeGC<Error>(ErrorType::Error, e.what())));
+              continue;
+            }
+          }
+
+          (*settlePromise)();
+        };
+
+        (*processNext)();
+      } catch (const std::exception& e) {
+        std::string message = e.what();
+        if (message.rfind("TypeError: ", 0) == 0) {
+          message = message.substr(11);
+        }
+        promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, message)));
+      }
+      return Value(promise);
+    };
+    asyncDisposableStackProto->properties["disposeAsync"] = Value(asyncDisposeAsync);
+    asyncDisposableStackProto->properties["__non_enum_disposeAsync"] = Value(true);
+    asyncDisposableStackProto->properties[WellKnownSymbols::asyncDisposeKey()] = Value(asyncDisposeAsync);
+    asyncDisposableStackProto->properties["__non_enum_" + WellKnownSymbols::asyncDisposeKey()] =
+      Value(true);
+    asyncDisposableStackProto->properties["dispose"] = Value(asyncDisposeAsync);
+    asyncDisposableStackProto->properties["__non_enum_dispose"] = Value(true);
+
+    auto asyncDisposableUse = GarbageCollector::makeGC<Function>();
+    asyncDisposableUse->isNative = true;
+    asyncDisposableUse->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposableUse->properties["name"] = Value(std::string("use"));
+    asyncDisposableUse->properties["__non_writable_name"] = Value(true);
+    asyncDisposableUse->properties["__non_enum_name"] = Value(true);
+    asyncDisposableUse->properties["length"] = Value(1.0);
+    asyncDisposableUse->properties["__non_writable_length"] = Value(true);
+    asyncDisposableUse->properties["__non_enum_length"] = Value(true);
+    asyncDisposableUse->nativeFunc =
+      [requireStackInstance, makeReferenceErrorValue](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj =
+        requireStackInstance(receiver, "__async_disposable_state__", "AsyncDisposableStack.prototype.use");
+      auto stateIt = obj->properties.find("__async_disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw JsValueException(makeReferenceErrorValue("AsyncDisposableStack is already disposed"));
+      }
+      Value valueArg = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (valueArg.isUndefined() || valueArg.isNull()) {
+        return valueArg;
+      }
+      if (!isObjectLikeValue(valueArg)) {
+        throw std::runtime_error("TypeError: value is not an object");
+      }
+      auto* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable");
+      }
+      Value method(Undefined{});
+      auto [foundAsyncMethod, asyncMethod] =
+        interp->getPropertyForExternal(valueArg, WellKnownSymbols::asyncDisposeKey());
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (foundAsyncMethod && !asyncMethod.isUndefined() && !asyncMethod.isNull()) {
+        method = asyncMethod;
+      } else {
+        auto [foundSyncMethod, syncMethod] =
+          interp->getPropertyForExternal(valueArg, WellKnownSymbols::disposeKey());
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw JsValueException(err);
+        }
+        if (foundSyncMethod && !syncMethod.isUndefined() && !syncMethod.isNull()) {
+          method = syncMethod;
+        }
+      }
+      if (method.isUndefined() || method.isNull()) {
+        throw std::runtime_error("TypeError: value does not have a callable @@asyncDispose");
+      }
+      if (!method.isFunction()) {
+        throw std::runtime_error("TypeError: value @@asyncDispose is not callable");
+      }
+      auto resources = obj->properties["__async_disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("use"));
+      record->properties["__dispose_method__"] = method;
+      record->properties["__dispose_value__"] = valueArg;
+      resources->elements.push_back(Value(record));
+      return valueArg;
+    };
+    asyncDisposableStackProto->properties["use"] = Value(asyncDisposableUse);
+    asyncDisposableStackProto->properties["__non_enum_use"] = Value(true);
+
+    auto asyncDisposableAdopt = GarbageCollector::makeGC<Function>();
+    asyncDisposableAdopt->isNative = true;
+    asyncDisposableAdopt->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposableAdopt->properties["name"] = Value(std::string("adopt"));
+    asyncDisposableAdopt->properties["__non_writable_name"] = Value(true);
+    asyncDisposableAdopt->properties["__non_enum_name"] = Value(true);
+    asyncDisposableAdopt->properties["length"] = Value(2.0);
+    asyncDisposableAdopt->properties["__non_writable_length"] = Value(true);
+    asyncDisposableAdopt->properties["__non_enum_length"] = Value(true);
+    asyncDisposableAdopt->nativeFunc =
+      [requireStackInstance, makeReferenceErrorValue](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__async_disposable_state__", "AsyncDisposableStack.prototype.adopt");
+      if (args.size() < 3 || !args[2].isFunction()) {
+        throw std::runtime_error("TypeError: onDisposeAsync is not callable");
+      }
+      auto stateIt = obj->properties.find("__async_disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw JsValueException(makeReferenceErrorValue("AsyncDisposableStack is already disposed"));
+      }
+      auto resources = obj->properties["__async_disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("adopt"));
+      record->properties["__dispose_method__"] = args[2];
+      record->properties["__dispose_value__"] = args.size() > 1 ? args[1] : Value(Undefined{});
+      resources->elements.push_back(Value(record));
+      return args.size() > 1 ? args[1] : Value(Undefined{});
+    };
+    asyncDisposableStackProto->properties["adopt"] = Value(asyncDisposableAdopt);
+    asyncDisposableStackProto->properties["__non_enum_adopt"] = Value(true);
+
+    auto asyncDisposableDefer = GarbageCollector::makeGC<Function>();
+    asyncDisposableDefer->isNative = true;
+    asyncDisposableDefer->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposableDefer->properties["name"] = Value(std::string("defer"));
+    asyncDisposableDefer->properties["__non_writable_name"] = Value(true);
+    asyncDisposableDefer->properties["__non_enum_name"] = Value(true);
+    asyncDisposableDefer->properties["length"] = Value(1.0);
+    asyncDisposableDefer->properties["__non_writable_length"] = Value(true);
+    asyncDisposableDefer->properties["__non_enum_length"] = Value(true);
+    asyncDisposableDefer->nativeFunc =
+      [requireStackInstance, makeReferenceErrorValue](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__async_disposable_state__", "AsyncDisposableStack.prototype.defer");
+      if (args.size() < 2 || !args[1].isFunction()) {
+        throw std::runtime_error("TypeError: onDisposeAsync is not callable");
+      }
+      auto stateIt = obj->properties.find("__async_disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw JsValueException(makeReferenceErrorValue("AsyncDisposableStack is already disposed"));
+      }
+      auto resources = obj->properties["__async_disposable_resources__"].getGC<Array>();
+      auto record = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      record->properties["__dispose_kind__"] = Value(std::string("defer"));
+      record->properties["__dispose_method__"] = args[1];
+      resources->elements.push_back(Value(record));
+      return Value(Undefined{});
+    };
+    asyncDisposableStackProto->properties["defer"] = Value(asyncDisposableDefer);
+    asyncDisposableStackProto->properties["__non_enum_defer"] = Value(true);
+
+    auto asyncDisposableMove = GarbageCollector::makeGC<Function>();
+    asyncDisposableMove->isNative = true;
+    asyncDisposableMove->properties["__uses_this_arg__"] = Value(true);
+    asyncDisposableMove->properties["name"] = Value(std::string("move"));
+    asyncDisposableMove->properties["__non_writable_name"] = Value(true);
+    asyncDisposableMove->properties["__non_enum_name"] = Value(true);
+    asyncDisposableMove->properties["length"] = Value(0.0);
+    asyncDisposableMove->properties["__non_writable_length"] = Value(true);
+    asyncDisposableMove->properties["__non_enum_length"] = Value(true);
+    asyncDisposableMove->nativeFunc =
+      [requireStackInstance, makeStackStateObject, makeReferenceErrorValue, asyncDisposableStackProto](
+        const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      auto obj = requireStackInstance(
+        receiver, "__async_disposable_state__", "AsyncDisposableStack.prototype.move");
+      auto stateIt = obj->properties.find("__async_disposable_state__");
+      if (stateIt != obj->properties.end() &&
+          stateIt->second.isString() &&
+          stateIt->second.toString() == "disposed") {
+        throw JsValueException(makeReferenceErrorValue("AsyncDisposableStack is already disposed"));
+      }
+      Value moved = makeStackStateObject("__async_disposable_state__", "__async_disposable_resources__");
+      auto movedObj = moved.getGC<Object>();
+      movedObj->properties["__proto__"] = Value(asyncDisposableStackProto);
+      movedObj->properties["__async_disposable_resources__"] =
+        obj->properties["__async_disposable_resources__"];
+      auto replacementResources = GarbageCollector::makeGC<Array>();
+      GarbageCollector::instance().reportAllocation(sizeof(Array));
+      obj->properties["__async_disposable_resources__"] = Value(replacementResources);
+      obj->properties["__async_disposable_state__"] = Value(std::string("disposed"));
+      return moved;
+    };
+    asyncDisposableStackProto->properties["move"] = Value(asyncDisposableMove);
+    asyncDisposableStackProto->properties["__non_enum_move"] = Value(true);
+
+    env->define("AsyncDisposableStack", Value(asyncDisposableStackCtor));
+    if (auto globalThis = env->get("globalThis"); globalThis && globalThis->isObject()) {
+      globalThis->getGC<Object>()->properties["__non_enum_AsyncDisposableStack"] = Value(true);
+    }
   }
 
   // Map constructor
@@ -9510,38 +11765,1104 @@ GCPtr<Environment> Environment::createGlobal() {
 
   // %IteratorPrototype% - base prototype for all built-in iterators
   auto iteratorPrototype = GarbageCollector::makeGC<Object>();
-  iteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Iterator"));
-  iteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  // Iterator.prototype[@@toStringTag] is an accessor property per ES2025
+  {
+    auto toStringTagGetter = GarbageCollector::makeGC<Function>();
+    toStringTagGetter->isNative = true;
+    toStringTagGetter->properties["name"] = Value(std::string("get [Symbol.toStringTag]"));
+    toStringTagGetter->properties["length"] = Value(0.0);
+    toStringTagGetter->properties["__non_writable_name"] = Value(true);
+    toStringTagGetter->properties["__non_enum_name"] = Value(true);
+    toStringTagGetter->properties["__non_writable_length"] = Value(true);
+    toStringTagGetter->properties["__non_enum_length"] = Value(true);
+    toStringTagGetter->nativeFunc = [](const std::vector<Value>&) -> Value {
+      return Value(std::string("Iterator"));
+    };
+    auto toStringTagSetter = GarbageCollector::makeGC<Function>();
+    toStringTagSetter->isNative = true;
+    toStringTagSetter->properties["name"] = Value(std::string("set [Symbol.toStringTag]"));
+    toStringTagSetter->properties["length"] = Value(1.0);
+    toStringTagSetter->properties["__non_writable_name"] = Value(true);
+    toStringTagSetter->properties["__non_enum_name"] = Value(true);
+    toStringTagSetter->properties["__non_writable_length"] = Value(true);
+    toStringTagSetter->properties["__non_enum_length"] = Value(true);
+    toStringTagSetter->properties["__uses_this_arg__"] = Value(true);
+    toStringTagSetter->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      // The setter is a no-op per spec (accepts the value but doesn't store)
+      return Value(Undefined{});
+    };
+    const auto& toStringTagKey = WellKnownSymbols::toStringTagKey();
+    iteratorPrototype->properties["__get_" + toStringTagKey] = Value(toStringTagGetter);
+    iteratorPrototype->properties["__set_" + toStringTagKey] = Value(toStringTagSetter);
+    iteratorPrototype->properties["__non_enum_" + toStringTagKey] = Value(true);
+  }
   if (auto objProtoVal = env->get("__object_prototype__"); objProtoVal && objProtoVal->isObject()) {
     iteratorPrototype->properties["__proto__"] = *objProtoVal;
   }
+  {
+    auto iteratorSelf = GarbageCollector::makeGC<Function>();
+    iteratorSelf->isNative = true;
+    iteratorSelf->properties["name"] = Value(std::string("[Symbol.iterator]"));
+    iteratorSelf->properties["length"] = Value(0.0);
+    iteratorSelf->properties["__non_writable_name"] = Value(true);
+    iteratorSelf->properties["__non_enum_name"] = Value(true);
+    iteratorSelf->properties["__non_writable_length"] = Value(true);
+    iteratorSelf->properties["__non_enum_length"] = Value(true);
+    iteratorSelf->properties["__uses_this_arg__"] = Value(true);
+    iteratorSelf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    iteratorPrototype->properties[WellKnownSymbols::iteratorKey()] = Value(iteratorSelf);
+    iteratorPrototype->properties["__non_enum_" + WellKnownSymbols::iteratorKey()] = Value(true);
+  }
+  {
+    auto iteratorDispose = GarbageCollector::makeGC<Function>();
+    iteratorDispose->isNative = true;
+    iteratorDispose->properties["name"] = Value(std::string("[Symbol.dispose]"));
+    iteratorDispose->properties["length"] = Value(0.0);
+    iteratorDispose->properties["__non_writable_name"] = Value(true);
+    iteratorDispose->properties["__non_enum_name"] = Value(true);
+    iteratorDispose->properties["__non_writable_length"] = Value(true);
+    iteratorDispose->properties["__non_enum_length"] = Value(true);
+    iteratorDispose->properties["__uses_this_arg__"] = Value(true);
+    iteratorDispose->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      Interpreter* interp = getGlobalInterpreter();
+      if (!interp) {
+        throw std::runtime_error("TypeError: Interpreter unavailable");
+      }
+      auto [foundReturn, returnMethod] = interp->getPropertyForExternal(receiver, "return");
+      if (foundReturn && !returnMethod.isUndefined()) {
+        if (!returnMethod.isFunction()) {
+          throw std::runtime_error("TypeError: Iterator.prototype[Symbol.dispose] return is not callable");
+        }
+        interp->callForHarness(returnMethod, {}, receiver);
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw std::runtime_error(err.toString());
+        }
+      }
+      return Value(Undefined{});
+    };
+    iteratorPrototype->properties[WellKnownSymbols::disposeKey()] = Value(iteratorDispose);
+    iteratorPrototype->properties["__non_enum_" + WellKnownSymbols::disposeKey()] = Value(true);
+  }
   env->define("__iterator_prototype__", Value(iteratorPrototype));
+
+  // ===== Iterator constructor and helpers (ES2025 Iterator Helpers) =====
+  {
+    // Iterator constructor - abstract, throws if called directly via new Iterator()
+    auto iteratorConstructor = GarbageCollector::makeGC<Function>();
+    iteratorConstructor->isNative = true;
+    iteratorConstructor->isConstructor = true;
+    iteratorConstructor->properties["name"] = Value(std::string("Iterator"));
+    iteratorConstructor->properties["length"] = Value(0.0);
+    iteratorConstructor->properties["__non_writable_name"] = Value(true);
+    iteratorConstructor->properties["__non_enum_name"] = Value(true);
+    iteratorConstructor->properties["__non_writable_length"] = Value(true);
+    iteratorConstructor->properties["__non_enum_length"] = Value(true);
+    iteratorConstructor->properties["prototype"] = Value(iteratorPrototype);
+    iteratorConstructor->properties["__non_writable_prototype"] = Value(true);
+    iteratorConstructor->properties["__non_configurable_prototype"] = Value(true);
+    iteratorConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+      return Value(GarbageCollector::makeGC<Object>());
+    };
+    iteratorPrototype->properties["constructor"] = Value(iteratorConstructor);
+    iteratorPrototype->properties["__non_enum_constructor"] = Value(true);
+    iteratorPrototype->properties["__non_writable_constructor"] = Value(true);
+
+    // Helper: define a method on Iterator.prototype
+    auto defineIterMethod = [&](const std::string& name, int length,
+        std::function<Value(const std::vector<Value>&)> impl) {
+      auto fn = GarbageCollector::makeGC<Function>();
+      fn->isNative = true;
+      fn->properties["__uses_this_arg__"] = Value(true);
+      fn->properties["name"] = Value(name);
+      fn->properties["__non_writable_name"] = Value(true);
+      fn->properties["__non_enum_name"] = Value(true);
+      fn->properties["length"] = Value(static_cast<double>(length));
+      fn->properties["__non_writable_length"] = Value(true);
+      fn->properties["__non_enum_length"] = Value(true);
+      fn->properties["__throw_on_new__"] = Value(true);
+      fn->nativeFunc = impl;
+      iteratorPrototype->properties[name] = Value(fn);
+      iteratorPrototype->properties["__non_enum_" + name] = Value(true);
+    };
+
+    // Helper: GetIteratorDirect - get 'next' from this once
+    auto getIterDirect = [](const Value& thisVal) -> std::pair<Value, Value> {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+      // GetIteratorDirect: get 'next' method from this (no callable check per spec)
+      auto [hasNext, nextMethod] = interp->getPropertyForExternal(thisVal, "next");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      return {thisVal, nextMethod};
+    };
+
+    // Helper: call next and check done (uses getPropertyForExternal to trigger getters)
+    auto iterStep = [](Interpreter* interp, const Value& nextMethod, const Value& iterObj) -> std::pair<bool, Value> {
+      if (!nextMethod.isFunction()) {
+        throw std::runtime_error("TypeError: iterator.next is not a function");
+      }
+      Value step = interp->callForHarness(nextMethod, {}, iterObj);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (!step.isObject()) {
+        throw std::runtime_error("TypeError: Iterator result is not an object");
+      }
+      auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      bool done = hasDone && doneVal.toBool();
+      if (done) return {true, Value(Undefined{})};
+      auto [hasVal, val] = interp->getPropertyForExternal(step, "value");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      return {false, val};
+    };
+
+    // Helper: close iterator via return()
+    auto iterClose = [](Interpreter* interp, const Value& iterObj) {
+      auto [hasReturn, returnMethod] = interp->getPropertyForExternal(iterObj, "return");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (hasReturn && returnMethod.isFunction()) {
+        interp->callForHarness(returnMethod, {}, iterObj);
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw JsValueException(err);
+        }
+      }
+    };
+
+    // %IteratorHelperPrototype%
+    auto iteratorHelperPrototype = GarbageCollector::makeGC<Object>();
+    iteratorHelperPrototype->properties["__proto__"] = Value(iteratorPrototype);
+    iteratorHelperPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Iterator Helper"));
+    iteratorHelperPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+    iteratorHelperPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+    // Inherit Symbol.iterator from iteratorPrototype (workaround for prototype chain walk)
+    {
+      auto selfIterFn = GarbageCollector::makeGC<Function>();
+      selfIterFn->isNative = true;
+      selfIterFn->properties["__uses_this_arg__"] = Value(true);
+      selfIterFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        return args.empty() ? Value(Undefined{}) : args[0];
+      };
+      iteratorHelperPrototype->properties[WellKnownSymbols::iteratorKey()] = Value(selfIterFn);
+      iteratorHelperPrototype->properties["__non_enum_" + WellKnownSymbols::iteratorKey()] = Value(true);
+    }
+    {
+      // %IteratorHelperPrototype%.next
+      auto helperNext = GarbageCollector::makeGC<Function>();
+      helperNext->isNative = true;
+      helperNext->properties["name"] = Value(std::string("next"));
+      helperNext->properties["length"] = Value(0.0);
+      helperNext->properties["__non_writable_name"] = Value(true);
+      helperNext->properties["__non_enum_name"] = Value(true);
+      helperNext->properties["__non_writable_length"] = Value(true);
+      helperNext->properties["__non_enum_length"] = Value(true);
+      helperNext->properties["__uses_this_arg__"] = Value(true);
+      helperNext->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isObject()) {
+          throw std::runtime_error("TypeError: Iterator Helper next requires this to be an Object");
+        }
+        auto self = args[0].getGC<Object>();
+        auto nextFnIt = self->properties.find("__iterator_helper_next_fn__");
+        if (nextFnIt == self->properties.end() || !nextFnIt->second.isFunction()) {
+          throw std::runtime_error("TypeError: Iterator Helper next called on incompatible receiver");
+        }
+        auto doneIt = self->properties.find("__iterator_helper_done__");
+        if (doneIt != self->properties.end() && doneIt->second.isBool() && doneIt->second.toBool()) {
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        }
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        Value result = interp->callForHarness(nextFnIt->second, {}, args[0]);
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw JsValueException(err);
+        }
+        return result;
+      };
+      iteratorHelperPrototype->properties["next"] = Value(helperNext);
+      iteratorHelperPrototype->properties["__non_enum_next"] = Value(true);
+
+      // %IteratorHelperPrototype%.return
+      auto helperReturn = GarbageCollector::makeGC<Function>();
+      helperReturn->isNative = true;
+      helperReturn->properties["name"] = Value(std::string("return"));
+      helperReturn->properties["length"] = Value(0.0);
+      helperReturn->properties["__non_writable_name"] = Value(true);
+      helperReturn->properties["__non_enum_name"] = Value(true);
+      helperReturn->properties["__non_writable_length"] = Value(true);
+      helperReturn->properties["__non_enum_length"] = Value(true);
+      helperReturn->properties["__uses_this_arg__"] = Value(true);
+      helperReturn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        if (args.empty() || !args[0].isObject()) {
+          throw std::runtime_error("TypeError: Iterator Helper return requires this to be an Object");
+        }
+        auto self = args[0].getGC<Object>();
+        self->properties["__iterator_helper_done__"] = Value(true);
+        auto underlyingIt = self->properties.find("__iterator_helper_underlying__");
+        if (underlyingIt != self->properties.end()) {
+          auto* interp = getGlobalInterpreter();
+          if (interp) {
+            auto [hasReturn, returnMethod] = interp->getPropertyForExternal(underlyingIt->second, "return");
+            if (hasReturn && returnMethod.isFunction()) {
+              Value result = interp->callForHarness(returnMethod, {}, underlyingIt->second);
+              if (interp->hasError()) {
+                Value err = interp->getError();
+                interp->clearError();
+                throw JsValueException(err);
+              }
+              return result;
+            }
+          }
+        }
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      };
+      iteratorHelperPrototype->properties["return"] = Value(helperReturn);
+      iteratorHelperPrototype->properties["__non_enum_return"] = Value(true);
+    }
+
+    // ===== Eager methods =====
+
+    // Iterator.prototype.toArray()
+    defineIterMethod("toArray", 0, [getIterDirect, iterStep](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      auto result = GarbageCollector::makeGC<Array>();
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) break;
+        result->elements.push_back(val);
+      }
+      return Value(result);
+    });
+
+    // Iterator.prototype.forEach(fn)
+    defineIterMethod("forEach", 1, [getIterDirect, iterStep, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value fn = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!fn.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.forEach callback is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      double counter = 0;
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) break;
+        try {
+          interp->callForHarness(fn, {val, Value(counter)});
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (...) {
+          iterClose(interp, iter);
+          throw;
+        }
+        counter++;
+      }
+      return Value(Undefined{});
+    });
+
+    // Iterator.prototype.some(predicate)
+    defineIterMethod("some", 1, [getIterDirect, iterStep, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value predicate = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!predicate.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.some predicate is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      double counter = 0;
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) return Value(false);
+        Value result;
+        try {
+          result = interp->callForHarness(predicate, {val, Value(counter)});
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (...) {
+          iterClose(interp, iter);
+          throw;
+        }
+        if (result.toBool()) {
+          iterClose(interp, iter);
+          return Value(true);
+        }
+        counter++;
+      }
+    });
+
+    // Iterator.prototype.every(predicate)
+    defineIterMethod("every", 1, [getIterDirect, iterStep, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value predicate = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!predicate.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.every predicate is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      double counter = 0;
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) return Value(true);
+        Value result;
+        try {
+          result = interp->callForHarness(predicate, {val, Value(counter)});
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (...) {
+          iterClose(interp, iter);
+          throw;
+        }
+        if (!result.toBool()) {
+          iterClose(interp, iter);
+          return Value(false);
+        }
+        counter++;
+      }
+    });
+
+    // Iterator.prototype.find(predicate)
+    defineIterMethod("find", 1, [getIterDirect, iterStep, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value predicate = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!predicate.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.find predicate is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      double counter = 0;
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) return Value(Undefined{});
+        Value result;
+        try {
+          result = interp->callForHarness(predicate, {val, Value(counter)});
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (...) {
+          iterClose(interp, iter);
+          throw;
+        }
+        if (result.toBool()) {
+          iterClose(interp, iter);
+          return val;
+        }
+        counter++;
+      }
+    });
+
+    // Iterator.prototype.reduce(reducer[, initialValue])
+    defineIterMethod("reduce", 1, [getIterDirect, iterStep, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value reducer = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!reducer.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.reduce reducer is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto* interp = getGlobalInterpreter();
+      Value accumulator;
+      double counter = 0;
+      bool hasInit = args.size() > 2;
+      if (hasInit) {
+        accumulator = args[2];
+      } else {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) {
+          throw std::runtime_error("TypeError: Reduce of empty iterator with no initial value");
+        }
+        accumulator = val;
+        counter = 1;
+      }
+      while (true) {
+        auto [done, val] = iterStep(interp, nextMethod, iter);
+        if (done) return accumulator;
+        try {
+          accumulator = interp->callForHarness(reducer, {accumulator, val, Value(counter)});
+          if (interp->hasError()) {
+            Value err = interp->getError();
+            interp->clearError();
+            throw JsValueException(err);
+          }
+        } catch (...) {
+          iterClose(interp, iter);
+          throw;
+        }
+        counter++;
+      }
+    });
+
+    // ===== Lazy methods =====
+
+    // Helper: read done/value from iterator result using proper property access (triggers getters)
+    auto readIterResult = [](Interpreter* interp, const Value& step) -> std::pair<bool, Value> {
+      auto [hasDone, doneVal] = interp->getPropertyForExternal(step, "done");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (hasDone && doneVal.toBool()) return {true, Value(Undefined{})};
+      auto [hasVal, val] = interp->getPropertyForExternal(step, "value");
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      return {false, val};
+    };
+
+    // Helper: create an IteratorHelper object
+    auto makeHelper = [iteratorHelperPrototype](const Value& underlying, const Value& nextFn) -> Value {
+      auto helper = GarbageCollector::makeGC<Object>();
+      helper->properties["__proto__"] = Value(iteratorHelperPrototype);
+      helper->properties["__iterator_helper_underlying__"] = underlying;
+      helper->properties["__iterator_helper_next_fn__"] = nextFn;
+      // Add Symbol.iterator directly for for-of compatibility
+      auto selfFn = GarbageCollector::makeGC<Function>();
+      selfFn->isNative = true;
+      selfFn->properties["__uses_this_arg__"] = Value(true);
+      selfFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+        return args.empty() ? Value(Undefined{}) : args[0];
+      };
+      helper->properties[WellKnownSymbols::iteratorKey()] = Value(selfFn);
+      return Value(helper);
+    };
+
+    // Iterator.prototype.map(mapper)
+    defineIterMethod("map", 1, [getIterDirect, iterStep, iterClose, makeHelper, readIterResult](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value mapper = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!mapper.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.map mapper is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto counterPtr = std::make_shared<double>(0);
+      auto closedPtr = std::make_shared<bool>(false);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [iter, nextMethod, mapper, counterPtr, closedPtr, iterClose, readIterResult](const std::vector<Value>&) -> Value {
+        if (*closedPtr) return makeIteratorResultObject(Value(Undefined{}), true);
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        Value step = interp->callForHarness(nextMethod, {}, iter);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!step.isObject()) throw std::runtime_error("TypeError: Iterator result is not an object");
+        auto [done, val] = readIterResult(interp, step);
+        if (done) {
+          *closedPtr = true;
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        }
+        Value mapped;
+        try {
+          mapped = interp->callForHarness(mapper, {val, Value(*counterPtr)});
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        } catch (...) {
+          *closedPtr = true;
+          iterClose(interp, iter);
+          throw;
+        }
+        (*counterPtr)++;
+        return makeIteratorResultObject(mapped, false);
+      };
+      return makeHelper(iter, Value(nextFn));
+    });
+
+    // Iterator.prototype.filter(predicate)
+    defineIterMethod("filter", 1, [getIterDirect, iterStep, iterClose, makeHelper, readIterResult](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value predicate = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!predicate.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.filter predicate is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto counterPtr = std::make_shared<double>(0);
+      auto closedPtr = std::make_shared<bool>(false);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [iter, nextMethod, predicate, counterPtr, closedPtr, iterClose, readIterResult](const std::vector<Value>&) -> Value {
+        if (*closedPtr) return makeIteratorResultObject(Value(Undefined{}), true);
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        while (true) {
+          Value step = interp->callForHarness(nextMethod, {}, iter);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!step.isObject()) throw std::runtime_error("TypeError: Iterator result is not an object");
+          auto [done, val] = readIterResult(interp, step);
+          if (done) {
+            *closedPtr = true;
+            return makeIteratorResultObject(Value(Undefined{}), true);
+          }
+          Value result;
+          try {
+            result = interp->callForHarness(predicate, std::vector<Value>{val, Value(*counterPtr)});
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          } catch (...) {
+            *closedPtr = true;
+            iterClose(interp, iter);
+            throw;
+          }
+          (*counterPtr)++;
+          if (result.toBool()) {
+            return makeIteratorResultObject(val, false);
+          }
+        }
+      };
+      return makeHelper(iter, Value(nextFn));
+    });
+
+    // Iterator.prototype.take(limit)
+    // Helper: ToNumber with ToPrimitive for objects
+    auto toNumberForIter = [](const Value& val) -> double {
+      if (val.isNumber()) return val.toNumber();
+      if (val.isUndefined()) return std::numeric_limits<double>::quiet_NaN();
+      if (val.isNull()) return 0.0;
+      if (val.isBool()) return val.toBool() ? 1.0 : 0.0;
+      if (val.isString()) return val.toNumber();
+      if (val.isBigInt()) throw std::runtime_error("TypeError: Cannot convert a BigInt value to a number");
+      if (val.isSymbol()) throw std::runtime_error("TypeError: Cannot convert a Symbol value to a number");
+      // Object: ToPrimitive(number hint) then ToNumber
+      auto* interp = getGlobalInterpreter();
+      if (interp) {
+        Value prim = interp->toPrimitive(val, false);
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          throw JsValueException(err);
+        }
+        return prim.toNumber();
+      }
+      return val.toNumber();
+    };
+
+    defineIterMethod("take", 1, [getIterDirect, iterClose, makeHelper, toNumberForIter, readIterResult](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      // Step 2: check this is Object BEFORE ToNumber
+      if (thisVal.isUndefined() || thisVal.isNull() || thisVal.isBool() ||
+          thisVal.isNumber() || thisVal.isString() || thisVal.isSymbol() || thisVal.isBigInt()) {
+        throw std::runtime_error("TypeError: Iterator.prototype.take called on non-object");
+      }
+      Value limitVal = args.size() > 1 ? args[1] : Value(Undefined{});
+      double numLimit = toNumberForIter(limitVal);
+      if (std::isnan(numLimit)) {
+        auto* ic = getGlobalInterpreter();
+        if (ic) iterClose(ic, thisVal);
+        throw std::runtime_error("RangeError: Iterator.prototype.take limit is NaN");
+      }
+      double intLimit = std::isinf(numLimit) ? numLimit : std::trunc(numLimit);
+      if (intLimit < 0) {
+        auto* ic = getGlobalInterpreter();
+        if (ic) iterClose(ic, thisVal);
+        throw std::runtime_error("RangeError: Iterator.prototype.take limit must be non-negative");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto remainingPtr = std::make_shared<double>(intLimit);
+      auto closedPtr = std::make_shared<bool>(false);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [iter, nextMethod, remainingPtr, closedPtr, iterClose, readIterResult](const std::vector<Value>&) -> Value {
+        if (*closedPtr) return makeIteratorResultObject(Value(Undefined{}), true);
+        if (*remainingPtr <= 0) {
+          *closedPtr = true;
+          auto* interp = getGlobalInterpreter();
+          if (interp) iterClose(interp, iter);
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        }
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        Value step = interp->callForHarness(nextMethod, {}, iter);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!step.isObject()) throw std::runtime_error("TypeError: Iterator result is not an object");
+        auto [done, val] = readIterResult(interp, step);
+        if (done) {
+          *closedPtr = true;
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        }
+        (*remainingPtr)--;
+        if (*remainingPtr <= 0) {
+          *closedPtr = true;
+          iterClose(interp, iter);
+        }
+        return makeIteratorResultObject(val, false);
+      };
+      return makeHelper(iter, Value(nextFn));
+    });
+
+    // Iterator.prototype.drop(limit)
+    defineIterMethod("drop", 1, [getIterDirect, makeHelper, toNumberForIter, readIterResult, iterClose](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (thisVal.isUndefined() || thisVal.isNull() || thisVal.isBool() ||
+          thisVal.isNumber() || thisVal.isString() || thisVal.isSymbol() || thisVal.isBigInt()) {
+        throw std::runtime_error("TypeError: Iterator.prototype.drop called on non-object");
+      }
+      Value limitVal = args.size() > 1 ? args[1] : Value(Undefined{});
+      double numLimit = toNumberForIter(limitVal);
+      if (std::isnan(numLimit)) {
+        auto* ic = getGlobalInterpreter();
+        if (ic) iterClose(ic, thisVal);
+        throw std::runtime_error("RangeError: Iterator.prototype.drop limit is NaN");
+      }
+      double intLimit = std::isinf(numLimit) ? numLimit : std::trunc(numLimit);
+      if (intLimit < 0) {
+        auto* ic = getGlobalInterpreter();
+        if (ic) iterClose(ic, thisVal);
+        throw std::runtime_error("RangeError: Iterator.prototype.drop limit must be non-negative");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto droppedPtr = std::make_shared<bool>(false);
+      auto limitPtr = std::make_shared<double>(intLimit);
+      auto closedPtr = std::make_shared<bool>(false);
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [iter, nextMethod, droppedPtr, limitPtr, closedPtr, readIterResult](const std::vector<Value>&) -> Value {
+        if (*closedPtr) return makeIteratorResultObject(Value(Undefined{}), true);
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        // Drop phase: skip first 'limit' values
+        if (!*droppedPtr) {
+          *droppedPtr = true;
+          for (double i = 0; i < *limitPtr; i++) {
+            Value step = interp->callForHarness(nextMethod, {}, iter);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (step.isObject()) {
+              auto [done, _] = readIterResult(interp, step);
+              if (done) {
+                *closedPtr = true;
+                return makeIteratorResultObject(Value(Undefined{}), true);
+              }
+            }
+          }
+        }
+        // Yield phase
+        Value step = interp->callForHarness(nextMethod, {}, iter);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        if (!step.isObject()) throw std::runtime_error("TypeError: Iterator result is not an object");
+        auto [done, val] = readIterResult(interp, step);
+        if (done) {
+          *closedPtr = true;
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        }
+        return makeIteratorResultObject(val, false);
+      };
+      return makeHelper(iter, Value(nextFn));
+    });
+
+    // Iterator.prototype.flatMap(mapper)
+    defineIterMethod("flatMap", 1, [getIterDirect, iterClose, makeHelper, readIterResult](const std::vector<Value>& args) -> Value {
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      Value mapper = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (!mapper.isFunction()) {
+        auto* interp2 = getGlobalInterpreter();
+        if (interp2) iterClose(interp2, thisVal);
+        throw std::runtime_error("TypeError: Iterator.prototype.flatMap mapper is not a function");
+      }
+      auto [iter, nextMethod] = getIterDirect(thisVal);
+      auto counterPtr = std::make_shared<double>(0);
+      auto closedPtr = std::make_shared<bool>(false);
+      // Inner iterator state
+      auto innerIterPtr = std::make_shared<Value>(Undefined{});
+      auto innerNextPtr = std::make_shared<Value>(Undefined{});
+      auto nextFn = GarbageCollector::makeGC<Function>();
+      nextFn->isNative = true;
+      nextFn->nativeFunc = [iter, nextMethod, mapper, counterPtr, closedPtr, innerIterPtr, innerNextPtr, iterClose, readIterResult](const std::vector<Value>&) -> Value {
+        if (*closedPtr) return makeIteratorResultObject(Value(Undefined{}), true);
+        auto* interp = getGlobalInterpreter();
+        if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+        while (true) {
+          // If we have an inner iterator, drain it first
+          if (innerNextPtr->isFunction()) {
+            Value innerStep = interp->callForHarness(*innerNextPtr, {}, *innerIterPtr);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+            if (innerStep.isObject()) {
+              auto [innerDone, innerVal] = readIterResult(interp, innerStep);
+              if (!innerDone) {
+                return makeIteratorResultObject(innerVal, false);
+              }
+            }
+            // Inner iterator exhausted
+            *innerIterPtr = Value(Undefined{});
+            *innerNextPtr = Value(Undefined{});
+          }
+          // Get next value from outer iterator
+          Value step = interp->callForHarness(nextMethod, {}, iter);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          if (!step.isObject()) throw std::runtime_error("TypeError: Iterator result is not an object");
+          auto [done, val] = readIterResult(interp, step);
+          if (done) {
+            *closedPtr = true;
+            return makeIteratorResultObject(Value(Undefined{}), true);
+          }
+          Value mapped;
+          try {
+            mapped = interp->callForHarness(mapper, {val, Value(*counterPtr)});
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+          } catch (...) {
+            *closedPtr = true;
+            iterClose(interp, iter);
+            throw;
+          }
+          (*counterPtr)++;
+          // GetIteratorFlattenable: primitives are NOT flattened (spec behavior)
+          if (mapped.isString() || mapped.isNumber() || mapped.isBool() ||
+              mapped.isUndefined() || mapped.isNull() || mapped.isSymbol() || mapped.isBigInt()) {
+            *closedPtr = true;
+            iterClose(interp, iter);
+            throw std::runtime_error("TypeError: Iterator.prototype.flatMap mapper returned a non-object");
+          }
+          // Get iterator from mapped value (objects only)
+          const auto& iterKey = WellKnownSymbols::iteratorKey();
+          auto [hasIterMethod, iterMethod] = interp->getPropertyForExternal(mapped, iterKey);
+          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); iterClose(interp, iter); throw JsValueException(err); }
+          if (hasIterMethod && iterMethod.isFunction()) {
+            Value innerIter = interp->callForHarness(iterMethod, {}, mapped);
+            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); iterClose(interp, iter); throw JsValueException(err); }
+            auto [hasInnerNext, innerNext] = interp->getPropertyForExternal(innerIter, "next");
+            if (hasInnerNext && innerNext.isFunction()) {
+              *innerIterPtr = innerIter;
+              *innerNextPtr = innerNext;
+              continue; // Loop back to drain inner
+            }
+          }
+          // Has Symbol.iterator but it didn't work, or no Symbol.iterator - try .next() directly
+          auto [hasDirectNext, directNext] = interp->getPropertyForExternal(mapped, "next");
+          if (hasDirectNext && directNext.isFunction()) {
+            *innerIterPtr = mapped;
+            *innerNextPtr = directNext;
+            continue;
+          }
+          // Not iterable - throw TypeError per spec
+          *closedPtr = true;
+          iterClose(interp, iter);
+          throw std::runtime_error("TypeError: Iterator.prototype.flatMap mapper must return an iterable");
+        }
+      };
+      return makeHelper(iter, Value(nextFn));
+    });
+
+    // Iterator.from(O)
+    auto iteratorFrom = GarbageCollector::makeGC<Function>();
+    iteratorFrom->isNative = true;
+    iteratorFrom->properties["name"] = Value(std::string("from"));
+    iteratorFrom->properties["length"] = Value(1.0);
+    iteratorFrom->properties["__non_writable_name"] = Value(true);
+    iteratorFrom->properties["__non_enum_name"] = Value(true);
+    iteratorFrom->properties["__non_writable_length"] = Value(true);
+    iteratorFrom->properties["__non_enum_length"] = Value(true);
+    iteratorFrom->properties["__throw_on_new__"] = Value(true);
+    iteratorFrom->nativeFunc = [iteratorPrototype, iteratorHelperPrototype](const std::vector<Value>& args) -> Value {
+      if (args.empty()) throw std::runtime_error("TypeError: Iterator.from requires an argument");
+      Value O = args[0];
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Interpreter unavailable");
+      // Check for Symbol.iterator
+      const auto& iterKey = WellKnownSymbols::iteratorKey();
+      auto [hasIterMethod, iterMethod] = interp->getPropertyForExternal(O, iterKey);
+      if (hasIterMethod && !iterMethod.isUndefined() && !iterMethod.isNull()) {
+        if (!iterMethod.isFunction()) {
+          throw std::runtime_error("TypeError: Iterator.from: Symbol.iterator is not a function");
+        }
+        Value iterator = interp->callForHarness(iterMethod, {}, O);
+        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
+        // Check if iterator already inherits from Iterator.prototype
+        auto [hasProto, proto] = interp->getPropertyForExternal(iterator, "__proto__");
+        // Walk prototype chain to see if iteratorPrototype is in it
+        Value current = iterator;
+        bool inheritsFromIterator = false;
+        for (int depth = 0; depth < 20; depth++) {
+          auto [hasCurProto, curProto] = interp->getPropertyForExternal(current, "__proto__");
+          if (!hasCurProto || curProto.isNull() || curProto.isUndefined()) break;
+          if (curProto.isObject() && curProto.getGC<Object>().get() == iteratorPrototype.get()) {
+            inheritsFromIterator = true;
+            break;
+          }
+          current = curProto;
+        }
+        if (inheritsFromIterator) return iterator;
+        // Wrap it
+        auto [hasNext, nextMethod] = interp->getPropertyForExternal(iterator, "next");
+        auto wrapper = GarbageCollector::makeGC<Object>();
+        wrapper->properties["__proto__"] = Value(iteratorPrototype);
+        auto wrapperNext = GarbageCollector::makeGC<Function>();
+        wrapperNext->isNative = true;
+        wrapperNext->nativeFunc = [iterator, nextMethod](const std::vector<Value>&) -> Value {
+          auto* interp2 = getGlobalInterpreter();
+          if (!interp2) throw std::runtime_error("TypeError: Interpreter unavailable");
+          return interp2->callForHarness(nextMethod, {}, iterator);
+        };
+        wrapper->properties["next"] = Value(wrapperNext);
+        auto wrapperReturn = GarbageCollector::makeGC<Function>();
+        wrapperReturn->isNative = true;
+        wrapperReturn->nativeFunc = [iterator](const std::vector<Value>&) -> Value {
+          auto* interp2 = getGlobalInterpreter();
+          if (!interp2) throw std::runtime_error("TypeError: Interpreter unavailable");
+          auto [hasReturn, returnMethod] = interp2->getPropertyForExternal(iterator, "return");
+          if (hasReturn && returnMethod.isFunction()) {
+            return interp2->callForHarness(returnMethod, {}, iterator);
+          }
+          return makeIteratorResultObject(Value(Undefined{}), true);
+        };
+        wrapper->properties["return"] = Value(wrapperReturn);
+        return Value(wrapper);
+      }
+      // No Symbol.iterator - treat as iterator-like (has .next())
+      auto [hasNext, nextMethod] = interp->getPropertyForExternal(O, "next");
+      if (!hasNext || !nextMethod.isFunction()) {
+        throw std::runtime_error("TypeError: Iterator.from: argument is not iterable and does not have a next method");
+      }
+      // Wrap in WrapForValidIteratorPrototype
+      auto wrapper = GarbageCollector::makeGC<Object>();
+      wrapper->properties["__proto__"] = Value(iteratorPrototype);
+      auto wrapperNext = GarbageCollector::makeGC<Function>();
+      wrapperNext->isNative = true;
+      wrapperNext->nativeFunc = [O, nextMethod](const std::vector<Value>&) -> Value {
+        auto* interp2 = getGlobalInterpreter();
+        if (!interp2) throw std::runtime_error("TypeError: Interpreter unavailable");
+        return interp2->callForHarness(nextMethod, {}, O);
+      };
+      wrapper->properties["next"] = Value(wrapperNext);
+      return Value(wrapper);
+    };
+    iteratorConstructor->properties["from"] = Value(iteratorFrom);
+    iteratorConstructor->properties["__non_enum_from"] = Value(true);
+
+    env->define("Iterator", Value(iteratorConstructor));
+  }
+  // ===== End Iterator helpers =====
+
+  auto asyncIteratorPrototype = GarbageCollector::makeGC<Object>();
+  asyncIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("AsyncIterator"));
+  asyncIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  if (auto objProtoVal = env->get("__object_prototype__"); objProtoVal && objProtoVal->isObject()) {
+    asyncIteratorPrototype->properties["__proto__"] = *objProtoVal;
+  }
+  {
+    auto asyncIteratorSelf = GarbageCollector::makeGC<Function>();
+    asyncIteratorSelf->isNative = true;
+    asyncIteratorSelf->properties["name"] = Value(std::string("[Symbol.asyncIterator]"));
+    asyncIteratorSelf->properties["length"] = Value(0.0);
+    asyncIteratorSelf->properties["__non_writable_name"] = Value(true);
+    asyncIteratorSelf->properties["__non_enum_name"] = Value(true);
+    asyncIteratorSelf->properties["__non_writable_length"] = Value(true);
+    asyncIteratorSelf->properties["__non_enum_length"] = Value(true);
+    asyncIteratorSelf->properties["__uses_this_arg__"] = Value(true);
+    asyncIteratorSelf->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      return args.empty() ? Value(Undefined{}) : args[0];
+    };
+    asyncIteratorPrototype->properties[WellKnownSymbols::asyncIteratorKey()] = Value(asyncIteratorSelf);
+    asyncIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::asyncIteratorKey()] = Value(true);
+  }
+  {
+    auto asyncIteratorDispose = GarbageCollector::makeGC<Function>();
+    asyncIteratorDispose->isNative = true;
+    asyncIteratorDispose->properties["name"] = Value(std::string("[Symbol.asyncDispose]"));
+    asyncIteratorDispose->properties["length"] = Value(0.0);
+    asyncIteratorDispose->properties["__non_writable_name"] = Value(true);
+    asyncIteratorDispose->properties["__non_enum_name"] = Value(true);
+    asyncIteratorDispose->properties["__non_writable_length"] = Value(true);
+    asyncIteratorDispose->properties["__non_enum_length"] = Value(true);
+    asyncIteratorDispose->properties["__uses_this_arg__"] = Value(true);
+    asyncIteratorDispose->nativeFunc = [env](const std::vector<Value>& args) -> Value {
+      auto promise = GarbageCollector::makeGC<Promise>();
+      if (auto intrinsicPromise = env->get("__intrinsic_Promise__");
+          intrinsicPromise && intrinsicPromise->isFunction()) {
+        auto promiseCtor = intrinsicPromise->getGC<Function>();
+        promise->properties["constructor"] = *intrinsicPromise;
+        auto protoIt = promiseCtor->properties.find("prototype");
+        if (protoIt != promiseCtor->properties.end()) {
+          promise->properties["__proto__"] = protoIt->second;
+        }
+      }
+
+      Value receiver = args.empty() ? Value(Undefined{}) : args[0];
+      Interpreter* interp = getGlobalInterpreter();
+      if (!interp) {
+        promise->reject(Value(GarbageCollector::makeGC<Error>(
+          ErrorType::TypeError, "Interpreter unavailable")));
+        return Value(promise);
+      }
+
+      Value returnMethod(Undefined{});
+      try {
+        auto [foundReturn, foundValue] = interp->getPropertyForExternal(receiver, "return");
+        if (foundReturn) {
+          returnMethod = foundValue;
+        }
+      } catch (const JsValueException& e) {
+        promise->reject(e.value());
+        return Value(promise);
+      } catch (const std::exception& e) {
+        promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::Error, e.what())));
+        return Value(promise);
+      }
+
+      if (returnMethod.isUndefined()) {
+        promise->resolve(Value(Undefined{}));
+        return Value(promise);
+      }
+      if (!returnMethod.isFunction()) {
+        promise->reject(Value(GarbageCollector::makeGC<Error>(
+          ErrorType::TypeError, "AsyncIterator.prototype[Symbol.asyncDispose] return is not callable")));
+        return Value(promise);
+      }
+
+      try {
+        Value result = interp->callForHarness(returnMethod, {}, receiver);
+        if (interp->hasError()) {
+          Value err = interp->getError();
+          interp->clearError();
+          promise->reject(err);
+          return Value(promise);
+        }
+        if (result.isPromise()) {
+          result.getGC<Promise>()->then(
+            [promise](Value) -> Value {
+              promise->resolve(Value(Undefined{}));
+              return Value(Undefined{});
+            },
+            [promise](Value reason) -> Value {
+              promise->reject(reason);
+              return Value(Undefined{});
+            });
+          return Value(promise);
+        }
+        promise->resolve(Value(Undefined{}));
+      } catch (const JsValueException& e) {
+        promise->reject(e.value());
+      } catch (const std::exception& e) {
+        promise->reject(Value(GarbageCollector::makeGC<Error>(ErrorType::Error, e.what())));
+      }
+      return Value(promise);
+    };
+    asyncIteratorPrototype->properties[WellKnownSymbols::asyncDisposeKey()] = Value(asyncIteratorDispose);
+    asyncIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::asyncDisposeKey()] = Value(true);
+  }
+  env->define("__async_iterator_prototype__", Value(asyncIteratorPrototype));
 
   // %MapIteratorPrototype% - shared prototype for Map iterator instances
   auto mapIteratorPrototype = GarbageCollector::makeGC<Object>();
   mapIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Map Iterator"));
   mapIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  mapIteratorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
   mapIteratorPrototype->properties["__proto__"] = Value(iteratorPrototype);
+
+  // %MapIteratorPrototype%.next - single shared method on the prototype
+  {
+    auto mapIterNext = GarbageCollector::makeGC<Function>();
+    mapIterNext->isNative = true;
+    mapIterNext->properties["name"] = Value(std::string("next"));
+    mapIterNext->properties["length"] = Value(0.0);
+    mapIterNext->properties["__non_writable_name"] = Value(true);
+    mapIterNext->properties["__non_enum_name"] = Value(true);
+    mapIterNext->properties["__non_writable_length"] = Value(true);
+    mapIterNext->properties["__non_enum_length"] = Value(true);
+    mapIterNext->properties["__uses_this_arg__"] = Value(true);
+    mapIterNext->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      // Step 1-2: Validate this is an Object with [[MapIteratorData]]
+      if (args.empty() || !args[0].isObject()) {
+        throw std::runtime_error("TypeError: %MapIteratorPrototype%.next requires that 'this' be an Object");
+      }
+      auto thisObj = args[0].getGC<Object>();
+      auto kindIt = thisObj->properties.find("__map_iterator_kind__");
+      if (kindIt == thisObj->properties.end()) {
+        throw std::runtime_error("TypeError: %MapIteratorPrototype%.next requires that 'this' be a Map Iterator");
+      }
+      // Check if already exhausted
+      auto doneIt = thisObj->properties.find("__map_iterator_done__");
+      if (doneIt != thisObj->properties.end() && doneIt->second.isBool() && doneIt->second.toBool()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto mapIt = thisObj->properties.find("__map_iterator_map__");
+      auto idxIt = thisObj->properties.find("__map_iterator_index__");
+      if (mapIt == thisObj->properties.end() || idxIt == thisObj->properties.end()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      if (!mapIt->second.isMap()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto m = mapIt->second.getGC<Map>();
+      size_t idx = static_cast<size_t>(idxIt->second.toNumber());
+      std::string kind = kindIt->second.isString() ? std::get<std::string>(kindIt->second.data) : "key+value";
+
+      if (idx >= m->entries.size()) {
+        thisObj->properties["__map_iterator_done__"] = Value(true);
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto& entry = m->entries[idx];
+      thisObj->properties["__map_iterator_index__"] = Value(static_cast<double>(idx + 1));
+
+      if (kind == "key") {
+        return makeIteratorResultObject(entry.first, false);
+      } else if (kind == "value") {
+        return makeIteratorResultObject(entry.second, false);
+      } else {
+        auto pair = GarbageCollector::makeGC<Array>();
+        pair->elements.push_back(entry.first);
+        pair->elements.push_back(entry.second);
+        return makeIteratorResultObject(Value(pair), false);
+      }
+    };
+    mapIteratorPrototype->properties["next"] = Value(mapIterNext);
+    mapIteratorPrototype->properties["__non_enum_next"] = Value(true);
+  }
 
   defineMapMethod("entries", 0, [validateMapThis, mapIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto m = validateMapThis(args, "entries");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [m, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= m->entries.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& entry = m->entries[*indexPtr];
-      auto pair = GarbageCollector::makeGC<Array>();
-      pair->elements.push_back(entry.first);
-      pair->elements.push_back(entry.second);
-      (*indexPtr)++;
-      return makeIteratorResultObject(Value(pair), false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__map_iterator_map__"] = Value(m);
+    iterObj->properties["__map_iterator_index__"] = Value(0.0);
+    iterObj->properties["__map_iterator_kind__"] = Value(std::string("key+value"));
     return Value(iterObj);
   });
 
@@ -9549,18 +12870,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto m = validateMapThis(args, "keys");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [m, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= m->entries.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& entry = m->entries[*indexPtr];
-      (*indexPtr)++;
-      return makeIteratorResultObject(entry.first, false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__map_iterator_map__"] = Value(m);
+    iterObj->properties["__map_iterator_index__"] = Value(0.0);
+    iterObj->properties["__map_iterator_kind__"] = Value(std::string("key"));
     return Value(iterObj);
   });
 
@@ -9568,18 +12880,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto m = validateMapThis(args, "values");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(mapIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [m, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= m->entries.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& entry = m->entries[*indexPtr];
-      (*indexPtr)++;
-      return makeIteratorResultObject(entry.second, false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__map_iterator_map__"] = Value(m);
+    iterObj->properties["__map_iterator_index__"] = Value(0.0);
+    iterObj->properties["__map_iterator_kind__"] = Value(std::string("value"));
     return Value(iterObj);
   });
 
@@ -9924,27 +13227,72 @@ GCPtr<Environment> Environment::createGlobal() {
   auto setIteratorPrototype = GarbageCollector::makeGC<Object>();
   setIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Set Iterator"));
   setIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  setIteratorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
   setIteratorPrototype->properties["__proto__"] = Value(iteratorPrototype);
+
+  // %SetIteratorPrototype%.next - single shared method on the prototype
+  {
+    auto setIterNext = GarbageCollector::makeGC<Function>();
+    setIterNext->isNative = true;
+    setIterNext->properties["name"] = Value(std::string("next"));
+    setIterNext->properties["length"] = Value(0.0);
+    setIterNext->properties["__non_writable_name"] = Value(true);
+    setIterNext->properties["__non_enum_name"] = Value(true);
+    setIterNext->properties["__non_writable_length"] = Value(true);
+    setIterNext->properties["__non_enum_length"] = Value(true);
+    setIterNext->properties["__uses_this_arg__"] = Value(true);
+    setIterNext->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isObject()) {
+        throw std::runtime_error("TypeError: %SetIteratorPrototype%.next requires that 'this' be an Object");
+      }
+      auto thisObj = args[0].getGC<Object>();
+      auto kindIt = thisObj->properties.find("__set_iterator_kind__");
+      if (kindIt == thisObj->properties.end()) {
+        throw std::runtime_error("TypeError: %SetIteratorPrototype%.next requires that 'this' be a Set Iterator");
+      }
+      auto doneIt = thisObj->properties.find("__set_iterator_done__");
+      if (doneIt != thisObj->properties.end() && doneIt->second.isBool() && doneIt->second.toBool()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto setIt = thisObj->properties.find("__set_iterator_set__");
+      auto idxIt = thisObj->properties.find("__set_iterator_index__");
+      if (setIt == thisObj->properties.end() || idxIt == thisObj->properties.end()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      if (!setIt->second.isSet()) {
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto s = setIt->second.getGC<Set>();
+      size_t idx = static_cast<size_t>(idxIt->second.toNumber());
+      std::string kind = kindIt->second.isString() ? std::get<std::string>(kindIt->second.data) : "value";
+
+      if (idx >= s->values.size()) {
+        thisObj->properties["__set_iterator_done__"] = Value(true);
+        return makeIteratorResultObject(Value(Undefined{}), true);
+      }
+      auto& elem = s->values[idx];
+      thisObj->properties["__set_iterator_index__"] = Value(static_cast<double>(idx + 1));
+
+      if (kind == "key+value") {
+        auto pair = GarbageCollector::makeGC<Array>();
+        pair->elements.push_back(elem);
+        pair->elements.push_back(elem);
+        return makeIteratorResultObject(Value(pair), false);
+      } else {
+        return makeIteratorResultObject(elem, false);
+      }
+    };
+    setIteratorPrototype->properties["next"] = Value(setIterNext);
+    setIteratorPrototype->properties["__non_enum_next"] = Value(true);
+  }
 
   defineSetMethod("entries", 0, [validateSetThis, setIteratorPrototype](const std::vector<Value>& args) -> Value {
     auto s = validateSetThis(args, "entries");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(setIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [s, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= s->values.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& elem = s->values[*indexPtr];
-      auto pair = GarbageCollector::makeGC<Array>();
-      pair->elements.push_back(elem);
-      pair->elements.push_back(elem);
-      (*indexPtr)++;
-      return makeIteratorResultObject(Value(pair), false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__set_iterator_set__"] = Value(s);
+    iterObj->properties["__set_iterator_index__"] = Value(0.0);
+    iterObj->properties["__set_iterator_kind__"] = Value(std::string("key+value"));
     return Value(iterObj);
   });
 
@@ -9952,18 +13300,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto s = validateSetThis(args, "keys");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(setIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [s, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= s->values.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& elem = s->values[*indexPtr];
-      (*indexPtr)++;
-      return makeIteratorResultObject(elem, false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__set_iterator_set__"] = Value(s);
+    iterObj->properties["__set_iterator_index__"] = Value(0.0);
+    iterObj->properties["__set_iterator_kind__"] = Value(std::string("value"));
     return Value(iterObj);
   });
 
@@ -9971,18 +13310,9 @@ GCPtr<Environment> Environment::createGlobal() {
     auto s = validateSetThis(args, "values");
     auto iterObj = GarbageCollector::makeGC<Object>();
     iterObj->properties["__proto__"] = Value(setIteratorPrototype);
-    auto indexPtr = std::make_shared<size_t>(0);
-    auto nextFn = GarbageCollector::makeGC<Function>();
-    nextFn->isNative = true;
-    nextFn->nativeFunc = [s, indexPtr](const std::vector<Value>&) -> Value {
-      if (*indexPtr >= s->values.size()) {
-        return makeIteratorResultObject(Value(Undefined{}), true);
-      }
-      auto& elem = s->values[*indexPtr];
-      (*indexPtr)++;
-      return makeIteratorResultObject(elem, false);
-    };
-    iterObj->properties["next"] = Value(nextFn);
+    iterObj->properties["__set_iterator_set__"] = Value(s);
+    iterObj->properties["__set_iterator_index__"] = Value(0.0);
+    iterObj->properties["__set_iterator_kind__"] = Value(std::string("value"));
     return Value(iterObj);
   });
 
@@ -11017,25 +14347,52 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     return false;
   };
-  proxyConstructor->nativeFunc = [isCallableTarget](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2) {
-      // Need target and handler
-      return Value(Undefined{});
+  proxyConstructor->properties["name"] = Value(std::string("Proxy"));
+  proxyConstructor->properties["length"] = Value(2.0);
+  proxyConstructor->properties["__non_writable_name"] = Value(true);
+  proxyConstructor->properties["__non_enum_name"] = Value(true);
+  proxyConstructor->properties["__non_writable_length"] = Value(true);
+  proxyConstructor->properties["__non_enum_length"] = Value(true);
+  auto isObjectLikeForProxy = [](const Value& v) -> bool {
+    return v.isObject() || v.isArray() || v.isFunction() || v.isClass() || v.isProxy() ||
+           v.isRegex() || v.isMap() || v.isSet() || v.isWeakMap() || v.isWeakSet() ||
+           v.isError() || v.isPromise() || v.isTypedArray() || v.isArrayBuffer() ||
+           v.isDataView() || v.isGenerator();
+  };
+  proxyConstructor->nativeFunc = [isCallableTarget, isObjectLikeForProxy](const std::vector<Value>& args) -> Value {
+    Value target = args.size() > 0 ? args[0] : Value(Undefined{});
+    Value handler = args.size() > 1 ? args[1] : Value(Undefined{});
+    if (!isObjectLikeForProxy(target)) {
+      throw std::runtime_error("TypeError: Cannot create proxy with a non-object as target");
     }
-    auto proxy = GarbageCollector::makeGC<Proxy>(args[0], args[1]);
+    if (!isObjectLikeForProxy(handler)) {
+      throw std::runtime_error("TypeError: Cannot create proxy with a non-object as handler");
+    }
+    auto proxy = GarbageCollector::makeGC<Proxy>(target, handler);
     GarbageCollector::instance().reportAllocation(sizeof(Proxy));
-    proxy->isCallable = isCallableTarget(args[0]);
+    proxy->isCallable = isCallableTarget(target);
     return Value(proxy);
   };
 
   // Proxy.revocable(target, handler)
   auto proxyRevocable = GarbageCollector::makeGC<Function>();
   proxyRevocable->isNative = true;
-  proxyRevocable->nativeFunc = [isCallableTarget](const std::vector<Value>& args) -> Value {
-    if (args.size() < 2) {
-      return Value(Undefined{});
+  proxyRevocable->properties["name"] = Value(std::string("revocable"));
+  proxyRevocable->properties["length"] = Value(2.0);
+  proxyRevocable->properties["__non_writable_name"] = Value(true);
+  proxyRevocable->properties["__non_enum_name"] = Value(true);
+  proxyRevocable->properties["__non_writable_length"] = Value(true);
+  proxyRevocable->properties["__non_enum_length"] = Value(true);
+  proxyRevocable->nativeFunc = [isCallableTarget, isObjectLikeForProxy](const std::vector<Value>& args) -> Value {
+    Value target = args.size() > 0 ? args[0] : Value(Undefined{});
+    Value handler = args.size() > 1 ? args[1] : Value(Undefined{});
+    if (!isObjectLikeForProxy(target)) {
+      throw std::runtime_error("TypeError: Cannot create proxy with a non-object as target");
     }
-    auto proxy = GarbageCollector::makeGC<Proxy>(args[0], args[1]);
+    if (!isObjectLikeForProxy(handler)) {
+      throw std::runtime_error("TypeError: Cannot create proxy with a non-object as handler");
+    }
+    auto proxy = GarbageCollector::makeGC<Proxy>(target, handler);
     GarbageCollector::instance().reportAllocation(sizeof(Proxy));
     proxy->isCallable = isCallableTarget(args[0]);
 
@@ -11173,9 +14530,54 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     return false;
   };
-  auto getReflectOwnDescriptor =
-    [callObjectStatic](const Value& objectValue, const Value& keyValue) -> ReflectOwnPropertyDescriptor {
+  std::function<ReflectOwnPropertyDescriptor(const Value&, const Value&)> getReflectOwnDescriptor =
+    [&](const Value& objectValue, const Value& keyValue) -> ReflectOwnPropertyDescriptor {
     ReflectOwnPropertyDescriptor desc;
+    if (objectValue.isProxy()) {
+      auto proxy = objectValue.getGC<Proxy>();
+      if (proxy && proxy->handler && proxy->handler->isObject()) {
+        auto handlerObj = proxy->handler->getGC<Object>();
+        auto trapIt = handlerObj->properties.find("getOwnPropertyDescriptor");
+        if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+          auto* interpreter = getGlobalInterpreter();
+          if (!interpreter || !proxy->target) {
+            return desc;
+          }
+          Value trapResult = interpreter->callForHarness(
+            trapIt->second, {*proxy->target, keyValue}, *proxy->handler);
+          if (interpreter->hasError()) {
+            Value err = interpreter->getError();
+            interpreter->clearError();
+            throw JsValueException(err);
+          }
+          if (trapResult.isUndefined()) {
+            return desc;
+          }
+          Value descriptor = trapResult;
+          desc.exists = true;
+          auto [hasGet, getter] = getOwnPropertyLike(descriptor, "get", descriptor);
+          auto [hasSet, setter] = getOwnPropertyLike(descriptor, "set", descriptor);
+          if (hasGet || hasSet) {
+            desc.isAccessor = true;
+            desc.getter = hasGet ? getter : Value(Undefined{});
+            desc.setter = hasSet ? setter : Value(Undefined{});
+          } else {
+            auto [hasValue, value] = getOwnPropertyLike(descriptor, "value", descriptor);
+            if (hasValue) {
+              desc.value = value;
+            }
+          }
+          auto [hasWritable, writable] = getOwnPropertyLike(descriptor, "writable", descriptor);
+          if (hasWritable) {
+            desc.writable = writable.toBool();
+          }
+          return desc;
+        }
+      }
+      if (proxy && proxy->target) {
+        return getReflectOwnDescriptor(*proxy->target, keyValue);
+      }
+    }
     Value descriptor = callObjectStatic("getOwnPropertyDescriptor", {objectValue, keyValue});
     if (descriptor.isUndefined()) {
       return desc;
@@ -11203,10 +14605,46 @@ GCPtr<Environment> Environment::createGlobal() {
     Value result = callObjectStatic("isExtensible", {target});
     return result.toBool();
   };
-  auto putReflectOwnDataProperty = [](const Value& target,
-                                      const std::string& key,
-                                      const Value& value,
-                                      bool allowCreate) -> bool {
+  std::function<bool(const Value&, const std::string&, const Value&, bool)> putReflectOwnDataProperty =
+    [&](const Value& target,
+        const std::string& key,
+        const Value& value,
+        bool allowCreate) -> bool {
+    if (target.isProxy()) {
+      auto proxy = target.getGC<Proxy>();
+      if (proxy && proxy->handler && proxy->handler->isObject()) {
+        auto handlerObj = proxy->handler->getGC<Object>();
+        auto trapIt = handlerObj->properties.find("defineProperty");
+        if (trapIt != handlerObj->properties.end() && trapIt->second.isFunction()) {
+          auto* interpreter = getGlobalInterpreter();
+          if (!interpreter || !proxy->target) {
+            return false;
+          }
+          auto descriptor = GarbageCollector::makeGC<Object>();
+          GarbageCollector::instance().reportAllocation(sizeof(Object));
+          descriptor->properties["value"] = value;
+          if (allowCreate) {
+            descriptor->properties["writable"] = Value(true);
+            descriptor->properties["enumerable"] = Value(true);
+            descriptor->properties["configurable"] = Value(true);
+          }
+          Value trapResult = interpreter->callForHarness(
+            trapIt->second,
+            {*proxy->target, propertyKeyValueForName(key), Value(descriptor)},
+            *proxy->handler);
+          if (interpreter->hasError()) {
+            Value err = interpreter->getError();
+            interpreter->clearError();
+            throw JsValueException(err);
+          }
+          return trapResult.toBool();
+        }
+      }
+      if (proxy && proxy->target) {
+        return putReflectOwnDataProperty(*proxy->target, key, value, allowCreate);
+      }
+      return false;
+    }
     auto updateBag = [&](auto& bag, bool nonExtensible, bool frozen) -> bool {
       bool exists = bag.find(key) != bag.end();
       bool hasAccessor =
@@ -12000,6 +15438,12 @@ GCPtr<Environment> Environment::createGlobal() {
           }
           return trapResult;
         }
+      }
+    }
+    if (args[0].isObject()) {
+      auto obj = args[0].getGC<Object>();
+      if (obj->isModuleNamespace) {
+        maybeTriggerDeferredNamespaceEvaluation(obj);
       }
     }
     auto result = makeArrayWithPrototype();
@@ -13472,15 +16916,11 @@ GCPtr<Environment> Environment::createGlobal() {
           }
           if (input.isString()) {
             const std::string& str = std::get<std::string>(input.data);
-            size_t cpLen = 0, bytePos = 0;
-            while (bytePos < str.size()) {
-              unsigned char c = str[bytePos];
-              size_t charLen = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-              wrapper->properties[std::to_string(cpLen)] = Value(str.substr(bytePos, charLen));
-              bytePos += charLen;
-              cpLen++;
+            size_t strLen = String_utf16Length(str);
+            for (size_t i = 0; i < strLen; i++) {
+              wrapper->properties[std::to_string(i)] = Value(String_utf16CodeUnitStringAt(str, i));
             }
-            wrapper->properties["length"] = Value(static_cast<double>(cpLen));
+            wrapper->properties["length"] = Value(static_cast<double>(strLen));
           }
           return Value(wrapper);
         }
@@ -13627,23 +17067,15 @@ GCPtr<Environment> Environment::createGlobal() {
         // For String, set length and indexed properties
         if (thisVal.isString()) {
           const std::string& str = std::get<std::string>(thisVal.data);
-          size_t cpLen = 0;
-          size_t bytePos = 0;
-          while (bytePos < str.size()) {
-            unsigned char c = str[bytePos];
-            size_t charLen = 1;
-            if ((c & 0x80) == 0) charLen = 1;
-            else if ((c & 0xE0) == 0xC0) charLen = 2;
-            else if ((c & 0xF0) == 0xE0) charLen = 3;
-            else if ((c & 0xF8) == 0xF0) charLen = 4;
-            wrapper->properties[std::to_string(cpLen)] = Value(str.substr(bytePos, charLen));
-            wrapper->properties["__non_writable_" + std::to_string(cpLen)] = Value(true);
-            wrapper->properties["__non_enum_" + std::to_string(cpLen)] = Value(true);
-            wrapper->properties["__non_configurable_" + std::to_string(cpLen)] = Value(true);
-            bytePos += charLen;
-            cpLen++;
+          size_t strLen = String_utf16Length(str);
+          for (size_t i = 0; i < strLen; i++) {
+            std::string idx = std::to_string(i);
+            wrapper->properties[idx] = Value(String_utf16CodeUnitStringAt(str, i));
+            wrapper->properties["__non_writable_" + idx] = Value(true);
+            wrapper->properties["__non_enum_" + idx] = Value(true);
+            wrapper->properties["__non_configurable_" + idx] = Value(true);
           }
-          wrapper->properties["length"] = Value(static_cast<double>(cpLen));
+          wrapper->properties["length"] = Value(static_cast<double>(strLen));
           wrapper->properties["__non_writable_length"] = Value(true);
           wrapper->properties["__non_enum_length"] = Value(true);
           wrapper->properties["__non_configurable_length"] = Value(true);
@@ -14985,6 +18417,17 @@ GCPtr<Environment> Environment::createGlobal() {
       return Value(result);
     }
 
+    if (arrayLike.isTypedArray()) {
+      auto srcTypedArray = arrayLike.getGC<TypedArray>();
+      size_t index = 0;
+      size_t length = srcTypedArray->currentLength();
+      for (size_t i = 0; i < length; ++i) {
+        result->elements.push_back(
+          applyMap(Value(srcTypedArray->getElement(i)), index++));
+      }
+      return Value(result);
+    }
+
     // If it's a string, convert each character to array element
     if (arrayLike.isString()) {
       std::string str = std::get<std::string>(arrayLike.data);
@@ -15001,39 +18444,58 @@ GCPtr<Environment> Environment::createGlobal() {
       auto srcObj = arrayLike.getGC<Object>();
       const auto& iteratorKey = WellKnownSymbols::iteratorKey();
 
+      // Look up Symbol.iterator, walking the prototype chain
+      Value iteratorMethod;
       auto iteratorMethodIt = srcObj->properties.find(iteratorKey);
-      if (iteratorMethodIt != srcObj->properties.end() && iteratorMethodIt->second.isFunction()) {
+      if (iteratorMethodIt != srcObj->properties.end()) {
+        iteratorMethod = iteratorMethodIt->second;
+      } else {
+        Interpreter* interpForIter = getGlobalInterpreter();
+        if (interpForIter) {
+          auto [found, val] = interpForIter->getPropertyForExternal(arrayLike, iteratorKey);
+          if (found) iteratorMethod = val;
+        }
+      }
+      if (iteratorMethod.isFunction()) {
         Interpreter* interpreter = getGlobalInterpreter();
         if (interpreter) {
-          iteratorValue = interpreter->callForHarness(iteratorMethodIt->second, {}, arrayLike);
+          iteratorValue = interpreter->callForHarness(iteratorMethod, {}, arrayLike);
           if (interpreter->hasError()) {
             Value err = interpreter->getError();
             interpreter->clearError();
             throw std::runtime_error(err.toString());
           }
         } else {
-          auto iterMethod = iteratorMethodIt->second.getGC<Function>();
+          auto iterMethod = iteratorMethod.getGC<Function>();
           iteratorValue = iterMethod->isNative ? iterMethod->nativeFunc({}) : Value(Undefined{});
         }
       }
 
       if (iteratorValue.isObject()) {
         auto iterObj = iteratorValue.getGC<Object>();
+        // Find "next" on own properties or prototype chain
+        Value nextMethod;
         auto nextIt = iterObj->properties.find("next");
-        if (nextIt != iterObj->properties.end() && nextIt->second.isFunction()) {
+        if (nextIt != iterObj->properties.end()) {
+          nextMethod = nextIt->second;
+        } else {
+          auto [foundN, nv] = getPropertyLike(iteratorValue, "next", iteratorValue);
+          if (foundN) nextMethod = nv;
+        }
+        if (nextMethod.isFunction()) {
           size_t index = 0;
           while (true) {
             Value stepResult;
             Interpreter* interpreter = getGlobalInterpreter();
             if (interpreter) {
-              stepResult = interpreter->callForHarness(nextIt->second, {}, iteratorValue);
+              stepResult = interpreter->callForHarness(nextMethod, {}, iteratorValue);
               if (interpreter->hasError()) {
                 Value err = interpreter->getError();
                 interpreter->clearError();
                 throw std::runtime_error(err.toString());
               }
             } else {
-              auto nextFn = nextIt->second.getGC<Function>();
+              auto nextFn = nextMethod.getGC<Function>();
               stepResult = nextFn->isNative ? nextFn->nativeFunc({}) : Value(Undefined{});
             }
 
@@ -18448,6 +21910,23 @@ GCPtr<Environment> Environment::createGlobal() {
 
   env->define("__object_prototype__", Value(objectPrototype));
   setGlobalObjectPrototype(Value(objectPrototype));
+  if (regExpPrototype->properties.find("__proto__") == regExpPrototype->properties.end()) {
+    regExpPrototype->properties["__proto__"] = Value(objectPrototype);
+  }
+  if (auto iterProtoVal = env->get("__iterator_prototype__");
+      iterProtoVal && iterProtoVal->isObject()) {
+    auto iterProto = iterProtoVal->getGC<Object>();
+    if (iterProto->properties.find("__proto__") == iterProto->properties.end()) {
+      iterProto->properties["__proto__"] = Value(objectPrototype);
+    }
+  }
+  if (auto asyncIterProtoVal = env->get("__async_iterator_prototype__");
+      asyncIterProtoVal && asyncIterProtoVal->isObject()) {
+    auto asyncIterProto = asyncIterProtoVal->getGC<Object>();
+    if (asyncIterProto->properties.find("__proto__") == asyncIterProto->properties.end()) {
+      asyncIterProto->properties["__proto__"] = Value(objectPrototype);
+    }
+  }
   // Set JSON/Reflect [[Prototype]] to Object.prototype (defined earlier but before objectPrototype)
   if (auto jsonVal = env->get("__intrinsic_JSON__"); jsonVal && jsonVal->isObject()) {
     jsonVal->getGC<Object>()->properties["__proto__"] = Value(objectPrototype);
@@ -18486,6 +21965,15 @@ GCPtr<Environment> Environment::createGlobal() {
     setErrorProtoChain("SyntaxError");
     setErrorProtoChain("URIError");
     setErrorProtoChain("EvalError");
+    setErrorProtoChain("SuppressedError");
+  }
+  for (const std::string& name : {"DisposableStack", "AsyncDisposableStack"}) {
+    auto val = env->get(name);
+    if (!val || !val->isFunction()) continue;
+    auto fn = val->getGC<Function>();
+    auto protoIt = fn->properties.find("prototype");
+    if (protoIt == fn->properties.end() || !protoIt->second.isObject()) continue;
+    protoIt->second.getGC<Object>()->properties["__proto__"] = Value(objectPrototype);
   }
   if (auto hiddenArrayProto = env->get("__array_prototype__");
       hiddenArrayProto.has_value() && hiddenArrayProto->isObject()) {
@@ -18909,9 +22397,9 @@ GCPtr<Environment> Environment::createGlobal() {
 
     if (thisVal.isRegex()) {
       auto rx = thisVal.getGC<Regex>();
-      if (key == "source" || key == "flags") return Value(true);
       if (rx->properties.find(key) == rx->properties.end() &&
-          rx->properties.find("__get_" + key) == rx->properties.end()) {
+          rx->properties.find("__get_" + key) == rx->properties.end() &&
+          rx->properties.find("__set_" + key) == rx->properties.end()) {
         return Value(false);
       }
       auto neIt = rx->properties.find("__non_enum_" + key);
@@ -18963,8 +22451,11 @@ GCPtr<Environment> Environment::createGlobal() {
       // Internal properties
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
           key.substr(key.size() - 2) == "__") return Value(false);
-      auto it = fn->properties.find(key);
-      if (it == fn->properties.end()) return Value(false);
+      if (fn->properties.find(key) == fn->properties.end() &&
+          fn->properties.find("__get_" + key) == fn->properties.end() &&
+          fn->properties.find("__set_" + key) == fn->properties.end()) {
+        return Value(false);
+      }
       // Check enum marker: built-in function props default non-enumerable
       auto enumIt = fn->properties.find("__enum_" + key);
       return Value(enumIt != fn->properties.end());
@@ -19005,8 +22496,11 @@ GCPtr<Environment> Environment::createGlobal() {
       // Internal properties
       if (key.size() >= 4 && key.substr(0, 2) == "__" &&
           key.substr(key.size() - 2) == "__") return Value(false);
-      auto it = obj->properties.find(key);
-      if (it == obj->properties.end()) return Value(false);
+      if (obj->properties.find(key) == obj->properties.end() &&
+          obj->properties.find("__get_" + key) == obj->properties.end() &&
+          obj->properties.find("__set_" + key) == obj->properties.end()) {
+        return Value(false);
+      }
       auto neIt = obj->properties.find("__non_enum_" + key);
       return Value(neIt == obj->properties.end());
     }
@@ -19333,6 +22827,7 @@ GCPtr<Environment> Environment::createGlobal() {
     };
 
     if (obj && obj->isModuleNamespace) {
+      maybeTriggerDeferredNamespaceEvaluation(obj);
       appendSymbolForKey(WellKnownSymbols::toStringTagKey());
       return Value(result);
     }
@@ -19716,6 +23211,10 @@ GCPtr<Environment> Environment::createGlobal() {
     }
     auto obj = args[0].getGC<Object>();
     if (obj->isModuleNamespace) {
+      return Value(Null{});
+    }
+    auto nullProtoIt = obj->properties.find("__null_proto__");
+    if (nullProtoIt != obj->properties.end() && nullProtoIt->second.toBool()) {
       return Value(Null{});
     }
     auto it = obj->properties.find("__proto__");
@@ -20262,8 +23761,67 @@ GCPtr<Environment> Environment::createGlobal() {
     if (!args[0].isObject() && !args[0].isFunction() && !args[0].isPromise() && !args[0].isRegex() && !args[0].isClass() &&
          !args[0].isArray() && !args[0].isError() && !args[0].isTypedArray() &&
          !args[0].isArrayBuffer() && !args[0].isDataView() && !args[0].isMap() && !args[0].isSet() &&
-         !args[0].isWeakMap() && !args[0].isWeakSet() && !args[0].isGenerator()) {
+         !args[0].isWeakMap() && !args[0].isWeakSet() && !args[0].isGenerator() && !args[0].isProxy()) {
       return Value(Undefined{});
+    }
+
+    // Proxy [[GetOwnProperty]] - delegate to trap or target
+    if (args[0].isProxy()) {
+      auto proxyPtr = args[0].getGC<Proxy>();
+      if (proxyPtr->revoked) {
+        throw std::runtime_error("TypeError: Cannot perform 'getOwnPropertyDescriptor' on a revoked proxy");
+      }
+      Value handlerVal = proxyPtr->handler ? *proxyPtr->handler : Value(Undefined{});
+      Value targetVal = proxyPtr->target ? *proxyPtr->target : Value(Undefined{});
+      // Get the trap
+      Value trap(Undefined{});
+      auto getTrap = [](const Value& handler, const std::string& trapName) -> Value {
+        if (handler.isObject()) {
+          auto obj = handler.getGC<Object>();
+          auto it = obj->properties.find(trapName);
+          if (it != obj->properties.end()) return it->second;
+        } else if (handler.isFunction()) {
+          auto fn = handler.getGC<Function>();
+          auto it = fn->properties.find(trapName);
+          if (it != fn->properties.end()) return it->second;
+        }
+        return Value(Undefined{});
+      };
+      trap = getTrap(handlerVal, "getOwnPropertyDescriptor");
+      if (trap.isUndefined() || trap.isNull()) {
+        // No trap - fall through to target's [[GetOwnProperty]]
+        // Recursively look up GOPD via Object.getOwnPropertyDescriptor
+        auto* interp = getGlobalInterpreter();
+        if (interp) {
+          auto env = interp->getEnvironment();
+          if (auto objCtorVal = env->getRoot()->get("Object"); objCtorVal && objCtorVal->isFunction()) {
+            auto objCtor = objCtorVal->getGC<Function>();
+            auto gopdIt = objCtor->properties.find("getOwnPropertyDescriptor");
+            if (gopdIt != objCtor->properties.end() && gopdIt->second.isFunction()) {
+              return interp->callForHarness(gopdIt->second, {targetVal, Value(key)});
+            }
+          }
+        }
+        return Value(Undefined{});
+      }
+      if (!trap.isFunction()) {
+        throw std::runtime_error("TypeError: 'getOwnPropertyDescriptor' on proxy: trap is not a function");
+      }
+      auto* interp = getGlobalInterpreter();
+      if (!interp) return Value(Undefined{});
+      Value trapResult = interp->callForHarness(trap, {targetVal, Value(key)});
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (trapResult.isUndefined()) {
+        return Value(Undefined{});
+      }
+      if (!trapResult.isObject()) {
+        throw std::runtime_error("TypeError: 'getOwnPropertyDescriptor' on proxy: trap must return an object or undefined");
+      }
+      return trapResult;
     }
 
     auto descriptor = GarbageCollector::makeGC<Object>();
@@ -20346,11 +23904,13 @@ GCPtr<Environment> Environment::createGlobal() {
         descriptor->properties["value"] = it->second;
       }
 
-      // name and length: non-writable, non-enumerable, configurable
+      // name and length: default {writable: false, enumerable: false, configurable: true}
+      // Only override configurable from marker (e.g. %ThrowTypeError% needs configurable: false)
       if (key == "name" || key == "length") {
+        bool configurable = fn->properties.find("__non_configurable_" + key) == fn->properties.end();
         descriptor->properties["writable"] = Value(false);
         descriptor->properties["enumerable"] = Value(false);
-        descriptor->properties["configurable"] = Value(true);
+        descriptor->properties["configurable"] = Value(configurable);
       } else if (key == "prototype") {
         bool protoWritable = fn->properties.find("__non_writable_prototype") == fn->properties.end();
         bool protoConfigurable = fn->properties.find("__non_configurable_prototype") == fn->properties.end();
@@ -20743,8 +24303,15 @@ GCPtr<Environment> Environment::createGlobal() {
       }
 
       if (obj->isModuleNamespace) {
+        maybeTriggerDeferredNamespaceEvaluation(obj, key);
         if (key == WellKnownSymbols::toStringTagKey()) {
-          descriptor->properties["value"] = Value(std::string("Module"));
+          auto tagIt = obj->properties.find(key);
+          if (tagIt != obj->properties.end()) {
+            descriptor->properties["value"] = tagIt->second;
+          } else {
+            descriptor->properties["value"] =
+              Value(std::string(obj->isDeferredModuleNamespace ? "Deferred Module" : "Module"));
+          }
           descriptor->properties["writable"] = Value(false);
           descriptor->properties["enumerable"] = Value(false);
           descriptor->properties["configurable"] = Value(false);
@@ -21134,6 +24701,7 @@ GCPtr<Environment> Environment::createGlobal() {
       if (args[0].isObject()) {
         auto obj = args[0].getGC<Object>();
         if (obj->isModuleNamespace) {
+          maybeTriggerDeferredNamespaceEvaluation(obj, key);
           if (!defineModuleNamespaceProperty(obj, key, args[2].getGC<Object>())) {
             throw std::runtime_error("TypeError: Cannot redefine module namespace property");
           }
@@ -22378,13 +25946,31 @@ GCPtr<Environment> Environment::createGlobal() {
   stringConstructorFn->isNative = true;
   stringConstructorFn->isConstructor = true;
   stringConstructorFn->properties["__wrap_primitive__"] = Value(true);
-  stringConstructorFn->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
+  stringConstructorFn->properties["name"] = Value(std::string("String"));
+  stringConstructorFn->properties["length"] = Value(1.0);
+  stringConstructorFn->properties["__non_writable_name"] = Value(true);
+  stringConstructorFn->properties["__non_enum_name"] = Value(true);
+  stringConstructorFn->properties["__non_writable_length"] = Value(true);
+  stringConstructorFn->properties["__non_enum_length"] = Value(true);
+  stringConstructorFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
     if (args.empty()) {
       return Value(std::string(""));
     }
-    Value primitive = toPrimitive(args[0], true);
+    Value primitive = toPrimitiveForStringBuiltin(args[0], true);
     return Value(primitive.toString());
   };
+
+  auto stringConstructFn = GarbageCollector::makeGC<Function>();
+  stringConstructFn->isNative = true;
+  stringConstructFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    if (args.empty()) return Value(std::string(""));
+    Value primitive = toPrimitiveForStringBuiltin(args[0], true);
+    if (primitive.isSymbol()) {
+      throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
+    }
+    return Value(primitive.toString());
+  };
+  stringConstructorFn->properties["__native_construct__"] = Value(stringConstructFn);
 
   // Wrap in an Object to hold static methods
   auto stringConstructorObj = GarbageCollector::makeGC<Object>();
@@ -22539,22 +26125,44 @@ GCPtr<Environment> Environment::createGlobal() {
 
   auto stringPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+  stringPrototype->properties["__primitive_value__"] = Value(std::string(""));
+  stringPrototype->properties["length"] = Value(0.0);
+  stringPrototype->properties["__non_writable_length"] = Value(true);
+  stringPrototype->properties["__non_enum_length"] = Value(true);
+  stringPrototype->properties["__non_configurable_length"] = Value(true);
 
   // thisToString: Coerce this (args[0]) to string per ES spec §21.1.3
   // RequireObjectCoercible(this) then ToString(this)
-  auto thisToString = [toPrimitive](const std::vector<Value>& args, const char* methodName) -> std::string {
+  auto thisToString = [](const std::vector<Value>& args, const char* methodName) -> std::string {
     if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
       throw std::runtime_error(std::string("TypeError: String.prototype.") + methodName + " called on null or undefined");
     }
     if (args[0].isString()) return std::get<std::string>(args[0].data);
-    if (args[0].isSymbol()) {
+    Value prim = toPrimitiveForStringBuiltin(args[0], true);
+    if (prim.isSymbol()) {
       throw std::runtime_error("TypeError: Cannot convert a Symbol value to a string");
     }
-    if (isObjectLikeValue(args[0])) {
-      Value prim = toPrimitive(args[0], true);
-      return prim.toString();
+    return prim.toString();
+  };
+
+  auto isRegExpForStringMethod = [](const Value& value) -> bool {
+    if (value.isUndefined() || value.isNull()) {
+      return false;
     }
-    return args[0].toString();
+    auto* interp = getGlobalInterpreter();
+    if (interp && isObjectLikeValue(value)) {
+      const std::string& matchKey = WellKnownSymbols::matchKey();
+      auto [found, matchProp] = interp->getPropertyForExternal(value, matchKey);
+      if (interp->hasError()) {
+        Value err = interp->getError();
+        interp->clearError();
+        throw JsValueException(err);
+      }
+      if (found && !matchProp.isUndefined()) {
+        return matchProp.toBool();
+      }
+    }
+    return value.isRegex();
   };
 
   auto installStringPrototypeMethod =
@@ -22626,7 +26234,7 @@ GCPtr<Environment> Environment::createGlobal() {
   });
   installStringPrototypeMethod("indexOf", 1, String_indexOf, true);
   installStringPrototypeMethod("lastIndexOf", 1, String_lastIndexOf, true);
-  installStringPrototypeMethod("split", 2, String_split, true);
+  installStringPrototypeMethod("split", 2, String_split, false);
   installStringPrototypeMethod("substring", 2, String_substring, true);
   installStringPrototypeMethod("toLowerCase", 0, String_toLowerCase, true);
   installStringPrototypeMethod("toUpperCase", 0, String_toUpperCase, true);
@@ -22635,6 +26243,8 @@ GCPtr<Environment> Environment::createGlobal() {
   installStringPrototypeMethod("localeCompare", 1, [thisToString](const std::vector<Value>& args) -> Value {
     std::string self = thisToString(args, "localeCompare");
     std::string that = args.size() > 1 ? toStringForStringBuiltinArg(args[1]) : "undefined";
+    self = unicode::normalize(self, "NFD");
+    that = unicode::normalize(that, "NFD");
     if (self < that) return Value(-1.0);
     if (self > that) return Value(1.0);
     return Value(0.0);
@@ -22710,9 +26320,9 @@ GCPtr<Environment> Environment::createGlobal() {
   }, false);
 
   // String.prototype.includes
-  installStringPrototypeMethod("includes", 1, [thisToString](const std::vector<Value>& args) -> Value {
+  installStringPrototypeMethod("includes", 1, [thisToString, isRegExpForStringMethod](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "includes");
-    if (args.size() >= 2 && args[1].isRegex()) {
+    if (args.size() >= 2 && isRegExpForStringMethod(args[1])) {
       throw std::runtime_error("TypeError: First argument to String.prototype.includes must not be a regular expression");
     }
     std::string searchStr = (args.size() < 2 || args[1].isUndefined()) ? "undefined" : toStringForStringBuiltinArg(args[1]);
@@ -22721,8 +26331,15 @@ GCPtr<Environment> Environment::createGlobal() {
       pos = toIntegerForStringBuiltinArg(args[2]);
       if (pos < 0) pos = 0;
     }
-    size_t start = static_cast<size_t>(std::min(pos, static_cast<double>(str.size())));
-    return Value(str.find(searchStr, start) != std::string::npos);
+    size_t start = static_cast<size_t>(std::min(pos, static_cast<double>(unicode::utf16Length(str))));
+    if (searchStr.empty()) {
+      return Value(true);
+    }
+    if (start >= unicode::utf16Length(str)) {
+      return Value(false);
+    }
+    str = unicode::utf16Slice(str, static_cast<int>(start), static_cast<int>(unicode::utf16Length(str)));
+    return Value(str.find(searchStr) != std::string::npos);
   }, false);
 
   // String.prototype.repeat
@@ -22777,203 +26394,26 @@ GCPtr<Environment> Environment::createGlobal() {
   }, false);
 
   // String.prototype.search
-  installStringPrototypeMethod("search", 1, [thisToString](const std::vector<Value>& args) -> Value {
-    std::string str = thisToString(args, "search");
-    // ES2020: Check for @@search on the argument
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
-      auto* interp = getGlobalInterpreter();
-      if (interp) {
-        const std::string& searchKey = WellKnownSymbols::searchKey();
-        auto [found, searcher] = interp->getPropertyForExternal(args[1], searchKey);
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        if (found && !searcher.isUndefined() && !searcher.isNull()) {
-          if (!searcher.isFunction()) throw std::runtime_error("TypeError: @@search is not a function");
-          Value result = interp->callForHarness(searcher, {Value(str)}, args[1]);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          return result;
-        }
-      }
-    }
-    if (args.size() < 2) return Value(-1.0);
-    if (args[1].isRegex()) {
-      // Use std::regex for matching
-      auto rx = args[1].getGC<Regex>();
-#if USE_SIMPLE_REGEX
-      // Simple regex: use string find as fallback for now
-      auto pos = str.find(rx->pattern);
-      return Value(pos != std::string::npos ? static_cast<double>(pos) : -1.0);
-#else
-      std::smatch m;
-      if (std::regex_search(str, m, rx->regex)) {
-        return Value(static_cast<double>(m.position(0)));
-      }
-      return Value(-1.0);
-#endif
-    }
-    std::string searchStr = toStringForStringBuiltinArg(args[1]);
-    auto pos = str.find(searchStr);
-    return Value(pos != std::string::npos ? static_cast<double>(pos) : -1.0);
-  }, false);
+  installStringPrototypeMethod("search", 1, String_search, false);
 
   // String.prototype.match
-  installStringPrototypeMethod("match", 1, [thisToString](const std::vector<Value>& args) -> Value {
-    std::string str = thisToString(args, "match");
-    // ES2020: Check for @@match on the argument
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
-      auto* interp = getGlobalInterpreter();
-      if (interp) {
-        const std::string& matchKey = WellKnownSymbols::matchKey();
-        auto [found, matcher] = interp->getPropertyForExternal(args[1], matchKey);
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        if (found && !matcher.isUndefined() && !matcher.isNull()) {
-          if (!matcher.isFunction()) throw std::runtime_error("TypeError: @@match is not a function");
-          Value result = interp->callForHarness(matcher, {Value(str)}, args[1]);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          return result;
-        }
-      }
-    }
-    if (args.size() < 2 || args[1].isUndefined()) {
-      auto result = makeArrayWithPrototype();
-      result->elements.push_back(Value(std::string("")));
-      result->properties["index"] = Value(0.0);
-      result->properties["input"] = Value(str);
-      return Value(result);
-    }
-    if (args[1].isRegex()) {
-      auto rx = args[1].getGC<Regex>();
-      bool global = rx->flags.find('g') != std::string::npos;
-#if USE_SIMPLE_REGEX
-      (void)global;
-      auto pos = str.find(rx->pattern);
-      if (pos == std::string::npos) return Value(Null{});
-      auto result = makeArrayWithPrototype();
-      result->elements.push_back(Value(rx->pattern));
-      result->properties["index"] = Value(static_cast<double>(pos));
-      result->properties["input"] = Value(str);
-      return Value(result);
-#else
-      if (!global) {
-        std::smatch m;
-        if (!std::regex_search(str, m, rx->regex)) return Value(Null{});
-        auto result = makeArrayWithPrototype();
-        result->elements.push_back(Value(m.str(0)));
-        for (size_t i = 1; i < m.size(); ++i) {
-          if (m[i].matched) result->elements.push_back(Value(m.str(i)));
-          else result->elements.push_back(Value(Undefined{}));
-        }
-        result->properties["index"] = Value(static_cast<double>(m.position(0)));
-        result->properties["input"] = Value(str);
-        return Value(result);
-      }
-      // Global: all matches
-      auto result = makeArrayWithPrototype();
-      auto begin = std::sregex_iterator(str.begin(), str.end(), rx->regex);
-      auto end = std::sregex_iterator();
-      for (auto it = begin; it != end; ++it) {
-        result->elements.push_back(Value(it->str()));
-      }
-      if (result->elements.empty()) return Value(Null{});
-      return Value(result);
-#endif
-    }
-    std::string searchStr = args[1].toString();
-    auto pos = str.find(searchStr);
-    if (pos == std::string::npos) return Value(Null{});
-    auto result = makeArrayWithPrototype();
-    result->elements.push_back(Value(searchStr));
-    result->properties["index"] = Value(static_cast<double>(pos));
-    result->properties["input"] = Value(str);
-    return Value(result);
-  }, false);
+  installStringPrototypeMethod("match", 1, String_match, false);
 
   // String.prototype.normalize
   installStringPrototypeMethod("normalize", 0, [thisToString](const std::vector<Value>& args) -> Value {
     std::string str = thisToString(args, "normalize");
-    // Basic implementation - just return the string (proper Unicode normalization is complex)
+    std::string form = "NFC";
     if (args.size() > 1 && !args[1].isUndefined()) {
-      std::string form = args[1].toString();
-      if (form != "NFC" && form != "NFD" && form != "NFKC" && form != "NFKD") {
-        throw std::runtime_error("RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
-      }
+      form = toStringForStringBuiltinArg(args[1]);
     }
-    return Value(str);
+    if (form != "NFC" && form != "NFD" && form != "NFKC" && form != "NFKD") {
+      throw std::runtime_error("RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+    }
+    return Value(unicode::normalize(str, form));
   }, false);
 
   // String.prototype.replaceAll
-  installStringPrototypeMethod("replaceAll", 2, [thisToString](const std::vector<Value>& args) -> Value {
-    std::string str = thisToString(args, "replaceAll");
-    // ES2021: Check @@replace on the searchValue (objects only, not primitives)
-    if (args.size() >= 2 && !args[1].isUndefined() && !args[1].isNull() && !args[1].isString() && !args[1].isBool() && !args[1].isNumber() && !args[1].isBigInt() && !args[1].isSymbol()) {
-      auto* interp = getGlobalInterpreter();
-      if (interp) {
-        // IsRegExp check via @@match
-        const std::string& matchKey = WellKnownSymbols::matchKey();
-        auto [hasMatch, matchProp] = interp->getPropertyForExternal(args[1], matchKey);
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        bool isRegExp = (hasMatch && !matchProp.isUndefined() && !matchProp.isNull()) || args[1].isRegex();
-        if (isRegExp) {
-          // Must have 'g' flag
-          if (args[1].isRegex()) {
-            auto rx = args[1].getGC<Regex>();
-            if (rx->flags.find('g') == std::string::npos)
-              throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-          } else {
-            auto [hasFlags, flagsVal] = interp->getPropertyForExternal(args[1], "flags");
-            if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-            std::string flags = hasFlags ? flagsVal.toString() : "";
-            if (flags.find('g') == std::string::npos)
-              throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-          }
-        }
-        // Check for @@replace
-        const std::string& replaceKey = WellKnownSymbols::replaceKey();
-        auto [found, replacer] = interp->getPropertyForExternal(args[1], replaceKey);
-        if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-        if (found && !replacer.isUndefined() && !replacer.isNull()) {
-          if (!replacer.isFunction()) throw std::runtime_error("TypeError: @@replace is not a function");
-          Value replaceValue = args.size() > 2 ? args[2] : Value(Undefined{});
-          Value result = interp->callForHarness(replacer, {Value(str), replaceValue}, args[1]);
-          if (interp->hasError()) { Value err = interp->getError(); interp->clearError(); throw JsValueException(err); }
-          return result;
-        }
-      }
-    }
-    if (args.size() < 2) return Value(str);
-    if (args[1].isRegex()) {
-      auto rx = args[1].getGC<Regex>();
-      if (rx->flags.find('g') == std::string::npos) {
-        throw std::runtime_error("TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-      }
-      // Delegate to replace for global regex
-      return String_replace(args);
-    }
-    std::string searchStr = args[1].toString();
-    std::string replaceStr = args.size() > 2 ? args[2].toString() : "undefined";
-    if (searchStr.empty()) {
-      // Insert between every char
-      std::string result;
-      result += replaceStr;
-      for (size_t i = 0; i < str.size(); ++i) {
-        result += str[i];
-        result += replaceStr;
-      }
-      return Value(result);
-    }
-    std::string result;
-    size_t pos = 0;
-    while (true) {
-      size_t found = str.find(searchStr, pos);
-      if (found == std::string::npos) {
-        result += str.substr(pos);
-        break;
-      }
-      result += str.substr(pos, found - pos);
-      result += replaceStr;
-      pos = found + searchStr.size();
-    }
-    return Value(result);
-  }, false);
+  installStringPrototypeMethod("replaceAll", 2, String_replaceAll, false);
 
   // String.prototype.isWellFormed (ES2024)
   // Operates on UTF-16 code units: lone surrogates = not well-formed, paired surrogates = well-formed
@@ -23070,6 +26510,52 @@ GCPtr<Environment> Environment::createGlobal() {
     return Value(result);
   }, true);
 
+  // %StringIteratorPrototype%
+  auto stringIteratorPrototype = GarbageCollector::makeGC<Object>();
+  stringIteratorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("String Iterator"));
+  stringIteratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  stringIteratorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  stringIteratorPrototype->properties["__proto__"] = Value(iteratorPrototype);
+  {
+    auto strIterNext = GarbageCollector::makeGC<Function>();
+    strIterNext->isNative = true;
+    strIterNext->properties["name"] = Value(std::string("next"));
+    strIterNext->properties["length"] = Value(0.0);
+    strIterNext->properties["__non_writable_name"] = Value(true);
+    strIterNext->properties["__non_enum_name"] = Value(true);
+    strIterNext->properties["__non_writable_length"] = Value(true);
+    strIterNext->properties["__non_enum_length"] = Value(true);
+    strIterNext->properties["__uses_this_arg__"] = Value(true);
+    strIterNext->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      if (args.empty() || !args[0].isObject()) {
+        throw std::runtime_error("TypeError: %StringIteratorPrototype%.next requires that 'this' be an Object");
+      }
+      auto thisObj = args[0].getGC<Object>();
+      auto strIt = thisObj->properties.find("__string_iterator_string__");
+      if (strIt == thisObj->properties.end()) {
+        throw std::runtime_error("TypeError: %StringIteratorPrototype%.next requires that 'this' be a String Iterator");
+      }
+      auto doneIt = thisObj->properties.find("__string_iterator_done__");
+      if (doneIt != thisObj->properties.end() && doneIt->second.isBool() && doneIt->second.toBool()) {
+        return Interpreter::makeIteratorResult(Value(Undefined{}), true);
+      }
+      const std::string& str = std::get<std::string>(strIt->second.data);
+      auto posIt = thisObj->properties.find("__string_iterator_pos__");
+      size_t bytePos = posIt != thisObj->properties.end() ? static_cast<size_t>(posIt->second.toNumber()) : 0;
+      if (bytePos >= str.size()) {
+        thisObj->properties["__string_iterator_done__"] = Value(true);
+        return Interpreter::makeIteratorResult(Value(Undefined{}), true);
+      }
+      size_t start = bytePos;
+      unicode::decodeUTF8(str, bytePos);
+      thisObj->properties["__string_iterator_pos__"] = Value(static_cast<double>(bytePos));
+      return Interpreter::makeIteratorResult(Value(str.substr(start, bytePos - start)), false);
+    };
+    stringIteratorPrototype->properties["next"] = Value(strIterNext);
+    stringIteratorPrototype->properties["__non_enum_next"] = Value(true);
+  }
+  env->define("__string_iterator_prototype__", Value(stringIteratorPrototype));
+
   {
     const auto& iterKey = WellKnownSymbols::iteratorKey();
     auto stringProtoIterator = GarbageCollector::makeGC<Function>();
@@ -23083,7 +26569,23 @@ GCPtr<Environment> Environment::createGlobal() {
     stringProtoIterator->properties["__non_enum_length"] = Value(true);
     stringProtoIterator->properties["__uses_this_arg__"] = Value(true);
     stringProtoIterator->properties["__throw_on_new__"] = Value(true);
-    stringProtoIterator->nativeFunc = String_iterator;
+    stringProtoIterator->nativeFunc = [stringIteratorPrototype](const std::vector<Value>& args) -> Value {
+      if (args.empty() || args[0].isUndefined() || args[0].isNull()) {
+        throw std::runtime_error("TypeError: String.prototype[Symbol.iterator] called on null or undefined");
+      }
+      std::string str;
+      if (args[0].isString()) {
+        str = std::get<std::string>(args[0].data);
+      } else {
+        str = args[0].toString();
+      }
+      auto iteratorObj = GarbageCollector::makeGC<Object>();
+      GarbageCollector::instance().reportAllocation(sizeof(Object));
+      iteratorObj->properties["__proto__"] = Value(stringIteratorPrototype);
+      iteratorObj->properties["__string_iterator_string__"] = Value(str);
+      iteratorObj->properties["__string_iterator_pos__"] = Value(0.0);
+      return Value(iteratorObj);
+    };
     stringPrototype->properties[iterKey] = Value(stringProtoIterator);
     stringPrototype->properties["__non_enum_" + iterKey] = Value(true);
   }
@@ -23306,6 +26808,16 @@ GCPtr<Environment> Environment::createGlobal() {
     globalThisObj->properties[std::string("__non_writable_") + name] = Value(true);
     globalThisObj->properties[std::string("__non_configurable_") + name] = Value(true);
     globalThisObj->properties[std::string("__non_enum_") + name] = Value(true);
+  }
+  const char* nonEnumerableBuiltinGlobals[] = {
+    "SuppressedError",
+    "DisposableStack",
+    "AsyncDisposableStack",
+  };
+  for (const char* name : nonEnumerableBuiltinGlobals) {
+    if (globalThisObj->properties.find(name) != globalThisObj->properties.end()) {
+      globalThisObj->properties[std::string("__non_enum_") + name] = Value(true);
+    }
   }
 
   // Define globalThis pointing to the global object
@@ -24156,8 +27668,11 @@ GCPtr<Environment> Environment::createGlobal() {
   throwTypeErrorAccessor->properties["length"] = Value(0.0);
   throwTypeErrorAccessor->properties["__non_writable_name"] = Value(true);
   throwTypeErrorAccessor->properties["__non_enum_name"] = Value(true);
+  throwTypeErrorAccessor->properties["__non_configurable_name"] = Value(true);
   throwTypeErrorAccessor->properties["__non_writable_length"] = Value(true);
   throwTypeErrorAccessor->properties["__non_enum_length"] = Value(true);
+  throwTypeErrorAccessor->properties["__non_configurable_length"] = Value(true);
+  throwTypeErrorAccessor->properties["__non_extensible__"] = Value(true);
   throwTypeErrorAccessor->nativeFunc = [](const std::vector<Value>&) -> Value {
     throw std::runtime_error("TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed");
   };
@@ -24519,6 +28034,7 @@ GCPtr<Environment> Environment::createGlobal() {
   fpHasInstance->properties["__non_enum_length"] = Value(true);
   fpHasInstance->properties["__uses_this_arg__"] = Value(true);
   fpHasInstance->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    auto* interpreter = getGlobalInterpreter();
     auto sameIdentity = [](const Value& lhs, const Value& rhs) -> bool {
       if (lhs.isObject() && rhs.isObject()) {
         return lhs.getGC<Object>().get() == rhs.getGC<Object>().get();
@@ -24528,7 +28044,6 @@ GCPtr<Environment> Environment::createGlobal() {
       }
       return false;
     };
-    auto* interpreter = getGlobalInterpreter();
     auto getProto = [interpreter](const Value& value, const auto& self) -> Value {
       if (value.isProxy()) {
         auto proxy = value.getGC<Proxy>();
@@ -24584,18 +28099,31 @@ GCPtr<Environment> Environment::createGlobal() {
         !V.isArrayBuffer() && !V.isDataView() && !V.isGenerator()) {
       return Value(false);
     }
-    // Get F.prototype
-    Value Fproto;
-    if (F.isFunction()) {
+
+    // OrdinaryHasInstance performs Get(F, "prototype"), which must observe
+    // inherited accessors such as a getter installed on %FunctionPrototype%.
+    Value Fproto(Undefined{});
+    if (interpreter) {
+      auto [foundProto, protoValue] = interpreter->getPropertyForExternal(F, "prototype");
+      if (interpreter->hasError()) {
+        Value err = interpreter->getError();
+        interpreter->clearError();
+        throw JsValueException(err);
+      }
+      if (!foundProto) {
+        return Value(false);
+      }
+      Fproto = protoValue;
+    } else if (F.isFunction()) {
       auto fn = F.getGC<Function>();
       auto it = fn->properties.find("prototype");
-      if (it != fn->properties.end()) Fproto = it->second;
-      else return Value(false);
+      if (it == fn->properties.end()) return Value(false);
+      Fproto = it->second;
     } else if (F.isClass()) {
       auto cls = F.getGC<Class>();
       auto it = cls->properties.find("prototype");
-      if (it != cls->properties.end()) Fproto = it->second;
-      else return Value(false);
+      if (it == cls->properties.end()) return Value(false);
+      Fproto = it->second;
     }
     if (!Fproto.isObject() && !Fproto.isFunction()) {
       throw std::runtime_error("TypeError: Function has non-object prototype in instanceof check");
@@ -24670,6 +28198,8 @@ GCPtr<Environment> Environment::createGlobal() {
   GarbageCollector::instance().reportAllocation(sizeof(Object));
   auto generatorPrototype = GarbageCollector::makeGC<Object>();
   GarbageCollector::instance().reportAllocation(sizeof(Object));
+  auto asyncGeneratorPrototype = GarbageCollector::makeGC<Object>();
+  GarbageCollector::instance().reportAllocation(sizeof(Object));
   
   // %GeneratorFunction.prototype% inherits from Function.prototype
   generatorFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
@@ -24681,8 +28211,12 @@ GCPtr<Environment> Environment::createGlobal() {
   generatorFunctionPrototype->properties["__non_enum_arguments"] = Value(true);
   // %GeneratorFunction.prototype.prototype% is %GeneratorPrototype%
   generatorFunctionPrototype->properties["prototype"] = Value(generatorPrototype);
-  // %GeneratorPrototype% inherits from Object.prototype
-  if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+  generatorFunctionPrototype->properties["__non_writable_prototype"] = Value(true);
+  generatorFunctionPrototype->properties["__non_enum_prototype"] = Value(true);
+  // %GeneratorPrototype% inherits from %IteratorPrototype% (not Object.prototype directly)
+  if (auto iterProto = env->get("__iterator_prototype__"); iterProto && iterProto->isObject()) {
+    generatorPrototype->properties["__proto__"] = *iterProto;
+  } else if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
     auto fn = std::get<GCPtr<Function>>(objCtor->data);
     auto protoIt = fn->properties.find("prototype");
     if (protoIt != fn->properties.end()) {
@@ -24691,12 +28225,111 @@ GCPtr<Environment> Environment::createGlobal() {
   }
   // %GeneratorPrototype%.constructor is %GeneratorFunction.prototype%
   generatorPrototype->properties["constructor"] = Value(generatorFunctionPrototype);
+  generatorPrototype->properties["__non_enum_constructor"] = Value(true);
+  generatorPrototype->properties["__non_writable_constructor"] = Value(true);
   // %GeneratorPrototype%[@@toStringTag] = "Generator"
   generatorPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("Generator"));
   generatorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  generatorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+
+  // %GeneratorPrototype%.next
+  {
+    auto genNextFn = GarbageCollector::makeGC<Function>();
+    genNextFn->isNative = true;
+    genNextFn->isConstructor = false;
+    genNextFn->properties["name"] = Value(std::string("next"));
+    genNextFn->properties["length"] = Value(1.0);
+    genNextFn->properties["__non_writable_name"] = Value(true);
+    genNextFn->properties["__non_enum_name"] = Value(true);
+    genNextFn->properties["__non_writable_length"] = Value(true);
+    genNextFn->properties["__non_enum_length"] = Value(true);
+    genNextFn->properties["__uses_this_arg__"] = Value(true);
+    genNextFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Cannot call generator next without interpreter");
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (!thisVal.isGenerator()) {
+        throw std::runtime_error("TypeError: Method Generator.prototype.next called on incompatible receiver");
+      }
+      auto genPtr = thisVal.getGC<Generator>();
+      Value resumeValue = args.size() > 1 ? args[1] : Value(Undefined{});
+      if (genPtr->state == GeneratorState::SuspendedStart) {
+        resumeValue = Value(Undefined{});
+      }
+      return interp->generatorResume(genPtr, 0, resumeValue);
+    };
+    generatorPrototype->properties["next"] = Value(genNextFn);
+    generatorPrototype->properties["__non_enum_next"] = Value(true);
+  }
+  // %GeneratorPrototype%.return
+  {
+    auto genReturnFn = GarbageCollector::makeGC<Function>();
+    genReturnFn->isNative = true;
+    genReturnFn->isConstructor = false;
+    genReturnFn->properties["name"] = Value(std::string("return"));
+    genReturnFn->properties["length"] = Value(1.0);
+    genReturnFn->properties["__non_writable_name"] = Value(true);
+    genReturnFn->properties["__non_enum_name"] = Value(true);
+    genReturnFn->properties["__non_writable_length"] = Value(true);
+    genReturnFn->properties["__non_enum_length"] = Value(true);
+    genReturnFn->properties["__uses_this_arg__"] = Value(true);
+    genReturnFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Cannot call generator return without interpreter");
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (!thisVal.isGenerator()) {
+        throw std::runtime_error("TypeError: Method Generator.prototype.return called on incompatible receiver");
+      }
+      auto genPtr = thisVal.getGC<Generator>();
+      Value returnValue = args.size() > 1 ? args[1] : Value(Undefined{});
+      return interp->generatorResume(genPtr, 1, returnValue);
+    };
+    generatorPrototype->properties["return"] = Value(genReturnFn);
+    generatorPrototype->properties["__non_enum_return"] = Value(true);
+  }
+  // %GeneratorPrototype%.throw
+  {
+    auto genThrowFn = GarbageCollector::makeGC<Function>();
+    genThrowFn->isNative = true;
+    genThrowFn->isConstructor = false;
+    genThrowFn->properties["name"] = Value(std::string("throw"));
+    genThrowFn->properties["length"] = Value(1.0);
+    genThrowFn->properties["__non_writable_name"] = Value(true);
+    genThrowFn->properties["__non_enum_name"] = Value(true);
+    genThrowFn->properties["__non_writable_length"] = Value(true);
+    genThrowFn->properties["__non_enum_length"] = Value(true);
+    genThrowFn->properties["__uses_this_arg__"] = Value(true);
+    genThrowFn->nativeFunc = [](const std::vector<Value>& args) -> Value {
+      auto* interp = getGlobalInterpreter();
+      if (!interp) throw std::runtime_error("TypeError: Cannot call generator throw without interpreter");
+      Value thisVal = args.empty() ? Value(Undefined{}) : args[0];
+      if (!thisVal.isGenerator()) {
+        throw std::runtime_error("TypeError: Method Generator.prototype.throw called on incompatible receiver");
+      }
+      auto genPtr = thisVal.getGC<Generator>();
+      Value throwValue = args.size() > 1 ? args[1] : Value(Undefined{});
+      return interp->generatorResume(genPtr, 2, throwValue);
+    };
+    generatorPrototype->properties["throw"] = Value(genThrowFn);
+    generatorPrototype->properties["__non_enum_throw"] = Value(true);
+  }
+  if (auto asyncIterProto = env->get("__async_iterator_prototype__"); asyncIterProto && asyncIterProto->isObject()) {
+    asyncGeneratorPrototype->properties["__proto__"] = *asyncIterProto;
+  } else if (auto objCtor = env->get("Object"); objCtor && objCtor->isFunction()) {
+    auto fn = std::get<GCPtr<Function>>(objCtor->data);
+    auto protoIt = fn->properties.find("prototype");
+    if (protoIt != fn->properties.end()) {
+      asyncGeneratorPrototype->properties["__proto__"] = protoIt->second;
+    }
+  }
+  asyncGeneratorPrototype->properties[WellKnownSymbols::toStringTagKey()] =
+    Value(std::string("AsyncGenerator"));
+  asyncGeneratorPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  asyncGeneratorPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
   // %GeneratorFunction.prototype%[@@toStringTag] = "GeneratorFunction"
   generatorFunctionPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("GeneratorFunction"));
   generatorFunctionPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  generatorFunctionPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
 
   // GeneratorFunction constructor (not a global binding; reachable via
   // Object.getPrototypeOf(function*(){}).constructor)
@@ -24807,12 +28440,89 @@ GCPtr<Environment> Environment::createGlobal() {
 
   // Wire: GeneratorFunction.prototype and .constructor
   generatorFunctionConstructor->properties["prototype"] = Value(generatorFunctionPrototype);
+  generatorFunctionConstructor->properties["__non_writable_prototype"] = Value(true);
+  generatorFunctionConstructor->properties["__non_configurable_prototype"] = Value(true);
   generatorFunctionPrototype->properties["constructor"] = Value(generatorFunctionConstructor);
   generatorFunctionPrototype->properties["__non_enum_constructor"] = Value(true);
+  generatorFunctionPrototype->properties["__non_writable_constructor"] = Value(true);
+
+  // %AsyncFunction.prototype% - prototype for async function objects
+  auto asyncFunctionPrototype = GarbageCollector::makeGC<Object>();
+  asyncFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
+  asyncFunctionPrototype->properties[WellKnownSymbols::toStringTagKey()] = Value(std::string("AsyncFunction"));
+  asyncFunctionPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  asyncFunctionPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  // Not callable
+  // asyncFunctionPrototype is an Object, not a Function, so typeof returns "object" and it's not callable
+
+  // %AsyncFunction% constructor
+  auto asyncFunctionConstructor = GarbageCollector::makeGC<Function>();
+  asyncFunctionConstructor->isNative = true;
+  asyncFunctionConstructor->isConstructor = true;
+  asyncFunctionConstructor->properties["name"] = Value(std::string("AsyncFunction"));
+  asyncFunctionConstructor->properties["length"] = Value(1.0);
+  asyncFunctionConstructor->properties["__non_writable_name"] = Value(true);
+  asyncFunctionConstructor->properties["__non_enum_name"] = Value(true);
+  asyncFunctionConstructor->properties["__non_writable_length"] = Value(true);
+  asyncFunctionConstructor->properties["__non_enum_length"] = Value(true);
+  asyncFunctionConstructor->properties["__proto__"] = Value(functionConstructor);
+  asyncFunctionConstructor->properties["prototype"] = Value(asyncFunctionPrototype);
+  asyncFunctionConstructor->properties["__non_writable_prototype"] = Value(true);
+  asyncFunctionConstructor->properties["__non_configurable_prototype"] = Value(true);
+  asyncFunctionConstructor->nativeFunc = [](const std::vector<Value>& args) -> Value {
+    // AsyncFunction constructor: create async function from strings
+    throw std::runtime_error("TypeError: AsyncFunction constructor is not yet fully supported");
+  };
+  asyncFunctionPrototype->properties["constructor"] = Value(asyncFunctionConstructor);
+  asyncFunctionPrototype->properties["__non_enum_constructor"] = Value(true);
+  asyncFunctionPrototype->properties["__non_writable_constructor"] = Value(true);
+
+  // %AsyncGeneratorFunction.prototype% - prototype for async generator function objects
+  auto asyncGeneratorFunctionPrototype = GarbageCollector::makeGC<Object>();
+  asyncGeneratorFunctionPrototype->properties["__proto__"] = Value(functionPrototype);
+  asyncGeneratorFunctionPrototype->properties["__get_caller"] = Value(throwTypeErrorAccessor);
+  asyncGeneratorFunctionPrototype->properties["__set_caller"] = Value(throwTypeErrorAccessor);
+  asyncGeneratorFunctionPrototype->properties["__get_arguments"] = Value(throwTypeErrorAccessor);
+  asyncGeneratorFunctionPrototype->properties["__set_arguments"] = Value(throwTypeErrorAccessor);
+  asyncGeneratorFunctionPrototype->properties["__non_enum_caller"] = Value(true);
+  asyncGeneratorFunctionPrototype->properties["__non_enum_arguments"] = Value(true);
+  asyncGeneratorFunctionPrototype->properties["prototype"] = Value(asyncGeneratorPrototype);
+  asyncGeneratorFunctionPrototype->properties["__non_writable_prototype"] = Value(true);
+  asyncGeneratorFunctionPrototype->properties["__non_enum_prototype"] = Value(true);
+  asyncGeneratorFunctionPrototype->properties[WellKnownSymbols::toStringTagKey()] =
+    Value(std::string("AsyncGeneratorFunction"));
+  asyncGeneratorFunctionPrototype->properties["__non_enum_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  asyncGeneratorFunctionPrototype->properties["__non_writable_" + WellKnownSymbols::toStringTagKey()] = Value(true);
+  // AsyncGeneratorFunction constructor
+  auto asyncGeneratorFunctionConstructor = GarbageCollector::makeGC<Function>();
+  asyncGeneratorFunctionConstructor->isNative = true;
+  asyncGeneratorFunctionConstructor->isConstructor = true;
+  asyncGeneratorFunctionConstructor->properties["name"] = Value(std::string("AsyncGeneratorFunction"));
+  asyncGeneratorFunctionConstructor->properties["length"] = Value(1.0);
+  asyncGeneratorFunctionConstructor->properties["__non_writable_name"] = Value(true);
+  asyncGeneratorFunctionConstructor->properties["__non_enum_name"] = Value(true);
+  asyncGeneratorFunctionConstructor->properties["__non_writable_length"] = Value(true);
+  asyncGeneratorFunctionConstructor->properties["__non_enum_length"] = Value(true);
+  asyncGeneratorFunctionConstructor->properties["__proto__"] = Value(functionConstructor);
+  asyncGeneratorFunctionConstructor->properties["prototype"] = Value(asyncGeneratorFunctionPrototype);
+  asyncGeneratorFunctionConstructor->properties["__non_writable_prototype"] = Value(true);
+  asyncGeneratorFunctionConstructor->properties["__non_configurable_prototype"] = Value(true);
+  asyncGeneratorFunctionConstructor->nativeFunc = [](const std::vector<Value>&) -> Value {
+    // Stub - creating async generators from strings not supported
+    return Value(GarbageCollector::makeGC<Object>());
+  };
+  asyncGeneratorFunctionPrototype->properties["constructor"] = Value(asyncGeneratorFunctionConstructor);
+  asyncGeneratorFunctionPrototype->properties["__non_enum_constructor"] = Value(true);
+  asyncGeneratorFunctionPrototype->properties["__non_writable_constructor"] = Value(true);
+  // Note: constructor on asyncGeneratorPrototype deliberately not set to avoid
+  // breaking the dynamically-generated next/return/throw methods on async generators.
 
   // Store these in environment for internal use
   env->define("__generator_function_prototype__", Value(generatorFunctionPrototype));
   env->define("__generator_prototype__", Value(generatorPrototype));
+  env->define("__async_generator_prototype__", Value(asyncGeneratorPrototype));
+  env->define("__async_function_prototype__", Value(asyncFunctionPrototype));
+  env->define("__async_generator_function_prototype__", Value(asyncGeneratorFunctionPrototype));
 
   // ===== Deferred prototype chain setup =====
   // These must happen after all constructors are defined.
@@ -24845,7 +28555,7 @@ GCPtr<Environment> Environment::createGlobal() {
     "ArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray",
     "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
     "Float16Array", "Float32Array", "Float64Array",
-    "BigInt64Array", "BigUint64Array", "WeakRef", "FinalizationRegistry",
+    "BigInt64Array", "BigUint64Array", "WeakRef", "FinalizationRegistry", "Iterator",
     "globalThis", "undefined", "NaN", "Infinity",
     "eval", "parseInt", "parseFloat", "isNaN", "isFinite",
     "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",

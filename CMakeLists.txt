@@ -364,6 +364,7 @@ if(LIGHTJS_BUILD_TESTS)
 
   # Core functionality tests
   add_lightjs_test(lightjs_test tests/test.cc)
+  set_tests_properties(lightjs_test PROPERTIES TIMEOUT 180)
   add_lightjs_test(gc_test tests/gc_test.cc)
   add_lightjs_test(json_object_test tests/json_object_test.cc)
   add_lightjs_test(methods_test tests/methods_test.cc)

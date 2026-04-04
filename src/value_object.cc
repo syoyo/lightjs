@@ -625,7 +625,6 @@ Value Object_hasOwnProperty(const std::vector<Value>& args) {
   if (args[0].isRegex()) {
     auto rx = args[0].getGC<Regex>();
     if (isInternalProperty(key)) return Value(false);
-    if (key == "source" || key == "flags") return Value(true);
     if (rx->properties.find(key) != rx->properties.end()) return Value(true);
     if (rx->properties.find("__get_" + key) != rx->properties.end()) return Value(true);
     if (rx->properties.find("__set_" + key) != rx->properties.end()) return Value(true);

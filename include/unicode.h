@@ -51,5 +51,24 @@ std::vector<uint32_t> toCodePoints(const std::string& str);
 // Validate UTF-8 string
 bool isValidUTF8(const std::string& str);
 
+// Get the length of a UTF-8 string in UTF-16 code units
+size_t utf16Length(const std::string& str);
+
+// Get the UTF-16 code unit at a specific UTF-16 index
+bool utf16CodeUnitAt(const std::string& str, size_t targetIndex, uint16_t& outUnit);
+
+// Get a slice of a UTF-8 string based on UTF-16 indices
+std::string utf16Slice(const std::string& str, int start, int end);
+
+// Convert a string to lower/upper case (Unicode aware)
+std::string toLower(const std::string& str);
+std::string toUpper(const std::string& str);
+
+// Normalize UTF-8 string: merge paired surrogates into 4-byte sequences
+std::string normalizeUTF8(const std::string& str);
+
+// Normalize a UTF-8 string using one of the ECMAScript-supported Unicode forms.
+std::string normalize(const std::string& str, const std::string& form);
+
 } // namespace unicode
 } // namespace lightjs

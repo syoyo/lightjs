@@ -6,6 +6,7 @@
 namespace lightjs {
 
 size_t String_utf16Length(const std::string& str);
+std::string String_utf16CodeUnitStringAt(const std::string& str, size_t targetIndex);
 
 // String prototype methods
 Value String_charAt(const std::vector<Value>& args);
@@ -19,7 +20,10 @@ Value String_substring(const std::vector<Value>& args);
 Value String_substr(const std::vector<Value>& args);
 Value String_slice(const std::vector<Value>& args);
 Value String_split(const std::vector<Value>& args);
+Value String_search(const std::vector<Value>& args);
+Value String_match(const std::vector<Value>& args);
 Value String_replace(const std::vector<Value>& args);
+Value String_replaceAll(const std::vector<Value>& args);
 Value String_toLowerCase(const std::vector<Value>& args);
 Value String_toUpperCase(const std::vector<Value>& args);
 Value String_trim(const std::vector<Value>& args);
@@ -30,6 +34,7 @@ Value String_fromCodePoint(const std::vector<Value>& args);
 
 // Spec-compliant type coercion helpers for string built-ins
 // These throw TypeError on Symbol values, unlike Value::toString()/toNumber()
+Value toPrimitiveForStringBuiltin(const Value& value, bool preferString);
 std::string toStringForStringBuiltinArg(const Value& value);
 double toNumberForStringBuiltinArg(const Value& value);
 double toIntegerForStringBuiltinArg(const Value& value);

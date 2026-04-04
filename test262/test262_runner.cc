@@ -315,18 +315,9 @@ private:
       }
       Test262Metadata metadata = parseMetadata(testCode);
       static const std::vector<std::string> kUnsupportedFeatures = {
-        "tail-call-optimization",
-        "async-disposable-stack",
-        "explicit-resource-management",
-        "decorators",
-        "import-defer",
-        "source-phase-imports",
-        "source-phase-imports-module-source",
-        "import-attributes",
-        "regexp-modifiers",
         "regexp-v-flag",
         "regexp-unicode-property-escapes",
-        "caller",
+        "await-dictionary",
       };
       bool allowTopLevelAwaitForAwaitSyntaxCoverage =
         testPath.find("language/module-code/top-level-await/syntax/for-await-await-expr-") != std::string::npos;
@@ -340,6 +331,223 @@ private:
         testPath.find("language/expressions/dynamic-import/import-attributes/") != std::string::npos;
       const bool isDynamicImportImportDefer =
         testPath.find("language/expressions/dynamic-import/import-defer/") != std::string::npos;
+      const bool isStaticSourcePhaseImport =
+        testPath.find("language/module-code/source-phase-import/") != std::string::npos;
+      const bool isRegExpModifiersSyntaxValid =
+        testPath.find("built-ins/RegExp/regexp-modifiers/syntax/valid/") != std::string::npos;
+      const bool isRegExpModifiersEarlyError =
+        testPath.find("language/literals/regexp/early-err-") != std::string::npos ||
+        testPath.find("built-ins/RegExp/early-err-") != std::string::npos ||
+        testPath.find("built-ins/RegExp/syntax-err-") != std::string::npos;
+      const bool isRegExpModifiersPropertyOnly =
+        testPath.find("built-ins/RegExp/regexp-modifiers/") != std::string::npos &&
+        testPath.find("property.js") != std::string::npos;
+      const bool isRegExpModifiersScopedLowered =
+        testPath.find("built-ins/RegExp/regexp-modifiers/") != std::string::npos &&
+        testPath.find("property.js") == std::string::npos &&
+        true;
+      const bool isRegExpPropertyEscapesParseNegative =
+        testPath.find("built-ins/RegExp/property-escapes/") != std::string::npos &&
+        metadata.negative &&
+        metadata.negativePhase == "parse";
+      const bool isRegExpPropertyEscapesStringParseNegative =
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/") !=
+          std::string::npos &&
+        metadata.negative &&
+        metadata.negativePhase == "parse";
+      const bool isRegExpPropertyEscapesStringPositiveTargeted =
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/Basic_Emoji.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/Emoji_Keycap_Sequence.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Flag_Sequence.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Modifier_Sequence.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_Tag_Sequence.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence.js") !=
+          std::string::npos;
+      const bool isRegExpPropertyEscapesGeneratedSupportedSubset =
+        testPath.find("built-ins/RegExp/property-escapes/generated/ASCII.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/ASCII_Hex_Digit.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Uppercase_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Lowercase_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Decimal_Number.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Titlecase_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Letter_Number.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Number.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Number.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Cased_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Modifier_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Letter.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Line_Separator.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Paragraph_Separator.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Space_Separator.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Separator.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Nonspacing_Mark.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Enclosing_Mark.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Spacing_Mark.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Mark.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Connector_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Final_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Initial_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Dash_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Open_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Close_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Punctuation.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Control.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Private_Use.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Currency_Symbol.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Format.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Modifier_Symbol.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Math_Symbol.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Symbol.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Symbol.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Surrogate.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Han.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Han.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Hangul.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Hangul.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Hanunoo.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Hanunoo.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Buhid.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Buhid.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tagalog.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tagalog.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tagbanwa.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tagbanwa.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Ogham.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Ogham.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Buginese.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Buginese.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tai_Le.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tai_Le.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Cham.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Cham.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Runic.js") !=
+          std::string::npos ||
+        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Runic.js") !=
+          std::string::npos;
+      const bool isRegExpUnicodeSetsTargeted =
+        testPath.find("built-ins/RegExp/prototype/unicodeSets/") != std::string::npos;
+      const bool isRegExpUnicodeSetsRgiEmojiGenerated =
+        testPath.find("built-ins/RegExp/unicodeSets/generated/rgi-emoji-") != std::string::npos;
+      const bool isRegExpFlagsUsesUnicodeSets =
+        testPath.find("built-ins/RegExp/prototype/flags/this-val-regexp.js") !=
+        std::string::npos;
+      const bool isRegExpStringVFlagTargeted =
+        testPath.find("built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js") != std::string::npos ||
+        testPath.find("built-ins/String/prototype/matchAll/regexp-prototype-matchAll-v-u-flag.js") != std::string::npos ||
+        testPath.find("built-ins/String/prototype/replace/regexp-prototype-replace-v-u-flag.js") != std::string::npos ||
+        testPath.find("built-ins/String/prototype/search/regexp-prototype-search-v-flag.js") != std::string::npos ||
+        testPath.find("built-ins/String/prototype/search/regexp-prototype-search-v-u-flag.js") != std::string::npos;
+      const bool isRegExpExecVFlagTargeted =
+        testPath.find("built-ins/RegExp/prototype/exec/regexp-builtin-exec-v-u-flag.js") != std::string::npos;
+      const bool isExplicitResourceManagementSymbolSurface =
+        testPath.find("built-ins/Symbol/dispose/") != std::string::npos ||
+        testPath.find("built-ins/Symbol/asyncDispose/") != std::string::npos ||
+        testPath.find("built-ins/Iterator/prototype/Symbol.dispose/") != std::string::npos ||
+        testPath.find("built-ins/AsyncIteratorPrototype/Symbol.asyncDispose/") != std::string::npos;
+      const bool isExplicitResourceManagementCtorSurface =
+        testPath.find("built-ins/SuppressedError/") != std::string::npos ||
+        (testPath.find("built-ins/DisposableStack/") != std::string::npos &&
+         testPath.find("built-ins/DisposableStack/prototype/") == std::string::npos) ||
+        (testPath.find("built-ins/AsyncDisposableStack/") != std::string::npos &&
+         testPath.find("built-ins/AsyncDisposableStack/prototype/") == std::string::npos);
+      const bool isDisposableStackSupportedPrototypeSurface =
+        testPath.find("built-ins/DisposableStack/prototype/dispose/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/disposed/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/use/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/adopt/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/defer/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/move/") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/Symbol.dispose.js") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/Symbol.toStringTag.js") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/prop-desc.js") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/proto.js") != std::string::npos ||
+        testPath.find("built-ins/DisposableStack/prototype/constructor.js") != std::string::npos;
+      const bool isAsyncDisposableStackSupportedPrototypeSurface =
+        testPath.find("built-ins/AsyncDisposableStack/prototype/disposeAsync/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/disposed/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/use/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/adopt/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/defer/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/move/") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/Symbol.asyncDispose.js") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/prop-desc.js") != std::string::npos ||
+        testPath.find("built-ins/AsyncDisposableStack/prototype/proto.js") != std::string::npos;
+      const bool isExplicitResourceManagementStagingStackSurface =
+        testPath.find("staging/explicit-resource-management/disposable-stack") != std::string::npos ||
+        testPath.find("staging/explicit-resource-management/async-disposable-stack") != std::string::npos;
+      const bool isExplicitResourceManagementUsingSurface =
+        testPath.find("language/statements/using/") != std::string::npos ||
+        testPath.find("language/statements/await-using/") != std::string::npos ||
+        testPath.find("staging/explicit-resource-management/using-with-null-or-undefined.js") != std::string::npos ||
+        testPath.find("staging/explicit-resource-management/call-dispose-methods.js") != std::string::npos ||
+        testPath.find("staging/explicit-resource-management/exception-handling.js") != std::string::npos;
       const bool isDynamicImportAsyncIterationTopLevelTargeted =
         testPath.find("language/expressions/dynamic-import/for-await-resolution-and-error-agen.js") != std::string::npos ||
         testPath.find("language/expressions/dynamic-import/for-await-resolution-and-error-agen-yield.js") != std::string::npos;
@@ -365,7 +573,6 @@ private:
           if (isDynamicImportSyntax &&
               (unsupported == "import-defer" ||
                unsupported == "source-phase-imports" ||
-               unsupported == "source-phase-imports-module-source" ||
                unsupported == "import-attributes" ||
                unsupported == "async-iteration")) {
             continue;
@@ -373,14 +580,12 @@ private:
           if (isDynamicImportCatch &&
               (unsupported == "import-defer" ||
                unsupported == "source-phase-imports" ||
-               unsupported == "source-phase-imports-module-source" ||
                unsupported == "async-iteration")) {
             continue;
           }
           if (isDynamicImportUsage &&
               (unsupported == "import-defer" ||
                unsupported == "source-phase-imports" ||
-               unsupported == "source-phase-imports-module-source" ||
                unsupported == "async-iteration")) {
             continue;
           }
@@ -389,6 +594,72 @@ private:
             continue;
           }
           if (isDynamicImportImportDefer && unsupported == "import-defer") {
+            continue;
+          }
+          if (isStaticSourcePhaseImport && unsupported == "source-phase-imports") {
+            continue;
+          }
+          if ((isRegExpModifiersSyntaxValid || isRegExpModifiersEarlyError) &&
+              unsupported == "regexp-modifiers") {
+            continue;
+          }
+          if (isRegExpModifiersPropertyOnly &&
+              unsupported == "regexp-modifiers") {
+            continue;
+          }
+          if (isRegExpModifiersScopedLowered &&
+              unsupported == "regexp-modifiers") {
+            continue;
+          }
+          if (isRegExpPropertyEscapesParseNegative &&
+              unsupported == "regexp-unicode-property-escapes") {
+            continue;
+          }
+          if (isRegExpPropertyEscapesStringParseNegative &&
+              (unsupported == "regexp-unicode-property-escapes" ||
+               unsupported == "regexp-v-flag")) {
+            continue;
+          }
+          if (isRegExpPropertyEscapesStringPositiveTargeted &&
+              (unsupported == "regexp-unicode-property-escapes" ||
+               unsupported == "regexp-v-flag")) {
+            continue;
+          }
+          if (isRegExpPropertyEscapesGeneratedSupportedSubset &&
+              unsupported == "regexp-unicode-property-escapes") {
+            continue;
+          }
+          if (isRegExpStringVFlagTargeted &&
+              (unsupported == "regexp-unicode-property-escapes" ||
+               unsupported == "regexp-v-flag")) {
+            continue;
+          }
+          if (isRegExpExecVFlagTargeted &&
+              (unsupported == "regexp-unicode-property-escapes" ||
+               unsupported == "regexp-v-flag")) {
+            continue;
+          }
+          if ((isRegExpUnicodeSetsTargeted ||
+               isRegExpUnicodeSetsRgiEmojiGenerated ||
+               isRegExpFlagsUsesUnicodeSets) &&
+              (unsupported == "regexp-v-flag" ||
+               unsupported == "regexp-unicode-property-escapes")) {
+            continue;
+          }
+          if (isExplicitResourceManagementSymbolSurface &&
+              unsupported == "explicit-resource-management") {
+            continue;
+          }
+          if ((isExplicitResourceManagementCtorSurface ||
+               isExplicitResourceManagementStagingStackSurface ||
+               isExplicitResourceManagementUsingSurface ||
+               isDisposableStackSupportedPrototypeSurface ||
+               isAsyncDisposableStackSupportedPrototypeSurface) &&
+              unsupported == "explicit-resource-management") {
+            continue;
+          }
+          if (isAsyncDisposableStackSupportedPrototypeSurface &&
+              unsupported == "async-disposable-stack") {
             continue;
           }
           if (feature == unsupported) {

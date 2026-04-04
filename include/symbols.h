@@ -10,6 +10,10 @@ public:
   static const std::string& iteratorKey();
   static const Value& asyncIterator();
   static const std::string& asyncIteratorKey();
+  static const Value& dispose();
+  static const std::string& disposeKey();
+  static const Value& asyncDispose();
+  static const std::string& asyncDisposeKey();
   static const Value& toStringTag();
   static const std::string& toStringTagKey();
   static const Value& toPrimitive();
