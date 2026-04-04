@@ -20408,6 +20408,361 @@ GCPtr<Environment> Environment::createGlobal() {
   };
   promiseConstructor->properties["allSettled"] = Value(promiseAllSettled);
 
+  // Promise.allKeyed - resolves a dictionary of keyed values
+  auto promiseAllKeyed = GarbageCollector::makeGC<Function>();
+  promiseAllKeyed->isNative = true;
+  promiseAllKeyed->isConstructor = false;
+  promiseAllKeyed->properties["__uses_this_arg__"] = Value(true);
+  promiseAllKeyed->properties["__throw_on_new__"] = Value(true);
+  promiseAllKeyed->properties["name"] = Value(std::string("allKeyed"));
+  promiseAllKeyed->properties["__non_writable_name"] = Value(true);
+  promiseAllKeyed->properties["__non_enum_name"] = Value(true);
+  promiseAllKeyed->properties["length"] = Value(1.0);
+  promiseAllKeyed->properties["__non_writable_length"] = Value(true);
+  promiseAllKeyed->properties["__non_enum_length"] = Value(true);
+  promiseAllKeyed->nativeFunc = [callChecked, getProperty, newPromiseCapability](const std::vector<Value>& args) -> Value {
+    Value constructor = args.empty() ? Value(Undefined{}) : args[0];
+    Value dictionary = args.size() > 1 ? args[1] : Value(Undefined{});
+
+    auto typeErrorValue = [](const std::string& msg) -> Value {
+      return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, msg));
+    };
+
+    auto [resultPromise, resolve, reject] = newPromiseCapability(constructor);
+    auto rejectAndReturn = [&](const Value& reason) -> Value {
+      try {
+        callChecked(reject, {reason}, Value(Undefined{}));
+      } catch (...) {
+      }
+      return resultPromise;
+    };
+
+    Value promiseResolveMethod = Value(Undefined{});
+    try {
+      auto [hasResolve, resolveValue] = getProperty(constructor, "resolve");
+      if (!hasResolve || !resolveValue.isFunction()) {
+        return rejectAndReturn(typeErrorValue("Promise.resolve is not callable"));
+      }
+      promiseResolveMethod = resolveValue;
+    } catch (const JsValueException& e) {
+      return rejectAndReturn(e.value());
+    } catch (const std::exception& e) {
+      return rejectAndReturn(Value(std::string(e.what())));
+    }
+
+    Value keysValue = Value(Undefined{});
+    try {
+      keysValue = Object_keys({dictionary});
+    } catch (const JsValueException& e) {
+      return rejectAndReturn(e.value());
+    } catch (const std::exception& e) {
+      return rejectAndReturn(Value(std::string(e.what())));
+    }
+
+    if (!keysValue.isArray()) {
+      return rejectAndReturn(typeErrorValue("Object.keys result is not an array"));
+    }
+
+    auto keysArray = keysValue.getGC<Array>();
+    auto resultObject = makeObjectWithPrototype();
+    if (keysArray->elements.empty()) {
+      try {
+        callChecked(resolve, {Value(resultObject)}, Value(Undefined{}));
+      } catch (...) {
+      }
+      return resultPromise;
+    }
+
+    auto remaining = std::make_shared<size_t>(keysArray->elements.size());
+    auto alreadyRejected = std::make_shared<bool>(false);
+    auto resolveIfDone = [remaining, alreadyRejected, resolve, resultObject, callChecked]() {
+      if (*remaining != 0 || *alreadyRejected) {
+        return;
+      }
+      try {
+        callChecked(resolve, {Value(resultObject)}, Value(Undefined{}));
+      } catch (...) {
+      }
+    };
+    auto rejectOnce = [alreadyRejected, reject, callChecked](const Value& reason) {
+      if (*alreadyRejected) {
+        return;
+      }
+      *alreadyRejected = true;
+      try {
+        callChecked(reject, {reason}, Value(Undefined{}));
+      } catch (...) {
+      }
+    };
+
+    for (const auto& keyValue : keysArray->elements) {
+      std::string key = keyValue.toString();
+      Value nextValue = Value(Undefined{});
+      try {
+        auto [hasValue, propertyValue] = getProperty(dictionary, key);
+        nextValue = hasValue ? propertyValue : Value(Undefined{});
+      } catch (const JsValueException& e) {
+        return rejectAndReturn(e.value());
+      } catch (const std::exception& e) {
+        return rejectAndReturn(Value(std::string(e.what())));
+      }
+
+      Value nextPromise = Value(Undefined{});
+      try {
+        nextPromise = callChecked(promiseResolveMethod, {nextValue}, constructor);
+      } catch (const JsValueException& e) {
+        return rejectAndReturn(e.value());
+      } catch (const std::exception& e) {
+        return rejectAndReturn(Value(std::string(e.what())));
+      }
+
+      auto alreadySettled = std::make_shared<bool>(false);
+
+      auto fulfillElement = GarbageCollector::makeGC<Function>();
+      fulfillElement->isNative = true;
+      fulfillElement->isConstructor = false;
+      fulfillElement->properties["name"] = Value(std::string(""));
+      fulfillElement->properties["__non_writable_name"] = Value(true);
+      fulfillElement->properties["__non_enum_name"] = Value(true);
+      fulfillElement->properties["length"] = Value(1.0);
+      fulfillElement->properties["__non_writable_length"] = Value(true);
+      fulfillElement->properties["__non_enum_length"] = Value(true);
+      fulfillElement->nativeFunc = [resultObject, key, remaining, alreadySettled, resolveIfDone]
+        (const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadySettled) {
+          return Value(Undefined{});
+        }
+        *alreadySettled = true;
+        resultObject->properties[key] = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+        (*remaining)--;
+        resolveIfDone();
+        return Value(Undefined{});
+      };
+
+      auto rejectElement = GarbageCollector::makeGC<Function>();
+      rejectElement->isNative = true;
+      rejectElement->isConstructor = false;
+      rejectElement->properties["name"] = Value(std::string(""));
+      rejectElement->properties["__non_writable_name"] = Value(true);
+      rejectElement->properties["__non_enum_name"] = Value(true);
+      rejectElement->properties["length"] = Value(1.0);
+      rejectElement->properties["__non_writable_length"] = Value(true);
+      rejectElement->properties["__non_enum_length"] = Value(true);
+      rejectElement->nativeFunc = [alreadySettled, rejectOnce](const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadySettled) {
+          return Value(Undefined{});
+        }
+        *alreadySettled = true;
+        rejectOnce(innerArgs.empty() ? Value(Undefined{}) : innerArgs[0]);
+        return Value(Undefined{});
+      };
+
+      try {
+        auto [hasThen, thenValue] = getProperty(nextPromise, "then");
+        if (!hasThen || !thenValue.isFunction()) {
+          return rejectAndReturn(typeErrorValue("Promise resolve result is not thenable"));
+        }
+        callChecked(thenValue, {Value(fulfillElement), Value(rejectElement)}, nextPromise);
+      } catch (const JsValueException& e) {
+        if (!*alreadySettled) {
+          rejectOnce(e.value());
+        }
+        return resultPromise;
+      } catch (const std::exception& e) {
+        if (!*alreadySettled) {
+          rejectOnce(Value(std::string(e.what())));
+        }
+        return resultPromise;
+      }
+    }
+
+    return resultPromise;
+  };
+  promiseConstructor->properties["allKeyed"] = Value(promiseAllKeyed);
+  promiseConstructor->properties["__non_enum_allKeyed"] = Value(true);
+
+  // Promise.allSettledKeyed - settles a dictionary of keyed values
+  auto promiseAllSettledKeyed = GarbageCollector::makeGC<Function>();
+  promiseAllSettledKeyed->isNative = true;
+  promiseAllSettledKeyed->isConstructor = false;
+  promiseAllSettledKeyed->properties["__uses_this_arg__"] = Value(true);
+  promiseAllSettledKeyed->properties["__throw_on_new__"] = Value(true);
+  promiseAllSettledKeyed->properties["name"] = Value(std::string("allSettledKeyed"));
+  promiseAllSettledKeyed->properties["__non_writable_name"] = Value(true);
+  promiseAllSettledKeyed->properties["__non_enum_name"] = Value(true);
+  promiseAllSettledKeyed->properties["length"] = Value(1.0);
+  promiseAllSettledKeyed->properties["__non_writable_length"] = Value(true);
+  promiseAllSettledKeyed->properties["__non_enum_length"] = Value(true);
+  promiseAllSettledKeyed->nativeFunc = [callChecked, getProperty, newPromiseCapability](const std::vector<Value>& args) -> Value {
+    Value constructor = args.empty() ? Value(Undefined{}) : args[0];
+    Value dictionary = args.size() > 1 ? args[1] : Value(Undefined{});
+
+    auto typeErrorValue = [](const std::string& msg) -> Value {
+      return Value(GarbageCollector::makeGC<Error>(ErrorType::TypeError, msg));
+    };
+
+    auto [resultPromise, resolve, reject] = newPromiseCapability(constructor);
+    auto rejectAndReturn = [&](const Value& reason) -> Value {
+      try {
+        callChecked(reject, {reason}, Value(Undefined{}));
+      } catch (...) {
+      }
+      return resultPromise;
+    };
+
+    Value promiseResolveMethod = Value(Undefined{});
+    try {
+      auto [hasResolve, resolveValue] = getProperty(constructor, "resolve");
+      if (!hasResolve || !resolveValue.isFunction()) {
+        return rejectAndReturn(typeErrorValue("Promise.resolve is not callable"));
+      }
+      promiseResolveMethod = resolveValue;
+    } catch (const JsValueException& e) {
+      return rejectAndReturn(e.value());
+    } catch (const std::exception& e) {
+      return rejectAndReturn(Value(std::string(e.what())));
+    }
+
+    Value keysValue = Value(Undefined{});
+    try {
+      keysValue = Object_keys({dictionary});
+    } catch (const JsValueException& e) {
+      return rejectAndReturn(e.value());
+    } catch (const std::exception& e) {
+      return rejectAndReturn(Value(std::string(e.what())));
+    }
+
+    if (!keysValue.isArray()) {
+      return rejectAndReturn(typeErrorValue("Object.keys result is not an array"));
+    }
+
+    auto keysArray = keysValue.getGC<Array>();
+    auto resultObject = makeObjectWithPrototype();
+    if (keysArray->elements.empty()) {
+      try {
+        callChecked(resolve, {Value(resultObject)}, Value(Undefined{}));
+      } catch (...) {
+      }
+      return resultPromise;
+    }
+
+    auto remaining = std::make_shared<size_t>(keysArray->elements.size());
+    auto alreadyRejected = std::make_shared<bool>(false);
+    auto resolveIfDone = [remaining, alreadyRejected, resolve, resultObject, callChecked]() {
+      if (*remaining != 0 || *alreadyRejected) {
+        return;
+      }
+      try {
+        callChecked(resolve, {Value(resultObject)}, Value(Undefined{}));
+      } catch (...) {
+      }
+    };
+    auto rejectOnce = [alreadyRejected, reject, callChecked](const Value& reason) {
+      if (*alreadyRejected) {
+        return;
+      }
+      *alreadyRejected = true;
+      try {
+        callChecked(reject, {reason}, Value(Undefined{}));
+      } catch (...) {
+      }
+    };
+
+    for (const auto& keyValue : keysArray->elements) {
+      std::string key = keyValue.toString();
+      Value nextValue = Value(Undefined{});
+      try {
+        auto [hasValue, propertyValue] = getProperty(dictionary, key);
+        nextValue = hasValue ? propertyValue : Value(Undefined{});
+      } catch (const JsValueException& e) {
+        return rejectAndReturn(e.value());
+      } catch (const std::exception& e) {
+        return rejectAndReturn(Value(std::string(e.what())));
+      }
+
+      Value nextPromise = Value(Undefined{});
+      try {
+        nextPromise = callChecked(promiseResolveMethod, {nextValue}, constructor);
+      } catch (const JsValueException& e) {
+        return rejectAndReturn(e.value());
+      } catch (const std::exception& e) {
+        return rejectAndReturn(Value(std::string(e.what())));
+      }
+
+      auto alreadySettled = std::make_shared<bool>(false);
+
+      auto fulfillElement = GarbageCollector::makeGC<Function>();
+      fulfillElement->isNative = true;
+      fulfillElement->isConstructor = false;
+      fulfillElement->properties["name"] = Value(std::string(""));
+      fulfillElement->properties["__non_writable_name"] = Value(true);
+      fulfillElement->properties["__non_enum_name"] = Value(true);
+      fulfillElement->properties["length"] = Value(1.0);
+      fulfillElement->properties["__non_writable_length"] = Value(true);
+      fulfillElement->properties["__non_enum_length"] = Value(true);
+      fulfillElement->nativeFunc = [resultObject, key, remaining, alreadySettled, resolveIfDone]
+        (const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadySettled) {
+          return Value(Undefined{});
+        }
+        *alreadySettled = true;
+        auto entry = makeObjectWithPrototype();
+        entry->properties["status"] = Value(std::string("fulfilled"));
+        entry->properties["value"] = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+        resultObject->properties[key] = Value(entry);
+        (*remaining)--;
+        resolveIfDone();
+        return Value(Undefined{});
+      };
+
+      auto rejectElement = GarbageCollector::makeGC<Function>();
+      rejectElement->isNative = true;
+      rejectElement->isConstructor = false;
+      rejectElement->properties["name"] = Value(std::string(""));
+      rejectElement->properties["__non_writable_name"] = Value(true);
+      rejectElement->properties["__non_enum_name"] = Value(true);
+      rejectElement->properties["length"] = Value(1.0);
+      rejectElement->properties["__non_writable_length"] = Value(true);
+      rejectElement->properties["__non_enum_length"] = Value(true);
+      rejectElement->nativeFunc = [resultObject, key, remaining, alreadySettled, resolveIfDone]
+        (const std::vector<Value>& innerArgs) -> Value {
+        if (*alreadySettled) {
+          return Value(Undefined{});
+        }
+        *alreadySettled = true;
+        auto entry = makeObjectWithPrototype();
+        entry->properties["status"] = Value(std::string("rejected"));
+        entry->properties["reason"] = innerArgs.empty() ? Value(Undefined{}) : innerArgs[0];
+        resultObject->properties[key] = Value(entry);
+        (*remaining)--;
+        resolveIfDone();
+        return Value(Undefined{});
+      };
+
+      try {
+        auto [hasThen, thenValue] = getProperty(nextPromise, "then");
+        if (!hasThen || !thenValue.isFunction()) {
+          return rejectAndReturn(typeErrorValue("Promise resolve result is not thenable"));
+        }
+        callChecked(thenValue, {Value(fulfillElement), Value(rejectElement)}, nextPromise);
+      } catch (const JsValueException& e) {
+        if (!*alreadySettled) {
+          rejectOnce(e.value());
+        }
+        return resultPromise;
+      } catch (const std::exception& e) {
+        if (!*alreadySettled) {
+          rejectOnce(Value(std::string(e.what())));
+        }
+        return resultPromise;
+      }
+    }
+
+    return resultPromise;
+  };
+  promiseConstructor->properties["allSettledKeyed"] = Value(promiseAllSettledKeyed);
+  promiseConstructor->properties["__non_enum_allSettledKeyed"] = Value(true);
+
   // Promise.any - resolves when any promise fulfills, rejects if all reject
   auto promiseAny = GarbageCollector::makeGC<Function>();
   promiseAny->isNative = true;

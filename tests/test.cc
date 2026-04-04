@@ -1699,6 +1699,45 @@ int main() {
     num * num
   )", "25", true);
 
+  runTest("Promise keyed combinator surface", R"(
+    let threw = false;
+    try {
+      new Promise.allKeyed({});
+    } catch (e) {
+      threw = e instanceof TypeError;
+    }
+    [
+      typeof Promise.allKeyed,
+      Promise.allKeyed.name,
+      Promise.allKeyed.length,
+      typeof Promise.allSettledKeyed,
+      Promise.allSettledKeyed.name,
+      Promise.allSettledKeyed.length,
+      threw
+    ].join("|")
+  )", "function|allKeyed|1|function|allSettledKeyed|1|true");
+
+  runTest("Promise.allKeyed resolves keyed values", R"(
+    let result = await Promise.allKeyed({
+      a: Promise.resolve(1),
+      b: 2
+    });
+    result.a + "," + result.b
+  )", "1,2", true);
+
+  runTest("Promise.allSettledKeyed settles keyed values", R"(
+    let result = await Promise.allSettledKeyed({
+      ok: Promise.resolve(3),
+      nope: Promise.reject("x")
+    });
+    [
+      result.ok.status,
+      result.ok.value,
+      result.nope.status,
+      result.nope.reason
+    ].join("|")
+  )", "fulfilled|3|rejected|x", true);
+
   // Unicode tests
   runTest("Unicode - emoji length", R"(
     const str = "Hello 👋 World 🌍";

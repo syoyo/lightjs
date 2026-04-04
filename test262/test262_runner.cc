@@ -317,7 +317,6 @@ private:
       static const std::vector<std::string> kUnsupportedFeatures = {
         "regexp-v-flag",
         "regexp-unicode-property-escapes",
-        "await-dictionary",
       };
       bool allowTopLevelAwaitForAwaitSyntaxCoverage =
         testPath.find("language/module-code/top-level-await/syntax/for-await-await-expr-") != std::string::npos;

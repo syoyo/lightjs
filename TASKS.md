@@ -23,18 +23,19 @@ This document tracks planned enhancements and future work for LightJS.
    - `build/test262_runner ./test262-suite --no-temp-skips --test language/expressions/dynamic-import`
    - `build/test262_runner ./test262-suite --no-temp-skips --test language --filter "tco"`
 
-### Latest Status (2026-03-26)
+### Latest Status (2026-04-04)
 
 | Scope | Result | Notes |
 |---|---|---|
-| `./build/test262_runner ./test262_suite --no-temp-skips` | `23,445 / 23,629` pass | `0` fail, `184` skip. This is the runner's default `test/language` sweep. |
-| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite passes after increasing `lightjs_test` timeout to account for the expanded regression set. |
+| `./build/test262_runner ./test262_suite --no-temp-skips` | `23,445 / 23,629` pass | `0` fail, `184` skip. This remains the most recent completed default `test/language` sweep; a fresh whole-suite rerun is still pending after the keyed-Promise batch. |
+| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite passes after increasing `lightjs_test` timeout to account for the expanded regression set, and it was revalidated after the keyed-Promise changes. |
+| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/Promise/allKeyed` + `built-ins/Promise/allSettledKeyed` | `12 / 12` pass | `await-dictionary` surface is now covered by `Promise.allKeyed` / `Promise.allSettledKeyed`; the live runner feature gate no longer includes `await-dictionary`. |
 
 Current failing `test262` clusters:
 
 - None in the default `test/language` sweep as of `2026-03-26`; the previous decorator, dynamic-import enumeration, and arrow-function restricted-property failures are now fixed.
 
-Current skip buckets observed in the full language run:
+Skip buckets observed in the last completed full language run:
 
 - `explicit-resource-management`
 - `async-disposable-stack`
@@ -595,21 +596,24 @@ When working on tasks:
   - Built-in constructor early errors: `built-ins/RegExp --filter syntax-err-arithmetic-modifiers` → `55/55` passing.
   - Built-in constructor early errors: `built-ins/RegExp --filter early-err-modifiers` → `22/22` passing.
   - Property-only runtime coverage: `built-ins/RegExp/regexp-modifiers --filter property` → `6/6` passing.
-  - This is no longer the main runner gate. The live `test262_runner` feature skip list is now centered on `regexp-v-flag`, `regexp-unicode-property-escapes`, and `await-dictionary`; the modifier shard still needs matcher semantics for scoped `i` / `m` / `s`, nested alternation isolation, and backreference behavior.
+  - This is no longer the main runner gate. The live `test262_runner` feature skip list is now centered on `regexp-v-flag` and `regexp-unicode-property-escapes`; the modifier shard still needs matcher semantics for scoped `i` / `m` / `s`, nested alternation isolation, and backreference behavior.
 - Recent RegExp status:
   - `built-ins/RegExp/prototype` → `487/487` passing after the `@@match`, `@@replace`, `@@search`, `@@matchAll`, `source`, `flags`, and `hasIndices` fixes.
   - `built-ins/RegExp/property-escapes/generated/ASCII_Hex_Digit.js` → `1/1` passing.
-  - The runner now explicitly unskips a narrow `property-escapes/generated` subset: `ASCII`, `ASCII_Hex_Digit`, `Script=Han`, `Script_Extensions=Han`, `Script=Hangul`, `Script_Extensions=Hangul`, `Script=Hanunoo`, `Script_Extensions=Hanunoo`, `Script=Buhid`, `Script_Extensions=Buhid`, `Script=Tagalog`, `Script_Extensions=Tagalog`, `Script=Tagbanwa`, `Script_Extensions=Tagbanwa`, `Script=Ogham`, `Script_Extensions=Ogham`, `Script=Buginese`, `Script_Extensions=Buginese`, `Script=Tai_Le`, `Script_Extensions=Tai_Le`, and `Script=Cham`, `Script_Extensions=Cham`.
+  - The runner currently explicitly unskips a `property-escapes/generated` subset that mirrors the implemented classifier/matcher set (currently 67 generated files). The next bounded regex expansion is the high-coverage script families (`Common`, `Inherited`, `Latin`, `Arabic`, `Cyrillic`, `Devanagari`, `Bengali`, `Gujarati`, `Brahmi`, `Khmer`) before tackling the remaining long tail.
 - Remaining unsupported feature buckets still present in the live `test262/test262_runner.cc` feature gate:
-  - `await-dictionary`
   - `regexp-v-flag`
   - `regexp-unicode-property-escapes`
+- Recent Promise status:
+  - `built-ins/Promise/allKeyed` → `6/6` passing.
+  - `built-ins/Promise/allSettledKeyed` → `6/6` passing.
+  - `await-dictionary` has been removed from the live `test262_runner` unsupported feature list after adding `Promise.allKeyed` / `Promise.allSettledKeyed`.
 - Stale historical notes:
   - `regexp-modifiers`, `explicit-resource-management`, `async-disposable-stack`, and `source-phase-imports-module-source` still appear in older task notes, but they are not in the current `kUnsupportedFeatures` list and should not be treated as the active global skip buckets.
 - Focused regression status:
   - `with` / `Symbol.unscopables` probes (`language/statements/with/{unscopables-inc-dec,set-mutable-binding-idref-with-proxy-env,set-mutable-binding-idref-compound-assign-with-proxy-env}.js`) and the related `function/arrow` unscopables suites pass.
-- `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, the selected Unicode property-escape subset, and explicit resource management disposal ordering. Current local result is `392/392` passing.
+  - `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, the selected Unicode property-escape subset, explicit resource management disposal ordering, and keyed Promise combinators. Current local result is `395/395` passing.
 
 ---
 
-**Last Updated:** 2026-04-04 (local regression and CTest status refreshed)
+**Last Updated:** 2026-04-04 (await-dictionary status and local regression totals refreshed)
