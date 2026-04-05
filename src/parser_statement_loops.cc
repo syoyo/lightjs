@@ -400,6 +400,7 @@ StmtPtr Parser::parseForStatement() {
       if (auto* varDecl = std::get_if<VarDeclaration>(&left->node)) {
         if (varDecl->kind == VarDeclaration::Kind::Let ||
             varDecl->kind == VarDeclaration::Kind::Const ||
+            varDecl->kind == VarDeclaration::Kind::Using ||
             varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
           std::vector<std::string> headNames;
           for (auto& decl : varDecl->declarations) {
@@ -545,6 +546,7 @@ StmtPtr Parser::parseForStatement() {
     if (auto* varDecl = std::get_if<VarDeclaration>(&init->node)) {
       if (varDecl->kind == VarDeclaration::Kind::Let ||
           varDecl->kind == VarDeclaration::Kind::Const ||
+          varDecl->kind == VarDeclaration::Kind::Using ||
           varDecl->kind == VarDeclaration::Kind::AwaitUsing) {
         std::vector<std::string> headNames;
         for (auto& decl : varDecl->declarations) {

@@ -2482,6 +2482,35 @@ int main() {
   }
   std::cout << std::endl;
 
+  gTotalTests++;
+  std::cout << "Test: Parser rejects for-head using var collisions" << std::endl;
+  try {
+    auto expectParseFailure = [](const std::string& code, bool isModule = false) {
+      Lexer lexer(code);
+      auto tokens = lexer.tokenize();
+      Parser parser(tokens, isModule);
+      parser.setSource(code);
+      return !parser.parse().has_value();
+    };
+    bool ok =
+      expectParseFailure("for (using x of []) { var x; }") &&
+      expectParseFailure(R"(
+        async function f() {
+          for (await using x of []) { var x; }
+        }
+      )", true);
+    if (!ok) {
+      std::cout << "  FAILED! Parser accepted invalid using head/body var name collisions" << std::endl;
+      gFailedTests++;
+    } else {
+      std::cout << "  PASSED" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cout << "  Error: " << e.what() << std::endl;
+    gFailedTests++;
+  }
+  std::cout << std::endl;
+
   runTest("RegExp scoped modifier lowering", R"(
     function expect(cond, label) {
       if (!cond) throw new Error(label);
@@ -2857,6 +2886,22 @@ int main() {
       /^\p{sc=Zzzz}+$/u.test(String.fromCodePoint(0x038B))
     ].join("|")
   )", "true|true|false|true|true|true|true|true");
+
+  runTest("RegExp property escapes additional binary aliases", R"(
+    [
+      /^\p{Alpha}+$/u.test("A"),
+      /^\p{space}+$/u.test("\u3000"),
+      /^\p{Bidi_C}+$/u.test("\u200E"),
+      /^\p{Bidi_M}+$/u.test("("),
+      /^\p{DI}+$/u.test("\u00AD"),
+      /^\p{EComp}+$/u.test("\uFE0F"),
+      /^\p{ExtPict}+$/u.test("\u{1F600}"),
+      /^\p{Hex}+$/u.test("AF09"),
+      /^\p{ID_Start}+$/u.test("A"),
+      /^\p{VS}+$/u.test("\uFE0F"),
+      /^\p{White_Space}+$/u.test("A")
+    ].join("|")
+  )", "true|true|true|true|true|true|true|true|true|true|false");
 
   runTest("RegExp symbol methods use UTF-16 indices for astral text", R"(
     [

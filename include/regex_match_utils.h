@@ -4984,6 +4984,8 @@ inline bool regexMatchesUnicodePropertyScriptExtensionsKhmer(uint32_t cp) {
 
 #include "regex_additional_script_matchers.inc"
 
+#include "regex_additional_binary_matchers.inc"
+
 inline bool regexMatchesSupportedUnicodeProperty(SupportedRegexUnicodeProperty property,
                                                  uint32_t cp) {
   switch (property) {
@@ -5063,6 +5065,11 @@ inline bool regexMatchesSupportedUnicodeProperty(SupportedRegexUnicodeProperty p
       return regexMatchesUnicodePropertySymbol(cp);
     case SupportedRegexUnicodeProperty::Surrogate:
       return regexMatchesUnicodePropertySurrogate(cp);
+#define LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY(identifier, canonical, alias) \
+    case SupportedRegexUnicodeProperty::identifier:                            \
+      return regexMatchesUnicodeProperty##identifier(cp);
+#include "regex_additional_binary_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY
     case SupportedRegexUnicodeProperty::ScriptHan:
       return regexMatchesUnicodePropertyScriptHan(cp);
     case SupportedRegexUnicodeProperty::ScriptExtensionsHan:

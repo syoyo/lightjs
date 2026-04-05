@@ -49,6 +49,10 @@ enum class SupportedRegexUnicodeProperty {
   OtherSymbol,
   Symbol,
   Surrogate,
+#define LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY(identifier, canonical, alias) \
+  identifier,
+#include "regex_additional_binary_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY
   ScriptHan,
   ScriptExtensionsHan,
   ScriptHangul,
@@ -422,6 +426,12 @@ classifySupportedRegexUnicodePropertyName(const std::string& propertyName) {
       propertyName == "gc=Surrogate") {
     return SupportedRegexUnicodeProperty::Surrogate;
   }
+#define LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY(identifier, canonical, alias) \
+  if (propertyName == #canonical || propertyName == #alias) {                  \
+    return SupportedRegexUnicodeProperty::identifier;                          \
+  }
+#include "regex_additional_binary_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_BINARY_PROPERTY
   if (propertyName == "Script=Han" ||
       propertyName == "Script=Hani" ||
       propertyName == "sc=Han" ||

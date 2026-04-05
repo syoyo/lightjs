@@ -2,7 +2,7 @@
 
 This document tracks planned enhancements and future work for LightJS.
 
-**Current Status:** ~24,000 LOC, ES2020 support, WebAssembly 1.0, C++17/C++20 dual support. Latest `test262` language sweep is `23,445/23,629` passing with `0` language failures and `184` skips.
+**Current Status:** ~24,000 LOC, ES2020 support, WebAssembly 1.0, C++17/C++20 dual support. Latest `test262` language sweep is `23,629/23,629` passing with `0` language failures and `0` skips.
 
 ---
 
@@ -23,28 +23,33 @@ This document tracks planned enhancements and future work for LightJS.
    - `build/test262_runner ./test262-suite --no-temp-skips --test language/expressions/dynamic-import`
    - `build/test262_runner ./test262-suite --no-temp-skips --test language --filter "tco"`
 
-### Latest Status (2026-04-04)
+### Latest Status (2026-04-05)
 
 | Scope | Result | Notes |
 |---|---|---|
-| `./build/test262_runner ./test262_suite --no-temp-skips` | `23,445 / 23,629` pass | `0` fail, `184` skip. This remains the most recent completed default `test/language` sweep; a fresh whole-suite rerun is still pending after the keyed-Promise and regex-script batches. |
-| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite passes after increasing `lightjs_test` timeout to account for the expanded regression set, and it was revalidated after the generalized script-property batch. |
-| `./build/lightjs_test` | `398 / 398` pass | Local regressions now include exact trailing-range coverage for the first script slice plus broader generated-script alias coverage such as `Armn`, `Cans`, `Zanb`, and `Zzzz`. |
+| `./build/test262_runner ./test262_suite --no-temp-skips` | `23,629 / 23,629` pass | `0` fail, `0` skip. The last remaining parser failure (`language/statements/for-of/head-using-bound-names-in-stmt.js`) is now fixed. |
+| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite was rerun after the generated binary-property batch and the `for (... using ...)` parser early-error fix. |
+| `./build/lightjs_test` | `400 / 400` pass | Local regressions now include generated binary property aliases plus parser coverage for `for` / `for-of` head `using` redeclaration early errors. |
 | `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/Promise/allKeyed` + `built-ins/Promise/allSettledKeyed` | `12 / 12` pass | `await-dictionary` surface is now covered by `Promise.allKeyed` / `Promise.allSettledKeyed`; the live runner feature gate no longer includes `await-dictionary`. |
-| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/RegExp/property-escapes/generated/{Script_-_Armenian.js,Script_Extensions_-_Armenian.js,Script_-_Canadian_Aboriginal.js,Script_-_Zanabazar_Square.js}` | `4 / 4` pass | Representative generated-script sentinels now pass after generalizing script support beyond the first 10-family slice. A broader rerun is still pending because these generated shards are expensive. |
+| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/RegExp/property-escapes/generated/{Script_-_Armenian.js,Script_Extensions_-_Armenian.js,Script_-_Canadian_Aboriginal.js,Script_-_Zanabazar_Square.js}` | `4 / 4` pass | Representative generated-script sentinels now pass after generalizing script support beyond the first 10-family slice. |
+| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/RegExp/property-escapes/generated/{Any.js,Alphabetic.js,White_Space.js,ID_Start.js,Variation_Selector.js}` | `5 / 5` pass | Representative generated binary-property sentinels now pass after wiring the remaining `51` non-script Unicode properties and aliases into parser classification plus matcher tables. |
 
 Current failing `test262` clusters:
 
-- None in the default `test/language` sweep as of `2026-03-26`; the previous decorator, dynamic-import enumeration, and arrow-function restricted-property failures are now fixed.
+- None in the latest `./build/test262_runner ./test262_suite --no-temp-skips` language sweep; the final remaining parse-negative `for-of`/`using` redeclaration case is now green.
 
 Skip buckets observed in the last completed full language run:
 
-- `explicit-resource-management`
-- `async-disposable-stack`
-- `source-phase-imports-module-source`
-- `regexp-modifiers`
-- `regexp-v-flag`
-- `regexp-unicode-property-escapes`
+- None.
+
+#### Changes (2026-04-05)
+
+**Batch 14:** Language sweep 100.0% (`23,629/23,629`), local regressions 100.0% (`400/400`):
+
+- **Generated binary Unicode property support** (`include/regex_utils.h`, `include/regex_match_utils.h`, `include/regex_additional_binary_properties.inc`, `include/regex_additional_binary_matchers.inc`): added the remaining `51` non-script generated binary property names, aliases, and matcher tables from the Test262 corpus, so the classifier-driven property-escape gating now recognizes sentinels like `Any`, `Alphabetic`, `White_Space`, `ID_Start`, and `Variation_Selector`.
+- **For-head `using` redeclaration early error** (`src/parser_statement_loops.cc`): plain `using` declarations in `for` / `for-of` heads now participate in the same body `var` redeclaration checks as `let`, `const`, and `await using`, fixing the last full-language parser failure.
+- **Regression coverage refresh** (`tests/test.cc`): added local parser coverage for head/body `using` collisions plus binary property alias probes, bringing `lightjs_test` to `400/400`.
+- **Sweep result**: rerunning `./build/test262_runner ./test262_suite --no-temp-skips` now yields `23,629/23,629` with `0` failures and `0` skips.
 
 #### Changes (2026-03-22)
 
@@ -579,9 +584,9 @@ When working on tasks:
 
 ## Test Status
 - Last full verified run:
-  - `./build/test262_runner ./test262_suite --no-temp-skips` (2026-03-26) → `23,445` passed, `0` failed, `184` skipped.
-  - The earlier `23` failures are cleared; the last fixed clusters were decorator parsing, dynamic import attribute enumeration ordering, arrow-function restricted properties, keyword-token default import parsing for static source-phase disambiguation, and the remaining `source-phase-imports` harness coverage.
-- `ctest --test-dir build --output-on-failure` was not rerun after the latest rebuild, so there is no fresh full CTest result recorded here yet.
+  - `./build/test262_runner ./test262_suite --no-temp-skips` (2026-04-05) → `23,629` passed, `0` failed, `0` skipped.
+  - The last remaining language failure was `language/statements/for-of/head-using-bound-names-in-stmt.js [parse]`; the parser now rejects plain `using` head/body `var` collisions just like `let`, `const`, and `await using`.
+- `ctest --test-dir build --output-on-failure` was rerun after the latest rebuild and is back to `13/13` passing.
 - Since the earlier all-green language run, the following previously skipped/unfinished areas were completed with targeted reruns:
   - `features: [caller]` → all `23/23` targeted files passing.
   - `features: [tail-call-optimization]` → all `32/32` targeted files passing.
@@ -603,8 +608,9 @@ When working on tasks:
   - `built-ins/RegExp/prototype` → `487/487` passing after the `@@match`, `@@replace`, `@@search`, `@@matchAll`, `source`, `flags`, and `hasIndices` fixes.
   - `built-ins/RegExp/property-escapes/generated/ASCII_Hex_Digit.js` → `1/1` passing.
   - The runner no longer hardcodes a handwritten `property-escapes/generated` subset. It now derives generated-file support from `classifySupportedRegexUnicodePropertyName(...)`, so new runtime coverage automatically widens the live runner gate.
-  - The latest slice added the remaining `Script` / `Script_Extensions` families from the generated corpus, bringing the implemented script surface to all `350` generated script files. A full generated-script rerun is still pending, but targeted sentinels for `Armenian`, `Script_Extensions=Armenian`, `Canadian_Aboriginal`, and `Zanabazar_Square` are `4/4` passing.
-  - The next regex expansion is the remaining non-script `regexp-unicode-property-escapes` long tail plus the separate `regexp-v-flag` bucket.
+  - The latest script slice added the remaining `Script` / `Script_Extensions` families from the generated corpus, bringing the implemented script surface to all `350` generated script files; representative sentinels for `Armenian`, `Script_Extensions=Armenian`, `Canadian_Aboriginal`, and `Zanabazar_Square` are `4/4` passing.
+  - The next slice added the remaining `51` non-script generated binary Unicode properties; representative sentinels for `Any`, `Alphabetic`, `White_Space`, `ID_Start`, and `Variation_Selector` are `5/5` passing.
+  - The next regex expansion is now the broader `regexp-v-flag` bucket plus any remaining non-generated `regexp-unicode-property-escapes` surfaces that still rely on the live feature gate.
 - Remaining unsupported feature buckets still present in the live `test262/test262_runner.cc` feature gate:
   - `regexp-v-flag`
   - `regexp-unicode-property-escapes`
@@ -616,8 +622,8 @@ When working on tasks:
   - `regexp-modifiers`, `explicit-resource-management`, `async-disposable-stack`, and `source-phase-imports-module-source` still appear in older task notes, but they are not in the current `kUnsupportedFeatures` list and should not be treated as the active global skip buckets.
 - Focused regression status:
   - `with` / `Symbol.unscopables` probes (`language/statements/with/{unscopables-inc-dec,set-mutable-binding-idref-with-proxy-env,set-mutable-binding-idref-compound-assign-with-proxy-env}.js`) and the related `function/arrow` unscopables suites pass.
-  - `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, exact trailing script-range sentinels, broader generated script aliases, explicit resource management disposal ordering, and keyed Promise combinators. Current local result is `398/398` passing.
+  - `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, exact trailing script-range sentinels, broader generated script aliases, generated binary property aliases, `using` head/body redeclaration early errors, explicit resource management disposal ordering, and keyed Promise combinators. Current local result is `400/400` passing.
 
 ---
 
-**Last Updated:** 2026-04-04 (generalized script-property coverage and local regression totals refreshed)
+**Last Updated:** 2026-04-05 (binary property coverage, `using` parser fix, and 100% language sweep refreshed)
