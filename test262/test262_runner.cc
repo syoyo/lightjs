@@ -4,6 +4,7 @@
 #include "environment.h"
 #include "event_loop.h"
 #include "module.h"
+#include "regex_utils.h"
 #include "test262_harness.h"
 #include <iostream>
 #include <fstream>
@@ -125,6 +126,40 @@ private:
     } catch (...) {
       return fallback;
     }
+  }
+
+  bool isSupportedRegExpPropertyEscapesGeneratedTest(const std::string& testPath) const {
+    static const std::string kPrefix = "built-ins/RegExp/property-escapes/generated/";
+    static const std::string kGeneralCategoryPrefix = "General_Category_-_";
+    static const std::string kScriptPrefix = "Script_-_";
+    static const std::string kScriptExtensionsPrefix = "Script_Extensions_-_";
+
+    auto prefixPos = testPath.find(kPrefix);
+    if (prefixPos == std::string::npos) {
+      return false;
+    }
+
+    std::string fileName = testPath.substr(prefixPos + kPrefix.size());
+    if (fileName.find('/') != std::string::npos ||
+        fileName.size() <= 3 ||
+        fileName.compare(fileName.size() - 3, 3, ".js") != 0) {
+      return false;
+    }
+    fileName.resize(fileName.size() - 3);
+
+    std::string propertyName;
+    if (fileName.compare(0, kGeneralCategoryPrefix.size(), kGeneralCategoryPrefix) == 0) {
+      propertyName = "General_Category=" + fileName.substr(kGeneralCategoryPrefix.size());
+    } else if (fileName.compare(0, kScriptExtensionsPrefix.size(), kScriptExtensionsPrefix) ==
+               0) {
+      propertyName = "Script_Extensions=" + fileName.substr(kScriptExtensionsPrefix.size());
+    } else if (fileName.compare(0, kScriptPrefix.size(), kScriptPrefix) == 0) {
+      propertyName = "Script=" + fileName.substr(kScriptPrefix.size());
+    } else {
+      propertyName = fileName;
+    }
+
+    return classifySupportedRegexUnicodePropertyName(propertyName).has_value();
   }
 
   Test262Metadata parseMetadata(const std::string& source) {
@@ -370,166 +405,7 @@ private:
         testPath.find("built-ins/RegExp/property-escapes/generated/strings/RGI_Emoji_ZWJ_Sequence.js") !=
           std::string::npos;
       const bool isRegExpPropertyEscapesGeneratedSupportedSubset =
-        testPath.find("built-ins/RegExp/property-escapes/generated/ASCII.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/ASCII_Hex_Digit.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Uppercase_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Lowercase_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Decimal_Number.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Titlecase_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Letter_Number.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Number.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Number.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Cased_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Modifier_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Letter.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Line_Separator.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Paragraph_Separator.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Space_Separator.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Separator.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Nonspacing_Mark.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Enclosing_Mark.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Spacing_Mark.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Mark.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Connector_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Final_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Initial_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Dash_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Open_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Close_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Punctuation.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Control.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Private_Use.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Currency_Symbol.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Format.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Modifier_Symbol.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Math_Symbol.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Other_Symbol.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Symbol.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/General_Category_-_Surrogate.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Han.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Han.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Hangul.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Hangul.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Hanunoo.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Hanunoo.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Buhid.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Buhid.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tagalog.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tagalog.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tagbanwa.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tagbanwa.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Ogham.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Ogham.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Buginese.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Buginese.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Tai_Le.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Tai_Le.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Cham.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Cham.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Runic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Runic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Common.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Common.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Inherited.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Inherited.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Latin.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Latin.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Arabic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Arabic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Cyrillic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Cyrillic.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Devanagari.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Devanagari.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Bengali.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Bengali.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Gujarati.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Gujarati.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Brahmi.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Brahmi.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_-_Khmer.js") !=
-          std::string::npos ||
-        testPath.find("built-ins/RegExp/property-escapes/generated/Script_Extensions_-_Khmer.js") !=
-          std::string::npos;
+        isSupportedRegExpPropertyEscapesGeneratedTest(testPath);
       const bool isRegExpUnicodeSetsTargeted =
         testPath.find("built-ins/RegExp/prototype/unicodeSets/") != std::string::npos;
       const bool isRegExpUnicodeSetsRgiEmojiGenerated =

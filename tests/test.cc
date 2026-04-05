@@ -2845,6 +2845,19 @@ int main() {
     ].join("|")
   )", "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true");
 
+  runTest("RegExp property escapes generated script aliases", R"(
+    [
+      /^\p{Script=Armn}+$/u.test("\u0531"),
+      /^\p{scx=Armn}+$/u.test("\u0308"),
+      /^\p{Script=Armn}+$/u.test("\u0308"),
+      /^\p{Script=Canadian_Aboriginal}+$/u.test("\u1401"),
+      /^\p{sc=Cans}+$/u.test(String.fromCodePoint(0x11AB0)),
+      /^\p{Script=Zanabazar_Square}+$/u.test(String.fromCodePoint(0x11A00)),
+      /^\p{sc=Zanb}+$/u.test(String.fromCodePoint(0x11A47)),
+      /^\p{sc=Zzzz}+$/u.test(String.fromCodePoint(0x038B))
+    ].join("|")
+  )", "true|true|false|true|true|true|true|true");
+
   runTest("RegExp symbol methods use UTF-16 indices for astral text", R"(
     [
       RegExp.prototype[Symbol.search].call(/a/, "𠮷a𠮷"),

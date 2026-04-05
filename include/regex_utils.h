@@ -91,6 +91,11 @@ enum class SupportedRegexUnicodeProperty {
   ScriptExtensionsBrahmi,
   ScriptKhmer,
   ScriptExtensionsKhmer,
+#define LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY(identifier, canonical, alias) \
+  Script##identifier, \
+  ScriptExtensions##identifier,
+#include "regex_additional_script_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY
 };
 
 struct SupportedRegexUnicodePropertyPattern {
@@ -669,6 +674,21 @@ classifySupportedRegexUnicodePropertyName(const std::string& propertyName) {
       propertyName == "scx=Khmr") {
     return SupportedRegexUnicodeProperty::ScriptExtensionsKhmer;
   }
+#define LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY(identifier, canonical, alias)     \
+  if (propertyName == "Script=" #canonical ||                                       \
+      propertyName == "Script=" #alias ||                                           \
+      propertyName == "sc=" #canonical ||                                           \
+      propertyName == "sc=" #alias) {                                               \
+    return SupportedRegexUnicodeProperty::Script##identifier;                       \
+  }                                                                                 \
+  if (propertyName == "Script_Extensions=" #canonical ||                            \
+      propertyName == "Script_Extensions=" #alias ||                                \
+      propertyName == "scx=" #canonical ||                                          \
+      propertyName == "scx=" #alias) {                                              \
+    return SupportedRegexUnicodeProperty::ScriptExtensions##identifier;             \
+  }
+#include "regex_additional_script_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY
   return std::nullopt;
 }
 

@@ -4982,6 +4982,8 @@ inline bool regexMatchesUnicodePropertyScriptExtensionsKhmer(uint32_t cp) {
   return regexMatchesUnicodePropertyRanges(cp, kRegexUnicodePropertyScriptExtensionsKhmerRanges);
 }
 
+#include "regex_additional_script_matchers.inc"
+
 inline bool regexMatchesSupportedUnicodeProperty(SupportedRegexUnicodeProperty property,
                                                  uint32_t cp) {
   switch (property) {
@@ -5143,6 +5145,13 @@ inline bool regexMatchesSupportedUnicodeProperty(SupportedRegexUnicodeProperty p
       return regexMatchesUnicodePropertyScriptKhmer(cp);
     case SupportedRegexUnicodeProperty::ScriptExtensionsKhmer:
       return regexMatchesUnicodePropertyScriptExtensionsKhmer(cp);
+#define LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY(identifier, canonical, alias) \
+    case SupportedRegexUnicodeProperty::Script##identifier:                    \
+      return regexMatchesUnicodePropertyScript##identifier(cp);                \
+    case SupportedRegexUnicodeProperty::ScriptExtensions##identifier:          \
+      return regexMatchesUnicodePropertyScriptExtensions##identifier(cp);
+#include "regex_additional_script_properties.inc"
+#undef LIGHTJS_REGEX_ADDITIONAL_SCRIPT_PROPERTY
   }
   return false;
 }

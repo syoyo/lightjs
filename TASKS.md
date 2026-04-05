@@ -28,10 +28,10 @@ This document tracks planned enhancements and future work for LightJS.
 | Scope | Result | Notes |
 |---|---|---|
 | `./build/test262_runner ./test262_suite --no-temp-skips` | `23,445 / 23,629` pass | `0` fail, `184` skip. This remains the most recent completed default `test/language` sweep; a fresh whole-suite rerun is still pending after the keyed-Promise and regex-script batches. |
-| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite passes after increasing `lightjs_test` timeout to account for the expanded regression set, and it was revalidated after the keyed-Promise changes. |
-| `./build/lightjs_test` | `397 / 397` pass | Local regressions now include exact trailing-range coverage for the newly added `Script` / `Script_Extensions` families: `Common`, `Inherited`, `Latin`, `Arabic`, `Cyrillic`, `Devanagari`, `Bengali`, `Gujarati`, `Brahmi`, and `Khmer`. |
+| `ctest --test-dir build --output-on-failure` | `13 / 13` pass | Full local CTest suite passes after increasing `lightjs_test` timeout to account for the expanded regression set, and it was revalidated after the generalized script-property batch. |
+| `./build/lightjs_test` | `398 / 398` pass | Local regressions now include exact trailing-range coverage for the first script slice plus broader generated-script alias coverage such as `Armn`, `Cans`, `Zanb`, and `Zzzz`. |
 | `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/Promise/allKeyed` + `built-ins/Promise/allSettledKeyed` | `12 / 12` pass | `await-dictionary` surface is now covered by `Promise.allKeyed` / `Promise.allSettledKeyed`; the live runner feature gate no longer includes `await-dictionary`. |
-| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/RegExp/property-escapes/generated/Script_-_Common.js` + `Script_-_Latin.js` | `2 / 2` pass | Representative generated-property sentinels now pass after extending the Unicode script matcher/classifier set. A full 20-file rerun for this script slice is still pending because these generated shards are expensive. |
+| `./build/test262_runner ./test262_suite --no-temp-skips --test built-ins/RegExp/property-escapes/generated/{Script_-_Armenian.js,Script_Extensions_-_Armenian.js,Script_-_Canadian_Aboriginal.js,Script_-_Zanabazar_Square.js}` | `4 / 4` pass | Representative generated-script sentinels now pass after generalizing script support beyond the first 10-family slice. A broader rerun is still pending because these generated shards are expensive. |
 
 Current failing `test262` clusters:
 
@@ -602,8 +602,9 @@ When working on tasks:
 - Recent RegExp status:
   - `built-ins/RegExp/prototype` → `487/487` passing after the `@@match`, `@@replace`, `@@search`, `@@matchAll`, `source`, `flags`, and `hasIndices` fixes.
   - `built-ins/RegExp/property-escapes/generated/ASCII_Hex_Digit.js` → `1/1` passing.
-  - The runner currently explicitly unskips a `property-escapes/generated` subset that mirrors the implemented classifier/matcher set (currently 87 generated files). The latest slice added `Script` / `Script_Extensions` support for `Common`, `Inherited`, `Latin`, `Arabic`, `Cyrillic`, `Devanagari`, `Bengali`, `Gujarati`, `Brahmi`, and `Khmer`; the next regex expansion is the remaining script long tail plus any still-missing binary properties.
-  - Representative generated-script sentinels: `built-ins/RegExp/property-escapes/generated/Script_-_Common.js` and `Script_-_Latin.js` → `2/2` passing.
+  - The runner no longer hardcodes a handwritten `property-escapes/generated` subset. It now derives generated-file support from `classifySupportedRegexUnicodePropertyName(...)`, so new runtime coverage automatically widens the live runner gate.
+  - The latest slice added the remaining `Script` / `Script_Extensions` families from the generated corpus, bringing the implemented script surface to all `350` generated script files. A full generated-script rerun is still pending, but targeted sentinels for `Armenian`, `Script_Extensions=Armenian`, `Canadian_Aboriginal`, and `Zanabazar_Square` are `4/4` passing.
+  - The next regex expansion is the remaining non-script `regexp-unicode-property-escapes` long tail plus the separate `regexp-v-flag` bucket.
 - Remaining unsupported feature buckets still present in the live `test262/test262_runner.cc` feature gate:
   - `regexp-v-flag`
   - `regexp-unicode-property-escapes`
@@ -615,8 +616,8 @@ When working on tasks:
   - `regexp-modifiers`, `explicit-resource-management`, `async-disposable-stack`, and `source-phase-imports-module-source` still appear in older task notes, but they are not in the current `kUnsupportedFeatures` list and should not be treated as the active global skip buckets.
 - Focused regression status:
   - `with` / `Symbol.unscopables` probes (`language/statements/with/{unscopables-inc-dec,set-mutable-binding-idref-with-proxy-env,set-mutable-binding-idref-compound-assign-with-proxy-env}.js`) and the related `function/arrow` unscopables suites pass.
-  - `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, the selected Unicode property-escape subset, exact trailing script-range sentinels, explicit resource management disposal ordering, and keyed Promise combinators. Current local result is `397/397` passing.
+  - `lightjs_test` includes local regressions for `String.normalize`, `String.replace`, `String.search`, `String.split`, static source-phase import parsing, regex modifier-group syntax, exact trailing script-range sentinels, broader generated script aliases, explicit resource management disposal ordering, and keyed Promise combinators. Current local result is `398/398` passing.
 
 ---
 
-**Last Updated:** 2026-04-04 (regex script slice and local regression totals refreshed)
+**Last Updated:** 2026-04-04 (generalized script-property coverage and local regression totals refreshed)
