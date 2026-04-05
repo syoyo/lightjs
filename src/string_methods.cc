@@ -15,6 +15,20 @@ namespace lightjs {
 // Internal helper for string methods
 namespace {
 
+constexpr size_t kMaxSplitResultElements = (256 * 1024 * 1024) / sizeof(Value);
+
+void appendSplitResult(const GCPtr<Array>& result,
+                       uint32_t limit,
+                       const Value& value) {
+    if (result->elements.size() >= limit) {
+        return;
+    }
+    if (result->elements.size() >= kMaxSplitResultElements) {
+        throw std::runtime_error("RangeError: split result exceeds implementation limit");
+    }
+    result->elements.push_back(value);
+}
+
 bool isObjectLikeForStringBuiltin(const Value& v) {
     return v.isObject() || v.isArray() || v.isFunction() || v.isRegex() || 
            v.isProxy() || v.isPromise() || v.isGenerator() || v.isClass() ||
@@ -442,7 +456,7 @@ Value String_split(const std::vector<Value>& args) {
 
     if (args.size() < 2 || args[1].isUndefined()) {
         if (limit == 0) return Value(result);
-        result->elements.push_back(Value(str));
+        appendSplitResult(result, limit, Value(str));
         return Value(result);
     }
 
@@ -453,7 +467,7 @@ Value String_split(const std::vector<Value>& args) {
         for (size_t i = 0; i < len && result->elements.size() < limit; ++i) {
             uint16_t unit;
             if (unicode::utf16CodeUnitAt(str, i, unit)) {
-                result->elements.push_back(Value(unicode::encodeUTF8(unit)));
+                appendSplitResult(result, limit, Value(unicode::encodeUTF8(unit)));
             }
         }
         return Value(result);
@@ -463,11 +477,11 @@ Value String_split(const std::vector<Value>& args) {
     size_t pos;
     while ((pos = str.find(separator, start)) != std::string::npos) {
         if (result->elements.size() >= limit) break;
-        result->elements.push_back(Value(str.substr(start, pos - start)));
+        appendSplitResult(result, limit, Value(str.substr(start, pos - start)));
         start = pos + separator.length();
     }
     if (result->elements.size() < limit) {
-        result->elements.push_back(Value(str.substr(start)));
+        appendSplitResult(result, limit, Value(str.substr(start)));
     }
     return Value(result);
 }

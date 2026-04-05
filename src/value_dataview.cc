@@ -23,294 +23,137 @@ inline bool isLittleEndian() {
   return *reinterpret_cast<uint8_t*>(&test) == 0x01;
 }
 
-static size_t dataViewAccessibleLength(const DataView& view, size_t elementSize) {
+static size_t dataViewAccessibleLength(const DataView& view) {
   if (!view.buffer || view.buffer->detached) {
     throw std::runtime_error("TypeError: DataView has a detached buffer");
   }
-  size_t visibleLength = view.currentByteLength();
-  if (view.byteOffset > view.buffer->byteLength || elementSize > visibleLength) {
-    return visibleLength;
+  return view.currentByteLength();
+}
+
+static size_t resolveDataViewOffset(const DataView& view, size_t offset, size_t width) {
+  size_t visibleLength = dataViewAccessibleLength(view);
+  size_t absoluteOffset = 0;
+  if (!checked::rangeWithin(offset, width, visibleLength) ||
+      !checked::add(view.byteOffset, offset, absoluteOffset) ||
+      !checked::rangeWithin(absoluteOffset, width, view.buffer->data.size())) {
+    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
   }
-  return visibleLength;
+  return absoluteOffset;
+}
+
+template <typename T>
+T readDataViewValue(const DataView& view, size_t offset, bool littleEndian) {
+  size_t absoluteOffset = resolveDataViewOffset(view, offset, sizeof(T));
+  T value{};
+  std::memcpy(&value, &view.buffer->data[absoluteOffset], sizeof(T));
+  if (littleEndian != isLittleEndian()) {
+    value = swapEndian(value);
+  }
+  return value;
+}
+
+template <typename T>
+void writeDataViewValue(const DataView& view, size_t offset, T value, bool littleEndian) {
+  size_t absoluteOffset = resolveDataViewOffset(view, offset, sizeof(T));
+  if (littleEndian != isLittleEndian()) {
+    value = swapEndian(value);
+  }
+  std::memcpy(&view.buffer->data[absoluteOffset], &value, sizeof(T));
 }
 
 // DataView get methods
 int8_t DataView::getInt8(size_t offset) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int8_t));
-  if (offset >= visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-  return static_cast<int8_t>(buffer->data[byteOffset + offset]);
+  size_t absoluteOffset = resolveDataViewOffset(*this, offset, sizeof(int8_t));
+  return static_cast<int8_t>(buffer->data[absoluteOffset]);
 }
 
 uint8_t DataView::getUint8(size_t offset) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint8_t));
-  if (offset >= visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-  return buffer->data[byteOffset + offset];
+  size_t absoluteOffset = resolveDataViewOffset(*this, offset, sizeof(uint8_t));
+  return buffer->data[absoluteOffset];
 }
 
 int16_t DataView::getInt16(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int16_t));
-  if (offset + sizeof(int16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  int16_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(int16_t));
-
-  // If requested endianness doesn't match system, swap bytes
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<int16_t>(*this, offset, littleEndian);
 }
 
 uint16_t DataView::getUint16(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
-  if (offset + sizeof(uint16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  uint16_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(uint16_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<uint16_t>(*this, offset, littleEndian);
 }
 
 int32_t DataView::getInt32(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int32_t));
-  if (offset + sizeof(int32_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  int32_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(int32_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<int32_t>(*this, offset, littleEndian);
 }
 
 uint32_t DataView::getUint32(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint32_t));
-  if (offset + sizeof(uint32_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  uint32_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(uint32_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<uint32_t>(*this, offset, littleEndian);
 }
 
 float DataView::getFloat16(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
-  if (offset + sizeof(uint16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  uint16_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(uint16_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return float16_to_float32(value);
+  return float16_to_float32(readDataViewValue<uint16_t>(*this, offset, littleEndian));
 }
 
 float DataView::getFloat32(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(float));
-  if (offset + sizeof(float) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  float value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(float));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<float>(*this, offset, littleEndian);
 }
 
 double DataView::getFloat64(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(double));
-  if (offset + sizeof(double) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  double value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(double));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<double>(*this, offset, littleEndian);
 }
 
 int64_t DataView::getBigInt64(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int64_t));
-  if (offset + sizeof(int64_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  int64_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(int64_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<int64_t>(*this, offset, littleEndian);
 }
 
 uint64_t DataView::getBigUint64(size_t offset, bool littleEndian) const {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint64_t));
-  if (offset + sizeof(uint64_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  uint64_t value;
-  std::memcpy(&value, &buffer->data[byteOffset + offset], sizeof(uint64_t));
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  return value;
+  return readDataViewValue<uint64_t>(*this, offset, littleEndian);
 }
 
 // DataView set methods
 void DataView::setInt8(size_t offset, int8_t value) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int8_t));
-  if (offset >= visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-  buffer->data[byteOffset + offset] = static_cast<uint8_t>(value);
+  size_t absoluteOffset = resolveDataViewOffset(*this, offset, sizeof(int8_t));
+  buffer->data[absoluteOffset] = static_cast<uint8_t>(value);
 }
 
 void DataView::setUint8(size_t offset, uint8_t value) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint8_t));
-  if (offset >= visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-  buffer->data[byteOffset + offset] = value;
+  size_t absoluteOffset = resolveDataViewOffset(*this, offset, sizeof(uint8_t));
+  buffer->data[absoluteOffset] = value;
 }
 
 void DataView::setInt16(size_t offset, int16_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int16_t));
-  if (offset + sizeof(int16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(int16_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setUint16(size_t offset, uint16_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
-  if (offset + sizeof(uint16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(uint16_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setInt32(size_t offset, int32_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int32_t));
-  if (offset + sizeof(int32_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(int32_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setUint32(size_t offset, uint32_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint32_t));
-  if (offset + sizeof(uint32_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(uint32_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setFloat16(size_t offset, double value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint16_t));
-  if (offset + sizeof(uint16_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
   uint16_t bits = float64_to_float16(value);
-  if (littleEndian != isLittleEndian()) {
-    bits = swapEndian(bits);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &bits, sizeof(uint16_t));
+  writeDataViewValue(*this, offset, bits, littleEndian);
 }
 
 void DataView::setFloat32(size_t offset, float value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(float));
-  if (offset + sizeof(float) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(float));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setFloat64(size_t offset, double value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(double));
-  if (offset + sizeof(double) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(double));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setBigInt64(size_t offset, int64_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(int64_t));
-  if (offset + sizeof(int64_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(int64_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 void DataView::setBigUint64(size_t offset, uint64_t value, bool littleEndian) {
-  size_t visibleLength = dataViewAccessibleLength(*this, sizeof(uint64_t));
-  if (offset + sizeof(uint64_t) > visibleLength) {
-    throw std::runtime_error("RangeError: Offset is outside the bounds of the DataView");
-  }
-
-  if (littleEndian != isLittleEndian()) {
-    value = swapEndian(value);
-  }
-  std::memcpy(&buffer->data[byteOffset + offset], &value, sizeof(uint64_t));
+  writeDataViewValue(*this, offset, value, littleEndian);
 }
 
 }  // namespace lightjs

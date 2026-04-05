@@ -1,6 +1,7 @@
 #pragma once
 
 #include "value.h"
+#include "checked_arithmetic.h"
 #include "environment.h"
 #include "interpreter.h"
 #include "streams.h"
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <iomanip>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <cstdlib>
 #include <cctype>
@@ -21,6 +23,18 @@
 namespace lightjs {
 
 namespace {
+template <typename T>
+T readScalarUnaligned(const uint8_t* ptr) {
+  T value{};
+  std::memcpy(&value, ptr, sizeof(T));
+  return value;
+}
+
+template <typename T>
+void writeScalarUnaligned(uint8_t* ptr, T value) {
+  std::memcpy(ptr, &value, sizeof(T));
+}
+
 std::vector<std::string> moduleNamespaceExportNames(const GCPtr<Object>& obj) {
   if (!obj) {
     return {};
@@ -118,24 +132,24 @@ uint8_t toUint8Clamp(double value) {
 double readTypedArrayNumberUnchecked(TypedArrayType type, const uint8_t* ptr) {
   switch (type) {
     case TypedArrayType::Int8:
-      return static_cast<double>(*reinterpret_cast<const int8_t*>(ptr));
+      return static_cast<double>(static_cast<int8_t>(*ptr));
     case TypedArrayType::Uint8:
     case TypedArrayType::Uint8Clamped:
-      return static_cast<double>(*reinterpret_cast<const uint8_t*>(ptr));
+      return static_cast<double>(*ptr);
     case TypedArrayType::Int16:
-      return static_cast<double>(*reinterpret_cast<const int16_t*>(ptr));
+      return static_cast<double>(readScalarUnaligned<int16_t>(ptr));
     case TypedArrayType::Uint16:
-      return static_cast<double>(*reinterpret_cast<const uint16_t*>(ptr));
+      return static_cast<double>(readScalarUnaligned<uint16_t>(ptr));
     case TypedArrayType::Float16:
-      return static_cast<double>(float16_to_float32(*reinterpret_cast<const uint16_t*>(ptr)));
+      return static_cast<double>(float16_to_float32(readScalarUnaligned<uint16_t>(ptr)));
     case TypedArrayType::Int32:
-      return static_cast<double>(*reinterpret_cast<const int32_t*>(ptr));
+      return static_cast<double>(readScalarUnaligned<int32_t>(ptr));
     case TypedArrayType::Uint32:
-      return static_cast<double>(*reinterpret_cast<const uint32_t*>(ptr));
+      return static_cast<double>(readScalarUnaligned<uint32_t>(ptr));
     case TypedArrayType::Float32:
-      return static_cast<double>(*reinterpret_cast<const float*>(ptr));
+      return static_cast<double>(readScalarUnaligned<float>(ptr));
     case TypedArrayType::Float64:
-      return *reinterpret_cast<const double*>(ptr);
+      return readScalarUnaligned<double>(ptr);
     default:
       return 0.0;
   }
@@ -144,34 +158,34 @@ double readTypedArrayNumberUnchecked(TypedArrayType type, const uint8_t* ptr) {
 void writeTypedArrayNumberUnchecked(TypedArrayType type, uint8_t* ptr, double value) {
   switch (type) {
     case TypedArrayType::Int8:
-      *reinterpret_cast<int8_t*>(ptr) = static_cast<int8_t>(toUintN<uint8_t>(value));
+      *ptr = static_cast<uint8_t>(static_cast<int8_t>(toUintN<uint8_t>(value)));
       break;
     case TypedArrayType::Uint8:
-      *reinterpret_cast<uint8_t*>(ptr) = toUintN<uint8_t>(value);
+      *ptr = toUintN<uint8_t>(value);
       break;
     case TypedArrayType::Uint8Clamped:
-      *reinterpret_cast<uint8_t*>(ptr) = toUint8Clamp(value);
+      *ptr = toUint8Clamp(value);
       break;
     case TypedArrayType::Int16:
-      *reinterpret_cast<int16_t*>(ptr) = static_cast<int16_t>(toUintN<uint16_t>(value));
+      writeScalarUnaligned<int16_t>(ptr, static_cast<int16_t>(toUintN<uint16_t>(value)));
       break;
     case TypedArrayType::Uint16:
-      *reinterpret_cast<uint16_t*>(ptr) = toUintN<uint16_t>(value);
+      writeScalarUnaligned<uint16_t>(ptr, toUintN<uint16_t>(value));
       break;
     case TypedArrayType::Float16:
-      *reinterpret_cast<uint16_t*>(ptr) = float64_to_float16(value);
+      writeScalarUnaligned<uint16_t>(ptr, float64_to_float16(value));
       break;
     case TypedArrayType::Int32:
-      *reinterpret_cast<int32_t*>(ptr) = toInt32Element(value);
+      writeScalarUnaligned<int32_t>(ptr, toInt32Element(value));
       break;
     case TypedArrayType::Uint32:
-      *reinterpret_cast<uint32_t*>(ptr) = toUintN<uint32_t>(value);
+      writeScalarUnaligned<uint32_t>(ptr, toUintN<uint32_t>(value));
       break;
     case TypedArrayType::Float32:
-      *reinterpret_cast<float*>(ptr) = static_cast<float>(value);
+      writeScalarUnaligned<float>(ptr, static_cast<float>(value));
       break;
     case TypedArrayType::Float64:
-      *reinterpret_cast<double*>(ptr) = value;
+      writeScalarUnaligned<double>(ptr, value);
       break;
     default:
       break;

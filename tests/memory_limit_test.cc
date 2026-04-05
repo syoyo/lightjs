@@ -1,8 +1,16 @@
 #include "../include/lightjs.h"
+#include "../include/http.h"
+#include "../include/wasm/wasm_decoder.h"
+#include "../include/wasm/wasm_runtime.h"
 #include <iostream>
 #include <cassert>
+#include <limits>
 
 using namespace lightjs;
+
+namespace lightjs::wasm {
+std::shared_ptr<WasmMemory> createMemory(const Limits& limits);
+}
 
 // Helper to run JavaScript and get result
 std::pair<Value, bool> runScript(const char* script) {
@@ -149,6 +157,74 @@ void testMemoryStatsOutput() {
   std::cout << "\nMemory statistics output test passed!\n";
 }
 
+void testWasmMemoryLimits() {
+  std::cout << "\n=== WASM Memory Guard Test ===\n";
+
+  using namespace lightjs::wasm;
+
+  Limits valid{1, 2, true, false};
+  auto memory = createMemory(valid);
+  assert(memory && "Expected valid WASM memory");
+  assert(memory->size() == 65536 && "Expected one memory page");
+  assert(memory->grow(1) && "Expected growth within declared max");
+  assert(!memory->grow(1) && "Expected growth beyond max to fail");
+
+  bool rejected = false;
+  try {
+    Limits tooLarge{std::numeric_limits<uint64_t>::max(), 0, false, false};
+    (void)createMemory(tooLarge);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected && "Expected oversized WASM memory to throw");
+
+  std::cout << "WASM memory guard test passed!\n";
+}
+
+void testWasmDecoderLimits() {
+  std::cout << "\n=== WASM Decoder Guard Test ===\n";
+
+  using namespace lightjs::wasm;
+
+  std::vector<uint8_t> oversized(16 * 1024 * 1024 + 1, 0);
+  oversized[0] = 0x00;
+  oversized[1] = 0x61;
+  oversized[2] = 0x73;
+  oversized[3] = 0x6d;
+  oversized[4] = 0x01;
+  oversized[5] = 0x00;
+  oversized[6] = 0x00;
+  oversized[7] = 0x00;
+
+  WasmDecoder decoder(oversized);
+  auto module = decoder.decode();
+  assert(!module && "Expected oversized module to be rejected");
+
+  std::cout << "WASM decoder guard test passed!\n";
+}
+
+void testHTTPParsingLimits() {
+  std::cout << "\n=== HTTP Parsing Guard Test ===\n";
+
+  bool rejectedPort = false;
+  try {
+    (void)http::URL::parse("http://example.com:999999/");
+  } catch (const std::exception&) {
+    rejectedPort = true;
+  }
+  assert(rejectedPort && "Expected invalid HTTP port to throw");
+
+  bool rejectedEscape = false;
+  try {
+    (void)http::urlDecode("%zz");
+  } catch (const std::exception&) {
+    rejectedEscape = true;
+  }
+  assert(rejectedEscape && "Expected invalid percent encoding to throw");
+
+  std::cout << "HTTP parsing guard test passed!\n";
+}
+
 int main() {
   try {
     std::cout << "=== LightJS Memory Limit Tests ===" << std::endl;
@@ -157,6 +233,9 @@ int main() {
     testMemoryTracking();
     testHeapLimitEnforcement();
     testMemoryStatsOutput();
+    testWasmMemoryLimits();
+    testWasmDecoderLimits();
+    testHTTPParsingLimits();
 
     std::cout << "\nAll memory limit tests passed!" << std::endl;
     return 0;

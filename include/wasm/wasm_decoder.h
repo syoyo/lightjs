@@ -64,6 +64,8 @@ private:
     // Section decoding for Element and DataCount
     bool decodeElementSection(WasmModule& module);
     bool decodeDataCountSection(WasmModule& module);
+    bool validateCount(uint32_t count, const char* label);
+    bool validateSectionSpan(size_t start, uint32_t size, size_t& end);
 
     // Error handling with context
     const char* sectionName(uint8_t sectionId) const {

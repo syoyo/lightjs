@@ -1,5 +1,7 @@
 #include "wasm/wasm_decoder.h"
+#include "checked_arithmetic.h"
 #include <cstring>
+#include <limits>
 
 namespace lightjs {
 namespace wasm {
@@ -24,6 +26,36 @@ enum class SectionId : uint8_t {
     Data = 11,
     DataCount = 12
 };
+
+namespace {
+
+constexpr size_t kMaxWasmModuleBytes = 16 * 1024 * 1024;
+constexpr size_t kMaxWasmSectionBytes = 8 * 1024 * 1024;
+constexpr uint32_t kMaxWasmSectionEntries = 100000;
+constexpr uint32_t kMaxWasmLocalEntries = 100000;
+constexpr size_t kMaxWasmStringBytes = 1 * 1024 * 1024;
+constexpr size_t kMaxWasmDataSegmentBytes = 8 * 1024 * 1024;
+constexpr size_t kMaxWasmExpressionInstructions = 100000;
+
+}  // namespace
+
+bool WasmDecoder::validateCount(uint32_t count, const char* label) {
+    if (count > kMaxWasmSectionEntries) {
+        setError(std::string(label) + " count exceeds implementation limit");
+        return false;
+    }
+    return true;
+}
+
+bool WasmDecoder::validateSectionSpan(size_t start, uint32_t size, size_t& end) {
+    if (size > kMaxWasmSectionBytes ||
+        !checked::add(start, static_cast<size_t>(size), end) ||
+        end > data_.size()) {
+        setError("Section exceeds implementation limit");
+        return false;
+    }
+    return true;
+}
 
 // Binary reading primitives
 uint8_t WasmDecoder::readByte() {
@@ -84,7 +116,14 @@ uint32_t WasmDecoder::readVarU32() {
     uint32_t shift = 0;
 
     while (true) {
+        if (shift >= 35) {
+            setError("VarU32 too long");
+            return 0;
+        }
         uint8_t byte = readByte();
+        if (!error_.empty()) {
+            return 0;
+        }
         result |= static_cast<uint32_t>(byte & 0x7F) << shift;
 
         if ((byte & 0x80) == 0) {
@@ -92,10 +131,6 @@ uint32_t WasmDecoder::readVarU32() {
         }
 
         shift += 7;
-        if (shift >= 35) {
-            setError("VarU32 too long");
-            return 0;
-        }
     }
 
     return result;
@@ -106,7 +141,14 @@ uint64_t WasmDecoder::readVarU64() {
     uint32_t shift = 0;
 
     while (true) {
+        if (shift >= 70) {
+            setError("VarU64 too long");
+            return 0;
+        }
         uint8_t byte = readByte();
+        if (!error_.empty()) {
+            return 0;
+        }
         result |= static_cast<uint64_t>(byte & 0x7F) << shift;
 
         if ((byte & 0x80) == 0) {
@@ -114,10 +156,6 @@ uint64_t WasmDecoder::readVarU64() {
         }
 
         shift += 7;
-        if (shift >= 70) {
-            setError("VarU64 too long");
-            return 0;
-        }
     }
 
     return result;
@@ -127,13 +165,23 @@ uint64_t WasmDecoder::readVarU64() {
 int32_t WasmDecoder::readVarI32() {
     int32_t result = 0;
     uint32_t shift = 0;
-    uint8_t byte;
+    uint8_t byte = 0;
 
-    do {
+    while (true) {
+        if (shift >= 35) {
+            setError("VarI32 too long");
+            return 0;
+        }
         byte = readByte();
+        if (!error_.empty()) {
+            return 0;
+        }
         result |= static_cast<int32_t>(byte & 0x7F) << shift;
         shift += 7;
-    } while ((byte & 0x80) != 0);
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
 
     // Sign extend
     if ((shift < 32) && (byte & 0x40)) {
@@ -146,13 +194,23 @@ int32_t WasmDecoder::readVarI32() {
 int64_t WasmDecoder::readVarI64() {
     int64_t result = 0;
     uint32_t shift = 0;
-    uint8_t byte;
+    uint8_t byte = 0;
 
-    do {
+    while (true) {
+        if (shift >= 70) {
+            setError("VarI64 too long");
+            return 0;
+        }
         byte = readByte();
+        if (!error_.empty()) {
+            return 0;
+        }
         result |= static_cast<int64_t>(byte & 0x7F) << shift;
         shift += 7;
-    } while ((byte & 0x80) != 0);
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
 
     // Sign extend
     if ((shift < 64) && (byte & 0x40)) {
@@ -164,7 +222,10 @@ int64_t WasmDecoder::readVarI64() {
 
 std::string WasmDecoder::readString() {
     uint32_t length = readVarU32();
-    if (pos_ + length > data_.size()) {
+    size_t end = 0;
+    if (length > kMaxWasmStringBytes ||
+        !checked::add(pos_, static_cast<size_t>(length), end) ||
+        end > data_.size()) {
         setError("Unexpected end of input reading string");
         return "";
     }
@@ -175,7 +236,8 @@ std::string WasmDecoder::readString() {
 }
 
 std::vector<uint8_t> WasmDecoder::readBytes(size_t count) {
-    if (pos_ + count > data_.size()) {
+    size_t end = 0;
+    if (!checked::add(pos_, count, end) || end > data_.size()) {
         setError("Unexpected end of input reading bytes");
         return {};
     }
@@ -213,6 +275,7 @@ std::optional<FuncType> WasmDecoder::readFuncType() {
 
     // Parameters
     uint32_t paramCount = readVarU32();
+    if (!validateCount(paramCount, "parameter")) return std::nullopt;
     for (uint32_t i = 0; i < paramCount; ++i) {
         auto type = readValueType();
         if (!type) return std::nullopt;
@@ -221,6 +284,7 @@ std::optional<FuncType> WasmDecoder::readFuncType() {
 
     // Results
     uint32_t resultCount = readVarU32();
+    if (!validateCount(resultCount, "result")) return std::nullopt;
     for (uint32_t i = 0; i < resultCount; ++i) {
         auto type = readValueType();
         if (!type) return std::nullopt;
@@ -231,7 +295,7 @@ std::optional<FuncType> WasmDecoder::readFuncType() {
 }
 
 std::optional<Limits> WasmDecoder::readLimits() {
-    Limits limits;
+    Limits limits{};
     uint8_t flags = readByte();
 
     limits.hasMax = (flags & 0x01) != 0;
@@ -247,6 +311,11 @@ std::optional<Limits> WasmDecoder::readLimits() {
         if (limits.hasMax) {
             limits.max = readVarU32();
         }
+    }
+
+    if (limits.hasMax && limits.max < limits.min) {
+        setError("Invalid limits");
+        return std::nullopt;
     }
 
     return limits;
@@ -270,6 +339,7 @@ bool WasmDecoder::readMagicAndVersion() {
 // Type section
 bool WasmDecoder::decodeTypeSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "type")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         auto funcType = readFuncType();
@@ -283,6 +353,7 @@ bool WasmDecoder::decodeTypeSection(WasmModule& module) {
 // Import section
 bool WasmDecoder::decodeImportSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "import")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         Import import;
@@ -319,6 +390,7 @@ bool WasmDecoder::decodeImportSection(WasmModule& module) {
 // Function section
 bool WasmDecoder::decodeFunctionSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "function")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t typeIdx = readVarU32();
@@ -331,6 +403,7 @@ bool WasmDecoder::decodeFunctionSection(WasmModule& module) {
 // Table section
 bool WasmDecoder::decodeTableSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "table")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         Table table;
@@ -351,6 +424,7 @@ bool WasmDecoder::decodeTableSection(WasmModule& module) {
 // Memory section
 bool WasmDecoder::decodeMemorySection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "memory")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         auto limits = readLimits();
@@ -364,6 +438,7 @@ bool WasmDecoder::decodeMemorySection(WasmModule& module) {
 // Global section
 bool WasmDecoder::decodeGlobalSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "global")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         Global global;
@@ -389,6 +464,7 @@ bool WasmDecoder::decodeGlobalSection(WasmModule& module) {
 // Export section
 bool WasmDecoder::decodeExportSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "export")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         Export exp;
@@ -413,10 +489,15 @@ bool WasmDecoder::decodeStartSection(WasmModule& module) {
 // Code section (function bodies)
 bool WasmDecoder::decodeCodeSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "code")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t bodySize = readVarU32();
         size_t bodyStart = pos_;
+        size_t bodyEnd = 0;
+        if (!validateSectionSpan(bodyStart, bodySize, bodyEnd)) {
+            return false;
+        }
 
         Function func;
         if (i < module.functionTypeIndices.size()) {
@@ -425,10 +506,18 @@ bool WasmDecoder::decodeCodeSection(WasmModule& module) {
 
         // Read locals
         uint32_t localGroupCount = readVarU32();
+        if (!validateCount(localGroupCount, "local group")) return false;
+        uint32_t totalLocals = 0;
         for (uint32_t j = 0; j < localGroupCount; ++j) {
             uint32_t count = readVarU32();
             auto type = readValueType();
             if (!type) return false;
+            if (count > kMaxWasmLocalEntries ||
+                totalLocals > kMaxWasmLocalEntries - count) {
+                setError("Local count exceeds implementation limit");
+                return false;
+            }
+            totalLocals += count;
 
             for (uint32_t k = 0; k < count; ++k) {
                 func.locals.push_back(*type);
@@ -442,8 +531,8 @@ bool WasmDecoder::decodeCodeSection(WasmModule& module) {
         module.functions.push_back(func);
 
         // Verify we read exactly bodySize bytes
-        if (pos_ != bodyStart + bodySize) {
-            pos_ = bodyStart + bodySize;
+        if (pos_ != bodyEnd) {
+            pos_ = bodyEnd;
         }
     }
 
@@ -453,6 +542,7 @@ bool WasmDecoder::decodeCodeSection(WasmModule& module) {
 // Data section (memory initialization)
 bool WasmDecoder::decodeDataSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "data segment")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t flags = readVarU32();
@@ -461,17 +551,32 @@ bool WasmDecoder::decodeDataSection(WasmModule& module) {
             // Active data segment
             auto offsetExpr = decodeExpression();
             uint32_t size = readVarU32();
+            if (size > kMaxWasmDataSegmentBytes) {
+                setError("Data segment exceeds implementation limit");
+                return false;
+            }
             readBytes(size);
         } else if (flags == 1) {
             // Passive data segment
             uint32_t size = readVarU32();
+            if (size > kMaxWasmDataSegmentBytes) {
+                setError("Data segment exceeds implementation limit");
+                return false;
+            }
             readBytes(size);
         } else if (flags == 2) {
             // Active with memory index
             uint32_t memIdx = readVarU32();
             auto offsetExpr = decodeExpression();
             uint32_t size = readVarU32();
+            if (size > kMaxWasmDataSegmentBytes) {
+                setError("Data segment exceeds implementation limit");
+                return false;
+            }
             readBytes(size);
+        } else {
+            setError("Unsupported data segment mode: " + std::to_string(flags));
+            return false;
         }
     }
 
@@ -483,6 +588,10 @@ std::vector<Instruction> WasmDecoder::decodeExpression() {
     std::vector<Instruction> instructions;
 
     while (true) {
+        if (instructions.size() >= kMaxWasmExpressionInstructions) {
+            setError("Expression exceeds implementation limit");
+            return {};
+        }
         auto instr = decodeInstruction();
         if (!instr) break;
 
@@ -521,6 +630,7 @@ std::optional<Instruction> WasmDecoder::decodeInstruction() {
 
         case Opcode::BrTable: {
             uint32_t count = readVarU32();
+            if (!validateCount(count, "branch table")) return std::nullopt;
             std::vector<uint32_t> targets;
             for (uint32_t i = 0; i < count; ++i) {
                 targets.push_back(readVarU32());
@@ -612,14 +722,29 @@ std::optional<Instruction> WasmDecoder::decodeInstruction() {
 std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
     auto module = std::make_shared<WasmModule>();
 
+    if (data_.size() > kMaxWasmModuleBytes) {
+        setError("WASM module exceeds implementation limit");
+        return std::nullopt;
+    }
+
     if (!readMagicAndVersion()) {
         return std::nullopt;
     }
 
     while (hasMore() && error_.empty()) {
         uint8_t sectionId = readByte();
+        if (!error_.empty()) {
+            return std::nullopt;
+        }
         uint32_t sectionSize = readVarU32();
+        if (!error_.empty()) {
+            return std::nullopt;
+        }
         size_t sectionStart = pos_;
+        size_t sectionEnd = 0;
+        if (!validateSectionSpan(sectionStart, sectionSize, sectionEnd)) {
+            return std::nullopt;
+        }
 
         // Track current section for error reporting
         currentSection_ = sectionId;
@@ -664,13 +789,13 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
             case SectionId::Custom:
             default:
                 // Skip unknown sections
-                pos_ = sectionStart + sectionSize;
+                pos_ = sectionEnd;
                 break;
         }
 
         // Ensure we're at the end of the section
-        if (pos_ != sectionStart + sectionSize) {
-            pos_ = sectionStart + sectionSize;
+        if (pos_ != sectionEnd) {
+            pos_ = sectionEnd;
         }
 
         // Reset section tracking
@@ -687,6 +812,7 @@ std::optional<std::shared_ptr<WasmModule>> WasmDecoder::decode() {
 // Element section - initializes table elements
 bool WasmDecoder::decodeElementSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "element segment")) return false;
 
     for (uint32_t i = 0; i < count; ++i) {
         // Element segment structure (simplified):
@@ -709,6 +835,7 @@ bool WasmDecoder::decodeElementSection(WasmModule& module) {
             auto offsetExpr = decodeExpression();
             // Read function indices
             uint32_t funcCount = readVarU32();
+            if (!validateCount(funcCount, "element function")) return false;
             for (uint32_t j = 0; j < funcCount; ++j) {
                 readVarU32();  // Skip function index
             }
@@ -725,6 +852,7 @@ bool WasmDecoder::decodeElementSection(WasmModule& module) {
 // DataCount section - validates data segment count
 bool WasmDecoder::decodeDataCountSection(WasmModule& module) {
     uint32_t count = readVarU32();
+    if (!validateCount(count, "data count")) return false;
 
     // The data count section simply provides a hint for validation
     // We don't need to store it, but we validate it matches data section later

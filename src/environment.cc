@@ -112,6 +112,7 @@ bool maybeTriggerDeferredNamespaceEvaluation(const GCPtr<Object>& obj,
 constexpr const char* kImportPhaseSourceSentinel = "__lightjs_import_phase_source__";
 constexpr const char* kImportPhaseDeferSentinel = "__lightjs_import_phase_defer__";
 constexpr const char* kWithScopeObjectBinding = "__with_scope_object__";
+constexpr size_t kMaxTypedArrayBytes = 256 * 1024 * 1024;
 
 size_t typedArrayElementSize(TypedArrayType type) {
   switch (type) {
@@ -133,6 +134,36 @@ size_t typedArrayElementSize(TypedArrayType type) {
       return 8;
   }
   return 1;
+}
+
+size_t checkedTypedArrayByteLength(TypedArrayType type, size_t length) {
+  size_t byteLength = 0;
+  if (!checked::mul(length, typedArrayElementSize(type), byteLength) ||
+      byteLength > kMaxTypedArrayBytes) {
+    throw std::runtime_error("RangeError: Invalid typed array length");
+  }
+  return byteLength;
+}
+
+size_t checkedTypedArrayIndexNumber(double number, const char* errorMessage) {
+  if (std::isnan(number) || number == 0.0) {
+    return 0;
+  }
+  if (std::isinf(number) || number < 0) {
+    throw std::runtime_error(errorMessage);
+  }
+  double integer = std::trunc(number);
+  if (integer > static_cast<double>(std::numeric_limits<size_t>::max())) {
+    throw std::runtime_error(errorMessage);
+  }
+  return static_cast<size_t>(integer);
+}
+
+void ensureTypedArrayViewRange(size_t byteOffset, size_t byteLength, size_t availableLength) {
+  size_t endOffset = 0;
+  if (!checked::add(byteOffset, byteLength, endOffset) || endOffset > availableLength) {
+    throw std::runtime_error("RangeError: Invalid typed array length");
+  }
 }
 
 bool isTypedArrayConstructorName(const std::string& name) {
@@ -3894,13 +3925,10 @@ GCPtr<Environment> Environment::createGlobal() {
 
   auto createTypedArrayConstructor = [](TypedArrayType type, const std::string& name) {
     auto makeStandaloneTypedArray = [type](size_t length) {
-      auto typedArray = GarbageCollector::makeGC<TypedArray>(type, length);
-      auto backingBuffer =
-        GarbageCollector::makeGC<ArrayBuffer>(length * typedArrayElementSize(type));
-      typedArray->viewedBuffer = backingBuffer;
-      typedArray->byteOffset = 0;
-      typedArray->length = length;
-      typedArray->lengthTracking = false;
+      size_t byteLength = checkedTypedArrayByteLength(type, length);
+      auto backingBuffer = GarbageCollector::makeGC<ArrayBuffer>(byteLength);
+      auto typedArray =
+        GarbageCollector::makeGC<TypedArray>(type, backingBuffer, 0, length, false);
       backingBuffer->views.push_back(typedArray);
       return typedArray;
     };
@@ -3952,10 +3980,7 @@ GCPtr<Environment> Environment::createGlobal() {
         size_t byteOffset = 0;
         if (args.size() > 1 && !args[1].isUndefined()) {
           double offsetNum = args[1].toNumber();
-          if (std::isnan(offsetNum) || std::isinf(offsetNum) || offsetNum < 0) {
-            throw std::runtime_error("RangeError: Invalid typed array offset");
-          }
-          byteOffset = static_cast<size_t>(offsetNum);
+          byteOffset = checkedTypedArrayIndexNumber(offsetNum, "RangeError: Invalid typed array offset");
         }
         if (byteOffset % elementSize != 0) {
           throw std::runtime_error("RangeError: Invalid typed array offset");
@@ -3968,14 +3993,9 @@ GCPtr<Environment> Environment::createGlobal() {
         size_t length = 0;
         if (!lengthTracking) {
           double lengthNum = args[2].toNumber();
-          if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
-            throw std::runtime_error("RangeError: Invalid typed array length");
-          }
-          length = static_cast<size_t>(lengthNum);
-          if (length > (std::numeric_limits<size_t>::max() - byteOffset) / elementSize ||
-              byteOffset + length * elementSize > buffer->byteLength) {
-            throw std::runtime_error("RangeError: Invalid typed array length");
-          }
+          length = checkedTypedArrayIndexNumber(lengthNum, "RangeError: Invalid typed array length");
+          ensureTypedArrayViewRange(byteOffset, checkedTypedArrayByteLength(type, length),
+                                    buffer->byteLength);
         } else if (byteOffset <= buffer->byteLength) {
           length = (buffer->byteLength - byteOffset) / elementSize;
         }
@@ -4007,17 +4027,7 @@ GCPtr<Environment> Environment::createGlobal() {
 
       // Otherwise treat as length
       double lengthNum = args[0].toNumber();
-      if (std::isnan(lengthNum) || std::isinf(lengthNum) || lengthNum < 0) {
-        // Invalid length, return empty array
-        return Value(makeStandaloneTypedArray(0));
-      }
-
-      size_t length = static_cast<size_t>(lengthNum);
-      // Sanity check: prevent allocating huge arrays
-      if (length > 1000000000) { // 1GB limit
-        return Value(makeStandaloneTypedArray(0));
-      }
-
+      size_t length = checkedTypedArrayIndexNumber(lengthNum, "RangeError: Invalid typed array length");
       return Value(makeStandaloneTypedArray(length));
     };
     func->nativeFunc = [name](const std::vector<Value>&) -> Value {
@@ -5924,10 +5934,24 @@ GCPtr<Environment> Environment::createGlobal() {
       }
 
       size_t elementSize = ta->elementSize();
-      size_t srcByteOffset = ta->byteOffset + from * elementSize;
-      size_t dstByteOffset = ta->byteOffset + to * elementSize;
+      size_t fromBytes = 0;
+      size_t toBytes = 0;
+      size_t byteCount = 0;
+      size_t srcByteOffset = 0;
+      size_t dstByteOffset = 0;
+      if (!checked::mul(from, elementSize, fromBytes) ||
+          !checked::mul(to, elementSize, toBytes) ||
+          !checked::mul(count, elementSize, byteCount) ||
+          !checked::add(ta->byteOffset, fromBytes, srcByteOffset) ||
+          !checked::add(ta->byteOffset, toBytes, dstByteOffset)) {
+        throw std::runtime_error("RangeError: TypedArray operation exceeds bounds");
+      }
       auto& bytes = ta->storage();
-      std::memmove(&bytes[dstByteOffset], &bytes[srcByteOffset], count * elementSize);
+      if (!checked::rangeWithin(srcByteOffset, byteCount, bytes.size()) ||
+          !checked::rangeWithin(dstByteOffset, byteCount, bytes.size())) {
+        throw std::runtime_error("RangeError: TypedArray operation exceeds bounds");
+      }
+      std::memmove(&bytes[dstByteOffset], &bytes[srcByteOffset], byteCount);
       return args[0];
     });
 
@@ -6634,7 +6658,6 @@ GCPtr<Environment> Environment::createGlobal() {
   arrayBufferConstructImpl->isNative = true;
   arrayBufferConstructImpl->isConstructor = true;
   arrayBufferConstructImpl->nativeFunc = [toPrimitive](const std::vector<Value>& args) -> Value {
-    constexpr size_t kMaxRequestedArrayBufferLength = static_cast<size_t>(7) * 1125899906842624ull;
     auto toIndex = [toPrimitive](const Value& input) -> size_t {
       if (input.isUndefined()) {
         return 0;
@@ -6668,10 +6691,14 @@ GCPtr<Environment> Environment::createGlobal() {
         if (maxByteLength < length) {
           throw std::runtime_error("RangeError: Invalid maxByteLength");
         }
-        if (maxByteLength >= kMaxRequestedArrayBufferLength) {
+        if (maxByteLength > kMaxTypedArrayBytes) {
           throw std::runtime_error("RangeError: Invalid maxByteLength");
         }
       }
+    }
+
+    if (length > kMaxTypedArrayBytes) {
+      throw std::runtime_error("RangeError: Invalid ArrayBuffer length");
     }
 
     auto buffer = GarbageCollector::makeGC<ArrayBuffer>(length, maxByteLength);

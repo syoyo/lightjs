@@ -16,6 +16,7 @@
 #include "object_shape.h"
 #include "ordered_map.h"
 #include "regex_utils.h"
+#include "checked_arithmetic.h"
 #include "value_core.h"
 
 #if USE_SIMPLE_REGEX
@@ -407,6 +408,10 @@ struct ArrayBuffer : public GCObject {
       resizable(maxLength != 0 && maxLength != length),
       detached(false),
       immutable(false) {
+    if (maxByteLength < byteLength || byteLength > data.max_size() ||
+        maxByteLength > data.max_size()) {
+      throw std::runtime_error("RangeError: Invalid ArrayBuffer length");
+    }
     data.resize(length, 0);
   }
 
@@ -421,6 +426,9 @@ struct ArrayBuffer : public GCObject {
 
   bool resize(size_t newByteLength) {
     if (detached || immutable || !resizable || newByteLength > maxByteLength) {
+      return false;
+    }
+    if (newByteLength > data.max_size()) {
       return false;
     }
     data.resize(newByteLength, 0);
@@ -614,7 +622,12 @@ struct TypedArray : public GCObject {
 
   TypedArray(TypedArrayType t, size_t len)
     : type(t), byteOffset(0), length(len), lengthTracking(false) {
-    buffer.resize(len * elementSize());
+    size_t byteLength = 0;
+    if (!checked::mul(len, elementSize(), byteLength) ||
+        byteLength > buffer.max_size()) {
+      throw std::runtime_error("RangeError: Invalid typed array length");
+    }
+    buffer.resize(byteLength);
   }
 
   TypedArray(TypedArrayType t, GCPtr<ArrayBuffer> backing, size_t offset,

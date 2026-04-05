@@ -1,10 +1,12 @@
 #include "http.h"
 #include "tls.h"
+#include "checked_arithmetic.h"
 #include <sstream>
 #include <fstream>
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <limits>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -24,6 +26,81 @@
 
 namespace lightjs {
 namespace http {
+
+namespace {
+
+constexpr size_t kMaxHTTPHeaderBytes = 64 * 1024;
+constexpr size_t kMaxBufferedResponseBytes = 64 * 1024 * 1024;
+
+uint16_t parsePortOrThrow(const std::string& text) {
+  if (text.empty()) {
+    throw std::runtime_error("Invalid URL port");
+  }
+
+  uint32_t port = 0;
+  for (unsigned char ch : text) {
+    if (!std::isdigit(ch)) {
+      throw std::runtime_error("Invalid URL port");
+    }
+    if (port > (std::numeric_limits<uint16_t>::max() - static_cast<uint32_t>(ch - '0')) / 10) {
+      throw std::runtime_error("Invalid URL port");
+    }
+    port = port * 10 + static_cast<uint32_t>(ch - '0');
+  }
+
+  if (port == 0) {
+    throw std::runtime_error("Invalid URL port");
+  }
+  return static_cast<uint16_t>(port);
+}
+
+int parseStatusCodeOrThrow(const std::string& text) {
+  if (text.empty()) {
+    throw std::runtime_error("Invalid HTTP status code");
+  }
+
+  int status = 0;
+  for (unsigned char ch : text) {
+    if (!std::isdigit(ch)) {
+      throw std::runtime_error("Invalid HTTP status code");
+    }
+    if (status > (std::numeric_limits<int>::max() - static_cast<int>(ch - '0')) / 10) {
+      throw std::runtime_error("Invalid HTTP status code");
+    }
+    status = status * 10 + static_cast<int>(ch - '0');
+  }
+  return status;
+}
+
+uint8_t parseHexByteOrThrow(const std::string& text) {
+  if (text.size() != 2) {
+    throw std::runtime_error("Invalid percent-encoding");
+  }
+
+  auto hexValue = [](unsigned char ch) -> int {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+  };
+
+  int hi = hexValue(static_cast<unsigned char>(text[0]));
+  int lo = hexValue(static_cast<unsigned char>(text[1]));
+  if (hi < 0 || lo < 0) {
+    throw std::runtime_error("Invalid percent-encoding");
+  }
+  return static_cast<uint8_t>((hi << 4) | lo);
+}
+
+void checkBufferedAppend(size_t currentSize, size_t appendSize, const char* errorMessage) {
+  size_t nextSize = 0;
+  if (!checked::add(currentSize, appendSize, nextSize) ||
+      nextSize > kMaxBufferedResponseBytes) {
+    throw std::runtime_error(errorMessage);
+  }
+}
+
+}  // namespace
 
 URL URL::parse(const std::string& url) {
   URL result;
@@ -59,10 +136,14 @@ URL URL::parse(const std::string& url) {
   size_t portPos = hostPort.find(':');
   if (portPos != std::string::npos) {
     result.host = hostPort.substr(0, portPos);
-    result.port = static_cast<uint16_t>(std::stoi(hostPort.substr(portPos + 1)));
+    result.port = parsePortOrThrow(hostPort.substr(portPos + 1));
   } else {
     result.host = hostPort;
     result.port = (result.protocol == "https") ? 443 : 80;
+  }
+
+  if (result.protocol != "file" && result.host.empty()) {
+    throw std::runtime_error("Invalid URL host");
   }
 
   return result;
@@ -106,6 +187,10 @@ Response HTTPClient::get(const std::string& url) {
 Response HTTPClient::request(const std::string& method, const std::string& urlStr,
                               const std::unordered_map<std::string, std::string>& headers,
                               const std::vector<uint8_t>& body) {
+  if (body.size() > kMaxBufferedResponseBytes) {
+    throw std::runtime_error("HTTP request body exceeds implementation limit");
+  }
+
   URL url = URL::parse(urlStr);
 
   if (url.protocol == "file") {
@@ -135,11 +220,30 @@ Response HTTPClient::fileRequest(const URL& url) {
   }
 
   file.seekg(0, std::ios::end);
-  size_t size = file.tellg();
+  std::streamoff fileSize = file.tellg();
+  if (fileSize < 0) {
+    resp.statusCode = 500;
+    resp.statusText = "Read error";
+    return resp;
+  }
+  if (static_cast<uint64_t>(fileSize) > kMaxBufferedResponseBytes) {
+    resp.statusCode = 413;
+    resp.statusText = "Payload Too Large";
+    return resp;
+  }
+  size_t size = static_cast<size_t>(fileSize);
   file.seekg(0, std::ios::beg);
 
   resp.body.resize(size);
-  file.read(reinterpret_cast<char*>(resp.body.data()), size);
+  if (size > 0) {
+    file.read(reinterpret_cast<char*>(resp.body.data()), static_cast<std::streamsize>(size));
+    if (!file) {
+      resp.statusCode = 500;
+      resp.statusText = "Read error";
+      resp.body.clear();
+      return resp;
+    }
+  }
 
   resp.statusCode = 200;
   resp.statusText = "OK";
@@ -203,6 +307,8 @@ std::vector<uint8_t> HTTPClient::receiveData(int sock) {
     if (received <= 0) {
       break;
     }
+    checkBufferedAppend(result.size(), static_cast<size_t>(received),
+                        "HTTP response exceeds implementation limit");
     result.insert(result.end(), buffer, buffer + received);
 
     if (received < sizeof(buffer)) {
@@ -290,6 +396,8 @@ Response HTTPClient::httpsRequest(const URL& url, const std::string& method,
   int received;
 
   while ((received = tlsConn->recv(buffer, sizeof(buffer))) > 0) {
+    checkBufferedAppend(responseData.size(), static_cast<size_t>(received),
+                        "HTTPS response exceeds implementation limit");
     responseData.insert(responseData.end(), buffer, buffer + received);
   }
 
@@ -366,7 +474,7 @@ Response HTTPClient::parseResponse(const std::vector<uint8_t>& data) {
   std::string dataStr(data.begin(), data.end());
   size_t headerEnd = dataStr.find("\r\n\r\n");
 
-  if (headerEnd == std::string::npos) {
+  if (headerEnd == std::string::npos || headerEnd > kMaxHTTPHeaderBytes) {
     resp.statusCode = 0;
     resp.statusText = "Invalid response";
     return resp;
@@ -385,7 +493,13 @@ Response HTTPClient::parseResponse(const std::vector<uint8_t>& data) {
   std::string statusLine = trim(lines[0]);
   auto statusParts = split(statusLine, ' ');
   if (statusParts.size() >= 2) {
-    resp.statusCode = std::stoi(statusParts[1]);
+    try {
+      resp.statusCode = parseStatusCodeOrThrow(statusParts[1]);
+    } catch (const std::exception&) {
+      resp.statusCode = 0;
+      resp.statusText = "Invalid response";
+      return resp;
+    }
   }
   if (statusParts.size() >= 3) {
     resp.statusText = statusParts[2];
@@ -428,10 +542,10 @@ std::string urlDecode(const std::string& str) {
 
   for (size_t i = 0; i < str.length(); i++) {
     if (str[i] == '%' && i + 2 < str.length()) {
-      std::string hex = str.substr(i + 1, 2);
-      int value = std::stoi(hex, nullptr, 16);
-      oss << static_cast<char>(value);
+      oss << static_cast<char>(parseHexByteOrThrow(str.substr(i + 1, 2)));
       i += 2;
+    } else if (str[i] == '%') {
+      throw std::runtime_error("Invalid percent-encoding");
     } else if (str[i] == '+') {
       oss << ' ';
     } else {

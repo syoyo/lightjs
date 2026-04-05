@@ -2,69 +2,112 @@
 
 namespace lightjs {
 
-double TypedArray::getElement(size_t index) const {
-  if (index >= currentLength()) return 0.0;
+namespace {
 
-  size_t byteIndex = byteOffset + index * elementSize();
+bool resolveTypedArrayElementAddress(const TypedArray& array,
+                                    size_t index,
+                                    size_t width,
+                                    size_t& byteIndex) {
+  if (array.isOutOfBounds() || index >= array.currentLength()) {
+    return false;
+  }
+
+  size_t relativeOffset = 0;
+  if (!checked::mul(index, array.elementSize(), relativeOffset) ||
+      !checked::add(array.byteOffset, relativeOffset, byteIndex)) {
+    return false;
+  }
+
+  const auto& bytes = array.storage();
+  return checked::rangeWithin(byteIndex, width, bytes.size());
+}
+
+bool resolveTypedArrayByteSpan(const TypedArray& array,
+                               size_t elementOffset,
+                               size_t elementCount,
+                               size_t& byteOffset,
+                               size_t& byteCount) {
+  size_t relativeOffset = 0;
+  if (!checked::mul(elementOffset, array.elementSize(), relativeOffset) ||
+      !checked::add(array.byteOffset, relativeOffset, byteOffset) ||
+      !checked::mul(elementCount, array.elementSize(), byteCount)) {
+    return false;
+  }
+
+  const auto& bytes = array.storage();
+  return checked::rangeWithin(byteOffset, byteCount, bytes.size());
+}
+
+}  // namespace
+
+double TypedArray::getElement(size_t index) const {
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return 0.0;
+  }
   const auto& bytes = storage();
   return readTypedArrayNumberUnchecked(type, &bytes[byteIndex]);
 }
 
 void TypedArray::setElement(size_t index, double value) {
-  if (index >= currentLength()) return;
-
-  size_t byteIndex = byteOffset + index * elementSize();
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return;
+  }
   auto& bytes = storage();
   writeTypedArrayNumberUnchecked(type, &bytes[byteIndex], value);
 }
 
 int64_t TypedArray::getBigIntElement(size_t index) const {
-  if (index >= currentLength()) return 0;
-
-  size_t byteIndex = byteOffset + index * elementSize();
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return 0;
+  }
   const auto& bytes = storage();
   const uint8_t* ptr = &bytes[byteIndex];
 
   switch (type) {
     case TypedArrayType::BigInt64:
-      return *reinterpret_cast<const int64_t*>(ptr);
+      return readScalarUnaligned<int64_t>(ptr);
     case TypedArrayType::BigUint64:
-      return static_cast<int64_t>(*reinterpret_cast<const uint64_t*>(ptr));
+      return static_cast<int64_t>(readScalarUnaligned<uint64_t>(ptr));
     default:
       return static_cast<int64_t>(getElement(index));
   }
 }
 
 uint64_t TypedArray::getBigUintElement(size_t index) const {
-  if (index >= currentLength()) return 0;
-
-  size_t byteIndex = byteOffset + index * elementSize();
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return 0;
+  }
   const auto& bytes = storage();
   const uint8_t* ptr = &bytes[byteIndex];
 
   switch (type) {
     case TypedArrayType::BigUint64:
-      return *reinterpret_cast<const uint64_t*>(ptr);
+      return readScalarUnaligned<uint64_t>(ptr);
     case TypedArrayType::BigInt64:
-      return static_cast<uint64_t>(*reinterpret_cast<const int64_t*>(ptr));
+      return static_cast<uint64_t>(readScalarUnaligned<int64_t>(ptr));
     default:
       return static_cast<uint64_t>(getElement(index));
   }
 }
 
 void TypedArray::setBigIntElement(size_t index, int64_t value) {
-  if (index >= currentLength()) return;
-
-  size_t byteIndex = byteOffset + index * elementSize();
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return;
+  }
   auto& bytes = storage();
   uint8_t* ptr = &bytes[byteIndex];
 
   switch (type) {
     case TypedArrayType::BigInt64:
-      *reinterpret_cast<int64_t*>(ptr) = value;
+      writeScalarUnaligned<int64_t>(ptr, value);
       break;
     case TypedArrayType::BigUint64:
-      *reinterpret_cast<uint64_t*>(ptr) = static_cast<uint64_t>(value);
+      writeScalarUnaligned<uint64_t>(ptr, static_cast<uint64_t>(value));
       break;
     default:
       setElement(index, static_cast<double>(value));
@@ -73,18 +116,19 @@ void TypedArray::setBigIntElement(size_t index, int64_t value) {
 }
 
 void TypedArray::setBigUintElement(size_t index, uint64_t value) {
-  if (index >= currentLength()) return;
-
-  size_t byteIndex = byteOffset + index * elementSize();
+  size_t byteIndex = 0;
+  if (!resolveTypedArrayElementAddress(*this, index, elementSize(), byteIndex)) {
+    return;
+  }
   auto& bytes = storage();
   uint8_t* ptr = &bytes[byteIndex];
 
   switch (type) {
     case TypedArrayType::BigUint64:
-      *reinterpret_cast<uint64_t*>(ptr) = value;
+      writeScalarUnaligned<uint64_t>(ptr, value);
       break;
     case TypedArrayType::BigInt64:
-      *reinterpret_cast<int64_t*>(ptr) = static_cast<int64_t>(value);
+      writeScalarUnaligned<int64_t>(ptr, static_cast<int64_t>(value));
       break;
     default:
       setElement(index, static_cast<double>(value));
@@ -103,10 +147,13 @@ bool TypedArray::isOutOfBounds() const {
     return false;
   }
   const size_t size = elementSize();
-  if (length > (std::numeric_limits<size_t>::max() - byteOffset) / size) {
+  size_t byteLength = 0;
+  size_t endOffset = 0;
+  if (!checked::mul(length, size, byteLength) ||
+      !checked::add(byteOffset, byteLength, endOffset)) {
     return true;
   }
-  return byteOffset + length * size > viewedBuffer->byteLength;
+  return endOffset > viewedBuffer->byteLength;
 }
 
 size_t TypedArray::currentLength() const {
@@ -126,7 +173,11 @@ size_t TypedArray::currentLength() const {
 }
 
 size_t TypedArray::currentByteLength() const {
-  return currentLength() * elementSize();
+  size_t byteLength = 0;
+  if (!checked::mul(currentLength(), elementSize(), byteLength)) {
+    return 0;
+  }
+  return byteLength;
 }
 
 std::vector<uint8_t>& TypedArray::storage() {
@@ -153,15 +204,20 @@ void TypedArray::copyFrom(const TypedArray& source, size_t srcOffset, size_t dst
   auto& targetBytes = storage();
   const size_t sourceElementSize = source.elementSize();
   const size_t targetElementSize = elementSize();
-  const size_t srcByteOffset = source.byteOffset + srcOffset * sourceElementSize;
-  const size_t dstByteOffset = byteOffset + dstOffset * targetElementSize;
+  size_t srcByteOffset = 0;
+  size_t dstByteOffset = 0;
+  size_t srcByteCount = 0;
+  size_t dstByteCount = 0;
+  if (!resolveTypedArrayByteSpan(source, srcOffset, count, srcByteOffset, srcByteCount) ||
+      !resolveTypedArrayByteSpan(*this, dstOffset, count, dstByteOffset, dstByteCount)) {
+    return;
+  }
 
   // Fast path: same representation, just move the bytes.
   if (type == source.type ||
       ((type == TypedArrayType::BigInt64 || type == TypedArrayType::BigUint64) &&
        (source.type == TypedArrayType::BigInt64 || source.type == TypedArrayType::BigUint64))) {
-    size_t bytesToCopy = count * targetElementSize;
-    std::memmove(&targetBytes[dstByteOffset], &sourceBytes[srcByteOffset], bytesToCopy);
+    std::memmove(&targetBytes[dstByteOffset], &sourceBytes[srcByteOffset], dstByteCount);
     return;
   }
 
@@ -269,22 +325,27 @@ void TypedArray::fill(double value, size_t start, size_t end) {
 
   size_t count = end - start;
   auto& bytes = storage();
+  size_t byteIndex = 0;
+  size_t byteCount = 0;
+  if (!resolveTypedArrayByteSpan(*this, start, count, byteIndex, byteCount)) {
+    return;
+  }
 
 #if USE_SIMD
   // SIMD-accelerated fill for common types
   switch (type) {
     case TypedArrayType::Float32: {
-      float* ptr = reinterpret_cast<float*>(&bytes[byteOffset + start * 4]);
+      float* ptr = reinterpret_cast<float*>(&bytes[byteIndex]);
       simd::fillFloat32(ptr, static_cast<float>(value), count);
       return;
     }
     case TypedArrayType::Int32: {
-      int32_t* ptr = reinterpret_cast<int32_t*>(&bytes[byteOffset + start * 4]);
+      int32_t* ptr = reinterpret_cast<int32_t*>(&bytes[byteIndex]);
       simd::fillInt32(ptr, static_cast<int32_t>(value), count);
       return;
     }
     case TypedArrayType::Uint32: {
-      int32_t* ptr = reinterpret_cast<int32_t*>(&bytes[byteOffset + start * 4]);
+      int32_t* ptr = reinterpret_cast<int32_t*>(&bytes[byteIndex]);
       simd::fillInt32(ptr, static_cast<int32_t>(static_cast<uint32_t>(value)), count);
       return;
     }
@@ -305,12 +366,17 @@ void TypedArray::setElements(const double* values, size_t offset, size_t count) 
   count = std::min(count, targetLength - offset);
   if (count == 0) return;
   auto& bytes = storage();
+  size_t byteIndex = 0;
+  size_t byteCount = 0;
+  if (!resolveTypedArrayByteSpan(*this, offset, count, byteIndex, byteCount)) {
+    return;
+  }
 
 #if USE_SIMD
   // SIMD-accelerated bulk set for Float32
   if (type == TypedArrayType::Float32) {
     // Convert doubles to floats first
-    float* dst = reinterpret_cast<float*>(&bytes[byteOffset + offset * 4]);
+    float* dst = reinterpret_cast<float*>(&bytes[byteIndex]);
     for (size_t i = 0; i < count; ++i) {
       dst[i] = static_cast<float>(values[i]);
     }
@@ -321,7 +387,7 @@ void TypedArray::setElements(const double* values, size_t offset, size_t count) 
   if (type == TypedArrayType::Int32) {
     // Convert doubles to int32 using SIMD where possible
     // For now, use scalar since input is double and we'd need temp buffer
-    int32_t* dst = reinterpret_cast<int32_t*>(&bytes[byteOffset + offset * 4]);
+    int32_t* dst = reinterpret_cast<int32_t*>(&bytes[byteIndex]);
     for (size_t i = 0; i < count; ++i) {
       dst[i] = static_cast<int32_t>(values[i]);
     }
@@ -330,8 +396,8 @@ void TypedArray::setElements(const double* values, size_t offset, size_t count) 
 
   // Float64 can be directly copied
   if (type == TypedArrayType::Float64) {
-    double* dst = reinterpret_cast<double*>(&bytes[byteOffset + offset * 8]);
-    simd::memcpySIMD(dst, values, count * sizeof(double));
+    double* dst = reinterpret_cast<double*>(&bytes[byteIndex]);
+    simd::memcpySIMD(dst, values, byteCount);
     return;
   }
 #endif
@@ -348,18 +414,23 @@ void TypedArray::getElements(double* values, size_t offset, size_t count) const 
   count = std::min(count, sourceLength - offset);
   if (count == 0) return;
   const auto& bytes = storage();
+  size_t byteIndex = 0;
+  size_t byteCount = 0;
+  if (!resolveTypedArrayByteSpan(*this, offset, count, byteIndex, byteCount)) {
+    return;
+  }
 
 #if USE_SIMD
   // Float64 can be directly copied
   if (type == TypedArrayType::Float64) {
-    const double* src = reinterpret_cast<const double*>(&bytes[byteOffset + offset * 8]);
-    simd::memcpySIMD(values, src, count * sizeof(double));
+    const double* src = reinterpret_cast<const double*>(&bytes[byteIndex]);
+    simd::memcpySIMD(values, src, byteCount);
     return;
   }
 
   // Float32 -> double conversion
   if (type == TypedArrayType::Float32) {
-    const float* src = reinterpret_cast<const float*>(&bytes[byteOffset + offset * 4]);
+    const float* src = reinterpret_cast<const float*>(&bytes[byteIndex]);
     for (size_t i = 0; i < count; ++i) {
       values[i] = static_cast<double>(src[i]);
     }
@@ -368,7 +439,7 @@ void TypedArray::getElements(double* values, size_t offset, size_t count) const 
 
   // Int32 -> double conversion
   if (type == TypedArrayType::Int32) {
-    const int32_t* src = reinterpret_cast<const int32_t*>(&bytes[byteOffset + offset * 4]);
+    const int32_t* src = reinterpret_cast<const int32_t*>(&bytes[byteIndex]);
     for (size_t i = 0; i < count; ++i) {
       values[i] = static_cast<double>(src[i]);
     }

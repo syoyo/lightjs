@@ -224,6 +224,9 @@ void JSONStringifier::stringifyString(const std::string& str) {
 }
 
 void JSONStringifier::serializeArray(const Value& arrayVal) {
+    if (stack_.size() >= kMaxNestingDepth) {
+        throw std::runtime_error("RangeError: JSON nesting exceeds implementation limit");
+    }
     auto ptr = getPointer(arrayVal);
     stack_.push_back(ptr);
     std::string prevIndent = indent_;
@@ -252,6 +255,9 @@ void JSONStringifier::serializeArray(const Value& arrayVal) {
 }
 
 void JSONStringifier::serializeObject(const Value& objVal) {
+    if (stack_.size() >= kMaxNestingDepth) {
+        throw std::runtime_error("RangeError: JSON nesting exceeds implementation limit");
+    }
     auto ptr = getPointer(objVal);
     stack_.push_back(ptr);
     std::string prevIndent = indent_;

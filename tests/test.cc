@@ -117,6 +117,43 @@ int main() {
     arr
   )", "[Array]");
 
+  runTest("ArrayBuffer rejects huge length", R"(
+    try {
+      new ArrayBuffer(268435457);
+      false
+    } catch (e) {
+      e instanceof RangeError
+    }
+  )", "true");
+
+  runTest("TypedArray rejects huge length", R"(
+    try {
+      new Uint8Array(268435457);
+      false
+    } catch (e) {
+      e instanceof RangeError
+    }
+  )", "true");
+
+  runTest("TypedArray rejects overflowing view", R"(
+    try {
+      new Uint32Array(new ArrayBuffer(16), 8, 3);
+      false
+    } catch (e) {
+      e instanceof RangeError
+    }
+  )", "true");
+
+  runTest("Sparse array growth limit", R"(
+    let arr = [];
+    try {
+      arr[4294967294] = 1;
+      false
+    } catch (e) {
+      e instanceof RangeError
+    }
+  )", "true");
+
   runTest("Object creation", R"(
     let obj = { x: 10, y: 20 };
     obj

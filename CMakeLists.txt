@@ -261,7 +261,9 @@ set(LIGHTJS_PUBLIC_HEADERS
   include/lightjs.h
   include/ast.h
   include/bigint.h
+  include/checked_arithmetic.h
   include/compat.h
+  include/checked_arithmetic.h
   include/environment.h
   include/interpreter.h
   include/lexer.h

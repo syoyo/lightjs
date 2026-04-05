@@ -27,6 +27,8 @@ std::vector<std::string> jsonEnumerableOwnKeys(Interpreter* interp, const Value&
 
 class JSONParser {
 public:
+    static constexpr size_t kMaxNestingDepth = 500;
+
     explicit JSONParser(const std::string& str);
 
     Value parse(std::string* outSource = nullptr);
@@ -44,10 +46,13 @@ private:
 
     const std::string& str_;
     size_t pos_;
+    size_t depth_ = 0;
 };
 
 class JSONStringifier {
 public:
+    static constexpr size_t kMaxNestingDepth = 500;
+
     void setGap(const std::string& g);
     void setReplacer(const Value& fn);
     void setPropertyList(const std::vector<std::string>& list);

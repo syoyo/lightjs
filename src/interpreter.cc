@@ -659,6 +659,44 @@ bool parseArrayIndex(const std::string& key, size_t& index) {
   return true;
 }
 
+constexpr size_t kMaxDenseArrayBytes = 256 * 1024 * 1024;
+
+bool denseArrayResizeAllowed(size_t newSize) {
+  if (newSize > std::vector<Value>().max_size()) {
+    return false;
+  }
+  if (sizeof(Value) == 0) {
+    return true;
+  }
+  return newSize <= kMaxDenseArrayBytes / sizeof(Value);
+}
+
+bool resizeDenseArray(const GCPtr<Array>& array, size_t newSize) {
+  if (!denseArrayResizeAllowed(newSize)) {
+    return false;
+  }
+  array->elements.resize(newSize, Value(Undefined{}));
+  return true;
+}
+
+bool growDenseArrayForIndex(const GCPtr<Array>& array,
+                            size_t index,
+                            bool markIntermediateHoles = false) {
+  size_t oldSize = array->elements.size();
+  size_t newSize = 0;
+  if (!checked::add(index, static_cast<size_t>(1), newSize) ||
+      !resizeDenseArray(array, newSize)) {
+    return false;
+  }
+
+  if (markIntermediateHoles) {
+    for (size_t hi = oldSize; hi < index; ++hi) {
+      array->properties["__hole_" + std::to_string(hi) + "__"] = Value(true);
+    }
+  }
+  return true;
+}
+
 // Compare JavaScript strings by UTF-16 code units (ECMAScript relational
 // comparisons use code unit order, not UTF-8 byte order).
 struct Utf16CodeUnitIter {
@@ -6792,7 +6830,10 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
         if (newLen < arrPtr->elements.size()) {
           arrPtr->elements.resize(newLen);
         } else if (newLen > arrPtr->elements.size()) {
-          arrPtr->elements.resize(newLen, Value(Undefined{}));
+          if (!resizeDenseArray(arrPtr, newLen)) {
+            throwError(ErrorType::RangeError, "Array length exceeds implementation limit");
+            LIGHTJS_RETURN(Value(Undefined{}));
+          }
         }
         LIGHTJS_RETURN(Value(static_cast<double>(arrPtr->elements.size())));
       }
@@ -6819,11 +6860,9 @@ Task Interpreter::evaluateAssignment(const AssignmentExpr& expr) {
               LIGHTJS_RETURN(right);
             }
             if (idx >= arrPtr->elements.size()) {
-              size_t oldSize = arrPtr->elements.size();
-              arrPtr->elements.resize(idx + 1, Value(Undefined{}));
-              // Mark intermediate indices as holes
-              for (size_t hi = oldSize; hi < idx; hi++) {
-                arrPtr->properties["__hole_" + std::to_string(hi) + "__"] = Value(true);
+              if (!growDenseArrayForIndex(arrPtr, idx, true)) {
+                throwError(ErrorType::RangeError, "Array index exceeds implementation limit");
+                LIGHTJS_RETURN(Value(Undefined{}));
               }
             }
             arrPtr->elements[idx] = right;
@@ -7635,10 +7674,9 @@ Task Interpreter::evaluateUpdate(const UpdateExpr& expr) {
           }
         } else {
           if (index >= arrPtr->elements.size()) {
-            size_t oldSize = arrPtr->elements.size();
-            arrPtr->elements.resize(index + 1, Value(Undefined{}));
-            for (size_t hi = oldSize; hi < index; hi++) {
-              arrPtr->properties["__hole_" + std::to_string(hi) + "__"] = Value(true);
+            if (!growDenseArrayForIndex(arrPtr, index, true)) {
+              throwError(ErrorType::RangeError, "Array index exceeds implementation limit");
+              LIGHTJS_RETURN(Value(Undefined{}));
             }
           }
           arrPtr->elements[index] = newValue;
@@ -17322,7 +17360,10 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
             if (receiver.isArray()) {
               auto recvArr = receiver.getGC<Array>();
               if (index >= recvArr->elements.size()) {
-                recvArr->elements.resize(index + 1, Value(Undefined{}));
+                if (!growDenseArrayForIndex(recvArr, index)) {
+                  throwError(ErrorType::RangeError, "Array index exceeds implementation limit");
+                  return false;
+                }
               }
               recvArr->elements[index] = assigned;
               return true;
@@ -17349,7 +17390,10 @@ Task Interpreter::bindDestructuringPattern(const Expression& pattern, Value valu
           auto recvArr = receiver.getGC<Array>();
           if (parseArrayIndex(key, index)) {
             if (index >= recvArr->elements.size()) {
-              recvArr->elements.resize(index + 1, Value(Undefined{}));
+              if (!growDenseArrayForIndex(recvArr, index)) {
+                throwError(ErrorType::RangeError, "Array index exceeds implementation limit");
+                return false;
+              }
             }
             recvArr->elements[index] = assigned;
           } else {

@@ -4,6 +4,26 @@
 
 namespace lightjs::detail {
 
+namespace {
+
+struct JSONNestingGuard {
+    explicit JSONNestingGuard(size_t& depth, size_t limit) : depth_(depth) {
+        if (depth_ >= limit) {
+            throw std::runtime_error("RangeError: JSON nesting exceeds implementation limit");
+        }
+        ++depth_;
+    }
+
+    ~JSONNestingGuard() {
+        --depth_;
+    }
+
+private:
+    size_t& depth_;
+};
+
+}  // namespace
+
 JSONParser::JSONParser(const std::string& str) : str_(str), pos_(0) {}
 
 void JSONParser::skipWhitespace() {
@@ -206,7 +226,11 @@ Value JSONParser::parseNumber() {
     }
 
     std::string numStr = str_.substr(start, pos_ - start);
-    return Value(std::stod(numStr));
+    try {
+        return Value(std::stod(numStr));
+    } catch (const std::exception&) {
+        throw std::runtime_error("Invalid number");
+    }
 }
 
 Value JSONParser::parseTrue() {
@@ -234,6 +258,7 @@ Value JSONParser::parseNull() {
 }
 
 Value JSONParser::parseObject() {
+    JSONNestingGuard guard(depth_, kMaxNestingDepth);
     if (str_[pos_] != '{') {
         throw std::runtime_error("Expected '{'");
     }
@@ -295,6 +320,7 @@ Value JSONParser::parseObject() {
 }
 
 Value JSONParser::parseArray() {
+    JSONNestingGuard guard(depth_, kMaxNestingDepth);
     if (str_[pos_] != '[') {
         throw std::runtime_error("Expected '['");
     }

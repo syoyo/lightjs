@@ -7,6 +7,24 @@
 
 using namespace lightjs;
 
+namespace {
+
+std::string nestedJSONArrayLiteral(size_t depth) {
+    return std::string(depth, '[') + "0" + std::string(depth, ']');
+}
+
+std::string jsonParseDepthLimitCode(size_t depth) {
+    return "let json = '" + nestedJSONArrayLiteral(depth) + R"(';
+        try {
+            JSON.parse(json);
+            false
+        } catch (e) {
+            e instanceof RangeError
+        })";
+}
+
+}  // namespace
+
 void runTest(const std::string& name, const std::string& code, const std::string& expected = "") {
     std::cout << "Test: " << name << std::endl;
 
@@ -24,9 +42,10 @@ void runTest(const std::string& name, const std::string& code, const std::string
 
         auto env = Environment::createGlobal();
         Interpreter interpreter(env);
+        setGlobalInterpreter(&interpreter);
 
         auto task = interpreter.evaluate(*program);
-                Value result;
+        Value result;
         LIGHTJS_RUN_TASK(task, result);
         std::string resultStr = result.toString();
 
@@ -44,6 +63,8 @@ void runTest(const std::string& name, const std::string& code, const std::string
     } catch (const std::exception& e) {
         std::cout << "  FAILED: " << e.what() << std::endl;
     }
+
+    setGlobalInterpreter(nullptr);
 
     std::cout << std::endl;
 }
@@ -102,6 +123,21 @@ int main() {
 
     runTest("JSON.parse boolean", R"(
         JSON.parse("true");
+    )", "true");
+
+    runTest("JSON.parse nesting limit", jsonParseDepthLimitCode(520), "true");
+
+    runTest("JSON.stringify nesting limit", R"(
+        let value = 0;
+        for (let i = 0; i < 520; i = i + 1) {
+            value = [value];
+        }
+        try {
+            JSON.stringify(value);
+            false
+        } catch (e) {
+            e instanceof RangeError
+        }
     )", "true");
 
     // Object.keys tests

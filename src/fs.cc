@@ -9,6 +9,25 @@
 namespace lightjs {
 namespace fs {
 
+namespace {
+
+constexpr size_t kMaxReadFileBytes = 64 * 1024 * 1024;
+
+size_t checkedFileSize(std::ifstream& file, const std::string& path) {
+  file.seekg(0, std::ios::end);
+  std::streamoff fileSize = file.tellg();
+  if (fileSize < 0) {
+    throw std::runtime_error("Cannot determine file size: " + path);
+  }
+  if (static_cast<uint64_t>(fileSize) > kMaxReadFileBytes) {
+    throw std::runtime_error("File exceeds implementation limit: " + path);
+  }
+  file.seekg(0, std::ios::beg);
+  return static_cast<size_t>(fileSize);
+}
+
+}  // namespace
+
 // Synchronous implementations
 
 Value readFileSync(const std::string& path, const std::string& encoding) {
@@ -18,9 +37,14 @@ Value readFileSync(const std::string& path, const std::string& encoding) {
       throw std::runtime_error("Cannot open file: " + path);
     }
 
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    std::string contents = buffer.str();
+    size_t size = checkedFileSize(file, path);
+    std::string contents(size, '\0');
+    if (size > 0) {
+      file.read(contents.data(), static_cast<std::streamsize>(size));
+      if (!file) {
+        throw std::runtime_error("Cannot read file: " + path);
+      }
+    }
 
     // If encoding specified, return as string
     if (!encoding.empty() && (encoding == "utf8" || encoding == "utf-8")) {
